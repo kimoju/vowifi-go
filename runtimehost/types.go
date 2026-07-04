@@ -226,6 +226,7 @@ type StartRequest struct {
 	Proxy         *ProxyConfig
 	IMSRegistrar  IMSRegistrar
 	SMSTransport  messaging.SMSTransport
+	USSDTransport messaging.USSDTransport
 	DeliveryStore messaging.DeliveryStore
 	Dispatch      eventhost.Dispatcher
 	BeforeStart   func(context.Context, SessionConfig) error
@@ -316,6 +317,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	}
 	svc := messaging.NewService(req.DeviceID, req.Profile.IMSI, req.DeliveryStore, req.Dispatch)
 	svc.SetSMSTransport(req.SMSTransport)
+	svc.SetUSSDTransport(req.USSDTransport)
 	inst := &Instance{state: state, service: svc}
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)

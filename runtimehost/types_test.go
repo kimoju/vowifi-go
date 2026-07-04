@@ -120,8 +120,44 @@ func TestStartWiresSMSTransport(t *testing.T) {
 	}
 }
 
+func TestStartWiresUSSDTransport(t *testing.T) {
+	transport := &runtimeUSSDTransport{}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503"},
+		USSDTransport: transport,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	res, err := inst.Service().SendUSSD(context.Background(), "*100#")
+	if err != nil {
+		t.Fatalf("SendUSSD() error = %v", err)
+	}
+	if res.Text != "ok" || len(transport.executeRequests) != 1 {
+		t.Fatalf("res=%+v requests=%+v", res, transport.executeRequests)
+	}
+}
+
 type runtimeSMSTransport struct {
 	requests []messaging.SMSSendRequest
+}
+
+type runtimeUSSDTransport struct {
+	executeRequests []messaging.USSDRequest
+}
+
+func (t *runtimeUSSDTransport) ExecuteUSSD(ctx context.Context, req messaging.USSDRequest) (messaging.USSDResult, error) {
+	t.executeRequests = append(t.executeRequests, req)
+	return messaging.USSDResult{Text: "ok", Done: true}, nil
+}
+
+func (t *runtimeUSSDTransport) ContinueUSSD(ctx context.Context, req messaging.USSDRequest) (messaging.USSDResult, error) {
+	return messaging.USSDResult{Text: "continued", Done: true}, nil
+}
+
+func (t *runtimeUSSDTransport) CancelUSSD(ctx context.Context, req messaging.USSDRequest) error {
+	return nil
 }
 
 func (t *runtimeSMSTransport) SendSMSPart(ctx context.Context, req messaging.SMSSendRequest) (messaging.SMSSendResult, error) {

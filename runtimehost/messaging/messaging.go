@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -39,6 +40,9 @@ type SendOutcome struct {
 type USSDResult struct {
 	SessionID string `json:"session_id,omitempty"`
 	Text      string `json:"text,omitempty"`
+	RawText   string `json:"raw_text,omitempty"`
+	Status    int    `json:"status,omitempty"`
+	DCS       int    `json:"dcs,omitempty"`
 	Done      bool   `json:"done"`
 }
 
@@ -68,6 +72,20 @@ type SMSSendResult struct {
 
 type SMSTransport interface {
 	SendSMSPart(context.Context, SMSSendRequest) (SMSSendResult, error)
+}
+
+type USSDTransport interface {
+	ExecuteUSSD(context.Context, USSDRequest) (USSDResult, error)
+	ContinueUSSD(context.Context, USSDRequest) (USSDResult, error)
+	CancelUSSD(context.Context, USSDRequest) error
+}
+
+type USSDRequest struct {
+	DeviceID  string
+	IMSI      string
+	SessionID string
+	Command   string
+	Input     string
 }
 
 type DeliveryPartMatch struct {
@@ -124,11 +142,14 @@ func RPCauseText(code int) string {
 }
 
 type Service struct {
-	deviceID  string
-	imsi      string
-	store     DeliveryStore
-	dispatch  eventhost.Dispatcher
-	transport SMSTransport
+	deviceID      string
+	imsi          string
+	store         DeliveryStore
+	dispatch      eventhost.Dispatcher
+	transport     SMSTransport
+	ussdTransport USSDTransport
+	mu            sync.Mutex
+	ussdSessions  map[string]USSDResult
 }
 
 func NewService(deviceID, imsi string, store DeliveryStore, dispatch eventhost.Dispatcher) *Service {
@@ -140,6 +161,13 @@ func (s *Service) SetSMSTransport(t SMSTransport) {
 		return
 	}
 	s.transport = t
+}
+
+func (s *Service) SetUSSDTransport(t USSDTransport) {
+	if s == nil {
+		return
+	}
+	s.ussdTransport = t
 }
 
 func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts SendOptions) (SendOutcome, error) {
@@ -215,23 +243,70 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 }
 
 func (s *Service) SendUSSD(ctx context.Context, command string) (*USSDResult, error) {
-	if strings.TrimSpace(command) == "" {
+	command = strings.TrimSpace(command)
+	if command == "" {
 		return nil, errors.New("ussd command is empty")
 	}
-	return &USSDResult{SessionID: fmt.Sprintf("ussd-%d", time.Now().UnixNano()), Text: "", Done: true}, nil
+	sessionID := fmt.Sprintf("ussd-%d", time.Now().UnixNano())
+	if s == nil || s.ussdTransport == nil {
+		return &USSDResult{SessionID: sessionID, Text: "", Done: true}, nil
+	}
+	res, err := s.ussdTransport.ExecuteUSSD(ctx, USSDRequest{
+		DeviceID:  s.deviceID,
+		IMSI:      s.imsi,
+		SessionID: sessionID,
+		Command:   command,
+	})
+	if err != nil {
+		return nil, err
+	}
+	res = normalizeUSSDResult(res, sessionID)
+	s.recordUSSDSession(res)
+	return &res, nil
 }
 
 func (s *Service) ContinueUSSD(ctx context.Context, sessionID, input string) (*USSDResult, error) {
-	if strings.TrimSpace(sessionID) == "" {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
 		return nil, errors.New("ussd session_id is empty")
 	}
-	return &USSDResult{SessionID: sessionID, Text: "", Done: true}, nil
+	input = strings.TrimSpace(input)
+	if s == nil || s.ussdTransport == nil {
+		return &USSDResult{SessionID: sessionID, Text: "", Done: true}, nil
+	}
+	if !s.hasUSSDSession(sessionID) {
+		return nil, fmt.Errorf("ussd session %s is not active", sessionID)
+	}
+	res, err := s.ussdTransport.ContinueUSSD(ctx, USSDRequest{
+		DeviceID:  s.deviceID,
+		IMSI:      s.imsi,
+		SessionID: sessionID,
+		Input:     input,
+	})
+	if err != nil {
+		return nil, err
+	}
+	res = normalizeUSSDResult(res, sessionID)
+	s.recordUSSDSession(res)
+	return &res, nil
 }
 
 func (s *Service) CancelUSSD(ctx context.Context, sessionID string) error {
-	if strings.TrimSpace(sessionID) == "" {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
 		return errors.New("ussd session_id is empty")
 	}
+	if s == nil || s.ussdTransport == nil {
+		return nil
+	}
+	if err := s.ussdTransport.CancelUSSD(ctx, USSDRequest{
+		DeviceID:  s.deviceID,
+		IMSI:      s.imsi,
+		SessionID: sessionID,
+	}); err != nil {
+		return err
+	}
+	s.clearUSSDSession(sessionID)
 	return nil
 }
 
@@ -356,4 +431,49 @@ func firstNonEmpty(items ...string) string {
 		}
 	}
 	return ""
+}
+
+func normalizeUSSDResult(res USSDResult, sessionID string) USSDResult {
+	if strings.TrimSpace(res.SessionID) == "" {
+		res.SessionID = sessionID
+	}
+	if res.Text == "" && res.RawText != "" {
+		res.Text = res.RawText
+	}
+	return res
+}
+
+func (s *Service) recordUSSDSession(res USSDResult) {
+	if s == nil || strings.TrimSpace(res.SessionID) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if res.Done {
+		delete(s.ussdSessions, res.SessionID)
+		return
+	}
+	if s.ussdSessions == nil {
+		s.ussdSessions = make(map[string]USSDResult)
+	}
+	s.ussdSessions[res.SessionID] = res
+}
+
+func (s *Service) hasUSSDSession(sessionID string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.ussdSessions[sessionID]
+	return ok
+}
+
+func (s *Service) clearUSSDSession(sessionID string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.ussdSessions, sessionID)
+	s.mu.Unlock()
 }

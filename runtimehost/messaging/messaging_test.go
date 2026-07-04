@@ -80,9 +80,86 @@ func TestSendSMSWithTransportFailureMarksDeliveryFailed(t *testing.T) {
 	}
 }
 
+func TestUSSDTransportSessionLifecycle(t *testing.T) {
+	transport := &fakeUSSDTransport{
+		executeResult:  USSDResult{Text: "1. Balance\n2. Data", RawText: "menu", Status: 1, DCS: 15, Done: false},
+		continueResult: USSDResult{Text: "Balance: 10", Status: 0, DCS: 15, Done: true},
+	}
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	svc.SetUSSDTransport(transport)
+
+	first, err := svc.SendUSSD(context.Background(), "*100#")
+	if err != nil {
+		t.Fatalf("SendUSSD() error = %v", err)
+	}
+	if first.Done || first.SessionID == "" || first.Text != "1. Balance\n2. Data" {
+		t.Fatalf("first=%+v", first)
+	}
+	if len(transport.executeRequests) != 1 || transport.executeRequests[0].Command != "*100#" {
+		t.Fatalf("execute requests=%+v", transport.executeRequests)
+	}
+
+	next, err := svc.ContinueUSSD(context.Background(), first.SessionID, "1")
+	if err != nil {
+		t.Fatalf("ContinueUSSD() error = %v", err)
+	}
+	if !next.Done || next.Text != "Balance: 10" {
+		t.Fatalf("next=%+v", next)
+	}
+	if len(transport.continueRequests) != 1 || transport.continueRequests[0].Input != "1" {
+		t.Fatalf("continue requests=%+v", transport.continueRequests)
+	}
+	if _, err := svc.ContinueUSSD(context.Background(), first.SessionID, "1"); err == nil {
+		t.Fatal("ContinueUSSD() err=nil after session completion, want inactive session error")
+	}
+}
+
+func TestUSSDCancelDelegatesAndClearsSession(t *testing.T) {
+	transport := &fakeUSSDTransport{executeResult: USSDResult{Text: "menu", Done: false}}
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	svc.SetUSSDTransport(transport)
+
+	first, err := svc.SendUSSD(context.Background(), "*100#")
+	if err != nil {
+		t.Fatalf("SendUSSD() error = %v", err)
+	}
+	if err := svc.CancelUSSD(context.Background(), first.SessionID); err != nil {
+		t.Fatalf("CancelUSSD() error = %v", err)
+	}
+	if len(transport.cancelRequests) != 1 || transport.cancelRequests[0].SessionID != first.SessionID {
+		t.Fatalf("cancel requests=%+v", transport.cancelRequests)
+	}
+	if _, err := svc.ContinueUSSD(context.Background(), first.SessionID, "1"); err == nil {
+		t.Fatal("ContinueUSSD() err=nil after cancel, want inactive session error")
+	}
+}
+
 type fakeSMSTransport struct {
 	requests []SMSSendRequest
 	failPart int
+}
+
+type fakeUSSDTransport struct {
+	executeRequests  []USSDRequest
+	continueRequests []USSDRequest
+	cancelRequests   []USSDRequest
+	executeResult    USSDResult
+	continueResult   USSDResult
+}
+
+func (t *fakeUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (USSDResult, error) {
+	t.executeRequests = append(t.executeRequests, req)
+	return t.executeResult, nil
+}
+
+func (t *fakeUSSDTransport) ContinueUSSD(ctx context.Context, req USSDRequest) (USSDResult, error) {
+	t.continueRequests = append(t.continueRequests, req)
+	return t.continueResult, nil
+}
+
+func (t *fakeUSSDTransport) CancelUSSD(ctx context.Context, req USSDRequest) error {
+	t.cancelRequests = append(t.cancelRequests, req)
+	return nil
 }
 
 func (t *fakeSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (SMSSendResult, error) {
