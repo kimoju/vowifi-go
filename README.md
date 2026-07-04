@@ -39,9 +39,12 @@ protocol layers needed by VoHive:
 - IKEv2 SA proposal/transform encoding, default IKE/ESP proposals,
   configuration payload requests, identity payloads, traffic selectors, and
   EAP-AKA/AKA' packet and attribute codecs
+- IKE_SA_INIT initiator flow with UDP/NAT-T transport support, X25519 key
+  exchange, NAT-D/MOBIKE notifications, responder parsing, SKEYSEED, and IKE SA
+  key material derivation
 
-The live UDP IKEv2 exchange, ESP packet transport, and RTP media transport are
-still implemented incrementally behind these APIs.
+The encrypted IKE_AUTH/EAP-AKA exchange, ESP packet transport, and RTP media
+transport are still implemented incrementally behind these APIs.
 
 ## Development
 
