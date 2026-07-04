@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
+	"github.com/iniwex5/vowifi-go/engine/swu/eapaka"
 	"github.com/iniwex5/vowifi-go/runtimehost/carrier"
 )
 
@@ -182,10 +183,14 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 			return WebsheetRequest{}, ErrChallengeNotImplemented
 		}
 		aka, err := req.AKAProvider.CalculateAKA(result.RAND, result.AUTN)
-		if err != nil {
+		syncFailure := errors.Is(err, sim.ErrSyncFailure)
+		if err != nil && !syncFailure {
 			return WebsheetRequest{}, err
 		}
-		answer, err := json.Marshal([]map[string]any{{
+		if syncFailure && len(aka.AUTS) == 0 {
+			return WebsheetRequest{}, err
+		}
+		answerBody := map[string]any{
 			"message-id":    2,
 			"operation":     "emergency-address-update",
 			"response-id":   result.ResponseID,
@@ -195,7 +200,11 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 			"aka-auts":      strings.ToUpper(hex.EncodeToString(aka.AUTS)),
 			"sip-username":  req.Identity.SIPUsername,
 			"terminal-imei": req.Identity.IMEI,
-		}})
+		}
+		if relay, err := buildEAPRelayAnswer(result, aka, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI), syncFailure); err == nil && relay != "" {
+			answerBody["eap-relay-packet"] = relay
+		}
+		answer, err := json.Marshal([]map[string]any{answerBody})
 		if err != nil {
 			return WebsheetRequest{}, err
 		}
@@ -262,6 +271,7 @@ type entitlementResult struct {
 	RAND              []byte
 	AUTN              []byte
 	ChallengeRequired bool
+	EAPPacket         *eapaka.Packet
 }
 
 func (r entitlementResult) HasChallenge() bool {
@@ -325,10 +335,56 @@ func walkEntitlement(v any, out *entitlementResult) {
 				}
 			case "challenge", "aka-challenge", "aka_challenge", "eap-aka-challenge", "eap_aka_challenge":
 				parseCombinedChallenge(value, out)
+			case "eap-relay-packet", "eap_relay_packet", "eap-relay", "eap_relay":
+				parseEAPRelayPacket(value, out)
 			}
 			walkEntitlement(value, out)
 		}
 	}
+}
+
+func parseEAPRelayPacket(v any, out *entitlementResult) {
+	raw, ok := decodeChallengeBytes(stringValue(v))
+	if !ok || len(raw) == 0 {
+		return
+	}
+	packet, err := eapaka.ParsePacket(raw)
+	if err != nil {
+		return
+	}
+	rand16, autn16, err := eapaka.ChallengeRANDAndAUTN(packet)
+	if err != nil {
+		return
+	}
+	if len(out.RAND) == 0 {
+		out.RAND = rand16
+	}
+	if len(out.AUTN) == 0 {
+		out.AUTN = autn16
+	}
+	p := packet
+	out.EAPPacket = &p
+}
+
+func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity string, syncFailure bool) (string, error) {
+	if result.EAPPacket == nil {
+		return "", nil
+	}
+	var packet eapaka.Packet
+	var err error
+	if syncFailure {
+		packet, err = eapaka.BuildSynchronizationFailureResponse(*result.EAPPacket, aka.AUTS)
+	} else {
+		packet, _, err = eapaka.BuildChallengeResponse(strings.TrimSpace(identity), *result.EAPPacket, aka)
+	}
+	if err != nil {
+		return "", err
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
 func parseCombinedChallenge(v any, out *entitlementResult) {

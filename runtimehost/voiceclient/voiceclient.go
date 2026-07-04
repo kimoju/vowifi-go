@@ -2,6 +2,7 @@ package voiceclient
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
@@ -43,6 +44,18 @@ type DigestAuthInput struct {
 	NC       int
 }
 
+type RegistrationBinding struct {
+	ContactURI       string
+	PublicIdentity   string
+	AssociatedURIs   []string
+	ServiceRoutes    []string
+	Paths            []string
+	SecurityServer   []string
+	SecurityVerify   []string
+	Expires          int
+	RegistrarContact string
+}
+
 type RegisterMessage struct {
 	URI     string
 	Headers map[string]string
@@ -77,6 +90,8 @@ type RegisterResult struct {
 	Reason     string
 	Attempts   int
 	Challenge  DigestChallenge
+	Binding    RegistrationBinding
+	AuthHeader string
 }
 
 func ParseWWWAuthenticate(header string) (DigestChallenge, error) {
@@ -142,7 +157,7 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 	if algorithm == "" {
 		algorithm = "MD5"
 	}
-	if !strings.EqualFold(algorithm, "MD5") && !strings.EqualFold(algorithm, "AKAv1-MD5") {
+	if !strings.EqualFold(algorithm, "MD5") && !strings.EqualFold(algorithm, "AKAv1-MD5") && !strings.EqualFold(algorithm, "AKAv2-MD5") {
 		return "", fmt.Errorf("unsupported digest algorithm %q", algorithm)
 	}
 
@@ -150,6 +165,9 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 	ha2 := md5Hex(method + ":" + uri)
 	response := ""
 	qop := firstQOP(ch.QOP)
+	if qop != "" && qop != "auth" {
+		return "", fmt.Errorf("unsupported digest qop %q", qop)
+	}
 	nc := in.NC
 	if nc <= 0 {
 		nc = 1
@@ -182,6 +200,29 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 	return strings.Join(parts, ", "), nil
 }
 
+func BuildAKADigestPassword(algorithm string, aka sim.AKAResult) (string, error) {
+	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
+	case "AKAV1-MD5":
+		if len(aka.RES) == 0 {
+			return "", errors.New("AKA RES is empty")
+		}
+		return string(aka.RES), nil
+	case "AKAV2-MD5":
+		if len(aka.RES) == 0 || len(aka.CK) == 0 || len(aka.IK) == 0 {
+			return "", errors.New("AKA RES/CK/IK required for AKAv2-MD5")
+		}
+		key := make([]byte, 0, len(aka.RES)+len(aka.IK)+len(aka.CK))
+		key = append(key, aka.RES...)
+		key = append(key, aka.IK...)
+		key = append(key, aka.CK...)
+		mac := hmac.New(md5.New, key)
+		_, _ = mac.Write([]byte("http-digest-akav2-password"))
+		return base64.StdEncoding.EncodeToString(mac.Sum(nil)), nil
+	default:
+		return "", fmt.Errorf("unsupported AKA digest algorithm %q", algorithm)
+	}
+}
+
 func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) map[string]string {
 	domain := strings.TrimSpace(profile.Domain)
 	impu := strings.TrimSpace(profile.IMPU)
@@ -189,16 +230,18 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 		impu = "sip:" + strings.TrimSpace(profile.IMPI) + "@" + domain
 	}
 	headers := map[string]string{
-		"To":              "<" + impu + ">",
-		"From":            "<" + impu + ">;tag=vowifi-go",
-		"Contact":         "<" + strings.TrimSpace(contactURI) + ">;+sip.instance=\"<urn:uuid:vowifi-go>\"",
-		"Call-ID":         strings.TrimSpace(callID),
-		"CSeq":            strings.TrimSpace(cseq) + " REGISTER",
-		"Max-Forwards":    "70",
-		"User-Agent":      firstNonEmpty(profile.UserAgent, "vowifi-go"),
-		"Allow":           "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, MESSAGE, OPTIONS",
-		"Supported":       "path, gruu, outbound, sec-agree",
-		"Security-Client": `ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=0;spi-s=0;port-c=0;port-s=0`,
+		"To":                   "<" + impu + ">",
+		"From":                 "<" + impu + ">;tag=vowifi-go",
+		"Contact":              "<" + strings.TrimSpace(contactURI) + ">;+sip.instance=\"<urn:uuid:vowifi-go>\"",
+		"Call-ID":              strings.TrimSpace(callID),
+		"CSeq":                 strings.TrimSpace(cseq) + " REGISTER",
+		"Max-Forwards":         "70",
+		"User-Agent":           firstNonEmpty(profile.UserAgent, "vowifi-go"),
+		"Allow":                "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, MESSAGE, OPTIONS",
+		"Supported":            "path, gruu, outbound, sec-agree, 100rel, timer",
+		"Require":              "sec-agree",
+		"P-Preferred-Identity": "<" + impu + ">",
+		"Security-Client":      `ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=0;spi-s=0;port-c=0;port-s=0`,
 	}
 	return headers
 }
@@ -231,7 +274,13 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		return RegisterResult{}, err
 	}
 	if isSIPSuccess(resp.StatusCode) {
-		return RegisterResult{Registered: true, StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1}, nil
+		return RegisterResult{
+			Registered: true,
+			StatusCode: resp.StatusCode,
+			Reason:     resp.Reason,
+			Attempts:   1,
+			Binding:    BuildRegistrationBinding(s.Profile, contactURI, resp, expires),
+		}, nil
 	}
 	if resp.StatusCode != 401 && resp.StatusCode != 407 {
 		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
@@ -245,25 +294,28 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		authHeader = firstHeader(resp.Headers, headerName)
 		authzHeader = "Proxy-Authorization"
 	}
-	ch, err := ParseWWWAuthenticate(authHeader)
+	ch, err := SelectDigestChallenge(resp.Headers, headerName)
 	if err != nil {
 		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1}, err
 	}
 
 	password := ""
-	if strings.EqualFold(ch.Algorithm, "AKAv1-MD5") {
+	if isAKADigestAlgorithm(ch.Algorithm) {
 		rand16, autn16, ok := ExtractAKAChallengeNonce(ch.Nonce)
 		if !ok {
 			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, ErrInvalidChallenge
 		}
 		if s.AKAProvider == nil {
-			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, errors.New("AKA provider required for AKAv1-MD5")
+			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, errors.New("AKA provider required for IMS digest AKA")
 		}
 		aka, err := s.AKAProvider.CalculateAKA(rand16, autn16)
 		if err != nil {
 			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
 		}
-		password = strings.ToUpper(hex.EncodeToString(aka.RES))
+		password, err = BuildAKADigestPassword(ch.Algorithm, aka)
+		if err != nil {
+			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
+		}
 	}
 
 	authz, err := BuildDigestAuthorization(ch, DigestAuthInput{
@@ -281,6 +333,9 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	msg.Headers = BuildRegisterHeaders(s.Profile, contactURI, callID, "2")
 	msg.Headers["Expires"] = strconv.Itoa(expires)
 	msg.Headers[authzHeader] = authz
+	if securityVerify := securityVerifyFromChallenge(resp.Headers); securityVerify != "" {
+		msg.Headers["Security-Verify"] = securityVerify
+	}
 	resp2, err := s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
 	if err != nil {
 		return RegisterResult{Attempts: 2, Challenge: ch}, err
@@ -291,11 +346,60 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		Reason:     resp2.Reason,
 		Attempts:   2,
 		Challenge:  ch,
+		Binding:    BuildRegistrationBinding(s.Profile, contactURI, resp2, expires),
+		AuthHeader: authz,
 	}
 	if !result.Registered {
 		return result, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 	}
 	return result, nil
+}
+
+func SelectDigestChallenge(headers map[string][]string, name string) (DigestChallenge, error) {
+	var best DigestChallenge
+	bestScore := -1
+	var firstErr error
+	for _, header := range rawHeaderValues(headers, name) {
+		ch, err := ParseWWWAuthenticate(header)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		score := digestAlgorithmScore(ch.Algorithm)
+		if score > bestScore {
+			best = ch
+			bestScore = score
+		}
+	}
+	if bestScore >= 0 {
+		return best, nil
+	}
+	if firstErr != nil {
+		return DigestChallenge{}, firstErr
+	}
+	return DigestChallenge{}, ErrInvalidChallenge
+}
+
+func BuildRegistrationBinding(profile IMSProfile, contactURI string, resp RegisterResponse, requestedExpires int) RegistrationBinding {
+	associated := normalizeAddressValues(headerListValues(resp.Headers, "P-Associated-URI"))
+	securityServer := trimHeaderValues(headerListValues(resp.Headers, "Security-Server"))
+	binding := RegistrationBinding{
+		ContactURI:       strings.TrimSpace(contactURI),
+		PublicIdentity:   defaultPublicIdentity(profile, associated),
+		AssociatedURIs:   associated,
+		ServiceRoutes:    trimHeaderValues(headerListValues(resp.Headers, "Service-Route")),
+		Paths:            trimHeaderValues(headerListValues(resp.Headers, "Path")),
+		SecurityServer:   securityServer,
+		SecurityVerify:   append([]string(nil), securityServer...),
+		Expires:          registrationExpires(resp.Headers, contactURI, requestedExpires),
+		RegistrarContact: firstTrimmed(headerListValues(resp.Headers, "Contact")...),
+	}
+	if len(binding.AssociatedURIs) == 0 && binding.PublicIdentity != "" {
+		binding.AssociatedURIs = []string{binding.PublicIdentity}
+	}
+	return binding
 }
 
 func splitAuthParams(s string) []string {
@@ -340,12 +444,7 @@ func firstQOP(qop string) string {
 }
 
 func firstHeader(headers map[string][]string, name string) string {
-	for key, values := range headers {
-		if strings.EqualFold(key, name) && len(values) > 0 {
-			return strings.TrimSpace(values[0])
-		}
-	}
-	return ""
+	return firstTrimmed(rawHeaderValues(headers, name)...)
 }
 
 func isSIPSuccess(code int) bool {
@@ -382,6 +481,176 @@ func decodeNonceBytes(nonce string) ([]byte, bool) {
 	return nil, false
 }
 
+func isAKADigestAlgorithm(algorithm string) bool {
+	alg := strings.ToUpper(strings.TrimSpace(algorithm))
+	return alg == "AKAV1-MD5" || alg == "AKAV2-MD5"
+}
+
+func digestAlgorithmScore(algorithm string) int {
+	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
+	case "AKAV2-MD5":
+		return 30
+	case "AKAV1-MD5":
+		return 20
+	case "MD5":
+		return 10
+	default:
+		return 0
+	}
+}
+
+func rawHeaderValues(headers map[string][]string, name string) []string {
+	var out []string
+	for key, values := range headers {
+		if strings.EqualFold(key, name) {
+			for _, value := range values {
+				if strings.TrimSpace(value) != "" {
+					out = append(out, strings.TrimSpace(value))
+				}
+			}
+		}
+	}
+	return out
+}
+
+func headerListValues(headers map[string][]string, name string) []string {
+	var out []string
+	for _, value := range rawHeaderValues(headers, name) {
+		out = append(out, splitSIPHeaderValues(value)...)
+	}
+	return out
+}
+
+func splitSIPHeaderValues(s string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	escaped := false
+	angleDepth := 0
+	for _, r := range s {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\' && inQuote:
+			cur.WriteRune(r)
+			escaped = true
+		case r == '"':
+			cur.WriteRune(r)
+			inQuote = !inQuote
+		case r == '<' && !inQuote:
+			angleDepth++
+			cur.WriteRune(r)
+		case r == '>' && !inQuote:
+			if angleDepth > 0 {
+				angleDepth--
+			}
+			cur.WriteRune(r)
+		case r == ',' && !inQuote && angleDepth == 0:
+			if part := strings.TrimSpace(cur.String()); part != "" {
+				out = append(out, part)
+			}
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if part := strings.TrimSpace(cur.String()); part != "" {
+		out = append(out, part)
+	}
+	return out
+}
+
+func normalizeAddressValues(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if uri := extractAddressURI(value); uri != "" {
+			out = append(out, uri)
+		}
+	}
+	return out
+}
+
+func trimHeaderValues(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func extractAddressURI(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if start := strings.IndexByte(value, '<'); start >= 0 {
+		if end := strings.IndexByte(value[start+1:], '>'); end >= 0 {
+			return strings.TrimSpace(value[start+1 : start+1+end])
+		}
+	}
+	if fields := strings.Fields(value); len(fields) > 0 {
+		value = fields[0]
+	}
+	return strings.TrimSpace(strings.Trim(value, "<>"))
+}
+
+func defaultPublicIdentity(profile IMSProfile, associated []string) string {
+	if len(associated) > 0 {
+		return associated[0]
+	}
+	if impu := strings.TrimSpace(profile.IMPU); impu != "" {
+		return impu
+	}
+	if strings.TrimSpace(profile.IMPI) != "" && strings.TrimSpace(profile.Domain) != "" {
+		return "sip:" + strings.TrimSpace(profile.IMPI) + "@" + strings.TrimSpace(profile.Domain)
+	}
+	return strings.TrimSpace(profile.IMPI)
+}
+
+func registrationExpires(headers map[string][]string, contactURI string, fallback int) int {
+	for _, value := range rawHeaderValues(headers, "Expires") {
+		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			return n
+		}
+	}
+	for _, contact := range headerListValues(headers, "Contact") {
+		if contactURI != "" && !strings.Contains(contact, contactURI) {
+			continue
+		}
+		if n, ok := headerParamInt(contact, "expires"); ok {
+			return n
+		}
+	}
+	if fallback > 0 {
+		return fallback
+	}
+	return 0
+}
+
+func headerParamInt(value, name string) (int, bool) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, part := range strings.Split(value, ";") {
+		key, raw, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || strings.ToLower(strings.TrimSpace(key)) != name {
+			continue
+		}
+		n, err := strconv.Atoi(strings.Trim(raw, `"`))
+		return n, err == nil
+	}
+	return 0, false
+}
+
+func securityVerifyFromChallenge(headers map[string][]string) string {
+	values := trimHeaderValues(headerListValues(headers, "Security-Server"))
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.Join(values, ", ")
+}
+
 func md5Hex(s string) string {
 	sum := md5.Sum([]byte(s))
 	return hex.EncodeToString(sum[:])
@@ -402,6 +671,15 @@ func quote(s string) string {
 }
 
 func firstNonEmpty(items ...string) string {
+	for _, item := range items {
+		if strings.TrimSpace(item) != "" {
+			return strings.TrimSpace(item)
+		}
+	}
+	return ""
+}
+
+func firstTrimmed(items ...string) string {
 	for _, item := range items {
 		if strings.TrimSpace(item) != "" {
 			return strings.TrimSpace(item)

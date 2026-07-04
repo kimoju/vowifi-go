@@ -22,14 +22,18 @@ protocol layers needed by VoHive:
   reading, and USIM/ISIM AKA AUTHENTICATE primitives
 - carrier presets and JSON carrier overrides, including AT&T TS.43/E911
   configuration for native `310/280` and `310/410` profiles
-- TS.43-style E911 entitlement bootstrap, token/websheet handling, and
-  RAND/AUTN challenge response through the AKA provider
+- TS.43-style E911 entitlement bootstrap, token/websheet handling, RAND/AUTN
+  challenge response through the AKA provider, and EAP-AKA relay packet
+  response generation for entitlement challenges
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
-  AKA nonce extraction, and Digest/AKAv1-MD5 authorization generation
-- IMS REGISTER session flow with 401/407 authentication retry
+  AKA nonce extraction, Digest/AKAv1-MD5 and AKAv2-MD5 authorization material,
+  Security-Verify echoing, and IMS registration binding parsing
+- IMS REGISTER session flow with 401/407 authentication retry, associated URI,
+  Service-Route, Path, Security-Server, and Contact expiry capture
 - SMS segmentation, SIP transport hooks, inbound SMS, delivery report matching,
   and USSD session transport hooks
-- outbound voice dialog bridging helpers, SDP parsing/building, and dialog
+- outbound voice dialog bridging helpers, SDP parsing/building, IMS INVITE/ACK/
+  BYE/CANCEL request construction, route-set application, and dialog
   termination hooks
 - SWu tunnel manager/session contracts with startup validation, tunnel readiness
   state integration, shutdown cleanup, and MOBIKE delegation

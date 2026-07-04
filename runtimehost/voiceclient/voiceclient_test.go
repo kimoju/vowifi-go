@@ -2,6 +2,8 @@ package voiceclient
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
 	"strings"
@@ -61,6 +63,25 @@ func TestBuildDigestAuthorizationRFC2617Vector(t *testing.T) {
 	}
 }
 
+func TestBuildAKADigestPasswordAKAv2(t *testing.T) {
+	aka := sim.AKAResult{
+		RES: []byte{0x01, 0x02, 0x03, 0x04},
+		IK:  bytesFrom(0x20, 16),
+		CK:  bytesFrom(0x40, 16),
+	}
+	got, err := BuildAKADigestPassword("AKAv2-MD5", aka)
+	if err != nil {
+		t.Fatalf("BuildAKADigestPassword() error = %v", err)
+	}
+	key := append(append(append([]byte(nil), aka.RES...), aka.IK...), aka.CK...)
+	mac := hmac.New(md5.New, key)
+	_, _ = mac.Write([]byte("http-digest-akav2-password"))
+	want := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	if got != want {
+		t.Fatalf("AKAv2 password=%q, want %q", got, want)
+	}
+}
+
 func TestBuildRegisterHeaders(t *testing.T) {
 	headers := BuildRegisterHeaders(IMSProfile{
 		IMPI:      "310280233641503@private.att.net",
@@ -78,15 +99,25 @@ func TestBuildRegisterHeaders(t *testing.T) {
 
 func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{
 			StatusCode: 401,
 			Reason:     "Unauthorized",
 			Headers: map[string][]string{
-				"WWW-Authenticate": {`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`},
+				"WWW-Authenticate": {challenge},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
 			},
 		},
-		{StatusCode: 200, Reason: "OK"},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"P-Associated-URI": {`<sip:user@example>, <tel:+18005551212>`},
+				"Service-Route":    {`<sip:pcscf1.example;lr>, <sip:pcscf2.example;lr>`},
+				"Contact":          {`<sip:user@192.0.2.10:5060>;expires=1800`},
+			},
+		},
 	}}
 	aka := &registerAKAProvider{}
 	result, err := RegisterSession{
@@ -111,8 +142,105 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 	if !strings.Contains(auth, `algorithm=AKAv1-MD5`) || !strings.Contains(auth, `username="impi@example"`) {
 		t.Fatalf("Authorization=%s", auth)
 	}
+	ch, _ := ParseWWWAuthenticate(challenge)
+	wantAuth, err := BuildDigestAuthorization(ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: string([]byte{0xAA, 0xBB, 0xCC, 0xDD}),
+		CNonce:   "cnonce",
+		NC:       1,
+	})
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization() error = %v", err)
+	}
+	if auth != wantAuth {
+		t.Fatalf("Authorization=%s, want binary RES digest %s", auth, wantAuth)
+	}
+	if got := transport.requests[1].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=111") {
+		t.Fatalf("Security-Verify=%q", got)
+	}
+	if result.Binding.PublicIdentity != "sip:user@example" || result.Binding.Expires != 1800 || len(result.Binding.ServiceRoutes) != 2 {
+		t.Fatalf("binding=%+v", result.Binding)
+	}
 	if got := strings.ToUpper(hex.EncodeToString(aka.rand)); got != strings.ToUpper(hex.EncodeToString(bytesFrom(0x10, 16))) {
 		t.Fatalf("RAND=%s", got)
+	}
+}
+
+func TestSelectDigestChallengePrefersAKAv2(t *testing.T) {
+	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	ch, err := SelectDigestChallenge(map[string][]string{
+		"WWW-Authenticate": {
+			`Digest realm="ims.example", nonce="md5nonce", algorithm=MD5`,
+			`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth"`,
+			`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`,
+		},
+	}, "WWW-Authenticate")
+	if err != nil {
+		t.Fatalf("SelectDigestChallenge() error = %v", err)
+	}
+	if ch.Algorithm != "AKAv2-MD5" {
+		t.Fatalf("challenge=%+v, want AKAv2-MD5", ch)
+	}
+}
+
+func TestBuildRegistrationBindingParsesIMSHeaders(t *testing.T) {
+	binding := BuildRegistrationBinding(IMSProfile{IMPU: "sip:fallback@example"}, "sip:user@192.0.2.10:5060", RegisterResponse{
+		Headers: map[string][]string{
+			"P-Associated-URI": {`"User, One" <sip:user@example>, <tel:+18005551212>`},
+			"Service-Route":    {`<sip:pcscf1.example;lr>, <sip:pcscf2.example;lr>`},
+			"Path":             {`<sip:path.example;lr>`},
+			"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=1;spi-s=2`},
+			"Contact":          {`<sip:user@192.0.2.10:5060>;expires=777`},
+		},
+	}, 3600)
+	if binding.PublicIdentity != "sip:user@example" || len(binding.AssociatedURIs) != 2 {
+		t.Fatalf("associated binding=%+v", binding)
+	}
+	if len(binding.ServiceRoutes) != 2 || binding.ServiceRoutes[1] != "<sip:pcscf2.example;lr>" {
+		t.Fatalf("routes=%+v", binding.ServiceRoutes)
+	}
+	if binding.Expires != 777 || len(binding.SecurityVerify) != 1 {
+		t.Fatalf("binding=%+v", binding)
+	}
+}
+
+func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
+	cfg := DialogRequestConfig{
+		Profile: IMSProfile{UserAgent: "VoHive"},
+		Registration: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@example",
+			ServiceRoutes:  []string{"<sip:pcscf1.example;lr>", "<sip:pcscf2.example;lr>"},
+		},
+		RemoteURI:       "sip:+18005551212@ims.example",
+		RemoteTargetURI: "sip:+18005551212@pcscf.example",
+		CallID:          "call-1",
+		LocalTag:        "ltag",
+		RemoteTag:       "rtag",
+		CSeq:            3,
+		SessionExpires:  1800,
+	}
+	invite, err := BuildInviteRequest(cfg, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatalf("BuildInviteRequest() error = %v", err)
+	}
+	if invite.URI != "sip:+18005551212@pcscf.example" || invite.Headers["Route"] != "<sip:pcscf1.example;lr>, <sip:pcscf2.example;lr>" {
+		t.Fatalf("invite=%+v", invite)
+	}
+	if invite.Headers["From"] != "<sip:user@example>;tag=ltag" || invite.Headers["To"] != "<sip:+18005551212@ims.example>;tag=rtag" {
+		t.Fatalf("dialog headers=%+v", invite.Headers)
+	}
+	if invite.Headers["Content-Type"] != "application/sdp" || invite.Headers["Session-Expires"] != "1800" {
+		t.Fatalf("invite headers=%+v", invite.Headers)
+	}
+	bye, err := BuildByeRequest(cfg)
+	if err != nil {
+		t.Fatalf("BuildByeRequest() error = %v", err)
+	}
+	if bye.Method != "BYE" || bye.Headers["CSeq"] != "3 BYE" || bye.Headers["Contact"] != "" {
+		t.Fatalf("bye=%+v", bye)
 	}
 }
 
