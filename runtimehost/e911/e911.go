@@ -3,9 +3,15 @@ package e911
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
 	"github.com/iniwex5/vowifi-go/runtimehost/carrier"
@@ -106,15 +112,331 @@ type WebsheetRequest struct {
 }
 
 func StartEmergencyAddressUpdate(ctx context.Context, req Request) (WebsheetRequest, error) {
-	if req.Carrier.E911.Provider == "" {
+	provider := strings.ToLower(strings.TrimSpace(req.Carrier.E911.Provider))
+	if provider == "" {
+		return WebsheetRequest{}, ErrUnsupportedProvider
+	}
+	if provider != "att" && provider != "att-ts43" && provider != "ts43" {
 		return WebsheetRequest{}, ErrUnsupportedProvider
 	}
 	if req.Carrier.E911.Websheet == "" {
 		return WebsheetRequest{}, ErrWebsheetUnavailable
+	}
+	if endpoint := strings.TrimSpace(req.Carrier.E911.EntitlementEndpoint); endpoint != "" {
+		ws, err := startTS43EmergencyAddressUpdate(ctx, endpoint, req)
+		if err == nil && strings.TrimSpace(ws.URL) != "" {
+			return ws, nil
+		}
+		if errors.Is(err, ErrChallengeNotImplemented) {
+			return WebsheetRequest{}, err
+		}
 	}
 	return WebsheetRequest{
 		URL:         req.Carrier.E911.Websheet,
 		ContentType: "text/html",
 		Title:       "Emergency address",
 	}, nil
+}
+
+func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req Request) (WebsheetRequest, error) {
+	client := req.Client
+	if client == nil {
+		client = NewDefaultHTTPClient()
+	}
+	payload, err := json.Marshal([]map[string]any{{
+		"message-id":      1,
+		"operation":       "emergency-address-update",
+		"app-id":          "ap2003",
+		"imsi":            req.Identity.IMSI,
+		"imei":            req.Identity.IMEI,
+		"mcc":             req.Identity.MCC,
+		"mnc":             req.Identity.MNC,
+		"sip-username":    req.Identity.SIPUsername,
+		"terminal-vendor": "vowifi-go",
+	}})
+	if err != nil {
+		return WebsheetRequest{}, err
+	}
+	resp, err := doEntitlement(ctx, client, req.Trace, &HTTPRequest{
+		Method: "POST",
+		URL:    endpoint,
+		Headers: []HeaderPair{
+			{Key: "Content-Type", Value: "application/json"},
+			{Key: "Accept", Value: "application/json"},
+			{Key: "x-protocol-version", Value: "2"},
+		},
+		Body: payload,
+	})
+	if err != nil {
+		return WebsheetRequest{}, err
+	}
+	result, err := parseEntitlementResponse(resp.Body)
+	if err != nil {
+		return WebsheetRequest{}, err
+	}
+	if ws := websheetFromEntitlement(req.Carrier.E911.Websheet, result); ws.URL != "" {
+		return ws, nil
+	}
+	if result.HasChallenge() {
+		if req.AKAProvider == nil {
+			return WebsheetRequest{}, ErrChallengeNotImplemented
+		}
+		aka, err := req.AKAProvider.CalculateAKA(result.RAND, result.AUTN)
+		if err != nil {
+			return WebsheetRequest{}, err
+		}
+		answer, err := json.Marshal([]map[string]any{{
+			"message-id":    2,
+			"operation":     "emergency-address-update",
+			"response-id":   result.ResponseID,
+			"aka-res":       strings.ToUpper(hex.EncodeToString(aka.RES)),
+			"aka-ck":        strings.ToUpper(hex.EncodeToString(aka.CK)),
+			"aka-ik":        strings.ToUpper(hex.EncodeToString(aka.IK)),
+			"aka-auts":      strings.ToUpper(hex.EncodeToString(aka.AUTS)),
+			"sip-username":  req.Identity.SIPUsername,
+			"terminal-imei": req.Identity.IMEI,
+		}})
+		if err != nil {
+			return WebsheetRequest{}, err
+		}
+		resp, err = doEntitlement(ctx, client, req.Trace, &HTTPRequest{
+			Method: "POST",
+			URL:    endpoint,
+			Headers: []HeaderPair{
+				{Key: "Content-Type", Value: "application/json"},
+				{Key: "Accept", Value: "application/json"},
+				{Key: "x-protocol-version", Value: "2"},
+			},
+			Body: answer,
+		})
+		if err != nil {
+			return WebsheetRequest{}, err
+		}
+		result, err = parseEntitlementResponse(resp.Body)
+		if err != nil {
+			return WebsheetRequest{}, err
+		}
+		if ws := websheetFromEntitlement(req.Carrier.E911.Websheet, result); ws.URL != "" {
+			return ws, nil
+		}
+	}
+	if result.Status == 6004 || result.ChallengeRequired {
+		return WebsheetRequest{}, ErrChallengeNotImplemented
+	}
+	return WebsheetRequest{}, fmt.Errorf("e911 entitlement response did not include websheet data")
+}
+
+func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req *HTTPRequest) (*HTTPResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if trace != nil {
+		trace.Request(req)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if trace != nil {
+			trace.Error(req, err)
+		}
+		return nil, err
+	}
+	if trace != nil {
+		trace.Response(req, resp)
+	}
+	if resp == nil {
+		return nil, errors.New("e911 entitlement HTTP client returned nil response")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("e911 entitlement HTTP status %d", resp.StatusCode)
+	}
+	return resp, nil
+}
+
+type entitlementResult struct {
+	Status            int
+	ResponseID        any
+	WebsheetURL       string
+	UserData          string
+	ContentType       string
+	Title             string
+	RAND              []byte
+	AUTN              []byte
+	ChallengeRequired bool
+}
+
+func (r entitlementResult) HasChallenge() bool {
+	return len(r.RAND) == 16 && len(r.AUTN) == 16
+}
+
+func parseEntitlementResponse(body []byte) (entitlementResult, error) {
+	var root any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return entitlementResult{}, err
+	}
+	var out entitlementResult
+	walkEntitlement(root, &out)
+	if out.ContentType == "" {
+		out.ContentType = "text/html"
+	}
+	if out.Title == "" {
+		out.Title = "Emergency address"
+	}
+	return out, nil
+}
+
+func walkEntitlement(v any, out *entitlementResult) {
+	switch x := v.(type) {
+	case []any:
+		for _, item := range x {
+			walkEntitlement(item, out)
+		}
+	case map[string]any:
+		for key, value := range x {
+			lower := strings.ToLower(strings.TrimSpace(key))
+			switch lower {
+			case "status":
+				if n, ok := numberValue(value); ok {
+					out.Status = n
+					if n == 6004 {
+						out.ChallengeRequired = true
+					}
+				}
+			case "response-id", "response_id", "responseid":
+				out.ResponseID = value
+			case "websheet", "websheet-url", "websheet_url", "e911-websheet-url", "e911_websheet_url", "address-url", "address_url", "url":
+				if s := stringValue(value); looksHTTPURL(s) && out.WebsheetURL == "" {
+					out.WebsheetURL = s
+				}
+			case "user-data", "userdata", "user_data", "token", "entitlement-token", "entitlement_token", "auth-token", "auth_token":
+				if s := strings.TrimSpace(stringValue(value)); s != "" && out.UserData == "" {
+					out.UserData = s
+				}
+			case "content-type", "content_type":
+				out.ContentType = strings.TrimSpace(stringValue(value))
+			case "title":
+				out.Title = strings.TrimSpace(stringValue(value))
+			case "rand":
+				if decoded, ok := decodeChallengeBytes(stringValue(value)); ok {
+					out.RAND = decoded
+				}
+			case "autn":
+				if decoded, ok := decodeChallengeBytes(stringValue(value)); ok {
+					out.AUTN = decoded
+				}
+			case "challenge", "aka-challenge", "aka_challenge", "eap-aka-challenge", "eap_aka_challenge":
+				parseCombinedChallenge(value, out)
+			}
+			walkEntitlement(value, out)
+		}
+	}
+}
+
+func parseCombinedChallenge(v any, out *entitlementResult) {
+	text := stringValue(v)
+	if text == "" {
+		return
+	}
+	raw, ok := decodeChallengeBytes(text)
+	if !ok || len(raw) < 32 {
+		return
+	}
+	if len(out.RAND) == 0 {
+		out.RAND = append([]byte(nil), raw[:16]...)
+	}
+	if len(out.AUTN) == 0 {
+		out.AUTN = append([]byte(nil), raw[16:32]...)
+	}
+}
+
+func websheetFromEntitlement(fallbackURL string, result entitlementResult) WebsheetRequest {
+	u := strings.TrimSpace(result.WebsheetURL)
+	userData := strings.TrimSpace(result.UserData)
+	if u == "" && userData != "" {
+		u = appendUserData(fallbackURL, userData)
+	}
+	if u == "" {
+		return WebsheetRequest{}
+	}
+	return WebsheetRequest{
+		URL:         u,
+		UserData:    userData,
+		ContentType: firstNonEmpty(result.ContentType, "text/html"),
+		Title:       firstNonEmpty(result.Title, "Emergency address"),
+	}
+}
+
+func appendUserData(rawURL, userData string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := parsed.Query()
+	if q.Get("token") == "" {
+		q.Set("token", userData)
+	}
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
+func numberValue(v any) (int, bool) {
+	switch x := v.(type) {
+	case float64:
+		return int(x), true
+	case int:
+		return x, true
+	case json.Number:
+		n, err := x.Int64()
+		return int(n), err == nil
+	case string:
+		var n int
+		_, err := fmt.Sscanf(strings.TrimSpace(x), "%d", &n)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func stringValue(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	default:
+		return ""
+	}
+}
+
+func decodeChallengeBytes(s string) ([]byte, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+	clean := strings.NewReplacer(" ", "", ":", "", "-", "").Replace(s)
+	if raw, err := hex.DecodeString(clean); err == nil {
+		return raw, true
+	}
+	if raw, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return raw, true
+	}
+	if raw, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return raw, true
+	}
+	return nil, false
+}
+
+func looksHTTPURL(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://")
+}
+
+func firstNonEmpty(items ...string) string {
+	for _, item := range items {
+		if strings.TrimSpace(item) != "" {
+			return strings.TrimSpace(item)
+		}
+	}
+	return ""
 }
