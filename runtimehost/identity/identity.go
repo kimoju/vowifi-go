@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/iniwex5/vowifi-go/runtimehost/simauth"
 )
 
 const (
@@ -153,5 +155,119 @@ func ReadISIMIdentity(access interface {
 	CloseLogicalChannel(channel int) error
 	TransmitAPDU(channel int, hexAPDU string) (string, error)
 }) (Identity, error) {
-	return Identity{}, errors.New("ISIM EF reader is not implemented")
+	if access == nil {
+		return Identity{}, errors.New("nil ISIM access")
+	}
+	aid, _, err := simauth.ResolveAID(access, "isim", simauth.ISIMAIDPrefix, simauth.ISIMAIDPrefix)
+	if err != nil {
+		return Identity{}, err
+	}
+	channel, err := access.OpenLogicalChannel(aid)
+	if err != nil {
+		return Identity{}, fmt.Errorf("open ISIM logical channel: %w", err)
+	}
+	defer func() { _ = access.CloseLogicalChannel(channel) }()
+
+	var id Identity
+	var readErrs []error
+
+	if raw, _, err := simauth.ReadTransparentEF(access, channel, 0x6F02); err == nil {
+		id.IMPI = decodeISIMString(raw)
+	} else {
+		readErrs = append(readErrs, fmt.Errorf("read EF_IMPI: %w", err))
+	}
+
+	if raw, _, err := simauth.ReadTransparentEF(access, channel, 0x6F03); err == nil {
+		id.Domain = decodeISIMString(raw)
+	} else {
+		readErrs = append(readErrs, fmt.Errorf("read EF_DOMAIN: %w", err))
+	}
+
+	if records, _, err := simauth.ReadLinearFixedEF(access, channel, 0x6F04, 16); err == nil {
+		for _, rec := range records {
+			if impu := decodeISIMString(rec); impu != "" && !containsString(id.IMPU, impu) {
+				id.IMPU = append(id.IMPU, impu)
+			}
+		}
+	} else {
+		readErrs = append(readErrs, fmt.Errorf("read EF_IMPU: %w", err))
+	}
+
+	if strings.TrimSpace(id.IMPI) != "" || strings.TrimSpace(id.Domain) != "" || len(id.IMPU) > 0 {
+		return id, nil
+	}
+	return Identity{}, errors.Join(readErrs...)
+}
+
+func decodeISIMString(raw []byte) string {
+	data := trimISIMPadding(raw)
+	if len(data) == 0 {
+		return ""
+	}
+	if data[0] == 0x80 {
+		if v, ok := decodeISIMDataObject(data[1:]); ok {
+			return decodeISIMStringValue(v)
+		}
+	}
+	if v, ok := simauth.FindTLV(data, 0x80); ok {
+		if s := decodeISIMStringValue(v); s != "" {
+			return s
+		}
+	}
+	return decodeISIMStringValue(data)
+}
+
+func decodeISIMDataObject(data []byte) ([]byte, bool) {
+	if len(data) == 0 {
+		return nil, false
+	}
+	l := int(data[0])
+	data = data[1:]
+	if l&0x80 != 0 {
+		n := l & 0x7F
+		if n == 0 || n > 3 || len(data) < n {
+			return nil, false
+		}
+		l = 0
+		for _, b := range data[:n] {
+			l = (l << 8) | int(b)
+		}
+		data = data[n:]
+	}
+	if l < 0 || len(data) < l {
+		return nil, false
+	}
+	return data[:l], true
+}
+
+func decodeISIMStringValue(data []byte) string {
+	data = trimISIMPadding(data)
+	if len(data) == 0 {
+		return ""
+	}
+	if l := int(data[0]); l > 0 && len(data) >= 1+l {
+		return strings.TrimSpace(string(trimISIMPadding(data[1 : 1+l])))
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func trimISIMPadding(data []byte) []byte {
+	start := 0
+	for start < len(data) && (data[start] == 0x00 || data[start] == 0xFF) {
+		start++
+	}
+	end := len(data)
+	for end > start && (data[end-1] == 0x00 || data[end-1] == 0xFF) {
+		end--
+	}
+	return data[start:end]
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
