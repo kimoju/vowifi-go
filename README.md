@@ -27,9 +27,11 @@ protocol layers needed by VoHive:
   response generation for entitlement challenges
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
   AKA nonce extraction, Digest/AKAv1-MD5 and AKAv2-MD5 authorization material,
-  Security-Verify echoing, and IMS registration binding parsing
+  Security-Verify echoing, wire-level UDP/TCP REGISTER transport, and IMS
+  registration binding parsing
 - IMS REGISTER session flow with 401/407 authentication retry, associated URI,
-  Service-Route, Path, Security-Server, and Contact expiry capture
+  Service-Route, Path, Security-Server, and Contact expiry capture, plus a
+  runtime `IMSRegistrar` adapter for the wire transport
 - SMS segmentation, SIP transport hooks, inbound SMS, delivery report matching,
   and USSD session transport hooks
 - outbound voice dialog bridging helpers, SDP parsing/building, IMS INVITE/ACK/
