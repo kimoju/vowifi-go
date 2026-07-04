@@ -209,6 +209,30 @@ func AUTSAttribute(auts []byte) Attribute {
 	return FixedAttribute(AttributeAUTS, auts)
 }
 
+func RANDAttribute(rand16 ...[]byte) Attribute {
+	var value []byte
+	for _, rand := range rand16 {
+		value = append(value, rand...)
+	}
+	return FixedAttribute(AttributeRAND, value)
+}
+
+func AUTNAttribute(autn16 []byte) Attribute {
+	return FixedAttribute(AttributeAUTN, autn16)
+}
+
+func PermanentIDReqAttribute() Attribute {
+	return FixedAttribute(AttributePermanentIDReq, nil)
+}
+
+func AnyIDReqAttribute() Attribute {
+	return FixedAttribute(AttributeAnyIDReq, nil)
+}
+
+func FullAuthIDReqAttribute() Attribute {
+	return FixedAttribute(AttributeFullAuthIDReq, nil)
+}
+
 func KDFInputAttribute(networkName string) Attribute {
 	return VariableAttribute(AttributeKDFInput, []byte(networkName))
 }
@@ -264,6 +288,32 @@ func (a Attribute) FixedValue(size int) ([]byte, error) {
 		return nil, ErrInvalidAttribute
 	}
 	return append([]byte(nil), a.Data[2:2+size]...), nil
+}
+
+func (a Attribute) RANDValues() ([][]byte, error) {
+	return fixed16Values(a)
+}
+
+func (a Attribute) AUTNValue() ([]byte, error) {
+	return a.FixedValue(16)
+}
+
+func (a Attribute) AUTSValue() ([]byte, error) {
+	return a.FixedValue(14)
+}
+
+func fixed16Values(a Attribute) ([][]byte, error) {
+	if len(a.Data) < 2 || (len(a.Data)-2)%16 != 0 {
+		return nil, ErrInvalidAttribute
+	}
+	var out [][]byte
+	for offset := 2; offset < len(a.Data); offset += 16 {
+		out = append(out, append([]byte(nil), a.Data[offset:offset+16]...))
+	}
+	if len(out) == 0 {
+		return nil, ErrInvalidAttribute
+	}
+	return out, nil
 }
 
 func paddingFor4(n int) int {

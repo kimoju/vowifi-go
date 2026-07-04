@@ -107,6 +107,52 @@ func TestAKAPrimeKDFAttributes(t *testing.T) {
 	}
 }
 
+func TestAKAChallengeAttributes(t *testing.T) {
+	raw, err := (Packet{
+		Code:       CodeRequest,
+		Identifier: 11,
+		Type:       TypeAKA,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{
+			RANDAttribute([]byte("1234567890abcdef")),
+			AUTNAttribute([]byte("fedcba0987654321")),
+			FullAuthIDReqAttribute(),
+		},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	parsed, err := ParsePacket(raw)
+	if err != nil {
+		t.Fatalf("ParsePacket() error = %v", err)
+	}
+	randAttr, ok := FindAttribute(parsed.Attributes, AttributeRAND)
+	if !ok {
+		t.Fatal("missing AT_RAND")
+	}
+	rands, err := randAttr.RANDValues()
+	if err != nil {
+		t.Fatalf("RANDValues() error = %v", err)
+	}
+	if len(rands) != 1 || string(rands[0]) != "1234567890abcdef" {
+		t.Fatalf("RAND=%q", rands)
+	}
+	autnAttr, ok := FindAttribute(parsed.Attributes, AttributeAUTN)
+	if !ok {
+		t.Fatal("missing AT_AUTN")
+	}
+	autn, err := autnAttr.AUTNValue()
+	if err != nil {
+		t.Fatalf("AUTNValue() error = %v", err)
+	}
+	if string(autn) != "fedcba0987654321" {
+		t.Fatalf("AUTN=%q", string(autn))
+	}
+	if _, ok := FindAttribute(parsed.Attributes, AttributeFullAuthIDReq); !ok {
+		t.Fatal("missing AT_FULLAUTH_ID_REQ")
+	}
+}
+
 func TestParseRejectsInvalidLengths(t *testing.T) {
 	if _, err := ParsePacket([]byte{1, 2, 0, 3}); !errors.Is(err, ErrInvalidPacket) {
 		t.Fatalf("ParsePacket() err=%v, want ErrInvalidPacket", err)
