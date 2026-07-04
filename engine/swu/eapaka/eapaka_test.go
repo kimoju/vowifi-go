@@ -1,0 +1,117 @@
+package eapaka
+
+import (
+	"encoding/hex"
+	"errors"
+	"testing"
+)
+
+func TestIdentityResponseMarshalParse(t *testing.T) {
+	raw, err := (Packet{
+		Code:       CodeResponse,
+		Identifier: 7,
+		Type:       TypeAKA,
+		Subtype:    SubtypeIdentity,
+		Attributes: []Attribute{IdentityAttribute("310280233641503")},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	want := "0207001c170500000e05000f33313032383032333336343135303300"
+	if hex.EncodeToString(raw) != want {
+		t.Fatalf("packet=%x, want %s", raw, want)
+	}
+	parsed, err := ParsePacket(raw)
+	if err != nil {
+		t.Fatalf("ParsePacket() error = %v", err)
+	}
+	if parsed.Code != CodeResponse || parsed.Type != TypeAKA || parsed.Subtype != SubtypeIdentity || len(parsed.Attributes) != 1 {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+	if parsed.Attributes[0].Type != AttributeIdentity {
+		t.Fatalf("attr=%+v", parsed.Attributes[0])
+	}
+	identity, err := parsed.Attributes[0].IdentityValue()
+	if err != nil {
+		t.Fatalf("IdentityValue() error = %v", err)
+	}
+	if identity != "310280233641503" {
+		t.Fatalf("identity=%q", identity)
+	}
+}
+
+func TestChallengeResponseAttributes(t *testing.T) {
+	raw, err := (Packet{
+		Code:       CodeResponse,
+		Identifier: 9,
+		Type:       TypeAKA,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{
+			RESAttribute([]byte{0x11, 0x22, 0x33, 0x44}),
+			FixedAttribute(AttributeMAC, make([]byte, 16)),
+		},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	parsed, err := ParsePacket(raw)
+	if err != nil {
+		t.Fatalf("ParsePacket() error = %v", err)
+	}
+	if parsed.Subtype != SubtypeChallenge || len(parsed.Attributes) != 2 {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+	res, bits, err := parsed.Attributes[0].RESValue()
+	if err != nil {
+		t.Fatalf("RESValue() error = %v", err)
+	}
+	if bits != 32 || hex.EncodeToString(res) != "11223344" {
+		t.Fatalf("RES bits=%d value=%x", bits, res)
+	}
+	mac, err := parsed.Attributes[1].FixedValue(16)
+	if err != nil {
+		t.Fatalf("FixedValue() error = %v", err)
+	}
+	if hex.EncodeToString(mac) != "00000000000000000000000000000000" {
+		t.Fatalf("MAC=%x", mac)
+	}
+}
+
+func TestAKAPrimeKDFAttributes(t *testing.T) {
+	raw, err := (Packet{
+		Code:       CodeResponse,
+		Identifier: 10,
+		Type:       TypeAKAPrime,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{
+			KDFInputAttribute("WLAN"),
+			KDFAttribute(1),
+		},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	parsed, err := ParsePacket(raw)
+	if err != nil {
+		t.Fatalf("ParsePacket() error = %v", err)
+	}
+	if parsed.Type != TypeAKAPrime || parsed.Attributes[0].Type != AttributeKDFInput || parsed.Attributes[1].Type != AttributeKDF {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+	networkName, err := parsed.Attributes[0].VariableValue()
+	if err != nil {
+		t.Fatalf("VariableValue() error = %v", err)
+	}
+	if string(networkName) != "WLAN" {
+		t.Fatalf("networkName=%q", string(networkName))
+	}
+}
+
+func TestParseRejectsInvalidLengths(t *testing.T) {
+	if _, err := ParsePacket([]byte{1, 2, 0, 3}); !errors.Is(err, ErrInvalidPacket) {
+		t.Fatalf("ParsePacket() err=%v, want ErrInvalidPacket", err)
+	}
+	if _, err := ParseAttributes([]byte{AttributeIdentity, 0, 0, 0}); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ParseAttributes() err=%v, want ErrInvalidAttribute", err)
+	}
+}
