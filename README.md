@@ -53,8 +53,11 @@ protocol layers needed by VoHive:
 - final IKE_AUTH CHILD_SA result parsing with responder ESP SPI,
   configuration/traffic selector extraction, and RFC 7296 ESP outbound/inbound
   key material derivation from SK_d and IKE_SA_INIT nonces
+- userspace ESP packet seal/open primitives with SPI/sequence handling,
+  AES-CBC payload encryption, HMAC-SHA integrity checks, RFC 4303 padding,
+  next-header restoration, and replay-window validation
 
-Kernel/userspace ESP SA installation, ESP packet transport, and RTP media
+Kernel/userspace ESP SA installation, packet routing transport, and RTP media
 transport are still implemented incrementally behind these APIs.
 
 ## Development
