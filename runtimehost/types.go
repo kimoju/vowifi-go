@@ -11,6 +11,7 @@ import (
 	"time"
 
 	swusim "github.com/iniwex5/vowifi-go/engine/sim"
+	"github.com/iniwex5/vowifi-go/engine/swu"
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
@@ -224,6 +225,7 @@ type StartRequest struct {
 	Access        ModemAccess
 	Dataplane     DataplanePolicy
 	Proxy         *ProxyConfig
+	TunnelManager swu.TunnelManager
 	IMSRegistrar  IMSRegistrar
 	SMSTransport  messaging.SMSTransport
 	USSDTransport messaging.USSDTransport
@@ -240,6 +242,7 @@ type Instance struct {
 	observers []Observer
 	notifier  func(string)
 	smsNotify func(deviceID, sender, content string, ts time.Time)
+	tunnel    swu.TunnelSession
 	stopped   bool
 }
 
@@ -274,6 +277,29 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	if modem != nil {
 		regStatus, regText = modem.GetRegStatus()
 	}
+	var tunnel swu.TunnelSession
+	var tunnelResult swu.TunnelResult
+	var tunnelReady bool
+	if req.TunnelManager != nil && strings.TrimSpace(req.Dataplane.Mode) != swu.DataplaneModeDisabled {
+		tunnelConfig := buildTunnelConfig(req, modem)
+		if err := tunnelConfig.Validate(); err != nil {
+			return nil, err
+		}
+		session, err := req.TunnelManager.EstablishTunnel(ctx, tunnelConfig)
+		if err != nil {
+			return nil, fmt.Errorf("SWU tunnel establishment failed: %w", err)
+		}
+		if session == nil {
+			return nil, errors.New("SWU tunnel establishment failed: nil tunnel session")
+		}
+		tunnel = session
+		tunnelResult = session.Result()
+		tunnelReady = tunnelResult.IsReady()
+		if !tunnelReady {
+			_ = session.Close(ctx)
+			return nil, fmt.Errorf("SWU tunnel establishment incomplete: %s", firstRuntimeNonEmpty(tunnelResult.Reason, "not ready"))
+		}
+	}
 	imsReady := req.IMSRegistrar == nil
 	imsReason := ""
 	if req.IMSRegistrar != nil {
@@ -303,13 +329,13 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		DataplaneMode: req.Dataplane.Mode,
 		SIMReady:      req.SIM != nil,
 		AccessReady:   modem != nil,
-		TunnelReady:   false,
+		TunnelReady:   tunnelReady,
 		IMSReady:      imsReady,
 		SMSReady:      true,
 		RegStatus:     regStatus,
 		RegStatusText: regText,
 		NetworkMode:   strings.TrimSpace(req.NetworkMode),
-		LastReason:    firstRuntimeNonEmpty(imsReason, "started"),
+		LastReason:    firstRuntimeNonEmpty(imsReason, tunnelResult.Reason, "started"),
 		UpdatedAt:     time.Now(),
 	}
 	if state.NetworkMode == "" && modem != nil {
@@ -318,7 +344,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	svc := messaging.NewService(req.DeviceID, req.Profile.IMSI, req.DeliveryStore, req.Dispatch)
 	svc.SetSMSTransport(req.SMSTransport)
 	svc.SetUSSDTransport(req.USSDTransport)
-	inst := &Instance{state: state, service: svc}
+	inst := &Instance{state: state, service: svc, tunnel: tunnel}
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
@@ -355,13 +381,20 @@ func (i *Instance) Stop(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	i.mu.Lock()
+	tunnel := i.tunnel
+	i.tunnel = nil
 	i.stopped = true
 	i.state.Phase = PhaseStopped
+	i.state.TunnelReady = false
 	i.state.LastReason = "stopped"
 	i.state.UpdatedAt = time.Now()
 	i.mu.Unlock()
+	var err error
+	if tunnel != nil {
+		err = tunnel.Close(ctx)
+	}
 	i.notify(ctx)
-	return nil
+	return err
 }
 
 func (i *Instance) Service() *messaging.Service {
@@ -439,8 +472,25 @@ func (i *Instance) TriggerMOBIKE(oldIP, newIP string) error {
 	if i == nil {
 		return errors.New("runtime instance is nil")
 	}
+	i.mu.RLock()
+	tunnel := i.tunnel
+	deviceID := i.state.DeviceID
+	i.mu.RUnlock()
+	reason := "mobike"
+	if tunnel != nil {
+		res, err := tunnel.MOBIKE(context.Background(), swu.MOBIKERequest{
+			DeviceID: deviceID,
+			OldIP:    strings.TrimSpace(oldIP),
+			NewIP:    strings.TrimSpace(newIP),
+			At:       time.Now(),
+		})
+		if err != nil {
+			return fmt.Errorf("MOBIKE update failed: %w", err)
+		}
+		reason = firstRuntimeNonEmpty(res.Reason, reason)
+	}
 	i.mu.Lock()
-	i.state.LastReason = "mobike"
+	i.state.LastReason = reason
 	i.state.UpdatedAt = time.Now()
 	i.mu.Unlock()
 	i.notify(context.Background())
@@ -490,4 +540,59 @@ func firstRuntimeNonEmpty(items ...string) string {
 		}
 	}
 	return ""
+}
+
+func buildTunnelConfig(req StartRequest, modem Modem) swu.TunnelConfig {
+	cfg := swu.TunnelConfig{
+		DeviceID:  strings.TrimSpace(req.DeviceID),
+		TraceID:   strings.TrimSpace(req.TraceID),
+		Mode:      req.Dataplane.Mode,
+		IMSI:      strings.TrimSpace(req.Profile.IMSI),
+		MCC:       strings.TrimSpace(req.Profile.MCC),
+		MNC:       strings.TrimSpace(req.Profile.MNC),
+		IMEI:      strings.TrimSpace(req.Profile.IMEI),
+		Proxy:     toSWUProxyConfig(req.Proxy),
+		StartedAt: time.Now(),
+	}
+	if modem != nil {
+		cfg.LocalInterface = strings.TrimSpace(modem.DeviceID())
+	}
+	if req.Prepared != nil {
+		cfg.EPDGAddress = strings.TrimSpace(req.Prepared.EPDGAddr)
+		cfg.EPDGSource = strings.TrimSpace(req.Prepared.EPDGSource)
+		if cfg.IMSI == "" {
+			cfg.IMSI = strings.TrimSpace(req.Prepared.Profile.IMSI)
+		}
+		if cfg.MCC == "" {
+			cfg.MCC = strings.TrimSpace(req.Prepared.Profile.MCC)
+		}
+		if cfg.MNC == "" {
+			cfg.MNC = strings.TrimSpace(req.Prepared.Profile.MNC)
+		}
+		if cfg.IMEI == "" {
+			cfg.IMEI = strings.TrimSpace(req.Prepared.Profile.IMEI)
+		}
+		cfg.Identity = swu.IMSIdentity{
+			IMPI:   strings.TrimSpace(req.Prepared.IMSIdentity.IMPI),
+			IMPU:   strings.TrimSpace(req.Prepared.IMSIdentity.IMPU),
+			Domain: strings.TrimSpace(req.Prepared.IMSIdentity.Domain),
+		}
+	}
+	return cfg
+}
+
+func toSWUProxyConfig(p *ProxyConfig) *swu.ProxyConfig {
+	if p == nil {
+		return nil
+	}
+	return &swu.ProxyConfig{
+		ID:       p.ID,
+		URL:      p.URL,
+		Address:  p.Address,
+		Addr:     p.Addr,
+		Username: p.Username,
+		Password: p.Password,
+		Country:  p.Country,
+		Enabled:  p.Enabled,
+	}
 }

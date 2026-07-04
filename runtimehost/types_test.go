@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/iniwex5/vowifi-go/engine/swu"
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
@@ -101,6 +102,119 @@ func TestStartWithoutIMSRegistrarKeepsCompatibilityReady(t *testing.T) {
 	if !inst.State().IMSReady {
 		t.Fatalf("IMSReady=false without explicit registrar")
 	}
+	if inst.State().TunnelReady {
+		t.Fatalf("TunnelReady=true without explicit tunnel manager")
+	}
+}
+
+func TestStartEstablishesTunnelWhenManagerProvided(t *testing.T) {
+	manager := &runtimeTunnelManager{session: &runtimeTunnelSession{result: swu.TunnelResult{
+		Ready:            true,
+		Mode:             swu.DataplaneModeUserspace,
+		EPDGAddress:      "epdg.example",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+		MOBIKESupported:  true,
+		Reason:           "ike ipsec ready",
+	}}}
+	prepared := identity.PreparedSession{
+		Profile:    identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280", IMEI: "356789012345678"},
+		EPDGAddr:   "epdg.example",
+		EPDGSource: "redirect",
+		IMSIdentity: identity.IMSIdentityResolution{
+			IMPI:   "310280233641503@private.att.net",
+			IMPU:   "sip:310280233641503@one.att.net",
+			Domain: "one.att.net",
+		},
+	}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		TraceID:       "trace-1",
+		Profile:       prepared.Profile,
+		Prepared:      &prepared,
+		Access:        NewModemAccessAdapter(testModem{}),
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: manager,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	st := inst.State()
+	if !st.TunnelReady || st.LastReason != "ike ipsec ready" {
+		t.Fatalf("state=%+v", st)
+	}
+	if manager.config.EPDGAddress != "epdg.example" || manager.config.Identity.Domain != "one.att.net" {
+		t.Fatalf("tunnel config=%+v", manager.config)
+	}
+}
+
+func TestStartRejectsIncompleteTunnel(t *testing.T) {
+	manager := &runtimeTunnelManager{session: &runtimeTunnelSession{result: swu.TunnelResult{
+		Ready:          true,
+		IKEEstablished: true,
+		Reason:         "child sa missing",
+	}}}
+	_, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: manager,
+	})
+	if err == nil || !strings.Contains(err.Error(), "SWU tunnel establishment incomplete") {
+		t.Fatalf("Start() err=%v, want incomplete tunnel", err)
+	}
+	if !manager.session.closed {
+		t.Fatalf("incomplete tunnel was not closed")
+	}
+}
+
+func TestStopClosesTunnel(t *testing.T) {
+	session := &runtimeTunnelSession{result: swu.TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: &runtimeTunnelManager{session: session},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := inst.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if !session.closed || inst.State().TunnelReady {
+		t.Fatalf("closed=%t state=%+v", session.closed, inst.State())
+	}
+}
+
+func TestTriggerMOBIKEDelegatesToTunnel(t *testing.T) {
+	session := &runtimeTunnelSession{
+		result: swu.TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true},
+		mobikeResult: swu.MOBIKEResult{
+			Rekeyed:          true,
+			IKEEstablished:   true,
+			IPsecEstablished: true,
+			Reason:           "mobike rekeyed",
+		},
+	}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: &runtimeTunnelManager{session: session},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := inst.TriggerMOBIKE("198.51.100.1", "198.51.100.2"); err != nil {
+		t.Fatalf("TriggerMOBIKE() error = %v", err)
+	}
+	if session.mobikeRequest.OldIP != "198.51.100.1" || session.mobikeRequest.NewIP != "198.51.100.2" {
+		t.Fatalf("mobike request=%+v", session.mobikeRequest)
+	}
+	if inst.State().LastReason != "mobike rekeyed" {
+		t.Fatalf("state=%+v", inst.State())
+	}
 }
 
 func TestStartWiresSMSTransport(t *testing.T) {
@@ -170,6 +284,45 @@ func TestInstanceHandlesIncomingSMSAndDeliveryReport(t *testing.T) {
 
 type runtimeSMSTransport struct {
 	requests []messaging.SMSSendRequest
+}
+
+type runtimeTunnelManager struct {
+	session *runtimeTunnelSession
+	err     error
+	config  swu.TunnelConfig
+}
+
+func (m *runtimeTunnelManager) EstablishTunnel(ctx context.Context, cfg swu.TunnelConfig) (swu.TunnelSession, error) {
+	m.config = cfg
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.session, nil
+}
+
+type runtimeTunnelSession struct {
+	result        swu.TunnelResult
+	mobikeResult  swu.MOBIKEResult
+	mobikeErr     error
+	mobikeRequest swu.MOBIKERequest
+	closed        bool
+}
+
+func (s *runtimeTunnelSession) Result() swu.TunnelResult {
+	return s.result
+}
+
+func (s *runtimeTunnelSession) MOBIKE(ctx context.Context, req swu.MOBIKERequest) (swu.MOBIKEResult, error) {
+	s.mobikeRequest = req
+	if s.mobikeErr != nil {
+		return swu.MOBIKEResult{}, s.mobikeErr
+	}
+	return s.mobikeResult, nil
+}
+
+func (s *runtimeTunnelSession) Close(ctx context.Context) error {
+	s.closed = true
+	return nil
 }
 
 type runtimeUSSDTransport struct {

@@ -6,7 +6,8 @@ This repository intentionally starts with the public API surface consumed by
 VoHive:
 
 - SIM AKA contracts under `engine/sim`
-- dataplane constants under `engine/swu`
+- SWu dataplane mode, tunnel establishment, and MOBIKE contracts under
+  `engine/swu`
 - runtime lifecycle, state, modem access, and service wrappers under
   `runtimehost`
 - carrier policy and E911 request contracts under `runtimehost/carrier` and
@@ -25,11 +26,16 @@ protocol layers needed by VoHive:
   RAND/AUTN challenge response through the AKA provider
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
   AKA nonce extraction, and Digest/AKAv1-MD5 authorization generation
-- SMS, USSD, event dispatch, and voice gateway integration helpers used by
-  VoHive
+- IMS REGISTER session flow with 401/407 authentication retry
+- SMS segmentation, SIP transport hooks, inbound SMS, delivery report matching,
+  and USSD session transport hooks
+- outbound voice dialog bridging helpers, SDP parsing/building, and dialog
+  termination hooks
+- SWu tunnel manager/session contracts with startup validation, tunnel readiness
+  state integration, shutdown cleanup, and MOBIKE delegation
 
-IKE/IPsec transport establishment, full IMS registration state machines, and
-media bridging are still implemented incrementally behind these APIs.
+The low-level IKEv2/ESP dataplane and RTP media transport are still implemented
+incrementally behind these APIs.
 
 ## Development
 
