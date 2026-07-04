@@ -33,9 +33,12 @@ protocol layers needed by VoHive:
   termination hooks
 - SWu tunnel manager/session contracts with startup validation, tunnel readiness
   state integration, shutdown cleanup, and MOBIKE delegation
+- IKEv2 binary header/payload framing, Notify/KE/Nonce/EAP helpers, NAT
+  detection hashes, MOBIKE notify helpers, and PRF+/SKEYSEED key derivation
+  primitives for the SWu dataplane
 
-The low-level IKEv2/ESP dataplane and RTP media transport are still implemented
-incrementally behind these APIs.
+The live UDP IKEv2 exchange, ESP packet transport, and RTP media transport are
+still implemented incrementally behind these APIs.
 
 ## Development
 
