@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/iniwex5/vowifi-go/engine/sim"
 	"github.com/iniwex5/vowifi-go/engine/swu/eapaka"
 )
 
@@ -43,6 +44,29 @@ type AuthResult struct {
 	EAPRequest            *eapaka.Packet
 	EAPAfterIdentity      *eapaka.Packet
 	NextMessageID         uint32
+}
+
+type AKAChallengeConfig struct {
+	Transport InitTransport
+	Init      InitResult
+	Keys      IKEKeys
+	SIM       sim.AKAProvider
+	Identity  string
+	Request   eapaka.Packet
+	MessageID uint32
+	Random    io.Reader
+	IV        []byte
+}
+
+type AKAChallengeResult struct {
+	RequestBytes  []byte
+	ResponseBytes []byte
+	ResponseInner []Payload
+	EAPResponse   eapaka.Packet
+	EAPNext       *eapaka.Packet
+	EAPKeys       eapaka.Keys
+	SyncFailure   bool
+	NextMessageID uint32
 }
 
 func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, error) {
@@ -143,6 +167,86 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 		return AuthResult{}, err
 	} else if ok {
 		out.EAPAfterIdentity = &nextEAP
+	}
+	return out, nil
+}
+
+func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAChallengeResult, error) {
+	if cfg.Transport == nil {
+		return AKAChallengeResult{}, fmt.Errorf("%w: transport is nil", ErrInvalidAuthConfig)
+	}
+	if cfg.SIM == nil {
+		return AKAChallengeResult{}, fmt.Errorf("%w: SIM provider is nil", ErrInvalidAuthConfig)
+	}
+	keys := cfg.Keys
+	if keys.Profile.RequiredLength() == 0 {
+		keys = cfg.Init.Keys
+	}
+	if err := validateKeySet(keys); err != nil {
+		return AKAChallengeResult{}, err
+	}
+	if cfg.MessageID == 0 {
+		return AKAChallengeResult{}, fmt.Errorf("%w: message_id is zero", ErrInvalidAuthConfig)
+	}
+	rand16, autn16, err := eapaka.ChallengeRANDAndAUTN(cfg.Request)
+	if err != nil {
+		return AKAChallengeResult{}, err
+	}
+	aka, err := cfg.SIM.CalculateAKA(rand16, autn16)
+	var eapResp eapaka.Packet
+	var eapKeys eapaka.Keys
+	var syncFailure bool
+	if err != nil {
+		if errors.Is(err, sim.ErrSyncFailure) && len(aka.AUTS) > 0 {
+			eapResp, err = eapaka.BuildSynchronizationFailureResponse(cfg.Request, aka.AUTS)
+			syncFailure = true
+		}
+		if err != nil {
+			return AKAChallengeResult{}, err
+		}
+	} else {
+		identity := strings.TrimSpace(cfg.Identity)
+		if identity == "" {
+			return AKAChallengeResult{}, fmt.Errorf("%w: identity is empty", ErrInvalidAuthConfig)
+		}
+		eapResp, eapKeys, err = eapaka.BuildChallengeResponse(identity, cfg.Request, aka)
+		if err != nil {
+			return AKAChallengeResult{}, err
+		}
+	}
+	eapRaw, err := eapResp.MarshalBinary()
+	if err != nil {
+		return AKAChallengeResult{}, err
+	}
+	iv, err := authIV(cfg.Random, keys.Profile, cfg.IV)
+	if err != nil {
+		return AKAChallengeResult{}, err
+	}
+	_, reqBytes, err := ProtectMessage(authHeader(cfg.Init, cfg.MessageID, true), keys, true, []Payload{EAPPayload(eapRaw)}, iv)
+	if err != nil {
+		return AKAChallengeResult{}, err
+	}
+	respBytes, err := cfg.Transport.ExchangeIKE(ctx, reqBytes)
+	if err != nil {
+		return AKAChallengeResult{}, err
+	}
+	_, inner, err := unprotectAuthResponse(respBytes, cfg.Init, keys, cfg.MessageID)
+	if err != nil {
+		return AKAChallengeResult{}, err
+	}
+	out := AKAChallengeResult{
+		RequestBytes:  append([]byte(nil), reqBytes...),
+		ResponseBytes: append([]byte(nil), respBytes...),
+		ResponseInner: clonePayloads(inner),
+		EAPResponse:   eapResp,
+		EAPKeys:       eapKeys,
+		SyncFailure:   syncFailure,
+		NextMessageID: cfg.MessageID + 1,
+	}
+	if next, ok, err := firstEAPPacket(inner); err != nil {
+		return AKAChallengeResult{}, err
+	} else if ok {
+		out.EAPNext = &next
 	}
 	return out, nil
 }

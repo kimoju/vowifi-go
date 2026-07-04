@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/iniwex5/vowifi-go/engine/sim"
 	"github.com/iniwex5/vowifi-go/engine/swu/eapaka"
 )
 
@@ -141,6 +142,131 @@ func TestRunIKEAuthEAPIdentity(t *testing.T) {
 	}
 }
 
+func TestRunIKEAuthAKAChallenge(t *testing.T) {
+	init := fakeInitResult(t)
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := simAKAResult()
+	challenge := signedAKAChallenge(t, identity, aka)
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(request, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+			t.Fatalf("request header=%+v inner=%+v", msg.Header, inner)
+		}
+		pkt, err := eapaka.ParsePacket(inner[0].Body)
+		if err != nil {
+			return nil, err
+		}
+		if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeChallenge {
+			t.Fatalf("packet=%+v", pkt)
+		}
+		keys, err := eapaka.DeriveKeys(identity, aka)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := pkt.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		if err := eapaka.VerifyMAC(keys.KAut, raw, nil); err != nil {
+			return nil, err
+		}
+		resAttr, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeRES)
+		if !ok {
+			t.Fatal("missing AT_RES")
+		}
+		res, _, err := resAttr.RESValue()
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(res, aka.RES) {
+			t.Fatalf("RES=%x", res)
+		}
+		success, err := (eapaka.Packet{Code: eapaka.CodeSuccess, Identifier: pkt.Identifier}).MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0x42}, init.Keys.Profile.EncryptionBlockSize))
+		return rawResp, err
+	})
+	res, err := RunIKE_AUTH_AKAChallenge(context.Background(), AKAChallengeConfig{
+		Transport: transport,
+		Init:      init,
+		SIM:       akaProviderStub{result: aka},
+		Identity:  identity,
+		Request:   challenge,
+		MessageID: 3,
+		IV:        bytes.Repeat([]byte{0x41}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_AKAChallenge() error = %v", err)
+	}
+	if res.SyncFailure || res.EAPNext == nil || res.EAPNext.Code != eapaka.CodeSuccess || res.NextMessageID != 4 {
+		t.Fatalf("result=%+v", res)
+	}
+	if len(res.EAPKeys.KAut) != eapaka.KeyLengthKAut || len(res.EAPKeys.MSK) != eapaka.KeyLengthMSK {
+		t.Fatalf("EAP keys=%+v", res.EAPKeys)
+	}
+}
+
+func TestRunIKEAuthAKAChallengeSyncFailure(t *testing.T) {
+	init := fakeInitResult(t)
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := simAKAResult()
+	challenge := signedAKAChallenge(t, identity, aka)
+	wantAUTS := bytes.Repeat([]byte{0xee}, 14)
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(request, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+			t.Fatalf("request header=%+v inner=%+v", msg.Header, inner)
+		}
+		pkt, err := eapaka.ParsePacket(inner[0].Body)
+		if err != nil {
+			return nil, err
+		}
+		if pkt.Subtype != eapaka.SubtypeSynchronizationFailure {
+			t.Fatalf("packet=%+v", pkt)
+		}
+		attr, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeAUTS)
+		if !ok {
+			t.Fatal("missing AT_AUTS")
+		}
+		auts, err := attr.AUTSValue()
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(auts, wantAUTS) {
+			t.Fatalf("AUTS=%x", auts)
+		}
+		failure, err := (eapaka.Packet{Code: eapaka.CodeFailure, Identifier: pkt.Identifier}).MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(failure)}, bytes.Repeat([]byte{0x52}, init.Keys.Profile.EncryptionBlockSize))
+		return rawResp, err
+	})
+	res, err := RunIKE_AUTH_AKAChallenge(context.Background(), AKAChallengeConfig{
+		Transport: transport,
+		Init:      init,
+		SIM:       akaProviderStub{result: sim.AKAResult{AUTS: wantAUTS}, err: sim.ErrSyncFailure},
+		Identity:  identity,
+		Request:   challenge,
+		MessageID: 3,
+		IV:        bytes.Repeat([]byte{0x51}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_AKAChallenge() error = %v", err)
+	}
+	if !res.SyncFailure || res.EAPNext == nil || res.EAPNext.Code != eapaka.CodeFailure {
+		t.Fatalf("result=%+v", res)
+	}
+}
+
 func TestBuildIKEAuthInitialPayloadsRejectsMissingID(t *testing.T) {
 	_, err := BuildIKEAuthInitialPayloads(AuthConfig{})
 	if !errors.Is(err, ErrInvalidIdentity) {
@@ -164,6 +290,55 @@ func fakeInitResult(t *testing.T) InitResult {
 		SelectedSA:   DefaultIKEProposal(),
 		Keys:         keys,
 	}
+}
+
+type akaProviderStub struct {
+	result sim.AKAResult
+	err    error
+}
+
+func (p akaProviderStub) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, error) {
+	if !bytes.Equal(rand16, bytes.Repeat([]byte{0xa1}, 16)) || !bytes.Equal(autn16, bytes.Repeat([]byte{0xb2}, 16)) {
+		return sim.AKAResult{}, errors.New("unexpected RAND/AUTN")
+	}
+	return p.result, p.err
+}
+
+func simAKAResult() sim.AKAResult {
+	return sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+}
+
+func signedAKAChallenge(t *testing.T, identity string, aka sim.AKAResult) eapaka.Packet {
+	t.Helper()
+	keys, err := eapaka.DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	challenge := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 10,
+		Type:       eapaka.TypeAKA,
+		Subtype:    eapaka.SubtypeChallenge,
+		Attributes: []eapaka.Attribute{
+			eapaka.RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
+			eapaka.AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
+			eapaka.MACAttribute(nil),
+		},
+	}
+	raw, err := challenge.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := eapaka.CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	challenge.Attributes[len(challenge.Attributes)-1] = eapaka.MACAttribute(mac)
+	return challenge
 }
 
 func gotTypes(payloads []Payload) []byte {

@@ -1,0 +1,290 @@
+package eapaka
+
+import (
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/binary"
+	"errors"
+	"fmt"
+
+	"github.com/iniwex5/vowifi-go/engine/sim"
+)
+
+const (
+	KeyLengthKEncr = 16
+	KeyLengthKAut  = 16
+	KeyLengthMSK   = 64
+	KeyLengthEMSK  = 64
+)
+
+var (
+	ErrInvalidAKAChallenge = errors.New("invalid eap-aka challenge")
+	ErrInvalidMAC          = errors.New("invalid eap-aka mac")
+	ErrInvalidKeyMaterial  = errors.New("invalid eap-aka key material")
+)
+
+type Keys struct {
+	MK    []byte
+	KEncr []byte
+	KAut  []byte
+	MSK   []byte
+	EMSK  []byte
+}
+
+func DeriveKeys(identity string, aka sim.AKAResult) (Keys, error) {
+	if len(aka.IK) == 0 || len(aka.CK) == 0 {
+		return Keys{}, fmt.Errorf("%w: IK/CK is empty", ErrInvalidKeyMaterial)
+	}
+	mkInput := make([]byte, 0, len(identity)+len(aka.IK)+len(aka.CK))
+	mkInput = append(mkInput, []byte(identity)...)
+	mkInput = append(mkInput, aka.IK...)
+	mkInput = append(mkInput, aka.CK...)
+	mkSum := sha1.Sum(mkInput)
+	stream := fips1862PRF(mkSum[:], KeyLengthKEncr+KeyLengthKAut+KeyLengthMSK+KeyLengthEMSK)
+	return Keys{
+		MK:    append([]byte(nil), mkSum[:]...),
+		KEncr: append([]byte(nil), stream[:KeyLengthKEncr]...),
+		KAut:  append([]byte(nil), stream[KeyLengthKEncr:KeyLengthKEncr+KeyLengthKAut]...),
+		MSK:   append([]byte(nil), stream[KeyLengthKEncr+KeyLengthKAut:KeyLengthKEncr+KeyLengthKAut+KeyLengthMSK]...),
+		EMSK:  append([]byte(nil), stream[KeyLengthKEncr+KeyLengthKAut+KeyLengthMSK:]...),
+	}, nil
+}
+
+func BuildChallengeResponse(identity string, request Packet, aka sim.AKAResult) (Packet, Keys, error) {
+	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
+		return Packet{}, Keys{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
+	}
+	if len(aka.RES) == 0 {
+		return Packet{}, Keys{}, fmt.Errorf("%w: RES is empty", ErrInvalidKeyMaterial)
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		return Packet{}, Keys{}, err
+	}
+	requestRaw, err := request.MarshalBinary()
+	if err != nil {
+		return Packet{}, Keys{}, err
+	}
+	if err := VerifyMAC(keys.KAut, requestRaw, nil); err != nil {
+		return Packet{}, Keys{}, err
+	}
+	response := Packet{
+		Code:       CodeResponse,
+		Identifier: request.Identifier,
+		Type:       request.Type,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{
+			RESAttribute(aka.RES),
+			MACAttribute(nil),
+		},
+	}
+	raw, err := response.MarshalBinary()
+	if err != nil {
+		return Packet{}, Keys{}, err
+	}
+	mac, err := CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		return Packet{}, Keys{}, err
+	}
+	response.Attributes[len(response.Attributes)-1] = MACAttribute(mac)
+	return response, keys, nil
+}
+
+func BuildSynchronizationFailureResponse(request Packet, auts []byte) (Packet, error) {
+	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
+		return Packet{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
+	}
+	if len(auts) == 0 {
+		return Packet{}, fmt.Errorf("%w: AUTS is empty", ErrInvalidAKAChallenge)
+	}
+	return Packet{
+		Code:       CodeResponse,
+		Identifier: request.Identifier,
+		Type:       request.Type,
+		Subtype:    SubtypeSynchronizationFailure,
+		Attributes: []Attribute{AUTSAttribute(auts)},
+	}, nil
+}
+
+func ChallengeRANDAndAUTN(request Packet) (rand16, autn16 []byte, err error) {
+	randAttr, ok := FindAttribute(request.Attributes, AttributeRAND)
+	if !ok {
+		return nil, nil, fmt.Errorf("%w: missing AT_RAND", ErrInvalidAKAChallenge)
+	}
+	rands, err := randAttr.RANDValues()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(rands) != 1 {
+		return nil, nil, fmt.Errorf("%w: RAND count %d", ErrInvalidAKAChallenge, len(rands))
+	}
+	autnAttr, ok := FindAttribute(request.Attributes, AttributeAUTN)
+	if !ok {
+		return nil, nil, fmt.Errorf("%w: missing AT_AUTN", ErrInvalidAKAChallenge)
+	}
+	autn, err := autnAttr.AUTNValue()
+	if err != nil {
+		return nil, nil, err
+	}
+	return rands[0], autn, nil
+}
+
+func MACAttribute(mac []byte) Attribute {
+	value := make([]byte, 16)
+	copy(value, mac)
+	return FixedAttribute(AttributeMAC, value)
+}
+
+func CalculateMAC(kAut, packet, extra []byte) ([]byte, error) {
+	if len(kAut) == 0 {
+		return nil, fmt.Errorf("%w: K_aut is empty", ErrInvalidKeyMaterial)
+	}
+	zeroed, err := packetWithZeroedMAC(packet)
+	if err != nil {
+		return nil, err
+	}
+	mac := hmac.New(sha1.New, kAut)
+	_, _ = mac.Write(zeroed)
+	_, _ = mac.Write(extra)
+	sum := mac.Sum(nil)
+	return append([]byte(nil), sum[:16]...), nil
+}
+
+func VerifyMAC(kAut, packet, extra []byte) error {
+	actual, err := packetMAC(packet)
+	if err != nil {
+		return err
+	}
+	expected, err := CalculateMAC(kAut, packet, extra)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(actual, expected) {
+		return fmt.Errorf("%w: AT_MAC mismatch", ErrInvalidMAC)
+	}
+	return nil
+}
+
+func packetMAC(packet []byte) ([]byte, error) {
+	offset, length, err := findMACAttribute(packet)
+	if err != nil {
+		return nil, err
+	}
+	if length != 20 {
+		return nil, fmt.Errorf("%w: AT_MAC length %d", ErrInvalidMAC, length)
+	}
+	return append([]byte(nil), packet[offset+4:offset+20]...), nil
+}
+
+func packetWithZeroedMAC(packet []byte) ([]byte, error) {
+	offset, length, err := findMACAttribute(packet)
+	if err != nil {
+		return nil, err
+	}
+	out := append([]byte(nil), packet...)
+	for i := offset + 2; i < offset+length; i++ {
+		out[i] = 0
+	}
+	return out, nil
+}
+
+func findMACAttribute(packet []byte) (offset int, length int, err error) {
+	if len(packet) < 8 {
+		return 0, 0, ErrInvalidPacket
+	}
+	packetLen := int(binary.BigEndian.Uint16(packet[2:4]))
+	if packetLen < 8 || packetLen > len(packet) {
+		return 0, 0, ErrInvalidPacket
+	}
+	for offset := 8; offset < packetLen; {
+		if packetLen-offset < 4 {
+			return 0, 0, ErrInvalidAttribute
+		}
+		length := int(packet[offset+1]) * 4
+		if length < 4 || offset+length > packetLen {
+			return 0, 0, ErrInvalidAttribute
+		}
+		if packet[offset] == AttributeMAC {
+			return offset, length, nil
+		}
+		offset += length
+	}
+	return 0, 0, fmt.Errorf("%w: missing AT_MAC", ErrInvalidMAC)
+}
+
+func fips1862PRF(seed []byte, length int) []byte {
+	xkey := make([]byte, 20)
+	copy(xkey, seed)
+	var out []byte
+	for len(out) < length {
+		for i := 0; i < 2 && len(out) < length; i++ {
+			w := fips1862G(xkey)
+			out = append(out, w...)
+			xkey = add160(xkey, w, 1)
+		}
+	}
+	return out[:length]
+}
+
+func fips1862G(xval []byte) []byte {
+	var block [64]byte
+	copy(block[:20], xval)
+	h0, h1, h2, h3, h4 := uint32(0x67452301), uint32(0xEFCDAB89), uint32(0x98BADCFE), uint32(0x10325476), uint32(0xC3D2E1F0)
+	var w [80]uint32
+	for i := 0; i < 16; i++ {
+		w[i] = binary.BigEndian.Uint32(block[i*4 : i*4+4])
+	}
+	for i := 16; i < 80; i++ {
+		w[i] = bitsRotateLeft32(w[i-3]^w[i-8]^w[i-14]^w[i-16], 1)
+	}
+	a, b, c, d, e := h0, h1, h2, h3, h4
+	for i := 0; i < 80; i++ {
+		var f, k uint32
+		switch {
+		case i < 20:
+			f = (b & c) | ((^b) & d)
+			k = 0x5A827999
+		case i < 40:
+			f = b ^ c ^ d
+			k = 0x6ED9EBA1
+		case i < 60:
+			f = (b & c) | (b & d) | (c & d)
+			k = 0x8F1BBCDC
+		default:
+			f = b ^ c ^ d
+			k = 0xCA62C1D6
+		}
+		temp := bitsRotateLeft32(a, 5) + f + e + k + w[i]
+		e = d
+		d = c
+		c = bitsRotateLeft32(b, 30)
+		b = a
+		a = temp
+	}
+	h0 += a
+	h1 += b
+	h2 += c
+	h3 += d
+	h4 += e
+	out := make([]byte, 20)
+	binary.BigEndian.PutUint32(out[0:4], h0)
+	binary.BigEndian.PutUint32(out[4:8], h1)
+	binary.BigEndian.PutUint32(out[8:12], h2)
+	binary.BigEndian.PutUint32(out[12:16], h3)
+	binary.BigEndian.PutUint32(out[16:20], h4)
+	return out
+}
+
+func add160(a, b []byte, carry uint16) []byte {
+	out := make([]byte, 20)
+	for i := 19; i >= 0; i-- {
+		sum := uint16(a[i]) + uint16(b[i]) + carry
+		out[i] = byte(sum)
+		carry = sum >> 8
+	}
+	return out
+}
+
+func bitsRotateLeft32(v uint32, n uint) uint32 {
+	return (v << n) | (v >> (32 - n))
+}
