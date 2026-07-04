@@ -5,6 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/iniwex5/vowifi-go/runtimehost/identity"
+	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
 )
 
 type testModem struct{}
@@ -96,4 +99,32 @@ func TestStartWithoutIMSRegistrarKeepsCompatibilityReady(t *testing.T) {
 	if !inst.State().IMSReady {
 		t.Fatalf("IMSReady=false without explicit registrar")
 	}
+}
+
+func TestStartWiresSMSTransport(t *testing.T) {
+	transport := &runtimeSMSTransport{}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:     "dev-1",
+		Profile:      identity.Profile{IMSI: "310280233641503"},
+		SMSTransport: transport,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	out, err := inst.SendSMSWithOptions(context.Background(), "+18005551212", strings.Repeat("a", 161), messaging.SendOptions{})
+	if err != nil {
+		t.Fatalf("SendSMSWithOptions() error = %v", err)
+	}
+	if out.PartsTotal != 2 || len(transport.requests) != 2 {
+		t.Fatalf("outcome=%+v requests=%+v", out, transport.requests)
+	}
+}
+
+type runtimeSMSTransport struct {
+	requests []messaging.SMSSendRequest
+}
+
+func (t *runtimeSMSTransport) SendSMSPart(ctx context.Context, req messaging.SMSSendRequest) (messaging.SMSSendResult, error) {
+	t.requests = append(t.requests, req)
+	return messaging.SMSSendResult{State: "sent"}, nil
 }

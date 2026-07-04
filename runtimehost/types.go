@@ -225,6 +225,7 @@ type StartRequest struct {
 	Dataplane     DataplanePolicy
 	Proxy         *ProxyConfig
 	IMSRegistrar  IMSRegistrar
+	SMSTransport  messaging.SMSTransport
 	DeliveryStore messaging.DeliveryStore
 	Dispatch      eventhost.Dispatcher
 	BeforeStart   func(context.Context, SessionConfig) error
@@ -314,6 +315,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		state.NetworkMode = modem.GetNetworkMode()
 	}
 	svc := messaging.NewService(req.DeviceID, req.Profile.IMSI, req.DeliveryStore, req.Dispatch)
+	svc.SetSMSTransport(req.SMSTransport)
 	inst := &Instance{state: state, service: svc}
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)

@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 )
 
 var ErrDeliveryNotFound = errors.New("delivery not found")
+var ErrSMSTransportUnavailable = errors.New("sms transport unavailable")
 
 type suppressKey struct{}
 
@@ -37,6 +40,34 @@ type USSDResult struct {
 	SessionID string `json:"session_id,omitempty"`
 	Text      string `json:"text,omitempty"`
 	Done      bool   `json:"done"`
+}
+
+type SMSPart struct {
+	PartNo     int
+	TotalParts int
+	Text       string
+	Encoding   string
+	UDH        []byte
+}
+
+type SMSSendRequest struct {
+	DeviceID  string
+	IMSI      string
+	Peer      string
+	MessageID string
+	Part      SMSPart
+}
+
+type SMSSendResult struct {
+	CallID    string
+	RPMR      int
+	State     string
+	SIPCode   int
+	ErrorText string
+}
+
+type SMSTransport interface {
+	SendSMSPart(context.Context, SMSSendRequest) (SMSSendResult, error)
 }
 
 type DeliveryPartMatch struct {
@@ -93,14 +124,22 @@ func RPCauseText(code int) string {
 }
 
 type Service struct {
-	deviceID string
-	imsi     string
-	store    DeliveryStore
-	dispatch eventhost.Dispatcher
+	deviceID  string
+	imsi      string
+	store     DeliveryStore
+	dispatch  eventhost.Dispatcher
+	transport SMSTransport
 }
 
 func NewService(deviceID, imsi string, store DeliveryStore, dispatch eventhost.Dispatcher) *Service {
 	return &Service{deviceID: deviceID, imsi: imsi, store: store, dispatch: dispatch}
+}
+
+func (s *Service) SetSMSTransport(t SMSTransport) {
+	if s == nil {
+		return
+	}
+	s.transport = t
 }
 
 func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts SendOptions) (SendOutcome, error) {
@@ -108,17 +147,71 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 	if to == "" {
 		return SendOutcome{}, errors.New("sms target is empty")
 	}
+	parts := SegmentSMS(text, opts.Encoding)
+	if len(parts) == 0 {
+		return SendOutcome{}, errors.New("sms content is empty")
+	}
 	id := fmt.Sprintf("vowifi-%d", time.Now().UnixNano())
 	now := time.Now()
 	if s != nil && s.store != nil {
-		_ = s.store.CreateSMSDelivery(id, s.imsi, s.deviceID, to, text, 1, now)
-		_ = s.store.UpsertSMSDeliveryPart(id, 1, "", 0, "sent", now)
-		_ = s.store.UpdateSMSDeliveryState(id, "sent", "", 0, now)
+		_ = s.store.CreateSMSDelivery(id, s.imsi, s.deviceID, to, text, len(parts), now)
+	}
+	acks := 0
+	state := "sent"
+	deliveryState := "sent"
+	lastErr := ""
+	for _, part := range parts {
+		partNow := time.Now()
+		res := SMSSendResult{State: "sent"}
+		var sendErr error
+		if s != nil && s.transport != nil {
+			res, sendErr = s.transport.SendSMSPart(ctx, SMSSendRequest{
+				DeviceID:  s.deviceID,
+				IMSI:      s.imsi,
+				Peer:      to,
+				MessageID: id,
+				Part:      part,
+			})
+		}
+		if res.State == "" {
+			res.State = "sent"
+		}
+		if sendErr != nil {
+			res.State = "failed"
+			if res.ErrorText == "" {
+				res.ErrorText = sendErr.Error()
+			}
+		}
+		if s != nil && s.store != nil {
+			_ = s.store.UpsertSMSDeliveryPart(id, part.PartNo, res.CallID, res.RPMR, res.State, partNow)
+		}
+		if res.State == "sent" || res.State == "delivered" || res.State == "accepted" {
+			acks++
+		}
+		if sendErr != nil {
+			state = "failed"
+			deliveryState = "failed"
+			lastErr = res.ErrorText
+			break
+		}
+		if res.State == "failed" {
+			state = "failed"
+			deliveryState = "failed"
+			lastErr = res.ErrorText
+			break
+		}
+	}
+	if s != nil && s.store != nil {
+		_ = s.store.UpdateSMSDeliveryState(id, state, lastErr, acks, time.Now())
 	}
 	if s != nil && s.dispatch != nil {
-		s.dispatch.Dispatch(ctx, eventhost.SMSSent{DevID: s.deviceID, TargetURI: to, Content: text, Time: now})
+		s.dispatch.Dispatch(ctx, eventhost.SMSSent{DevID: s.deviceID, TargetURI: to, Content: text, Time: now, TotalParts: len(parts)})
 	}
-	return SendOutcome{MessageID: id, Parts: 1, PartsTotal: 1, State: "sent", DeliveryState: "sent"}, nil
+	out := SendOutcome{MessageID: id, Parts: acks, PartsTotal: len(parts), State: state, DeliveryState: deliveryState}
+	if state == "failed" {
+		return out, errors.New(firstNonEmpty(lastErr, "sms send failed"))
+	}
+	return out, nil
 }
 
 func (s *Service) SendUSSD(ctx context.Context, command string) (*USSDResult, error) {
@@ -147,4 +240,120 @@ func (s *Service) GetSMSDeliveryStatus(messageID string) (*DeliveryStatus, error
 		return nil, ErrDeliveryNotFound
 	}
 	return s.store.GetSMSDeliveryStatus(messageID)
+}
+
+func SegmentSMS(text, encoding string) []SMSPart {
+	if text == "" {
+		return nil
+	}
+	enc := normalizeEncoding(text, encoding)
+	single, concat := smsPartLimits(enc)
+	if messageLen(text, enc) <= single {
+		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc}}
+	}
+	total := int(math.Ceil(float64(messageLen(text, enc)) / float64(concat)))
+	if total <= 0 {
+		total = 1
+	}
+	out := make([]SMSPart, 0, total)
+	remaining := text
+	for partNo := 1; remaining != ""; partNo++ {
+		chunk, rest := takeSMSChunk(remaining, enc, concat)
+		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: concatUDH(total, partNo)})
+		remaining = rest
+	}
+	for i := range out {
+		out[i].TotalParts = len(out)
+		out[i].UDH = concatUDH(len(out), out[i].PartNo)
+	}
+	return out
+}
+
+func normalizeEncoding(text, requested string) string {
+	req := strings.ToLower(strings.TrimSpace(requested))
+	switch req {
+	case "gsm7", "7bit", "gsm-7":
+		return "gsm7"
+	case "ucs2", "utf16":
+		return "ucs2"
+	case "utf8":
+		return "utf8"
+	}
+	if isGSM7Text(text) {
+		return "gsm7"
+	}
+	return "ucs2"
+}
+
+func smsPartLimits(encoding string) (single int, concat int) {
+	switch encoding {
+	case "gsm7":
+		return 160, 153
+	case "utf8":
+		return 140, 134
+	default:
+		return 70, 67
+	}
+}
+
+func messageLen(text, encoding string) int {
+	if encoding == "utf8" {
+		return len([]byte(text))
+	}
+	if encoding == "gsm7" {
+		return len([]rune(text))
+	}
+	return utf8.RuneCountInString(text)
+}
+
+func takeSMSChunk(text, encoding string, limit int) (string, string) {
+	if encoding == "utf8" {
+		if len(text) <= limit {
+			return text, ""
+		}
+		i := 0
+		for pos := range text {
+			if pos > limit {
+				break
+			}
+			i = pos
+		}
+		if i <= 0 {
+			_, size := utf8.DecodeRuneInString(text)
+			i = size
+		}
+		return text[:i], text[i:]
+	}
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text, ""
+	}
+	return string(runes[:limit]), string(runes[limit:])
+}
+
+func concatUDH(total, partNo int) []byte {
+	if total <= 1 {
+		return nil
+	}
+	return []byte{0x05, 0x00, 0x03, 0x01, byte(total), byte(partNo)}
+}
+
+func isGSM7Text(text string) bool {
+	for _, r := range text {
+		if !strings.ContainsRune(gsm7Alphabet, r) {
+			return false
+		}
+	}
+	return true
+}
+
+const gsm7Alphabet = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+
+func firstNonEmpty(items ...string) string {
+	for _, item := range items {
+		if strings.TrimSpace(item) != "" {
+			return strings.TrimSpace(item)
+		}
+	}
+	return ""
 }
