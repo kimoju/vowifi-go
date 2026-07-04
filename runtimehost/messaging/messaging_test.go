@@ -134,6 +134,60 @@ func TestUSSDCancelDelegatesAndClearsSession(t *testing.T) {
 	}
 }
 
+func TestHandleSMSDeliveryReportMarksAndRecomputes(t *testing.T) {
+	store := &fakeDeliveryStore{match: DeliveryPartMatch{MessageID: "msg-1", PartNo: 1, State: "delivered"}}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+
+	match, err := svc.HandleSMSDeliveryReport(context.Background(), SMSDeliveryReport{
+		InReplyTo: "sip-message-1",
+		CallID:    "call-1",
+		RPMR:      7,
+		SIPCode:   202,
+	})
+	if err != nil {
+		t.Fatalf("HandleSMSDeliveryReport() error = %v", err)
+	}
+	if match.MessageID != "msg-1" || store.reportState != "delivered" || store.reportSIPCode != 202 || store.reportRPMR != 7 {
+		t.Fatalf("match=%+v store=%+v", match, store)
+	}
+	if store.recomputedMessageID != "msg-1" {
+		t.Fatalf("recomputedMessageID=%q", store.recomputedMessageID)
+	}
+}
+
+func TestHandleSMSDeliveryReportFailureCause(t *testing.T) {
+	store := &fakeDeliveryStore{match: DeliveryPartMatch{MessageID: "msg-1", PartNo: 1, State: "failed"}}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+
+	_, err := svc.HandleSMSDeliveryReport(context.Background(), SMSDeliveryReport{
+		InReplyTo: "sip-message-1",
+		RPCause:   42,
+	})
+	if err != nil {
+		t.Fatalf("HandleSMSDeliveryReport() error = %v", err)
+	}
+	if store.reportState != "failed" || !strings.Contains(store.reportErrText, "42") {
+		t.Fatalf("store=%+v", store)
+	}
+}
+
+func TestHandleIncomingSMSDispatchesEvent(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+
+	err := svc.HandleIncomingSMS(context.Background(), IncomingSMS{Sender: "+10086", Content: "hello"})
+	if err != nil {
+		t.Fatalf("HandleIncomingSMS() error = %v", err)
+	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	got, ok := dispatch.events[0].(eventhost.SMSReceived)
+	if !ok || got.DevID != "dev-1" || got.Sender != "+10086" || got.Content != "hello" || got.Time.IsZero() {
+		t.Fatalf("event=%+v", dispatch.events[0])
+	}
+}
+
 type fakeSMSTransport struct {
 	requests []SMSSendRequest
 	failPart int
@@ -179,11 +233,21 @@ func (d *fakeDispatcher) Dispatch(ctx context.Context, ev eventhost.Event) {
 }
 
 type fakeDeliveryStore struct {
-	createdPartsTotal int
-	parts             []DeliveryPartStatus
-	state             string
-	lastError         string
-	acks              int
+	createdPartsTotal   int
+	parts               []DeliveryPartStatus
+	state               string
+	lastError           string
+	acks                int
+	match               DeliveryPartMatch
+	reportInReplyTo     string
+	reportCallID        string
+	reportDeviceID      string
+	reportRPMR          int
+	reportState         string
+	reportSIPCode       int
+	reportRPCause       int
+	reportErrText       string
+	recomputedMessageID string
 }
 
 func (s *fakeDeliveryStore) CreateSMSDelivery(messageID, imsi, deviceID, peer, content string, partsTotal int, at time.Time) error {
@@ -197,10 +261,19 @@ func (s *fakeDeliveryStore) UpsertSMSDeliveryPart(messageID string, partNo int, 
 }
 
 func (s *fakeDeliveryStore) MarkSMSDeliveryPartReport(inReplyTo, callID, deviceID string, rpMR int, state string, sipCode int, rpCause int, errText string, at time.Time) (DeliveryPartMatch, error) {
-	return DeliveryPartMatch{}, nil
+	s.reportInReplyTo = inReplyTo
+	s.reportCallID = callID
+	s.reportDeviceID = deviceID
+	s.reportRPMR = rpMR
+	s.reportState = state
+	s.reportSIPCode = sipCode
+	s.reportRPCause = rpCause
+	s.reportErrText = errText
+	return s.match, nil
 }
 
 func (s *fakeDeliveryStore) RecomputeSMSDelivery(messageID string, at time.Time) error {
+	s.recomputedMessageID = messageID
 	return nil
 }
 

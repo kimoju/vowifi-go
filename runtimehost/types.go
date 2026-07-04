@@ -392,6 +392,22 @@ func (i *Instance) GetSMSDeliveryStatus(messageID string) (*messaging.DeliverySt
 	return svc.GetSMSDeliveryStatus(messageID)
 }
 
+func (i *Instance) HandleIncomingSMS(ctx context.Context, msg messaging.IncomingSMS) error {
+	svc := i.Service()
+	if svc == nil {
+		return errors.New("messaging service is nil")
+	}
+	return svc.HandleIncomingSMS(ctx, msg)
+}
+
+func (i *Instance) HandleSMSDeliveryReport(ctx context.Context, report messaging.SMSDeliveryReport) (messaging.DeliveryPartMatch, error) {
+	svc := i.Service()
+	if svc == nil {
+		return messaging.DeliveryPartMatch{}, errors.New("messaging service is nil")
+	}
+	return svc.HandleSMSDeliveryReport(ctx, report)
+}
+
 func (i *Instance) State() State {
 	if i == nil {
 		return State{}

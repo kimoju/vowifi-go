@@ -46,6 +46,24 @@ type USSDResult struct {
 	Done      bool   `json:"done"`
 }
 
+type IncomingSMS struct {
+	Sender    string
+	Recipient string
+	Content   string
+	Timestamp time.Time
+}
+
+type SMSDeliveryReport struct {
+	InReplyTo string
+	CallID    string
+	RPMR      int
+	State     string
+	SIPCode   int
+	RPCause   int
+	ErrorText string
+	ReportAt  time.Time
+}
+
 type SMSPart struct {
 	PartNo     int
 	TotalParts int
@@ -317,6 +335,63 @@ func (s *Service) GetSMSDeliveryStatus(messageID string) (*DeliveryStatus, error
 	return s.store.GetSMSDeliveryStatus(messageID)
 }
 
+func (s *Service) HandleIncomingSMS(ctx context.Context, msg IncomingSMS) error {
+	sender := strings.TrimSpace(msg.Sender)
+	content := msg.Content
+	if sender == "" {
+		return errors.New("incoming sms sender is empty")
+	}
+	if strings.TrimSpace(content) == "" {
+		return errors.New("incoming sms content is empty")
+	}
+	at := msg.Timestamp
+	if at.IsZero() {
+		at = time.Now()
+	}
+	if s != nil && s.dispatch != nil {
+		s.dispatch.Dispatch(ctx, eventhost.SMSReceived{
+			DevID:   s.deviceID,
+			Sender:  sender,
+			Content: content,
+			Time:    at,
+		})
+	}
+	return nil
+}
+
+func (s *Service) HandleSMSDeliveryReport(ctx context.Context, report SMSDeliveryReport) (DeliveryPartMatch, error) {
+	if s == nil || s.store == nil {
+		return DeliveryPartMatch{}, ErrDeliveryNotFound
+	}
+	at := report.ReportAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	state := normalizeDeliveryReportState(report.State, report.SIPCode, report.RPCause)
+	errText := strings.TrimSpace(report.ErrorText)
+	if errText == "" && report.RPCause != 0 {
+		errText = RPCauseText(report.RPCause)
+	}
+	match, err := s.store.MarkSMSDeliveryPartReport(
+		strings.TrimSpace(report.InReplyTo),
+		strings.TrimSpace(report.CallID),
+		s.deviceID,
+		report.RPMR,
+		state,
+		report.SIPCode,
+		report.RPCause,
+		errText,
+		at,
+	)
+	if err != nil {
+		return DeliveryPartMatch{}, err
+	}
+	if match.MessageID != "" {
+		_ = s.store.RecomputeSMSDelivery(match.MessageID, at)
+	}
+	return match, nil
+}
+
 func SegmentSMS(text, encoding string) []SMSPart {
 	if text == "" {
 		return nil
@@ -431,6 +506,24 @@ func firstNonEmpty(items ...string) string {
 		}
 	}
 	return ""
+}
+
+func normalizeDeliveryReportState(state string, sipCode int, rpCause int) string {
+	state = strings.ToLower(strings.TrimSpace(state))
+	switch state {
+	case "delivered", "failed", "sent", "accepted":
+		return state
+	}
+	if rpCause != 0 {
+		return "failed"
+	}
+	if sipCode >= 200 && sipCode < 300 {
+		return "delivered"
+	}
+	if sipCode >= 300 {
+		return "failed"
+	}
+	return "delivered"
 }
 
 func normalizeUSSDResult(res USSDResult, sessionID string) USSDResult {

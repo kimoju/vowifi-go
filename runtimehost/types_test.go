@@ -5,7 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
 )
@@ -139,12 +141,79 @@ func TestStartWiresUSSDTransport(t *testing.T) {
 	}
 }
 
+func TestInstanceHandlesIncomingSMSAndDeliveryReport(t *testing.T) {
+	store := &runtimeDeliveryStore{match: messaging.DeliveryPartMatch{MessageID: "msg-1", PartNo: 1, State: "delivered"}}
+	dispatch := &runtimeDispatcher{}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503"},
+		DeliveryStore: store,
+		Dispatch:      dispatch,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := inst.HandleIncomingSMS(context.Background(), messaging.IncomingSMS{Sender: "+10086", Content: "hi"}); err != nil {
+		t.Fatalf("HandleIncomingSMS() error = %v", err)
+	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	match, err := inst.HandleSMSDeliveryReport(context.Background(), messaging.SMSDeliveryReport{InReplyTo: "sip-1", SIPCode: 200})
+	if err != nil {
+		t.Fatalf("HandleSMSDeliveryReport() error = %v", err)
+	}
+	if match.MessageID != "msg-1" || store.reportState != "delivered" || store.recomputed != "msg-1" {
+		t.Fatalf("match=%+v store=%+v", match, store)
+	}
+}
+
 type runtimeSMSTransport struct {
 	requests []messaging.SMSSendRequest
 }
 
 type runtimeUSSDTransport struct {
 	executeRequests []messaging.USSDRequest
+}
+
+type runtimeDispatcher struct {
+	events []eventhost.Event
+}
+
+func (d *runtimeDispatcher) Dispatch(ctx context.Context, ev eventhost.Event) {
+	d.events = append(d.events, ev)
+}
+
+type runtimeDeliveryStore struct {
+	match       messaging.DeliveryPartMatch
+	reportState string
+	recomputed  string
+}
+
+func (s *runtimeDeliveryStore) CreateSMSDelivery(messageID, imsi, deviceID, peer, content string, partsTotal int, at time.Time) error {
+	return nil
+}
+
+func (s *runtimeDeliveryStore) UpsertSMSDeliveryPart(messageID string, partNo int, callID string, rpMR int, state string, sentAt time.Time) error {
+	return nil
+}
+
+func (s *runtimeDeliveryStore) MarkSMSDeliveryPartReport(inReplyTo, callID, deviceID string, rpMR int, state string, sipCode int, rpCause int, errText string, at time.Time) (messaging.DeliveryPartMatch, error) {
+	s.reportState = state
+	return s.match, nil
+}
+
+func (s *runtimeDeliveryStore) RecomputeSMSDelivery(messageID string, at time.Time) error {
+	s.recomputed = messageID
+	return nil
+}
+
+func (s *runtimeDeliveryStore) UpdateSMSDeliveryState(messageID, state, lastError string, acks int, at time.Time) error {
+	return nil
+}
+
+func (s *runtimeDeliveryStore) GetSMSDeliveryStatus(messageID string) (*messaging.DeliveryStatus, error) {
+	return nil, messaging.ErrDeliveryNotFound
 }
 
 func (t *runtimeUSSDTransport) ExecuteUSSD(ctx context.Context, req messaging.USSDRequest) (messaging.USSDResult, error) {
