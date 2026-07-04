@@ -1,6 +1,7 @@
 package voiceclient
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
@@ -8,9 +9,12 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/iniwex5/vowifi-go/engine/sim"
 )
 
 var ErrInvalidChallenge = errors.New("invalid SIP digest challenge")
+var ErrRegistrationRejected = errors.New("IMS registration rejected")
 
 type IMSProfile struct {
 	IMPI      string
@@ -37,6 +41,42 @@ type DigestAuthInput struct {
 	Password string
 	CNonce   string
 	NC       int
+}
+
+type RegisterMessage struct {
+	URI     string
+	Headers map[string]string
+	Body    []byte
+}
+
+type RegisterResponse struct {
+	StatusCode int
+	Reason     string
+	Headers    map[string][]string
+	Body       []byte
+}
+
+type SIPRegisterTransport interface {
+	RoundTripRegister(context.Context, RegisterMessage) (RegisterResponse, error)
+}
+
+type RegisterSession struct {
+	Transport    SIPRegisterTransport
+	AKAProvider  sim.AKAProvider
+	Profile      IMSProfile
+	RegistrarURI string
+	ContactURI   string
+	CallID       string
+	CNonce       string
+	Expires      int
+}
+
+type RegisterResult struct {
+	Registered bool
+	StatusCode int
+	Reason     string
+	Attempts   int
+	Challenge  DigestChallenge
 }
 
 func ParseWWWAuthenticate(header string) (DigestChallenge, error) {
@@ -163,6 +203,101 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 	return headers
 }
 
+func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.Transport == nil {
+		return RegisterResult{}, errors.New("nil SIP register transport")
+	}
+	registrarURI := strings.TrimSpace(s.RegistrarURI)
+	contactURI := strings.TrimSpace(s.ContactURI)
+	if registrarURI == "" || contactURI == "" {
+		return RegisterResult{}, errors.New("registrar URI and contact URI are required")
+	}
+	callID := firstNonEmpty(s.CallID, "vowifi-go-register")
+	expires := s.Expires
+	if expires <= 0 {
+		expires = 3600
+	}
+
+	msg := RegisterMessage{
+		URI:     registrarURI,
+		Headers: BuildRegisterHeaders(s.Profile, contactURI, callID, "1"),
+	}
+	msg.Headers["Expires"] = strconv.Itoa(expires)
+	resp, err := s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
+	if err != nil {
+		return RegisterResult{}, err
+	}
+	if isSIPSuccess(resp.StatusCode) {
+		return RegisterResult{Registered: true, StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1}, nil
+	}
+	if resp.StatusCode != 401 && resp.StatusCode != 407 {
+		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
+	}
+
+	headerName := "WWW-Authenticate"
+	authHeader := firstHeader(resp.Headers, headerName)
+	authzHeader := "Authorization"
+	if authHeader == "" {
+		headerName = "Proxy-Authenticate"
+		authHeader = firstHeader(resp.Headers, headerName)
+		authzHeader = "Proxy-Authorization"
+	}
+	ch, err := ParseWWWAuthenticate(authHeader)
+	if err != nil {
+		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1}, err
+	}
+
+	password := ""
+	if strings.EqualFold(ch.Algorithm, "AKAv1-MD5") {
+		rand16, autn16, ok := ExtractAKAChallengeNonce(ch.Nonce)
+		if !ok {
+			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, ErrInvalidChallenge
+		}
+		if s.AKAProvider == nil {
+			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, errors.New("AKA provider required for AKAv1-MD5")
+		}
+		aka, err := s.AKAProvider.CalculateAKA(rand16, autn16)
+		if err != nil {
+			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
+		}
+		password = strings.ToUpper(hex.EncodeToString(aka.RES))
+	}
+
+	authz, err := BuildDigestAuthorization(ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      registrarURI,
+		Username: firstNonEmpty(s.Profile.IMPI, s.Profile.IMPU),
+		Password: password,
+		CNonce:   firstNonEmpty(s.CNonce, "vowifi-go"),
+		NC:       1,
+	})
+	if err != nil {
+		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
+	}
+
+	msg.Headers = BuildRegisterHeaders(s.Profile, contactURI, callID, "2")
+	msg.Headers["Expires"] = strconv.Itoa(expires)
+	msg.Headers[authzHeader] = authz
+	resp2, err := s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
+	if err != nil {
+		return RegisterResult{Attempts: 2, Challenge: ch}, err
+	}
+	result := RegisterResult{
+		Registered: isSIPSuccess(resp2.StatusCode),
+		StatusCode: resp2.StatusCode,
+		Reason:     resp2.Reason,
+		Attempts:   2,
+		Challenge:  ch,
+	}
+	if !result.Registered {
+		return result, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
+	}
+	return result, nil
+}
+
 func splitAuthParams(s string) []string {
 	var out []string
 	var cur strings.Builder
@@ -202,6 +337,31 @@ func firstQOP(qop string) string {
 		}
 	}
 	return strings.ToLower(strings.TrimSpace(qop))
+}
+
+func firstHeader(headers map[string][]string, name string) string {
+	for key, values := range headers {
+		if strings.EqualFold(key, name) && len(values) > 0 {
+			return strings.TrimSpace(values[0])
+		}
+	}
+	return ""
+}
+
+func isSIPSuccess(code int) bool {
+	return code >= 200 && code < 300
+}
+
+func cloneRegisterMessage(msg RegisterMessage) RegisterMessage {
+	out := RegisterMessage{
+		URI:     msg.URI,
+		Headers: make(map[string]string, len(msg.Headers)),
+		Body:    append([]byte(nil), msg.Body...),
+	}
+	for k, v := range msg.Headers {
+		out.Headers[k] = v
+	}
+	return out
 }
 
 func decodeNonceBytes(nonce string) ([]byte, bool) {

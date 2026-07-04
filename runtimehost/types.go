@@ -187,6 +187,29 @@ type SessionConfig struct {
 	Proxy         *ProxyConfig
 }
 
+type IMSRegistrationConfig struct {
+	DeviceID    string
+	TraceID     string
+	Profile     identity.Profile
+	Prepared    *identity.PreparedSession
+	SIM         SIMAdapter
+	Access      ModemAccess
+	NetworkMode string
+	Dataplane   DataplanePolicy
+	Proxy       *ProxyConfig
+}
+
+type IMSRegistrationResult struct {
+	Registered bool
+	StatusCode int
+	Reason     string
+	Server     string
+}
+
+type IMSRegistrar interface {
+	RegisterIMS(context.Context, IMSRegistrationConfig) (IMSRegistrationResult, error)
+}
+
 const StartModeMain = "main"
 
 type StartRequest struct {
@@ -201,6 +224,7 @@ type StartRequest struct {
 	Access        ModemAccess
 	Dataplane     DataplanePolicy
 	Proxy         *ProxyConfig
+	IMSRegistrar  IMSRegistrar
 	DeliveryStore messaging.DeliveryStore
 	Dispatch      eventhost.Dispatcher
 	BeforeStart   func(context.Context, SessionConfig) error
@@ -248,6 +272,29 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	if modem != nil {
 		regStatus, regText = modem.GetRegStatus()
 	}
+	imsReady := req.IMSRegistrar == nil
+	imsReason := ""
+	if req.IMSRegistrar != nil {
+		res, err := req.IMSRegistrar.RegisterIMS(ctx, IMSRegistrationConfig{
+			DeviceID:    req.DeviceID,
+			TraceID:     req.TraceID,
+			Profile:     req.Profile,
+			Prepared:    req.Prepared,
+			SIM:         req.SIM,
+			Access:      req.Access,
+			NetworkMode: req.NetworkMode,
+			Dataplane:   req.Dataplane,
+			Proxy:       req.Proxy,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("IMS registration failed: %w", err)
+		}
+		if !res.Registered {
+			return nil, fmt.Errorf("IMS registration rejected: %d %s", res.StatusCode, strings.TrimSpace(res.Reason))
+		}
+		imsReady = true
+		imsReason = firstRuntimeNonEmpty(res.Reason, res.Server)
+	}
 	state := State{
 		DeviceID:      req.DeviceID,
 		Phase:         PhaseReady,
@@ -255,12 +302,12 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		SIMReady:      req.SIM != nil,
 		AccessReady:   modem != nil,
 		TunnelReady:   false,
-		IMSReady:      true,
+		IMSReady:      imsReady,
 		SMSReady:      true,
 		RegStatus:     regStatus,
 		RegStatusText: regText,
 		NetworkMode:   strings.TrimSpace(req.NetworkMode),
-		LastReason:    "started",
+		LastReason:    firstRuntimeNonEmpty(imsReason, "started"),
 		UpdatedAt:     time.Now(),
 	}
 	if state.NetworkMode == "" && modem != nil {
@@ -415,3 +462,12 @@ type EventLocalNumberLearned = eventhost.LocalNumberLearned
 type EventLogNotify = eventhost.LogNotify
 
 type PrepareStartInput = identity.PrepareStartInput
+
+func firstRuntimeNonEmpty(items ...string) string {
+	for _, item := range items {
+		if strings.TrimSpace(item) != "" {
+			return strings.TrimSpace(item)
+		}
+	}
+	return ""
+}
