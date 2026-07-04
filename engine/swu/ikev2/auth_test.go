@@ -188,15 +188,33 @@ func TestRunIKEAuthAKAChallenge(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0x42}, init.Keys.Profile.EncryptionBlockSize))
+		saPayload, err := SecurityAssociationPayload(DefaultESPProposal([]byte{0xde, 0xad, 0xbe, 0xef}))
+		if err != nil {
+			return nil, err
+		}
+		tsiPayload, err := TrafficSelectorsPayload(PayloadTSi, IPv4AnyTrafficSelectors())
+		if err != nil {
+			return nil, err
+		}
+		tsrPayload, err := TrafficSelectorsPayload(PayloadTSr, IPv4AnyTrafficSelectors())
+		if err != nil {
+			return nil, err
+		}
+		cpPayload, err := ConfigurationPayload(Configuration{Type: CFGReply, Attributes: []ConfigurationAttribute{{Type: ConfigInternalIPv4Address, Value: []byte{10, 0, 0, 2}}}})
+		if err != nil {
+			return nil, err
+		}
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(success), saPayload, tsiPayload, tsrPayload, cpPayload}, bytes.Repeat([]byte{0x42}, init.Keys.Profile.EncryptionBlockSize))
 		return rawResp, err
 	})
+	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
 	res, err := RunIKE_AUTH_AKAChallenge(context.Background(), AKAChallengeConfig{
 		Transport: transport,
 		Init:      init,
 		SIM:       akaProviderStub{result: aka},
 		Identity:  identity,
 		Request:   challenge,
+		ChildSPI:  localSPI,
 		MessageID: 3,
 		IV:        bytes.Repeat([]byte{0x41}, init.Keys.Profile.EncryptionBlockSize),
 	})
@@ -208,6 +226,12 @@ func TestRunIKEAuthAKAChallenge(t *testing.T) {
 	}
 	if len(res.EAPKeys.KAut) != eapaka.KeyLengthKAut || len(res.EAPKeys.MSK) != eapaka.KeyLengthMSK {
 		t.Fatalf("EAP keys=%+v", res.EAPKeys)
+	}
+	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.LocalSPI, localSPI) || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Fatalf("child SA=%+v", res.ChildSA)
+	}
+	if len(res.ChildSA.Keys.Outbound.EncryptionKey) != 16 || len(res.ChildSA.Keys.Inbound.IntegrityKey) != 32 {
+		t.Fatalf("child keys=%+v", res.ChildSA.Keys)
 	}
 }
 
@@ -287,6 +311,8 @@ func fakeInitResult(t *testing.T) InitResult {
 	return InitResult{
 		InitiatorSPI: 0x0102030405060708,
 		ResponderSPI: 0x1112131415161718,
+		NonceI:       bytes.Repeat([]byte{0xa1}, 32),
+		NonceR:       bytes.Repeat([]byte{0xb2}, 32),
 		SelectedSA:   DefaultIKEProposal(),
 		Keys:         keys,
 	}

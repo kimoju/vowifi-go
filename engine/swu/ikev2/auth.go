@@ -53,6 +53,7 @@ type AKAChallengeConfig struct {
 	SIM       sim.AKAProvider
 	Identity  string
 	Request   eapaka.Packet
+	ChildSPI  []byte
 	MessageID uint32
 	Random    io.Reader
 	IV        []byte
@@ -65,6 +66,7 @@ type AKAChallengeResult struct {
 	EAPResponse   eapaka.Packet
 	EAPNext       *eapaka.Packet
 	EAPKeys       eapaka.Keys
+	ChildSA       *ChildSAResult
 	SyncFailure   bool
 	NextMessageID uint32
 }
@@ -248,6 +250,14 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	} else if ok {
 		out.EAPNext = &next
 	}
+	if hasPayload(inner, PayloadSA) {
+		child, err := ParseChildSAResult(cfg.Init, inner, cfg.ChildSPI)
+		if err != nil {
+			return AKAChallengeResult{}, err
+		}
+		child.NextMessageID = cfg.MessageID + 1
+		out.ChildSA = &child
+	}
 	return out, nil
 }
 
@@ -373,4 +383,13 @@ func clonePayloads(in []Payload) []Payload {
 		}
 	}
 	return out
+}
+
+func hasPayload(payloads []Payload, payloadType uint8) bool {
+	for _, p := range payloads {
+		if p.Type == payloadType {
+			return true
+		}
+	}
+	return false
 }
