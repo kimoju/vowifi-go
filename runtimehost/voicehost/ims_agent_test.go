@@ -145,6 +145,71 @@ func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentUsesReliableProvisionalSDPWhenFinalHasNoBody(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{
+		provisionals: []voiceclient.SIPResponse{
+			{
+				StatusCode: 183,
+				Reason:     "Session Progress",
+				Headers: map[string][]string{
+					"To":      {"<sip:+18005551212@ims.example>;tag=early-tag"},
+					"Contact": {"<sip:early@198.51.100.1:5060>"},
+					"Require": {"100rel"},
+					"RSeq":    {"9"},
+				},
+				Body: []byte(sampleSDP("203.0.113.90", 49190)),
+			},
+		},
+		responses: []voiceclient.SIPResponse{
+			{StatusCode: 200, Reason: "OK"},
+			{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers: map[string][]string{
+					"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+					"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+				},
+			},
+			{StatusCode: 200, Reason: "OK"},
+		},
+	}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID:    "call-early-sdp",
+		Callee:    "+18005551212",
+		RawSDP:    []byte(sampleSDP("192.0.2.50", 4002)),
+		RemoteSDP: SDPInfo{ConnectionIP: "192.0.2.50", MediaPort: 4002},
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("StartOutboundCall() result=%+v err=%v", result, err)
+	}
+	if result.LocalSDP.ConnectionIP != "203.0.113.90" || result.LocalSDP.MediaPort != 49190 {
+		t.Fatalf("LocalSDP=%+v", result.LocalSDP)
+	}
+	if !strings.Contains(string(result.RawSDP), "m=audio 49190 RTP/AVP") {
+		t.Fatalf("RawSDP=%q", result.RawSDP)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "PRACK" || transport.requests[1].Headers["RAck"] != "9 1 INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" {
+		t.Fatalf("writes=%+v", transport.writes)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-early-sdp"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE=%+v", transport.requests[2])
+	}
+}
+
 func TestIMSOutboundAgentRejectedInviteDoesNotAck(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 486, Reason: "Busy Here"}}}
 	agent := &IMSOutboundAgent{
@@ -258,6 +323,64 @@ func TestIMSOutboundAgentUsesRTPRelayWhenConfigured(t *testing.T) {
 		t.Fatalf("client answer body=%q", answer)
 	}
 	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-relay"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+}
+
+func TestIMSOutboundAgentRewritesReliableProvisionalSDPThroughRelay(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{
+		provisionals: []voiceclient.SIPResponse{
+			{
+				StatusCode: 183,
+				Reason:     "Session Progress",
+				Headers: map[string][]string{
+					"To":      {"<sip:+18005551212@ims.example>;tag=early-tag"},
+					"Require": {"100rel"},
+					"RSeq":    {"11"},
+				},
+				Body: []byte(sampleSDP("127.0.0.1", 49192)),
+			},
+		},
+		responses: []voiceclient.SIPResponse{
+			{StatusCode: 200, Reason: "OK"},
+			{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers:    map[string][]string{"To": {"<sip:+18005551212@ims.example>;tag=remote-tag"}},
+			},
+			{StatusCode: 200, Reason: "OK"},
+		},
+	}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+		MediaRelay: &RTPRelayConfig{
+			ClientListenIP:    "127.0.0.1",
+			ClientAdvertiseIP: "127.0.0.1",
+			IMSListenIP:       "127.0.0.1",
+			IMSAdvertiseIP:    "127.0.0.1",
+		},
+	}
+	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID:    "call-relay-early",
+		Callee:    "+18005551212",
+		RemoteSDP: SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: 4002, Payloads: []int{0, 101}, Direction: "sendrecv"},
+		RawSDP:    []byte(sampleSDP("127.0.0.1", 4002)),
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("StartOutboundCall() result=%+v err=%v", result, err)
+	}
+	if result.LocalSDP.ConnectionIP != "127.0.0.1" || result.LocalSDP.MediaPort <= 0 || result.LocalSDP.MediaPort == 49192 {
+		t.Fatalf("LocalSDP=%+v", result.LocalSDP)
+	}
+	if body := string(result.RawSDP); !strings.Contains(body, "c=IN IP4 127.0.0.1") || strings.Contains(body, "m=audio 49192") {
+		t.Fatalf("RawSDP=%q", body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-relay-early"}); err != nil {
 		t.Fatalf("EndVoiceCall() error = %v", err)
 	}
 }

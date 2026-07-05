@@ -81,7 +81,15 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		return OutboundCallResult{Accepted: false, Reason: "build IMS INVITE failed"}, err
 	}
 	nextCSeq := cfg.CSeq + 1
+	var provisionalSDP SDPInfo
+	var provisionalAnswer []byte
 	resp, err := a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
+		if body, info, ok, err := a.provisionalAnswer(provisional, relay); err != nil {
+			return err
+		} else if ok {
+			provisionalAnswer = body
+			provisionalSDP = info
+		}
 		prack, ok, err := buildReliableProvisionalPRACK(cfg, provisional, nextCSeq)
 		if err != nil || !ok {
 			return err
@@ -116,12 +124,19 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if err := a.Transport.WriteRequest(ctx, ack); err != nil {
 		return OutboundCallResult{Accepted: false, Reason: "IMS ACK failed"}, err
 	}
-	localSDP, err := ParseSDP(resp.Body)
-	if err != nil {
-		return OutboundCallResult{Accepted: false, Reason: "invalid IMS SDP answer"}, err
-	}
 	answerBody := append([]byte(nil), resp.Body...)
-	if relay != nil {
+	localSDP := provisionalSDP
+	if len(answerBody) == 0 {
+		answerBody = append([]byte(nil), provisionalAnswer...)
+	}
+	if len(resp.Body) > 0 {
+		parsed, err := ParseSDP(resp.Body)
+		if err != nil {
+			return OutboundCallResult{Accepted: false, Reason: "invalid IMS SDP answer"}, err
+		}
+		localSDP = parsed
+	}
+	if relay != nil && len(resp.Body) > 0 {
 		if err := relay.SetIMSRemote(localSDP); err != nil {
 			return OutboundCallResult{Accepted: false, Reason: "RTP relay remote setup failed"}, err
 		}
@@ -130,6 +145,13 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		if err != nil {
 			return OutboundCallResult{Accepted: false, Reason: "invalid RTP relay SDP answer"}, err
 		}
+	}
+	if localSDP.MediaPort <= 0 || strings.TrimSpace(localSDP.ConnectionIP) == "" {
+		parsed, err := ParseSDP(answerBody)
+		if err != nil {
+			return OutboundCallResult{Accepted: false, Reason: "invalid IMS SDP answer"}, err
+		}
+		localSDP = parsed
 	}
 	a.mu.Lock()
 	if a.dialogs == nil {
@@ -183,6 +205,29 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	delete(a.dialogs, callID)
 	a.mu.Unlock()
 	return nil
+}
+
+func (a *IMSOutboundAgent) provisionalAnswer(resp voiceclient.SIPResponse, relay *RTPRelaySession) ([]byte, SDPInfo, bool, error) {
+	if len(resp.Body) == 0 {
+		return nil, SDPInfo{}, false, nil
+	}
+	remoteSDP, err := ParseSDP(resp.Body)
+	if err != nil {
+		return nil, SDPInfo{}, false, fmt.Errorf("invalid IMS provisional SDP answer: %w", err)
+	}
+	answerBody := append([]byte(nil), resp.Body...)
+	localSDP := remoteSDP
+	if relay != nil {
+		if err := relay.SetIMSRemote(remoteSDP); err != nil {
+			return nil, SDPInfo{}, false, fmt.Errorf("RTP relay provisional remote setup failed: %w", err)
+		}
+		answerBody = RewriteSDPMediaEndpoint(resp.Body, relay.ClientEndpoint())
+		localSDP, err = ParseSDP(answerBody)
+		if err != nil {
+			return nil, SDPInfo{}, false, fmt.Errorf("invalid RTP relay provisional SDP answer: %w", err)
+		}
+	}
+	return answerBody, localSDP, true, nil
 }
 
 func (a *IMSOutboundAgent) roundTripInvite(ctx context.Context, invite voiceclient.SIPRequestMessage, onProvisional func(voiceclient.SIPResponse) error) (voiceclient.SIPResponse, error) {
