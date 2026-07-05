@@ -29,9 +29,10 @@ type IMSOutboundAgent struct {
 }
 
 type imsDialogState struct {
-	cfg   voiceclient.DialogRequestConfig
-	relay *RTPRelaySession
-	early bool
+	cfg    voiceclient.DialogRequestConfig
+	invite voiceclient.SIPRequestMessage
+	relay  *RTPRelaySession
+	early  bool
 }
 
 func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCallRequest) (OutboundCallResult, error) {
@@ -81,7 +82,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if err != nil {
 		return OutboundCallResult{Accepted: false, Reason: "build IMS INVITE failed"}, err
 	}
-	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: cfg, relay: relay, early: true})
+	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: cfg, invite: invite, relay: relay, early: true})
 	nextCSeq := cfg.CSeq + 1
 	var provisionalSDP SDPInfo
 	var provisionalAnswer []byte
@@ -231,6 +232,7 @@ func (a *IMSOutboundAgent) CancelVoiceCall(ctx context.Context, info DialogInfo)
 	if err != nil {
 		return err
 	}
+	copyDialogHeader(cancel.Headers, state.invite.Headers, "Via")
 	resp, err := a.Transport.RoundTripRequest(ctx, cancel)
 	if err != nil {
 		return err
@@ -350,6 +352,18 @@ func headerHasToken(headers map[string][]string, name, token string) bool {
 		}
 	}
 	return false
+}
+
+func copyDialogHeader(dst, src map[string]string, name string) {
+	if dst == nil || src == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	for key, value := range src {
+		if strings.EqualFold(key, name) && strings.TrimSpace(value) != "" {
+			dst[name] = strings.TrimSpace(value)
+			return
+		}
+	}
 }
 
 func (a *IMSOutboundAgent) remoteURI(callee string) string {

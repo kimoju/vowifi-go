@@ -184,6 +184,18 @@ func buildSIPRequestWire(msg SIPRequestMessage, transport string, localAddr net.
 	return out.Bytes(), nil
 }
 
+func ensureSIPRequestVia(msg *SIPRequestMessage, transport string, localAddr net.Addr) {
+	if msg == nil {
+		return
+	}
+	if msg.Headers == nil {
+		msg.Headers = make(map[string]string)
+	}
+	if firstHeaderValue(msg.Headers, "Via") == "" {
+		msg.Headers["Via"] = buildViaHeader(transport, localAddr)
+	}
+}
+
 func writeOrderedHeaders(out *bytes.Buffer, headers map[string]string) {
 	order := []string{
 		"Via", "Route", "Max-Forwards", "To", "From", "Call-ID", "CSeq", "Contact",

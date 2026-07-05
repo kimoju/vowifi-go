@@ -239,8 +239,12 @@ func TestIMSOutboundAgentRejectedInviteDoesNotAck(t *testing.T) {
 func TestIMSOutboundAgentCancelVoiceCallSendsCancelForEarlyDialog(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 200, Reason: "OK"}}}
 	agent := &IMSOutboundAgent{Transport: transport}
+	inviteVia := "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-invite;rport"
 	agent.storeDialog("call-cancel", imsDialogState{
 		early: true,
+		invite: voiceclient.SIPRequestMessage{
+			Headers: map[string]string{"Via": inviteVia},
+		},
 		cfg: voiceclient.DialogRequestConfig{
 			Profile:         voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
 			LocalURI:        "sip:user@ims.example",
@@ -262,6 +266,9 @@ func TestIMSOutboundAgentCancelVoiceCallSendsCancelForEarlyDialog(t *testing.T) 
 	cancel := transport.requests[0]
 	if cancel.Headers["CSeq"] != "1 CANCEL" || cancel.Headers["Call-ID"] != "call-cancel" || !strings.Contains(cancel.Headers["From"], "local-tag") {
 		t.Fatalf("CANCEL=%+v", cancel)
+	}
+	if cancel.Headers["Via"] != inviteVia {
+		t.Fatalf("CANCEL Via=%q, want original INVITE Via %q", cancel.Headers["Via"], inviteVia)
 	}
 	if _, ok := agent.dialogs["call-cancel"]; ok {
 		t.Fatal("early dialog still stored after successful CANCEL")

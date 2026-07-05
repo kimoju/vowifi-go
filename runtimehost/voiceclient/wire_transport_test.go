@@ -419,6 +419,56 @@ func TestWireSIPTransportReportsReliableProvisional(t *testing.T) {
 	}
 }
 
+func TestWireSIPTransportWritesGeneratedViaBackToRequest(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	seen := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			seen <- "read error: " + err.Error()
+			return
+		}
+		seen <- string(append([]byte(nil), buf[:n]...))
+		_, _ = pc.WriteTo([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"), addr)
+	}()
+
+	msg := SIPRequestMessage{
+		Method: "INVITE",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"To":           "<sip:callee@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Call-ID":      "via-writeback",
+			"CSeq":         "1 INVITE",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Max-Forwards": "70",
+		},
+	}
+	resp, err := WireSIPTransport{
+		Network:    "udp",
+		ServerAddr: pc.LocalAddr().String(),
+		Timeout:    time.Second,
+	}.RoundTripInvite(context.Background(), msg, nil)
+	if err != nil {
+		t.Fatalf("RoundTripInvite() error = %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("response=%+v", resp)
+	}
+	wire := <-seen
+	via := msg.Headers["Via"]
+	if via == "" || !strings.Contains(via, ";branch=z9hG4bK") || !strings.Contains(wire, "Via: "+via+"\r\n") {
+		t.Fatalf("Via writeback=%q wire=%q", via, wire)
+	}
+}
+
 func TestWireSIPTransportInviteWaitsForFinalResponseAndWritesAck(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

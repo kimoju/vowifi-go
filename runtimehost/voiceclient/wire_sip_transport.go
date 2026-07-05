@@ -52,6 +52,7 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return SIPResponse{}, err
 	}
+	ensureSIPRequestVia(&msg, transportName(network), conn.LocalAddr())
 	wire, err := buildSIPRequestWire(msg, transportName(network), conn.LocalAddr())
 	if err != nil {
 		return SIPResponse{}, err
@@ -128,6 +129,7 @@ func (t WireSIPTransport) WriteRequest(ctx context.Context, msg SIPRequestMessag
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
+	ensureSIPRequestVia(&msg, transportName(network), conn.LocalAddr())
 	wire, err := buildSIPRequestWire(msg, transportName(network), conn.LocalAddr())
 	if err != nil {
 		return err
