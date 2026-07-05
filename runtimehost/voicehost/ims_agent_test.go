@@ -14,8 +14,9 @@ func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {
 			StatusCode: 200,
 			Reason:     "OK",
 			Headers: map[string][]string{
-				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
-				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+				"To":           {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact":      {"<sip:carrier@198.51.100.1:5060>"},
+				"Record-Route": {"<sip:pcscf-dialog1.ims.example;lr>, <sip:pcscf-dialog2.ims.example;lr>"},
 			},
 			Body: []byte(sampleSDP("203.0.113.10", 49170)),
 		},
@@ -66,6 +67,9 @@ func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {
 	if transport.writes[0].URI != "sip:carrier@198.51.100.1:5060" || !strings.Contains(transport.writes[0].Headers["To"], "remote-tag") {
 		t.Fatalf("ACK=%+v", transport.writes[0])
 	}
+	if route := transport.writes[0].Headers["Route"]; route != "<sip:pcscf-dialog2.ims.example;lr>, <sip:pcscf-dialog1.ims.example;lr>" {
+		t.Fatalf("ACK Route=%q", route)
+	}
 
 	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-1"}); err != nil {
 		t.Fatalf("EndVoiceCall() error = %v", err)
@@ -76,6 +80,9 @@ func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {
 	bye := transport.requests[1]
 	if bye.URI != "sip:carrier@198.51.100.1:5060" || bye.Headers["CSeq"] != "2 BYE" {
 		t.Fatalf("BYE=%+v", bye)
+	}
+	if route := bye.Headers["Route"]; route != "<sip:pcscf-dialog2.ims.example;lr>, <sip:pcscf-dialog1.ims.example;lr>" {
+		t.Fatalf("BYE Route=%q", route)
 	}
 }
 
@@ -353,10 +360,11 @@ func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 				StatusCode: 183,
 				Reason:     "Session Progress",
 				Headers: map[string][]string{
-					"To":      {"<sip:+18005551212@ims.example>;tag=early-tag"},
-					"Contact": {"<sip:early@198.51.100.1:5060>"},
-					"Require": {"100rel"},
-					"RSeq":    {"42"},
+					"To":           {"<sip:+18005551212@ims.example>;tag=early-tag"},
+					"Contact":      {"<sip:early@198.51.100.1:5060>"},
+					"Require":      {"100rel"},
+					"RSeq":         {"42"},
+					"Record-Route": {"<sip:early-proxy1.ims.example;lr>, <sip:early-proxy2.ims.example;lr>"},
 				},
 			},
 		},
@@ -366,8 +374,9 @@ func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 				StatusCode: 200,
 				Reason:     "OK",
 				Headers: map[string][]string{
-					"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
-					"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+					"To":           {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+					"Contact":      {"<sip:carrier@198.51.100.1:5060>"},
+					"Record-Route": {"<sip:dialog-proxy.ims.example;lr>"},
 				},
 				Body: []byte(sampleSDP("203.0.113.10", 49170)),
 			},
@@ -380,6 +389,7 @@ func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 		Registration: voiceclient.RegistrationBinding{
 			ContactURI:     "sip:user@192.0.2.10:5060",
 			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:register-proxy.ims.example;lr>"},
 		},
 	}
 	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
@@ -401,6 +411,9 @@ func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 	if prack.URI != "sip:early@198.51.100.1:5060" || !strings.Contains(prack.Headers["To"], "early-tag") {
 		t.Fatalf("PRACK target/dialog=%+v", prack)
 	}
+	if route := prack.Headers["Route"]; route != "<sip:early-proxy2.ims.example;lr>, <sip:early-proxy1.ims.example;lr>" {
+		t.Fatalf("PRACK Route=%q", route)
+	}
 	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" {
 		t.Fatalf("writes=%+v", transport.writes)
 	}
@@ -409,6 +422,9 @@ func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 	}
 	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
 		t.Fatalf("BYE requests=%+v", transport.requests)
+	}
+	if route := transport.requests[2].Headers["Route"]; route != "<sip:dialog-proxy.ims.example;lr>" {
+		t.Fatalf("BYE Route=%q", route)
 	}
 }
 

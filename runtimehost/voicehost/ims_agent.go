@@ -150,6 +150,9 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 			Reason:     firstVoiceNonEmpty(resp.Reason, fmt.Sprintf("IMS rejected call: %d", resp.StatusCode)),
 		}, nil
 	}
+	if routeSet := recordRouteSet(resp.Headers); len(routeSet) > 0 {
+		cfg.RouteSet = routeSet
+	}
 	cfg.RemoteTag = sipHeaderTag(firstVoiceHeader(resp.Headers, "To"))
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
@@ -609,6 +612,9 @@ func buildReliableProvisionalPRACK(cfg voiceclient.DialogRequestConfig, resp voi
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		prackCfg.RemoteTargetURI = contact
 	}
+	if routeSet := recordRouteSet(resp.Headers); len(routeSet) > 0 {
+		prackCfg.RouteSet = routeSet
+	}
 	prack, err := voiceclient.BuildPrackRequest(prackCfg, strings.TrimSpace(rseq)+" "+strconv.Itoa(outboundInviteCSeq(cfg.CSeq))+" INVITE")
 	return prack, err == nil, err
 }
@@ -760,6 +766,66 @@ func firstValueSIPHeaders(headers map[string][]string) map[string]string {
 				break
 			}
 		}
+	}
+	return out
+}
+
+func recordRouteSet(headers map[string][]string) []string {
+	var routes []string
+	for key, values := range headers {
+		if !strings.EqualFold(key, "Record-Route") {
+			continue
+		}
+		for _, value := range values {
+			for _, route := range splitVoiceHeaderValues(value) {
+				if strings.TrimSpace(route) != "" {
+					routes = append(routes, strings.TrimSpace(route))
+				}
+			}
+		}
+	}
+	for i, j := 0, len(routes)-1; i < j; i, j = i+1, j-1 {
+		routes[i], routes[j] = routes[j], routes[i]
+	}
+	return routes
+}
+
+func splitVoiceHeaderValues(value string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	escaped := false
+	angleDepth := 0
+	for _, r := range value {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\' && inQuote:
+			cur.WriteRune(r)
+			escaped = true
+		case r == '"':
+			cur.WriteRune(r)
+			inQuote = !inQuote
+		case r == '<' && !inQuote:
+			angleDepth++
+			cur.WriteRune(r)
+		case r == '>' && !inQuote:
+			if angleDepth > 0 {
+				angleDepth--
+			}
+			cur.WriteRune(r)
+		case r == ',' && !inQuote && angleDepth == 0:
+			if part := strings.TrimSpace(cur.String()); part != "" {
+				out = append(out, part)
+			}
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if part := strings.TrimSpace(cur.String()); part != "" {
+		out = append(out, part)
 	}
 	return out
 }
