@@ -210,8 +210,12 @@ func TestIMSOutboundAgentUsesReliableProvisionalSDPWhenFinalHasNoBody(t *testing
 	}
 }
 
-func TestIMSOutboundAgentRejectedInviteDoesNotAck(t *testing.T) {
-	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 486, Reason: "Busy Here"}}}
+func TestIMSOutboundAgentRejectedInviteAcksFinalResponse(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 486,
+		Reason:     "Busy Here",
+		Headers:    map[string][]string{"To": {"<sip:+18005551212@ims.example>;tag=busy-tag"}},
+	}}}
 	agent := &IMSOutboundAgent{
 		Transport: transport,
 		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
@@ -231,8 +235,18 @@ func TestIMSOutboundAgentRejectedInviteDoesNotAck(t *testing.T) {
 	if result.Accepted || result.Reason != "Busy Here" {
 		t.Fatalf("result=%+v", result)
 	}
-	if len(transport.writes) != 0 {
-		t.Fatalf("ACK writes=%+v, want none", transport.writes)
+	if len(transport.requests) != 1 || transport.requests[0].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+	ack := transport.writes[0]
+	if ack.Headers["CSeq"] != "1 ACK" || !strings.Contains(ack.Headers["To"], "busy-tag") {
+		t.Fatalf("ACK=%+v", ack)
+	}
+	if ack.Headers["Via"] == "" || ack.Headers["Via"] != transport.requests[0].Headers["Via"] {
+		t.Fatalf("ACK Via=%q INVITE Via=%q", ack.Headers["Via"], transport.requests[0].Headers["Via"])
 	}
 }
 
@@ -462,6 +476,9 @@ func (t *fakeIMSVoiceTransport) RoundTripRequest(ctx context.Context, msg voicec
 }
 
 func (t *fakeIMSVoiceTransport) RoundTripInvite(ctx context.Context, msg voiceclient.SIPRequestMessage, onProvisional voiceclient.ProvisionalResponseHandler) (voiceclient.SIPResponse, error) {
+	if msg.Headers != nil && msg.Headers["Via"] == "" {
+		msg.Headers["Via"] = "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-fake;rport"
+	}
 	t.requests = append(t.requests, msg)
 	for _, resp := range t.provisionals {
 		if onProvisional != nil {

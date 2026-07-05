@@ -112,6 +112,12 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed"}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode >= 300 {
+			if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
+				a.deleteDialog(strings.TrimSpace(req.CallID))
+				return OutboundCallResult{Accepted: false, Reason: "IMS INVITE rejected ACK failed"}, err
+			}
+		}
 		a.deleteDialog(strings.TrimSpace(req.CallID))
 		return OutboundCallResult{
 			Accepted: false,
@@ -209,6 +215,17 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	delete(a.dialogs, callID)
 	a.mu.Unlock()
 	return nil
+}
+
+func (a *IMSOutboundAgent) ackRejectedInvite(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
+	ackCfg := cfg
+	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
+	ack, err := voiceclient.BuildAckRequest(ackCfg)
+	if err != nil {
+		return err
+	}
+	copyDialogHeader(ack.Headers, invite.Headers, "Via")
+	return a.Transport.WriteRequest(ctx, ack)
 }
 
 func (a *IMSOutboundAgent) CancelVoiceCall(ctx context.Context, info DialogInfo) error {
