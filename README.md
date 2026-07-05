@@ -23,8 +23,8 @@ protocol layers needed by VoHive:
 - carrier presets and JSON carrier overrides, including AT&T TS.43/E911
   configuration for native `310/280` and `310/410` profiles
 - TS.43-style E911 entitlement bootstrap, token/websheet handling, RAND/AUTN
-  challenge response through the AKA provider, and EAP-AKA relay packet
-  response generation for entitlement challenges
+  challenge response through the AKA provider, and EAP-AKA/AKA' relay packet
+  response generation with KDF negotiation for entitlement challenges
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
   AKA nonce extraction, Digest/AKAv1-MD5 and AKAv2-MD5 authorization material,
   Security-Verify echoing, wire-level UDP/TCP REGISTER transport, and IMS

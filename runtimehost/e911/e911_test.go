@@ -30,11 +30,13 @@ func (f *fakeHTTPClient) Do(req *HTTPRequest) (*HTTPResponse, error) {
 }
 
 type fakeAKAProvider struct {
-	rand []byte
-	autn []byte
+	rand  []byte
+	autn  []byte
+	calls int
 }
 
 func (f *fakeAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, error) {
+	f.calls++
 	f.rand = append([]byte(nil), rand16...)
 	f.autn = append([]byte(nil), autn16...)
 	return e911AKAResult(), nil
@@ -158,6 +160,69 @@ func TestStartEmergencyAddressUpdateHandlesEAPRelayChallenge(t *testing.T) {
 	}
 }
 
+func TestStartEmergencyAddressUpdateHandlesEAPRelayAKAPrimeKDFNegotiation(t *testing.T) {
+	identity := "310280233641503@private.att.net"
+	kdfOffer := eapRelayAKAPrimeKDFOffer(t, "WLAN", []uint16{99, eapaka.AKAPrimeKDFDefault})
+	selectedChallenge := signedEAPRelayAKAPrimeChallenge(t, identity, "WLAN", e911AKAResult(), []uint16{eapaka.AKAPrimeKDFDefault, 99})
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":10,"eap-relay-packet":"` + kdfOffer + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":11,"eap-relay-packet":"` + selectedChallenge + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+	aka := &fakeAKAProvider{}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity:    Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280", SIPUsername: identity},
+		AKAProvider: aka,
+		Client:      client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=1" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	if len(client.requests) != 3 {
+		t.Fatalf("requests=%d, want KDF negotiation then AKA response", len(client.requests))
+	}
+	first := decodeEntitlementAnswer(t, client.requests[1].Body)
+	if _, ok := first["aka-res"]; ok {
+		t.Fatalf("KDF negotiation answer must not include AKA RES: %s", client.requests[1].Body)
+	}
+	firstPacket := decodeRelayPacket(t, first)
+	if len(firstPacket.Attributes) != 1 || firstPacket.Attributes[0].Type != eapaka.AttributeKDF {
+		t.Fatalf("KDF negotiation packet=%+v", firstPacket)
+	}
+	kdf, err := firstPacket.Attributes[0].KDFValue()
+	if err != nil {
+		t.Fatalf("KDFValue() error = %v", err)
+	}
+	if kdf != eapaka.AKAPrimeKDFDefault {
+		t.Fatalf("AT_KDF=%d", kdf)
+	}
+	second := decodeEntitlementAnswer(t, client.requests[2].Body)
+	if strings.ToUpper(stringValue(second["aka-res"])) != "11223344" {
+		t.Fatalf("AKA answer body=%s", client.requests[2].Body)
+	}
+	secondPacket := decodeRelayPacket(t, second)
+	if secondPacket.Type != eapaka.TypeAKAPrime {
+		t.Fatalf("AKA' relay response=%+v", secondPacket)
+	}
+	if _, ok := eapaka.FindAttribute(secondPacket.Attributes, eapaka.AttributeRES); !ok {
+		t.Fatalf("AKA' relay response missing AT_RES: %+v", secondPacket)
+	}
+	if aka.calls != 1 {
+		t.Fatalf("AKA calls=%d, want only selected challenge to use SIM", aka.calls)
+	}
+}
+
 func TestStartEmergencyAddressUpdateReportsIncompleteChallenge(t *testing.T) {
 	client := &fakeHTTPClient{responses: []*HTTPResponse{{
 		StatusCode: 200,
@@ -239,4 +304,93 @@ func signedEAPRelayChallenge(t *testing.T, identity string, aka sim.AKAResult) s
 		t.Fatalf("MarshalBinary() error = %v", err)
 	}
 	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func eapRelayAKAPrimeKDFOffer(t *testing.T, networkName string, kdfs []uint16) string {
+	t.Helper()
+	attrs := []eapaka.Attribute{
+		eapaka.RANDAttribute(bytesFrom(0x10, 16)),
+		eapaka.AUTNAttribute(bytesFrom(0x40, 16)),
+		eapaka.KDFInputAttribute(networkName),
+	}
+	for _, kdf := range kdfs {
+		attrs = append(attrs, eapaka.KDFAttribute(kdf))
+	}
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 8,
+		Type:       eapaka.TypeAKAPrime,
+		Subtype:    eapaka.SubtypeChallenge,
+		Attributes: attrs,
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func signedEAPRelayAKAPrimeChallenge(t *testing.T, identity, networkName string, aka sim.AKAResult, kdfs []uint16) string {
+	t.Helper()
+	autn := bytesFrom(0x40, 16)
+	keys, err := eapaka.DeriveAKAPrimeKeys(identity, networkName, autn, aka)
+	if err != nil {
+		t.Fatalf("DeriveAKAPrimeKeys() error = %v", err)
+	}
+	attrs := []eapaka.Attribute{
+		eapaka.RANDAttribute(bytesFrom(0x10, 16)),
+		eapaka.AUTNAttribute(autn),
+		eapaka.KDFInputAttribute(networkName),
+	}
+	for _, kdf := range kdfs {
+		attrs = append(attrs, eapaka.KDFAttribute(kdf))
+	}
+	attrs = append(attrs, eapaka.MACAttribute(nil))
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 9,
+		Type:       eapaka.TypeAKAPrime,
+		Subtype:    eapaka.SubtypeChallenge,
+		Attributes: attrs,
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := eapaka.CalculateAKAPrimeMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateAKAPrimeMAC() error = %v", err)
+	}
+	packet.Attributes[len(packet.Attributes)-1] = eapaka.MACAttribute(mac)
+	raw, err = packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func decodeEntitlementAnswer(t *testing.T, body []byte) map[string]any {
+	t.Helper()
+	var payload []map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("answer JSON error = %v body=%s", err, body)
+	}
+	if len(payload) != 1 {
+		t.Fatalf("payload=%+v", payload)
+	}
+	return payload[0]
+}
+
+func decodeRelayPacket(t *testing.T, payload map[string]any) eapaka.Packet {
+	t.Helper()
+	relay, _ := payload["eap-relay-packet"].(string)
+	raw, err := base64.StdEncoding.DecodeString(relay)
+	if err != nil {
+		t.Fatalf("relay response base64 error = %v", err)
+	}
+	packet, err := eapaka.ParsePacket(raw)
+	if err != nil {
+		t.Fatalf("relay response parse error = %v", err)
+	}
+	return packet
 }

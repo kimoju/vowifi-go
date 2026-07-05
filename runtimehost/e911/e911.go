@@ -178,31 +178,13 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 	if ws := websheetFromEntitlement(req.Carrier.E911.Websheet, result); ws.URL != "" {
 		return ws, nil
 	}
-	if result.HasChallenge() {
-		if req.AKAProvider == nil {
+	for challengeResponses := 0; result.HasChallenge(); challengeResponses++ {
+		if challengeResponses >= 3 {
 			return WebsheetRequest{}, ErrChallengeNotImplemented
 		}
-		aka, err := req.AKAProvider.CalculateAKA(result.RAND, result.AUTN)
-		syncFailure := errors.Is(err, sim.ErrSyncFailure)
-		if err != nil && !syncFailure {
+		answerBody, err := buildEntitlementChallengeAnswer(req, result)
+		if err != nil {
 			return WebsheetRequest{}, err
-		}
-		if syncFailure && len(aka.AUTS) == 0 {
-			return WebsheetRequest{}, err
-		}
-		answerBody := map[string]any{
-			"message-id":    2,
-			"operation":     "emergency-address-update",
-			"response-id":   result.ResponseID,
-			"aka-res":       strings.ToUpper(hex.EncodeToString(aka.RES)),
-			"aka-ck":        strings.ToUpper(hex.EncodeToString(aka.CK)),
-			"aka-ik":        strings.ToUpper(hex.EncodeToString(aka.IK)),
-			"aka-auts":      strings.ToUpper(hex.EncodeToString(aka.AUTS)),
-			"sip-username":  req.Identity.SIPUsername,
-			"terminal-imei": req.Identity.IMEI,
-		}
-		if relay, err := buildEAPRelayAnswer(result, aka, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI), syncFailure); err == nil && relay != "" {
-			answerBody["eap-relay-packet"] = relay
 		}
 		answer, err := json.Marshal([]map[string]any{answerBody})
 		if err != nil {
@@ -233,6 +215,41 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 		return WebsheetRequest{}, ErrChallengeNotImplemented
 	}
 	return WebsheetRequest{}, fmt.Errorf("e911 entitlement response did not include websheet data")
+}
+
+func buildEntitlementChallengeAnswer(req Request, result entitlementResult) (map[string]any, error) {
+	answerBody := map[string]any{
+		"message-id":    2,
+		"operation":     "emergency-address-update",
+		"response-id":   result.ResponseID,
+		"sip-username":  req.Identity.SIPUsername,
+		"terminal-imei": req.Identity.IMEI,
+	}
+	if relay, negotiated, err := buildEAPRelayKDFNegotiationAnswer(result); err != nil {
+		return nil, err
+	} else if negotiated {
+		answerBody["eap-relay-packet"] = relay
+		return answerBody, nil
+	}
+	if req.AKAProvider == nil {
+		return nil, ErrChallengeNotImplemented
+	}
+	aka, err := req.AKAProvider.CalculateAKA(result.RAND, result.AUTN)
+	syncFailure := errors.Is(err, sim.ErrSyncFailure)
+	if err != nil && !syncFailure {
+		return nil, err
+	}
+	if syncFailure && len(aka.AUTS) == 0 {
+		return nil, err
+	}
+	answerBody["aka-res"] = strings.ToUpper(hex.EncodeToString(aka.RES))
+	answerBody["aka-ck"] = strings.ToUpper(hex.EncodeToString(aka.CK))
+	answerBody["aka-ik"] = strings.ToUpper(hex.EncodeToString(aka.IK))
+	answerBody["aka-auts"] = strings.ToUpper(hex.EncodeToString(aka.AUTS))
+	if relay, err := buildEAPRelayAnswer(result, aka, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI), syncFailure); err == nil && relay != "" {
+		answerBody["eap-relay-packet"] = relay
+	}
+	return answerBody, nil
 }
 
 func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req *HTTPRequest) (*HTTPResponse, error) {
@@ -385,6 +402,21 @@ func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity s
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
+func buildEAPRelayKDFNegotiationAnswer(result entitlementResult) (string, bool, error) {
+	if result.EAPPacket == nil {
+		return "", false, nil
+	}
+	packet, negotiated, err := eapaka.BuildAKAPrimeKDFNegotiationResponse(*result.EAPPacket)
+	if err != nil || !negotiated {
+		return "", negotiated, err
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		return "", false, err
+	}
+	return base64.StdEncoding.EncodeToString(raw), true, nil
 }
 
 func parseCombinedChallenge(v any, out *entitlementResult) {
