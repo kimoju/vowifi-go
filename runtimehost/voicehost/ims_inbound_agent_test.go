@@ -152,6 +152,7 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 			Headers:    map[string][]string{"Contact": {"<sip:client@192.0.2.60:5060>"}},
 			Body:       []byte(sampleSDP("192.0.2.60", 5000)),
 		},
+		{StatusCode: 200, Reason: "OK"},
 	}}
 	agent := &IMSInboundAgent{
 		ClientTransport:  transport,
@@ -201,6 +202,12 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	}
 	if transport.requests[2].Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" {
 		t.Fatalf("UPDATE Route=%q", transport.requests[2].Headers["Route"])
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-update"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 4 || transport.requests[3].Method != "BYE" || transport.requests[3].Headers["CSeq"] != "4 BYE" {
+		t.Fatalf("BYE after UPDATE=%+v", transport.requests)
 	}
 }
 
@@ -255,7 +262,8 @@ func TestIMSInboundAgentForwardsInDialogInfoToClient(t *testing.T) {
 	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-info"}); err != nil {
 		t.Fatalf("EndInboundCall() error = %v", err)
 	}
-	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].URI != "sip:client@192.0.2.60:5060" {
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].URI != "sip:client@192.0.2.60:5060" ||
+		transport.requests[2].Headers["CSeq"] != "8 BYE" {
 		t.Fatalf("BYE after INFO=%+v", transport.requests)
 	}
 }
@@ -387,8 +395,49 @@ func TestIMSInboundAgentRejectedReinviteAcksFinalResponse(t *testing.T) {
 	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-reinvite-reject"}); err != nil {
 		t.Fatalf("EndInboundCall() error = %v", err)
 	}
-	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "2 BYE" {
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "5 BYE" {
 		t.Fatalf("BYE requests=%+v", transport.requests)
+	}
+}
+
+func TestIMSInboundAgentAdvancesByeCSeqAfterFailure(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{StatusCode: 503, Reason: "Try Later"},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-bye-retry",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-bye-retry"}); err == nil {
+		t.Fatal("EndInboundCall() err=nil, want failed BYE")
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-bye-retry"}); err != nil {
+		t.Fatalf("EndInboundCall() retry error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[1].Method != "BYE" || transport.requests[2].Method != "BYE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if transport.requests[1].Headers["CSeq"] != "2 BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE CSeqs=%q/%q", transport.requests[1].Headers["CSeq"], transport.requests[2].Headers["CSeq"])
 	}
 }
 

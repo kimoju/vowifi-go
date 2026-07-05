@@ -700,6 +700,9 @@ func TestIMSOutboundAgentKeepsDialogWhenByeFails(t *testing.T) {
 	if len(transport.requests) != 3 || transport.requests[1].Method != "BYE" || transport.requests[2].Method != "BYE" {
 		t.Fatalf("requests=%+v", transport.requests)
 	}
+	if transport.requests[1].Headers["CSeq"] != "2 BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE CSeqs=%q/%q", transport.requests[1].Headers["CSeq"], transport.requests[2].Headers["CSeq"])
+	}
 }
 
 func TestIMSOutboundAgentUsesRTPRelayWhenConfigured(t *testing.T) {

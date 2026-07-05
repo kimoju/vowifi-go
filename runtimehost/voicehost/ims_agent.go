@@ -223,14 +223,19 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	}
 	a.mu.Lock()
 	state, ok := a.dialogs[callID]
-	a.mu.Unlock()
 	if !ok {
+		a.mu.Unlock()
 		return nil
 	}
-	bye, err := voiceclient.BuildByeRequest(state.cfg)
+	cfg := state.cfg
+	bye, err := voiceclient.BuildByeRequest(cfg)
 	if err != nil {
+		a.mu.Unlock()
 		return err
 	}
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
+	a.mu.Unlock()
 	resp, err := a.Transport.RoundTripRequest(ctx, bye)
 	if err != nil {
 		return err

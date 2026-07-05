@@ -180,8 +180,10 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 }
 
 func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req InboundCallRequest, state imsInboundDialogState) (InboundCallResult, error) {
+	callID := strings.TrimSpace(req.CallID)
+	reinviteCSeq := inboundCSeq(req.CSeq)
 	cfg := state.clientCfg
-	cfg.CSeq = inboundCSeq(req.CSeq)
+	cfg.CSeq = reinviteCSeq
 	body := append([]byte(nil), req.RawSDP...)
 	if len(body) > 0 && state.relay != nil {
 		remoteSDP, offerBody, err := inboundOfferSDP(req)
@@ -197,6 +199,8 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 	if err != nil {
 		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client re-INVITE failed"}, err
 	}
+	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, reinviteCSeq)
+	a.storeInboundDialog(callID, state)
 	resp, err := a.roundTripClientInvite(ctx, invite)
 	if err != nil {
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client re-INVITE failed"}, err
@@ -230,10 +234,10 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
 	}
-	cfg.CSeq = state.clientCfg.CSeq
+	cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, reinviteCSeq)
 	state.clientCfg = cfg
-	state.inviteCSeq = inboundCSeq(req.CSeq)
-	a.storeInboundDialog(strings.TrimSpace(req.CallID), state)
+	state.inviteCSeq = reinviteCSeq
+	a.storeInboundDialog(callID, state)
 	return result, nil
 }
 
@@ -286,7 +290,8 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 		return InboundCallResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
 	cfg := state.clientCfg
-	cfg.CSeq = inboundCSeq(req.CSeq)
+	updateCSeq := inboundCSeq(req.CSeq)
+	cfg.CSeq = updateCSeq
 	body := append([]byte(nil), req.RawSDP...)
 	if len(body) > 0 && state.relay != nil {
 		remoteSDP, offerBody, err := inboundDialogSDP(req)
@@ -302,6 +307,8 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 	if err != nil {
 		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client UPDATE failed"}, err
 	}
+	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, updateCSeq)
+	a.storeInboundDialog(callID, state)
 	resp, err := a.ClientTransport.RoundTripRequest(ctx, update)
 	if err != nil {
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client UPDATE failed"}, err
@@ -330,7 +337,7 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
 	}
-	cfg.CSeq = state.clientCfg.CSeq
+	cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, updateCSeq)
 	state.clientCfg = cfg
 	a.storeInboundDialog(callID, state)
 	return result, nil
@@ -352,11 +359,14 @@ func (a *IMSInboundAgent) HandleInboundPrack(ctx context.Context, req InboundDia
 		return InboundCallResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
 	cfg := state.clientCfg
-	cfg.CSeq = inboundCSeq(req.CSeq)
+	prackCSeq := inboundCSeq(req.CSeq)
+	cfg.CSeq = prackCSeq
 	prack, err := voiceclient.BuildPrackRequest(cfg, firstVoiceNonEmpty(req.RAck, firstVoiceHeader(req.Headers, "RAck")))
 	if err != nil {
 		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client PRACK failed"}, err
 	}
+	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, prackCSeq)
+	a.storeInboundDialog(callID, state)
 	resp, err := a.ClientTransport.RoundTripRequest(ctx, prack)
 	if err != nil {
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client PRACK failed"}, err
@@ -383,19 +393,22 @@ func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequ
 		return IMSInfoResult{Handled: true, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
 	cfg := state.clientCfg
-	cfg.CSeq = inboundCSeq(req.CSeq)
+	infoCSeq := inboundCSeq(req.CSeq)
+	cfg.CSeq = infoCSeq
 	info, err := voiceclient.BuildInfoRequest(cfg, req.ContentType, req.Body)
 	if err != nil {
 		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client INFO failed"}, err
 	}
 	applyIncomingInfoHeaders(info.Headers, req.InfoPackage, req.Headers)
+	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, infoCSeq)
+	a.storeInboundDialog(callID, state)
 	resp, err := a.ClientTransport.RoundTripRequest(ctx, info)
 	if err != nil {
 		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client INFO failed"}, err
 	}
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
-		cfg.CSeq = state.clientCfg.CSeq
+		cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, infoCSeq)
 		state.clientCfg = cfg
 		a.storeInboundDialog(callID, state)
 	}
@@ -447,11 +460,13 @@ func (a *IMSInboundAgent) EndInboundCall(ctx context.Context, info DialogInfo) e
 		return nil
 	}
 	cfg := state.clientCfg
-	cfg.CSeq++
+	cfg.CSeq = nextInboundClientCSeq(cfg.CSeq)
 	bye, err := voiceclient.BuildByeRequest(cfg)
 	if err != nil {
 		return err
 	}
+	state.clientCfg = cfg
+	a.storeInboundDialog(strings.TrimSpace(info.CallID), state)
 	resp, err := a.ClientTransport.RoundTripRequest(ctx, bye)
 	if err != nil {
 		return err
@@ -500,6 +515,20 @@ func inboundCSeq(cseq int) int {
 		return 1
 	}
 	return cseq
+}
+
+func nextInboundClientCSeq(cseq int) int {
+	if cseq <= 0 {
+		return 1
+	}
+	return cseq + 1
+}
+
+func maxInboundCSeq(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func inboundStatusCode(code, fallback int) int {
