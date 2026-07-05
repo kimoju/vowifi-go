@@ -118,9 +118,22 @@ func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target
 }
 
 func buildRegisterWire(msg RegisterMessage, transport string, localAddr net.Addr) ([]byte, error) {
+	return buildSIPRequestWire(SIPRequestMessage{
+		Method:  "REGISTER",
+		URI:     msg.URI,
+		Headers: msg.Headers,
+		Body:    msg.Body,
+	}, transport, localAddr)
+}
+
+func buildSIPRequestWire(msg SIPRequestMessage, transport string, localAddr net.Addr) ([]byte, error) {
+	method := strings.ToUpper(strings.TrimSpace(msg.Method))
+	if method == "" {
+		return nil, errors.New("SIP method is empty")
+	}
 	uri := strings.TrimSpace(msg.URI)
 	if uri == "" {
-		return nil, errors.New("REGISTER URI is empty")
+		return nil, errors.New("SIP request URI is empty")
 	}
 	headers := make(map[string]string, len(msg.Headers)+4)
 	for k, v := range msg.Headers {
@@ -135,7 +148,8 @@ func buildRegisterWire(msg RegisterMessage, transport string, localAddr net.Addr
 		headers["Content-Length"] = strconv.Itoa(len(msg.Body))
 	}
 	var out bytes.Buffer
-	out.WriteString("REGISTER ")
+	out.WriteString(method)
+	out.WriteString(" ")
 	out.WriteString(uri)
 	out.WriteString(" SIP/2.0\r\n")
 	writeOrderedHeaders(&out, headers)
@@ -148,10 +162,11 @@ func writeOrderedHeaders(out *bytes.Buffer, headers map[string]string) {
 	order := []string{
 		"Via", "Route", "Max-Forwards", "To", "From", "Call-ID", "CSeq", "Contact",
 		"Expires", "P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
-		"Security-Client", "Security-Verify", "Authorization", "Proxy-Authorization",
-		"Content-Type", "Accept", "Content-Length",
+		"P-Access-Network-Info", "Security-Client", "Security-Verify", "Authorization",
+		"Proxy-Authorization", "Session-Expires", "Content-Type", "Accept",
 	}
 	written := make(map[string]bool, len(order))
+	contentLength := ""
 	for _, name := range order {
 		for key, value := range headers {
 			if strings.EqualFold(key, name) && strings.TrimSpace(value) != "" {
@@ -164,12 +179,22 @@ func writeOrderedHeaders(out *bytes.Buffer, headers map[string]string) {
 		}
 	}
 	for key, value := range headers {
+		if strings.EqualFold(key, "Content-Length") {
+			contentLength = strings.TrimSpace(value)
+			written[strings.ToLower(key)] = true
+			continue
+		}
 		if written[strings.ToLower(key)] || strings.TrimSpace(value) == "" {
 			continue
 		}
 		out.WriteString(key)
 		out.WriteString(": ")
 		out.WriteString(value)
+		out.WriteString("\r\n")
+	}
+	if contentLength != "" {
+		out.WriteString("Content-Length: ")
+		out.WriteString(contentLength)
 		out.WriteString("\r\n")
 	}
 }

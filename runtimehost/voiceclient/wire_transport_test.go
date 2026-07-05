@@ -163,3 +163,77 @@ func TestWireRegisterTransportRoundTripOverTCP(t *testing.T) {
 		t.Fatalf("TCP request=%q", req)
 	}
 }
+
+func TestWireSIPTransportInviteWaitsForFinalResponseAndWritesAck(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	requests := make(chan []string, 1)
+	go func() {
+		var seen []string
+		buf := make([]byte, 65535)
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			requests <- []string{"read invite error: " + err.Error()}
+			return
+		}
+		seen = append(seen, string(append([]byte(nil), buf[:n]...)))
+		_, _ = pc.WriteTo([]byte("SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n"), addr)
+		_, _ = pc.WriteTo([]byte("SIP/2.0 200 OK\r\nContent-Type: application/sdp\r\nContent-Length: 9\r\n\r\nanswer=ok"), addr)
+
+		n, _, err = pc.ReadFrom(buf)
+		if err != nil {
+			requests <- append(seen, "read ack error: "+err.Error())
+			return
+		}
+		seen = append(seen, string(append([]byte(nil), buf[:n]...)))
+		requests <- seen
+	}()
+
+	transport := WireSIPTransport{Network: "udp", ServerAddr: pc.LocalAddr().String(), Timeout: time.Second}
+	resp, err := transport.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "INVITE",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"To":           "<sip:callee@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Call-ID":      "call-1",
+			"CSeq":         "1 INVITE",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Max-Forwards": "70",
+		},
+		Body: []byte("offer=ok"),
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRequest() error = %v", err)
+	}
+	if resp.StatusCode != 200 || string(resp.Body) != "answer=ok" {
+		t.Fatalf("response=%+v body=%q", resp, resp.Body)
+	}
+	if err := transport.WriteRequest(context.Background(), SIPRequestMessage{
+		Method: "ACK",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"To":           "<sip:callee@example>;tag=remote",
+			"From":         "<sip:user@example>;tag=t",
+			"Call-ID":      "call-1",
+			"CSeq":         "1 ACK",
+			"Max-Forwards": "70",
+		},
+	}); err != nil {
+		t.Fatalf("WriteRequest() error = %v", err)
+	}
+	seen := <-requests
+	if len(seen) != 2 {
+		t.Fatalf("requests=%d %v", len(seen), seen)
+	}
+	if !strings.Contains(seen[0], "INVITE sip:callee@example SIP/2.0") || !strings.Contains(seen[0], "Content-Length: 8") {
+		t.Fatalf("INVITE wire=%q", seen[0])
+	}
+	if !strings.Contains(seen[1], "ACK sip:callee@example SIP/2.0") || !strings.Contains(seen[1], "Via: SIP/2.0/UDP") {
+		t.Fatalf("ACK wire=%q", seen[1])
+	}
+}
