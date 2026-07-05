@@ -2,6 +2,7 @@ package ikev2
 
 import (
 	"context"
+	"crypto/aes"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -65,29 +66,35 @@ type AKAChallengeConfig struct {
 	MessageID          uint32
 	Random             io.Reader
 	IV                 []byte
+	EAPReauthIV        []byte
+	EAPReauthCounter   uint16
+	EAPReauthCounterOK bool
 }
 
 type AKAChallengeResult struct {
-	RequestBytes           []byte
-	ResponseBytes          []byte
-	ResponseInner          []Payload
-	EAPResponse            eapaka.Packet
-	EAPNext                *eapaka.Packet
-	EAPKeys                eapaka.Keys
-	EAPEncryptedAttributes []eapaka.Attribute
-	EAPNextPseudonym       string
-	EAPNextReauthID        string
-	EAPNotifications       []eapaka.Packet
-	EAPClientError         bool
-	ChildSA                *ChildSAResult
-	SyncFailure            bool
-	AuthFailure            bool
-	KDFNegotiated          bool
-	NextMessageID          uint32
-	FollowupRequestBytes   [][]byte
-	FollowupResponseBytes  [][]byte
-	FinalResponseBytes     []byte
-	FinalResponseInner     []Payload
+	RequestBytes             []byte
+	ResponseBytes            []byte
+	ResponseInner            []Payload
+	EAPResponse              eapaka.Packet
+	EAPNext                  *eapaka.Packet
+	EAPKeys                  eapaka.Keys
+	EAPEncryptedAttributes   []eapaka.Attribute
+	EAPNextPseudonym         string
+	EAPNextReauthID          string
+	EAPReauthenticated       bool
+	EAPReauthCounter         uint16
+	EAPReauthCounterTooSmall bool
+	EAPNotifications         []eapaka.Packet
+	EAPClientError           bool
+	ChildSA                  *ChildSAResult
+	SyncFailure              bool
+	AuthFailure              bool
+	KDFNegotiated            bool
+	NextMessageID            uint32
+	FollowupRequestBytes     [][]byte
+	FollowupResponseBytes    [][]byte
+	FinalResponseBytes       []byte
+	FinalResponseInner       []Payload
 }
 
 type FullAuthConfig struct {
@@ -405,10 +412,43 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	var authFailure bool
 	var kdfNegotiated bool
 	var clientError bool
+	var reauthenticated bool
+	var reauthCounter uint16
+	var reauthCounterTooSmall bool
 	var notifications []eapaka.Packet
 	var encryptedAttributes []eapaka.Attribute
 	var identityState eapaka.EncryptedIdentityState
-	if response, handled, err := buildAKAControlResponse(cfg.Request, cfg.EAPKeys); err != nil {
+	if cfg.Request.Code == eapaka.CodeRequest && cfg.Request.Subtype == eapaka.SubtypeReauthentication && len(cfg.EAPKeys.KAut) > 0 {
+		parsed, err := eapaka.ParseReauthenticationRequest(cfg.Request, cfg.EAPKeys)
+		if err != nil {
+			return AKAChallengeResult{}, err
+		}
+		reauthCounter = parsed.Counter
+		encryptedAttributes = parsed.EncryptedAttributes
+		identityState = parsed.IdentityState
+		eapIV, err := eapReauthIV(cfg.Random, cfg.EAPReauthIV)
+		if err != nil {
+			return AKAChallengeResult{}, err
+		}
+		if cfg.EAPReauthCounterOK && parsed.Counter <= cfg.EAPReauthCounter {
+			eapResp, err = eapaka.BuildReauthenticationCounterTooSmallResponse(cfg.Request, cfg.EAPKeys, eapIV)
+			if err != nil {
+				return AKAChallengeResult{}, err
+			}
+			eapKeys = cfg.EAPKeys
+			reauthCounterTooSmall = true
+		} else {
+			identity := strings.TrimSpace(cfg.Identity)
+			if identity == "" {
+				return AKAChallengeResult{}, fmt.Errorf("%w: reauthentication identity is empty", ErrInvalidAuthConfig)
+			}
+			eapResp, eapKeys, err = eapaka.BuildReauthenticationResponse(identity, cfg.Request, cfg.EAPKeys, eapIV)
+			if err != nil {
+				return AKAChallengeResult{}, err
+			}
+			reauthenticated = true
+		}
+	} else if response, handled, err := buildAKAControlResponse(cfg.Request, cfg.EAPKeys); err != nil {
 		return AKAChallengeResult{}, err
 	} else if handled {
 		eapResp = response
@@ -505,24 +545,27 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 		clientError = clientError || followups.ClientError
 	}
 	out := AKAChallengeResult{
-		RequestBytes:           append([]byte(nil), reqBytes...),
-		ResponseBytes:          append([]byte(nil), respBytes...),
-		ResponseInner:          clonePayloads(inner),
-		EAPResponse:            eapResp,
-		EAPKeys:                resultEAPKeys,
-		EAPEncryptedAttributes: cloneEAPAttributes(encryptedAttributes),
-		EAPNextPseudonym:       identityState.NextPseudonym,
-		EAPNextReauthID:        identityState.NextReauthID,
-		EAPNotifications:       cloneEAPPackets(notifications),
-		EAPClientError:         clientError,
-		SyncFailure:            syncFailure,
-		AuthFailure:            authFailure,
-		KDFNegotiated:          kdfNegotiated,
-		NextMessageID:          nextMessageID,
-		FollowupRequestBytes:   cloneByteSlices(followups.RequestBytes),
-		FollowupResponseBytes:  cloneByteSlices(followups.ResponseBytes),
-		FinalResponseBytes:     append([]byte(nil), finalRespBytes...),
-		FinalResponseInner:     clonePayloads(finalInner),
+		RequestBytes:             append([]byte(nil), reqBytes...),
+		ResponseBytes:            append([]byte(nil), respBytes...),
+		ResponseInner:            clonePayloads(inner),
+		EAPResponse:              eapResp,
+		EAPKeys:                  resultEAPKeys,
+		EAPEncryptedAttributes:   cloneEAPAttributes(encryptedAttributes),
+		EAPNextPseudonym:         identityState.NextPseudonym,
+		EAPNextReauthID:          identityState.NextReauthID,
+		EAPReauthenticated:       reauthenticated,
+		EAPReauthCounter:         reauthCounter,
+		EAPReauthCounterTooSmall: reauthCounterTooSmall,
+		EAPNotifications:         cloneEAPPackets(notifications),
+		EAPClientError:           clientError,
+		SyncFailure:              syncFailure,
+		AuthFailure:              authFailure,
+		KDFNegotiated:            kdfNegotiated,
+		NextMessageID:            nextMessageID,
+		FollowupRequestBytes:     cloneByteSlices(followups.RequestBytes),
+		FollowupResponseBytes:    cloneByteSlices(followups.ResponseBytes),
+		FinalResponseBytes:       append([]byte(nil), finalRespBytes...),
+		FinalResponseInner:       clonePayloads(finalInner),
 	}
 	if next, ok, err := firstEAPPacket(finalInner); err != nil {
 		return AKAChallengeResult{}, err
@@ -623,7 +666,7 @@ func buildAKAControlResponse(request eapaka.Packet, keys eapaka.Keys) (eapaka.Pa
 	} else if handled {
 		return response, true, nil
 	}
-	if request.Code == eapaka.CodeRequest && request.Subtype != eapaka.SubtypeChallenge {
+	if request.Code == eapaka.CodeRequest && request.Subtype != eapaka.SubtypeChallenge && request.Subtype != eapaka.SubtypeIdentity {
 		response, err := eapaka.BuildClientErrorResponse(request, eapaka.ClientErrorUnableToProcessPacket)
 		return response, true, err
 	}
@@ -870,6 +913,19 @@ func authIV(random io.Reader, profile KeyMaterialProfile, override []byte) ([]by
 		return append([]byte(nil), override...), nil
 	}
 	return RandomIV(random, profile)
+}
+
+func eapReauthIV(random io.Reader, override []byte) ([]byte, error) {
+	if len(override) > 0 {
+		if len(override) != aes.BlockSize {
+			return nil, fmt.Errorf("%w: EAP reauthentication IV length %d != %d", ErrInvalidAuthConfig, len(override), aes.BlockSize)
+		}
+		return append([]byte(nil), override...), nil
+	}
+	if random == nil {
+		random = rand.Reader
+	}
+	return randomBytes(random, aes.BlockSize)
 }
 
 func firstConfiguration(value, fallback Configuration) Configuration {

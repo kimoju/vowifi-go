@@ -729,6 +729,177 @@ func TestRunIKEAuthAKAChallengeHandlesAuthenticatedInitialNotification(t *testin
 	}
 }
 
+func TestRunIKEAuthAKAChallengeHandlesReauthentication(t *testing.T) {
+	init := fakeInitResult(t)
+	fullIdentity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	reauthIdentity := "reauth-2"
+	aka := simAKAResult()
+	eapKeys, err := eapaka.DeriveKeys(fullIdentity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	request := signedAKAReauthenticationRequest(t, eapaka.TypeAKA, eapKeys, 3, nonceS, []eapaka.Attribute{
+		eapaka.NextReauthIDAttribute("reauth-3"),
+	}, []eapaka.Attribute{eapaka.ResultIndAttribute()})
+	transport := InitTransportFunc(func(ctx context.Context, requestBytes []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(requestBytes, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+			t.Fatalf("request header=%+v inner=%+v", msg.Header, inner)
+		}
+		pkt, err := eapaka.ParsePacket(inner[0].Body)
+		if err != nil {
+			return nil, err
+		}
+		if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeReauthentication {
+			t.Fatalf("reauth response=%+v", pkt)
+		}
+		if _, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeResultInd); !ok {
+			t.Fatal("missing echoed AT_RESULT_IND")
+		}
+		raw, err := pkt.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		if err := eapaka.VerifyMAC(eapKeys.KAut, raw, nonceS); err != nil {
+			return nil, err
+		}
+		attrs := decryptedAKAReauthenticationResponseAttrs(t, eapKeys, pkt)
+		counterAttr, ok := eapaka.FindAttribute(attrs, eapaka.AttributeCounter)
+		if !ok {
+			t.Fatalf("missing encrypted AT_COUNTER in %+v", attrs)
+		}
+		counter, err := counterAttr.CounterValue()
+		if err != nil {
+			return nil, err
+		}
+		if counter != 3 {
+			t.Fatalf("counter=%d", counter)
+		}
+		payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xfa, 0xce, 0xfe, 0xed})
+		if err != nil {
+			return nil, err
+		}
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, payloads, bytes.Repeat([]byte{0x8a}, init.Keys.Profile.EncryptionBlockSize))
+		return rawResp, err
+	})
+	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
+	res, err := RunIKE_AUTH_AKAChallenge(context.Background(), AKAChallengeConfig{
+		Transport:          transport,
+		Init:               init,
+		EAPKeys:            eapKeys,
+		Identity:           reauthIdentity,
+		Request:            request,
+		ChildSPI:           localSPI,
+		MessageID:          3,
+		IV:                 bytes.Repeat([]byte{0x89}, init.Keys.Profile.EncryptionBlockSize),
+		EAPReauthIV:        bytes.Repeat([]byte{0x67}, 16),
+		EAPReauthCounter:   2,
+		EAPReauthCounterOK: true,
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_AKAChallenge(reauth) error = %v", err)
+	}
+	if !res.EAPReauthenticated || res.EAPReauthCounterTooSmall || res.EAPReauthCounter != 3 {
+		t.Fatalf("reauth flags result=%+v", res)
+	}
+	if res.EAPNext == nil || res.EAPNext.Code != eapaka.CodeSuccess || res.NextMessageID != 4 {
+		t.Fatalf("result=%+v", res)
+	}
+	if res.EAPNextReauthID != "reauth-3" || len(res.EAPEncryptedAttributes) != 3 {
+		t.Fatalf("reauth identity state=%q encrypted=%+v", res.EAPNextReauthID, res.EAPEncryptedAttributes)
+	}
+	expectedKeys, err := eapaka.DeriveReauthenticationKeys(reauthIdentity, eapKeys, 3, nonceS)
+	if err != nil {
+		t.Fatalf("DeriveReauthenticationKeys() error = %v", err)
+	}
+	if !bytes.Equal(res.EAPKeys.MSK, expectedKeys.MSK) || !bytes.Equal(res.EAPKeys.EMSK, expectedKeys.EMSK) || !bytes.Equal(res.EAPKeys.KAut, eapKeys.KAut) {
+		t.Fatalf("reauth keys=%+v expected=%+v", res.EAPKeys, expectedKeys)
+	}
+	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.LocalSPI, localSPI) || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xfa, 0xce, 0xfe, 0xed}) {
+		t.Fatalf("child SA=%+v", res.ChildSA)
+	}
+}
+
+func TestRunIKEAuthAKAChallengeHandlesReauthenticationCounterTooSmall(t *testing.T) {
+	init := fakeInitResult(t)
+	fullIdentity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := simAKAResult()
+	eapKeys, err := eapaka.DeriveKeys(fullIdentity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	request := signedAKAReauthenticationRequest(t, eapaka.TypeAKA, eapKeys, 2, nonceS, nil, nil)
+	transport := InitTransportFunc(func(ctx context.Context, requestBytes []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(requestBytes, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+			t.Fatalf("request header=%+v inner=%+v", msg.Header, inner)
+		}
+		pkt, err := eapaka.ParsePacket(inner[0].Body)
+		if err != nil {
+			return nil, err
+		}
+		if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeReauthentication {
+			t.Fatalf("reauth response=%+v", pkt)
+		}
+		raw, err := pkt.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		if err := eapaka.VerifyMAC(eapKeys.KAut, raw, nonceS); err != nil {
+			return nil, err
+		}
+		attrs := decryptedAKAReauthenticationResponseAttrs(t, eapKeys, pkt)
+		if tooSmall, ok := eapaka.FindAttribute(attrs, eapaka.AttributeCounterTooSmall); !ok {
+			t.Fatalf("missing encrypted AT_COUNTER_TOO_SMALL in %+v", attrs)
+		} else if err := tooSmall.CounterTooSmallValue(); err != nil {
+			return nil, err
+		}
+		identityReq, err := (eapaka.Packet{
+			Code:       eapaka.CodeRequest,
+			Identifier: pkt.Identifier + 1,
+			Type:       eapaka.TypeAKA,
+			Subtype:    eapaka.SubtypeIdentity,
+			Attributes: []eapaka.Attribute{eapaka.FullAuthIDReqAttribute()},
+		}).MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(identityReq)}, bytes.Repeat([]byte{0x8c}, init.Keys.Profile.EncryptionBlockSize))
+		return rawResp, err
+	})
+	res, err := RunIKE_AUTH_AKAChallenge(context.Background(), AKAChallengeConfig{
+		Transport:          transport,
+		Init:               init,
+		EAPKeys:            eapKeys,
+		Request:            request,
+		MessageID:          3,
+		IV:                 bytes.Repeat([]byte{0x8b}, init.Keys.Profile.EncryptionBlockSize),
+		EAPReauthIV:        bytes.Repeat([]byte{0x68}, 16),
+		EAPReauthCounter:   5,
+		EAPReauthCounterOK: true,
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_AKAChallenge(reauth counter-too-small) error = %v", err)
+	}
+	if res.EAPReauthenticated || !res.EAPReauthCounterTooSmall || res.EAPReauthCounter != 2 {
+		t.Fatalf("reauth flags result=%+v", res)
+	}
+	if !bytes.Equal(res.EAPKeys.MSK, eapKeys.MSK) || !bytes.Equal(res.EAPKeys.EMSK, eapKeys.EMSK) {
+		t.Fatalf("counter-too-small should preserve old keys: %+v", res.EAPKeys)
+	}
+	if res.EAPNext == nil || res.EAPNext.Subtype != eapaka.SubtypeIdentity || res.EAPNext.Identifier != request.Identifier+1 {
+		t.Fatalf("next EAP=%+v", res.EAPNext)
+	}
+}
+
 func TestRunIKEAuthAKAChallengeSendsClientErrorForUnsupportedSubtype(t *testing.T) {
 	init := fakeInitResult(t)
 	request := eapaka.Packet{
@@ -1190,6 +1361,65 @@ func signedAKANotification(t *testing.T, identifier uint8, keys eapaka.Keys, cod
 	}
 	notification.Attributes[len(notification.Attributes)-1] = eapaka.MACAttribute(mac)
 	return notification
+}
+
+func signedAKAReauthenticationRequest(t *testing.T, eapType uint8, keys eapaka.Keys, counter uint16, nonceS []byte, encryptedExtra, topLevelExtra []eapaka.Attribute) eapaka.Packet {
+	t.Helper()
+	iv := bytes.Repeat([]byte{0x56}, 16)
+	encryptedAttrs := []eapaka.Attribute{
+		eapaka.CounterAttribute(counter),
+		eapaka.NonceSAttribute(nonceS),
+	}
+	encryptedAttrs = append(encryptedAttrs, encryptedExtra...)
+	encrypted, err := eapaka.EncryptAttributes(keys.KEncr, iv, encryptedAttrs)
+	if err != nil {
+		t.Fatalf("EncryptAttributes() error = %v", err)
+	}
+	attrs := []eapaka.Attribute{
+		eapaka.IVAttribute(iv),
+		encrypted,
+	}
+	attrs = append(attrs, topLevelExtra...)
+	attrs = append(attrs, eapaka.MACAttribute(nil))
+	request := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 19,
+		Type:       eapType,
+		Subtype:    eapaka.SubtypeReauthentication,
+		Attributes: attrs,
+	}
+	raw, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	var mac []byte
+	if eapType == eapaka.TypeAKAPrime {
+		mac, err = eapaka.CalculateAKAPrimeMAC(keys.KAut, raw, nil)
+	} else {
+		mac, err = eapaka.CalculateMAC(keys.KAut, raw, nil)
+	}
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	request.Attributes[len(request.Attributes)-1] = eapaka.MACAttribute(mac)
+	return request
+}
+
+func decryptedAKAReauthenticationResponseAttrs(t *testing.T, keys eapaka.Keys, packet eapaka.Packet) []eapaka.Attribute {
+	t.Helper()
+	ivAttr, ok := eapaka.FindAttribute(packet.Attributes, eapaka.AttributeIV)
+	if !ok {
+		t.Fatal("missing AT_IV")
+	}
+	encryptedAttr, ok := eapaka.FindAttribute(packet.Attributes, eapaka.AttributeEncrData)
+	if !ok {
+		t.Fatal("missing AT_ENCR_DATA")
+	}
+	attrs, err := eapaka.DecryptEncryptedAttributes(keys.KEncr, ivAttr, encryptedAttr)
+	if err != nil {
+		t.Fatalf("DecryptEncryptedAttributes() error = %v", err)
+	}
+	return attrs
 }
 
 func signedAKAPrimeChallenge(t *testing.T, identity, networkName string, aka sim.AKAResult) eapaka.Packet {
