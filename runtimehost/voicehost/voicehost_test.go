@@ -23,7 +23,7 @@ func (a *fakeOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundC
 		return OutboundCallResult{}, a.err
 	}
 	if !a.result.Accepted {
-		return OutboundCallResult{Accepted: false, Reason: a.result.Reason}, nil
+		return a.result, nil
 	}
 	return a.result, nil
 }
@@ -100,6 +100,29 @@ func TestGatewayHandleClientInviteWithoutOutboundAgentReturns503(t *testing.T) {
 	g.HandleClientInvite("dev-1", newInviteRequest("call-1", "18005551212", sampleSDP("198.51.100.10", 4002)), tx)
 	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 503 {
 		t.Fatalf("responses=%v", responseCodes(tx.responses))
+	}
+}
+
+func TestGatewayHandleClientInvitePropagatesOutboundRejectStatus(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{result: OutboundCallResult{
+		Accepted:   false,
+		StatusCode: 404,
+		Reason:     "Not Found",
+	}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+
+	g.HandleClientInvite("dev-1", newInviteRequest("call-404", "18005551212", sampleSDP("198.51.100.10", 4002)), tx)
+
+	if len(tx.responses) != 2 {
+		t.Fatalf("responses=%v, want 100 and 404", responseCodes(tx.responses))
+	}
+	if tx.responses[0].StatusCode != 100 || tx.responses[1].StatusCode != 404 || tx.responses[1].Reason != "Not Found" {
+		t.Fatalf("responses=%d/%d reason=%q", tx.responses[0].StatusCode, tx.responses[1].StatusCode, tx.responses[1].Reason)
+	}
+	if status := g.DeviceStatus("dev-1"); status["active_dialogs"] != 0 {
+		t.Fatalf("DeviceStatus=%+v, want no active dialog", status)
 	}
 }
 

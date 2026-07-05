@@ -232,7 +232,7 @@ func TestIMSOutboundAgentRejectedInviteAcksFinalResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartOutboundCall() error = %v", err)
 	}
-	if result.Accepted || result.Reason != "Busy Here" {
+	if result.Accepted || result.StatusCode != 486 || result.Reason != "Busy Here" {
 		t.Fatalf("result=%+v", result)
 	}
 	if len(transport.requests) != 1 || transport.requests[0].Method != "INVITE" {

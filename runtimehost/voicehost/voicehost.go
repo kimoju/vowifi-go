@@ -46,10 +46,11 @@ type OutboundCallRequest struct {
 }
 
 type OutboundCallResult struct {
-	Accepted bool
-	Reason   string
-	LocalSDP SDPInfo
-	RawSDP   []byte
+	Accepted   bool
+	StatusCode int
+	Reason     string
+	LocalSDP   SDPInfo
+	RawSDP     []byte
 }
 
 type DialogInfo struct {
@@ -240,7 +241,7 @@ func (g *Gateway) HandleClientInvite(deviceID string, req *sip.Request, tx sip.S
 		if reason == "" {
 			reason = "Busy Here"
 		}
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 486, reason, nil))
+		_ = tx.Respond(sip.NewResponseFromRequest(req, localFinalStatusCode(result.StatusCode, 486), reason, nil))
 		return
 	}
 	body := append([]byte(nil), result.RawSDP...)
@@ -437,6 +438,13 @@ func (g *Gateway) dialog(callID string) DialogInfo {
 		return d
 	}
 	return DialogInfo{CallID: strings.TrimSpace(callID)}
+}
+
+func localFinalStatusCode(code, fallback int) int {
+	if code >= 300 && code <= 699 {
+		return code
+	}
+	return fallback
 }
 
 func sipCallID(req *sip.Request) string {

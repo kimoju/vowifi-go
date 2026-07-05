@@ -120,8 +120,9 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		}
 		a.deleteDialog(strings.TrimSpace(req.CallID))
 		return OutboundCallResult{
-			Accepted: false,
-			Reason:   firstVoiceNonEmpty(resp.Reason, fmt.Sprintf("IMS rejected call: %d", resp.StatusCode)),
+			Accepted:   false,
+			StatusCode: outboundStatusCode(resp.StatusCode, 486),
+			Reason:     firstVoiceNonEmpty(resp.Reason, fmt.Sprintf("IMS rejected call: %d", resp.StatusCode)),
 		}, nil
 	}
 	cfg.RemoteTag = sipHeaderTag(firstVoiceHeader(resp.Headers, "To"))
@@ -173,10 +174,11 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: byeCfg, relay: relay})
 	closeRelayOnError = false
 	return OutboundCallResult{
-		Accepted: true,
-		Reason:   firstVoiceNonEmpty(resp.Reason, "OK"),
-		LocalSDP: localSDP,
-		RawSDP:   answerBody,
+		Accepted:   true,
+		StatusCode: outboundStatusCode(resp.StatusCode, 200),
+		Reason:     firstVoiceNonEmpty(resp.Reason, "OK"),
+		LocalSDP:   localSDP,
+		RawSDP:     answerBody,
 	}, nil
 }
 
@@ -349,6 +351,13 @@ func outboundInviteCSeq(cseq int) int {
 		return 1
 	}
 	return cseq
+}
+
+func outboundStatusCode(code, fallback int) int {
+	if code >= 100 && code <= 699 {
+		return code
+	}
+	return fallback
 }
 
 func headerHasToken(headers map[string][]string, name, token string) bool {
