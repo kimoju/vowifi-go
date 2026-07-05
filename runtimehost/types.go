@@ -15,6 +15,7 @@ import (
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
+	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 	"github.com/iniwex5/vowifi-go/runtimehost/voicehost"
 )
 
@@ -201,10 +202,13 @@ type IMSRegistrationConfig struct {
 }
 
 type IMSRegistrationResult struct {
-	Registered bool
-	StatusCode int
-	Reason     string
-	Server     string
+	Registered     bool
+	StatusCode     int
+	Reason         string
+	Server         string
+	Profile        voiceclient.IMSProfile
+	Binding        voiceclient.RegistrationBinding
+	VoiceTransport voiceclient.SIPRequestTransport
 }
 
 type IMSRegistrar interface {
@@ -214,25 +218,29 @@ type IMSRegistrar interface {
 const StartModeMain = "main"
 
 type StartRequest struct {
-	Mode          string
-	DeviceID      string
-	TraceID       string
-	Profile       identity.Profile
-	Prepared      *identity.PreparedSession
-	NetworkMode   string
-	VoiceGateway  *voicehost.Gateway
-	SIM           SIMAdapter
-	Access        ModemAccess
-	Dataplane     DataplanePolicy
-	Proxy         *ProxyConfig
-	TunnelManager swu.TunnelManager
-	IMSRegistrar  IMSRegistrar
-	SMSTransport  messaging.SMSTransport
-	USSDTransport messaging.USSDTransport
-	DeliveryStore messaging.DeliveryStore
-	Dispatch      eventhost.Dispatcher
-	BeforeStart   func(context.Context, SessionConfig) error
-	ShouldRun     func() bool
+	Mode                string
+	DeviceID            string
+	TraceID             string
+	Profile             identity.Profile
+	Prepared            *identity.PreparedSession
+	NetworkMode         string
+	VoiceGateway        *voicehost.Gateway
+	SIM                 SIMAdapter
+	Access              ModemAccess
+	Dataplane           DataplanePolicy
+	Proxy               *ProxyConfig
+	TunnelManager       swu.TunnelManager
+	IMSRegistrar        IMSRegistrar
+	VoiceTransport      voiceclient.SIPRequestTransport
+	VoiceUserAgent      string
+	VoiceSessionExpires int
+	VoiceMediaRelay     *voicehost.RTPRelayConfig
+	SMSTransport        messaging.SMSTransport
+	USSDTransport       messaging.USSDTransport
+	DeliveryStore       messaging.DeliveryStore
+	Dispatch            eventhost.Dispatcher
+	BeforeStart         func(context.Context, SessionConfig) error
+	ShouldRun           func() bool
 }
 
 type Instance struct {
@@ -243,6 +251,7 @@ type Instance struct {
 	notifier  func(string)
 	smsNotify func(deviceID, sender, content string, ts time.Time)
 	tunnel    swu.TunnelSession
+	voice     voicehost.Agent
 	stopped   bool
 }
 
@@ -302,8 +311,9 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	}
 	imsReady := req.IMSRegistrar == nil
 	imsReason := ""
+	imsResult := IMSRegistrationResult{}
 	if req.IMSRegistrar != nil {
-		res, err := req.IMSRegistrar.RegisterIMS(ctx, IMSRegistrationConfig{
+		imsCfg := IMSRegistrationConfig{
 			DeviceID:    req.DeviceID,
 			TraceID:     req.TraceID,
 			Profile:     req.Profile,
@@ -313,7 +323,8 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 			NetworkMode: req.NetworkMode,
 			Dataplane:   req.Dataplane,
 			Proxy:       req.Proxy,
-		})
+		}
+		res, err := req.IMSRegistrar.RegisterIMS(ctx, imsCfg)
 		if err != nil {
 			return nil, fmt.Errorf("IMS registration failed: %w", err)
 		}
@@ -322,6 +333,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		}
 		imsReady = true
 		imsReason = firstRuntimeNonEmpty(res.Reason, res.Server)
+		imsResult = res
 	}
 	state := State{
 		DeviceID:      req.DeviceID,
@@ -344,12 +356,42 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	svc := messaging.NewService(req.DeviceID, req.Profile.IMSI, req.DeliveryStore, req.Dispatch)
 	svc.SetSMSTransport(req.SMSTransport)
 	svc.SetUSSDTransport(req.USSDTransport)
-	inst := &Instance{state: state, service: svc, tunnel: tunnel}
+	inst := &Instance{state: state, service: svc, tunnel: tunnel, voice: buildRuntimeVoiceAgent(req, imsResult)}
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
 	inst.notify(ctx)
 	return inst, nil
+}
+
+func buildRuntimeVoiceAgent(req StartRequest, reg IMSRegistrationResult) voicehost.Agent {
+	transport := req.VoiceTransport
+	if transport == nil {
+		transport = reg.VoiceTransport
+	}
+	if transport == nil || !reg.Registered {
+		return nil
+	}
+	binding := reg.Binding
+	if strings.TrimSpace(binding.ContactURI) == "" {
+		return nil
+	}
+	profile := reg.Profile
+	if strings.TrimSpace(profile.IMPU) == "" {
+		profile.IMPU = strings.TrimSpace(binding.PublicIdentity)
+	}
+	if strings.TrimSpace(profile.Domain) == "" {
+		profile.Domain = sipDomainRuntime(profile.IMPU)
+	}
+	return &voicehost.IMSOutboundAgent{
+		Transport:      transport,
+		Profile:        profile,
+		Registration:   binding,
+		Domain:         profile.Domain,
+		UserAgent:      firstRuntimeNonEmpty(req.VoiceUserAgent, profile.UserAgent),
+		SessionExpires: req.VoiceSessionExpires,
+		MediaRelay:     req.VoiceMediaRelay,
+	}
 }
 
 func (i *Instance) AddObserver(o Observer) {
@@ -395,6 +437,50 @@ func (i *Instance) Stop(ctx context.Context) error {
 	}
 	i.notify(ctx)
 	return err
+}
+
+func (i *Instance) StartOutboundCall(ctx context.Context, req voicehost.OutboundCallRequest) (voicehost.OutboundCallResult, error) {
+	agent := i.outboundVoiceAgent()
+	if agent == nil {
+		return voicehost.OutboundCallResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
+	}
+	return agent.StartOutboundCall(ctx, req)
+}
+
+func (i *Instance) EndVoiceCall(ctx context.Context, info voicehost.DialogInfo) error {
+	agent := i.dialogTerminator()
+	if agent == nil {
+		return voicehost.ErrIMSVoiceAgentNotReady
+	}
+	return agent.EndVoiceCall(ctx, info)
+}
+
+func (i *Instance) outboundVoiceAgent() voicehost.OutboundCallAgent {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.OutboundCallAgent)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogTerminator() voicehost.DialogTerminator {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogTerminator)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
 }
 
 func (i *Instance) Service() *messaging.Service {
@@ -538,6 +624,20 @@ func firstRuntimeNonEmpty(items ...string) string {
 		if strings.TrimSpace(item) != "" {
 			return strings.TrimSpace(item)
 		}
+	}
+	return ""
+}
+
+func sipDomainRuntime(uri string) string {
+	uri = strings.TrimSpace(uri)
+	if strings.HasPrefix(strings.ToLower(uri), "sip:") {
+		uri = uri[4:]
+	}
+	if _, host, ok := strings.Cut(uri, "@"); ok {
+		if semi := strings.IndexByte(host, ';'); semi >= 0 {
+			host = host[:semi]
+		}
+		return strings.Trim(strings.TrimSpace(host), "<>")
 	}
 	return ""
 }

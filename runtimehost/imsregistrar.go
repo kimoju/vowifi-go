@@ -13,22 +13,28 @@ import (
 )
 
 type IMSRegisterTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, string, string) voiceclient.SIPRegisterTransport
+type IMSVoiceTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, voiceclient.RegistrationBinding) voiceclient.SIPRequestTransport
 
 type WireIMSRegistrar struct {
-	Transport        voiceclient.SIPRegisterTransport
-	TransportFactory IMSRegisterTransportFactory
-	RegistrarURI     string
-	ContactURI       string
-	ContactHost      string
-	ContactPort      int
-	Network          string
-	ServerAddr       string
-	LocalAddr        string
-	Timeout          time.Duration
-	Expires          int
-	UserAgent        string
-	CallID           string
-	CNonce           string
+	Transport             voiceclient.SIPRegisterTransport
+	TransportFactory      IMSRegisterTransportFactory
+	VoiceTransport        voiceclient.SIPRequestTransport
+	VoiceFactory          IMSVoiceTransportFactory
+	RegistrarURI          string
+	ContactURI            string
+	ContactHost           string
+	ContactPort           int
+	Network               string
+	ServerAddr            string
+	LocalAddr             string
+	Timeout               time.Duration
+	Expires               int
+	UserAgent             string
+	CallID                string
+	CNonce                string
+	RetransmitInterval    time.Duration
+	MaxRetransmitInterval time.Duration
+	MaxRetransmits        int
 }
 
 func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationConfig) (IMSRegistrationResult, error) {
@@ -50,10 +56,13 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 	}
 	if transport == nil {
 		transport = voiceclient.WireRegisterTransport{
-			Network:    r.Network,
-			ServerAddr: r.ServerAddr,
-			LocalAddr:  r.LocalAddr,
-			Timeout:    r.Timeout,
+			Network:               r.Network,
+			ServerAddr:            r.ServerAddr,
+			LocalAddr:             r.LocalAddr,
+			Timeout:               r.Timeout,
+			RetransmitInterval:    r.RetransmitInterval,
+			MaxRetransmitInterval: r.MaxRetransmitInterval,
+			MaxRetransmits:        r.MaxRetransmits,
 		}
 	}
 	expires := r.Expires
@@ -76,14 +85,38 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 			StatusCode: result.StatusCode,
 			Reason:     result.Reason,
 			Server:     result.Binding.PublicIdentity,
+			Profile:    profile,
+			Binding:    result.Binding,
 		}, err
 	}
+	voiceTransport := r.voiceTransport(cfg, profile, result.Binding)
 	return IMSRegistrationResult{
-		Registered: result.Registered,
-		StatusCode: result.StatusCode,
-		Reason:     firstRuntimeNonEmpty(result.Reason, "ims registered"),
-		Server:     firstRuntimeNonEmpty(result.Binding.PublicIdentity, profile.Domain),
+		Registered:     result.Registered,
+		StatusCode:     result.StatusCode,
+		Reason:         firstRuntimeNonEmpty(result.Reason, "ims registered"),
+		Server:         firstRuntimeNonEmpty(result.Binding.PublicIdentity, profile.Domain),
+		Profile:        profile,
+		Binding:        result.Binding,
+		VoiceTransport: voiceTransport,
 	}, nil
+}
+
+func (r WireIMSRegistrar) voiceTransport(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, binding voiceclient.RegistrationBinding) voiceclient.SIPRequestTransport {
+	if r.VoiceTransport != nil {
+		return r.VoiceTransport
+	}
+	if r.VoiceFactory != nil {
+		return r.VoiceFactory(cfg, profile, binding)
+	}
+	return voiceclient.WireSIPTransport{
+		Network:               r.Network,
+		ServerAddr:            r.ServerAddr,
+		LocalAddr:             r.LocalAddr,
+		Timeout:               r.Timeout,
+		RetransmitInterval:    r.RetransmitInterval,
+		MaxRetransmitInterval: r.MaxRetransmitInterval,
+		MaxRetransmits:        r.MaxRetransmits,
+	}
 }
 
 func (r WireIMSRegistrar) profileFromConfig(cfg IMSRegistrationConfig) (voiceclient.IMSProfile, error) {

@@ -3,6 +3,7 @@ package runtimehost
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
+	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
+	"github.com/iniwex5/vowifi-go/runtimehost/voicehost"
 )
 
 type testModem struct{}
@@ -64,6 +67,85 @@ func TestStartUsesIMSRegistrarResult(t *testing.T) {
 	}
 	if registrar.config.DeviceID != "dev-1" || registrar.config.TraceID != "trace-1" || registrar.config.Access == nil {
 		t.Fatalf("registrar config=%+v", registrar.config)
+	}
+}
+
+func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
+	transport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote"},
+				"Contact": {"<sip:remote@pcscf.ims.example>"},
+			},
+			Body: runtimeSDP("198.51.100.22", 49170),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	gw := voicehost.NewGateway()
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
+		Registered: true,
+		StatusCode: 200,
+		Reason:     "ims registered",
+		Profile: voiceclient.IMSProfile{
+			IMPI:   "user@ims.example",
+			IMPU:   "sip:user@ims.example",
+			Domain: "ims.example",
+		},
+		Binding: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+		VoiceTransport: transport,
+	}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:     "dev-voice",
+		TraceID:      "trace-voice",
+		IMSRegistrar: registrar,
+		VoiceGateway: gw,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	agent, ok := gw.GetAgent("dev-voice").(voicehost.OutboundCallAgent)
+	if !ok || agent == nil || agent != inst {
+		t.Fatalf("gateway agent=%T, want runtime outbound agent", gw.GetAgent("dev-voice"))
+	}
+	res, err := agent.StartOutboundCall(context.Background(), voicehost.OutboundCallRequest{
+		DeviceID: "dev-voice",
+		CallID:   "call-runtime-voice",
+		Callee:   "+18005551212",
+		RemoteSDP: voicehost.SDPInfo{
+			ConnectionIP: "192.0.2.44",
+			MediaPort:    4000,
+			Payloads:     []int{0, 8},
+			Direction:    "sendrecv",
+		},
+		RawSDP: runtimeSDP("192.0.2.44", 4000),
+	})
+	if err != nil || !res.Accepted {
+		t.Fatalf("StartOutboundCall() res=%+v err=%v", res, err)
+	}
+	if len(transport.requests) != 1 || transport.requests[0].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if transport.requests[0].Headers["Route"] != "<sip:pcscf.ims.example;lr>" {
+		t.Fatalf("INVITE Route=%q", transport.requests[0].Headers["Route"])
+	}
+	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" {
+		t.Fatalf("writes=%+v", transport.writes)
+	}
+	terminator, ok := gw.GetAgent("dev-voice").(voicehost.DialogTerminator)
+	if !ok {
+		t.Fatalf("gateway agent=%T, want dialog terminator", gw.GetAgent("dev-voice"))
+	}
+	if err := terminator.EndVoiceCall(context.Background(), voicehost.DialogInfo{CallID: "call-runtime-voice"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "BYE" {
+		t.Fatalf("requests after BYE=%+v", transport.requests)
 	}
 }
 
@@ -284,6 +366,40 @@ func TestInstanceHandlesIncomingSMSAndDeliveryReport(t *testing.T) {
 
 type runtimeSMSTransport struct {
 	requests []messaging.SMSSendRequest
+}
+
+type runtimeVoiceTransport struct {
+	requests  []voiceclient.SIPRequestMessage
+	writes    []voiceclient.SIPRequestMessage
+	responses []voiceclient.SIPResponse
+}
+
+func (t *runtimeVoiceTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	t.requests = append(t.requests, msg)
+	if len(t.responses) == 0 {
+		return voiceclient.SIPResponse{StatusCode: 500, Reason: "empty"}, nil
+	}
+	resp := t.responses[0]
+	t.responses = t.responses[1:]
+	return resp, nil
+}
+
+func (t *runtimeVoiceTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
+	t.writes = append(t.writes, msg)
+	return nil
+}
+
+func runtimeSDP(ip string, port int) []byte {
+	return []byte("v=0\r\n" +
+		"o=- 0 0 IN IP4 " + ip + "\r\n" +
+		"s=VoWiFi\r\n" +
+		"c=IN IP4 " + ip + "\r\n" +
+		"t=0 0\r\n" +
+		"m=audio " + strconv.Itoa(port) + " RTP/AVP 0 8 101\r\n" +
+		"a=rtpmap:0 PCMU/8000\r\n" +
+		"a=rtpmap:8 PCMA/8000\r\n" +
+		"a=rtpmap:101 telephone-event/8000\r\n" +
+		"a=sendrecv\r\n")
 }
 
 type runtimeTunnelManager struct {

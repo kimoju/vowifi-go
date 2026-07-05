@@ -45,6 +45,15 @@ func TestWireIMSRegistrarUsesPreparedIdentity(t *testing.T) {
 	if !res.Registered || res.Server != "sip:user@ims.example" {
 		t.Fatalf("result=%+v", res)
 	}
+	if res.Profile.IMPU != "sip:user@ims.example" || res.Binding.ContactURI != "sip:user@192.0.2.10:5062" {
+		t.Fatalf("voice registration profile/binding=%+v/%+v", res.Profile, res.Binding)
+	}
+	if len(res.Binding.ServiceRoutes) != 1 || res.Binding.ServiceRoutes[0] != "<sip:pcscf.ims.example;lr>" {
+		t.Fatalf("service routes=%+v", res.Binding.ServiceRoutes)
+	}
+	if res.VoiceTransport == nil {
+		t.Fatal("VoiceTransport=nil, want SIP request transport for IMS voice")
+	}
 	if len(transport.requests) != 1 {
 		t.Fatalf("requests=%d", len(transport.requests))
 	}
