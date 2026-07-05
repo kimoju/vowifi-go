@@ -58,8 +58,9 @@ protocol layers needed by VoHive:
   Service-Route, Path, Security-Server, and Contact expiry capture, plus a
   runtime `IMSRegistrar` adapter for the wire transport
 - IMS REGISTER refresh maintenance on the reusable SIP flow, including
-  expiry-based renewal, retry scheduling, binding/auth/CSeq state updates, and
-  shutdown de-registration with the latest registration state
+  expiry-based renewal, retry scheduling, binding/auth/CSeq state updates,
+  full re-registration after recoverable refresh/flow failures, and shutdown
+  de-registration with the latest registration state
 - automatic IMS SIP CRLF keepalive scheduling on the registered wire flow to
   preserve NAT/PCSCF pinholes between SIP transactions
 - IMS de-registration flow for shutdown cleanup, sending `REGISTER` with

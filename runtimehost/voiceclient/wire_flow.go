@@ -163,6 +163,21 @@ func (f *WireSIPFlow) Close() error {
 	return f.closeConnLocked()
 }
 
+func (f *WireSIPFlow) Reset() error {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return ErrSIPFlowClosed
+	}
+	err := f.closeConnLocked()
+	f.targets = nil
+	f.targetIndex = 0
+	return err
+}
+
 func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()

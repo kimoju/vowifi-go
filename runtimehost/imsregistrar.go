@@ -177,6 +177,7 @@ type imsRegistrationMaintenance struct {
 	session voiceclient.RegisterSession
 	config  WireIMSRegistrar
 
+	recoverMu      sync.Mutex
 	mu             sync.Mutex
 	registered     bool
 	binding        voiceclient.RegistrationBinding
@@ -184,6 +185,7 @@ type imsRegistrationMaintenance struct {
 	authHeader     string
 	authHeaderName string
 	authState      voiceclient.DigestAuthState
+	recoveryCount  int
 	cancel         context.CancelFunc
 	done           chan struct{}
 	wg             sync.WaitGroup
@@ -306,8 +308,11 @@ func (m *imsRegistrationMaintenance) keepaliveLoop(ctx context.Context) {
 		if !m.isRegistered() {
 			continue
 		}
-		if err := m.flow.SendCRLFKeepalive(ctx); err != nil && (ctx.Err() != nil || errors.Is(err, voiceclient.ErrSIPFlowClosed)) {
-			return
+		if err := m.flow.SendCRLFKeepalive(ctx); err != nil {
+			if ctx.Err() != nil || errors.Is(err, voiceclient.ErrSIPFlowClosed) {
+				return
+			}
+			_ = m.recoverRegistration(ctx, err)
 		}
 	}
 }
@@ -340,6 +345,9 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 
 	result, err := m.session.Refresh(ctx, req)
 	if err != nil {
+		if m.shouldRecoverRegistration(result, err) {
+			return m.recoverRegistration(ctx, err)
+		}
 		return err
 	}
 	m.mu.Lock()
@@ -353,6 +361,93 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, cause error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	m.recoverMu.Lock()
+	defer m.recoverMu.Unlock()
+
+	m.mu.Lock()
+	if m.closed || !m.registered {
+		m.mu.Unlock()
+		return nil
+	}
+	m.recoveryCount++
+	session := m.session
+	session.CallID = imsRecoveryCallID(session.CallID, m.recoveryCount)
+	m.mu.Unlock()
+
+	if err := m.flow.Reset(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("IMS registration recovery reset failed: %w", err)
+	}
+	result, err := session.Register(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("IMS registration recovery failed after %v: %w", cause, err)
+	}
+	if !result.Registered {
+		return fmt.Errorf("IMS registration recovery did not register: %d %s", result.StatusCode, result.Reason)
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.session = session
+	m.registered = true
+	m.binding = result.Binding
+	m.nextCSeq = result.NextCSeq
+	m.authHeader = result.AuthHeader
+	m.authHeaderName = result.AuthHeaderName
+	m.authState = result.AuthState
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *imsRegistrationMaintenance) shouldRecoverRegistration(result voiceclient.RefreshResult, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, voiceclient.ErrSIPFlowClosed) ||
+		errors.Is(err, voiceclient.ErrInvalidChallenge) || errors.Is(err, voiceclient.ErrInvalidAuthenticationInfo) {
+		return false
+	}
+	if errors.Is(err, voiceclient.ErrRegistrationRejected) {
+		return isRecoverableIMSRegistrationStatus(result.StatusCode)
+	}
+	return true
+}
+
+func isRecoverableIMSRegistrationStatus(code int) bool {
+	switch code {
+	case 408, 430, 480, 481, 500, 502, 503, 504, 580:
+		return true
+	default:
+		return code >= 500 && code < 600
+	}
+}
+
+func imsRecoveryCallID(base string, n int) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "vowifi-go-register"
+	}
+	if n <= 0 {
+		n = 1
+	}
+	return base + "-recovery-" + strconv.Itoa(n)
 }
 
 func (m *imsRegistrationMaintenance) isRegistered() bool {
