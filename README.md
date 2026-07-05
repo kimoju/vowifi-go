@@ -83,9 +83,13 @@ protocol layers needed by VoHive:
 - Linux kernel XFRM/IPsec helpers that install ESP tunnel states, outbound/
   inbound/forward policies, optional marks, reqids, and XFRM interfaces from
   IKEv2 CHILD_SA key material with rollback and cleanup support
+- SRTP/SRTCP media helpers and RTP relay transforms for protecting and
+  unprotecting RTP/RTCP packets with AES-CM/HMAC-SHA1 and AEAD-AES-GCM
+  profiles, independent client/IMS key material, replay protection, and
+  authentication failure handling
 
-SRTP media, advanced RTCP feedback handling, and complete inbound IMS call
-handling are still implemented incrementally behind these APIs.
+Advanced RTCP feedback handling and complete inbound IMS call handling are
+still implemented incrementally behind these APIs.
 
 ## Development
 

@@ -23,6 +23,16 @@ type RTPRelayConfig struct {
 	IMSPort           int
 	IMSRTCPPort       int
 	BufferSize        int
+	Transforms        RTPRelayTransforms
+}
+
+type RTPRelayTransform func([]byte) ([]byte, error)
+
+type RTPRelayTransforms struct {
+	ClientToIMSRTP  RTPRelayTransform
+	IMSToClientRTP  RTPRelayTransform
+	ClientToIMSRTCP RTPRelayTransform
+	IMSToClientRTCP RTPRelayTransform
 }
 
 type RTPRelayStats struct {
@@ -38,6 +48,10 @@ type RTPRelayStats struct {
 	IMSToClientRTPBytes    uint64
 	ClientToIMSRTCPBytes   uint64
 	IMSToClientRTCPBytes   uint64
+	ClientToIMSRTPDrops    uint64
+	IMSToClientRTPDrops    uint64
+	ClientToIMSRTCPDrops   uint64
+	IMSToClientRTCPDrops   uint64
 }
 
 type RTPRelaySession struct {
@@ -69,6 +83,11 @@ type RTPRelaySession struct {
 	imsToClientRTPBytes    atomic.Uint64
 	clientToIMSRTCPBytes   atomic.Uint64
 	imsToClientRTCPBytes   atomic.Uint64
+	clientToIMSRTPDrops    atomic.Uint64
+	imsToClientRTPDrops    atomic.Uint64
+	clientToIMSRTCPDrops   atomic.Uint64
+	imsToClientRTCPDrops   atomic.Uint64
+	transforms             RTPRelayTransforms
 }
 
 func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SDPInfo) (*RTPRelaySession, error) {
@@ -122,15 +141,16 @@ func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SD
 		imsAdvertiseIP:    advertiseIP(cfg.IMSAdvertiseIP, imsListenIP),
 		bufferSize:        cfg.BufferSize,
 		cancel:            cancel,
+		transforms:        cfg.Transforms,
 	}
 	if s.bufferSize <= 0 {
 		s.bufferSize = 2048
 	}
 	s.wg.Add(4)
-	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, &s.clientToIMSRTPPackets, &s.clientToIMSRTPBytes)
-	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes)
-	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes)
-	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes)
+	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, &s.clientToIMSRTPPackets, &s.clientToIMSRTPBytes, &s.clientToIMSRTPDrops, s.transforms.ClientToIMSRTP)
+	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes, &s.imsToClientRTPDrops, s.transforms.IMSToClientRTP)
+	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes, &s.clientToIMSRTCPDrops, s.transforms.ClientToIMSRTCP)
+	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes, &s.imsToClientRTCPDrops, s.transforms.IMSToClientRTCP)
 	return s, nil
 }
 
@@ -207,6 +227,10 @@ func (s *RTPRelaySession) Stats() RTPRelayStats {
 		IMSToClientRTPBytes:    rtpInBytes,
 		ClientToIMSRTCPBytes:   s.clientToIMSRTCPBytes.Load(),
 		IMSToClientRTCPBytes:   s.imsToClientRTCPBytes.Load(),
+		ClientToIMSRTPDrops:    s.clientToIMSRTPDrops.Load(),
+		IMSToClientRTPDrops:    s.imsToClientRTPDrops.Load(),
+		ClientToIMSRTCPDrops:   s.clientToIMSRTCPDrops.Load(),
+		IMSToClientRTCPDrops:   s.imsToClientRTCPDrops.Load(),
 	}
 }
 
@@ -241,7 +265,7 @@ func (s *RTPRelaySession) Close() error {
 	return err
 }
 
-func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, packets, bytes *atomic.Uint64) {
+func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, packets, bytes, drops *atomic.Uint64, transform RTPRelayTransform) {
 	defer s.wg.Done()
 	buf := make([]byte, s.bufferSize)
 	for {
@@ -258,11 +282,21 @@ func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn
 		if dst == nil {
 			continue
 		}
-		if _, err := out.WriteToUDP(buf[:n], dst); err != nil {
+		packet := append([]byte(nil), buf[:n]...)
+		if transform != nil {
+			transformed, err := transform(packet)
+			if err != nil {
+				drops.Add(1)
+				continue
+			}
+			packet = transformed
+		}
+		if _, err := out.WriteToUDP(packet, dst); err != nil {
+			drops.Add(1)
 			continue
 		}
 		packets.Add(1)
-		bytes.Add(uint64(n))
+		bytes.Add(uint64(len(packet)))
 	}
 }
 
