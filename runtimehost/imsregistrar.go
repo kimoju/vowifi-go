@@ -71,7 +71,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 	if expires <= 0 {
 		expires = 3600
 	}
-	result, err := voiceclient.RegisterSession{
+	registerSession := voiceclient.RegisterSession{
 		Transport:    transport,
 		AKAProvider:  cfg.SIM,
 		Profile:      profile,
@@ -80,7 +80,8 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		CallID:       firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
 		CNonce:       firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
 		Expires:      expires,
-	}.Register(ctx)
+	}
+	result, err := registerSession.Register(ctx)
 	if err != nil {
 		if defaultFlow != nil {
 			_ = defaultFlow.Close()
@@ -107,7 +108,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		VoiceTransport: voiceTransport,
 		SMSTransport:   smsTransport,
 		USSDTransport:  ussdTransport,
-		Close:          closeDefaultSIPFlow(defaultFlow),
+		Close:          closeDefaultSIPFlow(defaultFlow, registerSession, result),
 	}, nil
 }
 
@@ -159,12 +160,21 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 	}
 }
 
-func closeDefaultSIPFlow(flow *voiceclient.WireSIPFlow) func(context.Context) error {
+func closeDefaultSIPFlow(flow *voiceclient.WireSIPFlow, session voiceclient.RegisterSession, result voiceclient.RegisterResult) func(context.Context) error {
 	if flow == nil {
 		return nil
 	}
-	return func(context.Context) error {
-		return flow.Close()
+	return func(ctx context.Context) error {
+		var err error
+		if result.Registered {
+			_, err = session.Deregister(ctx, voiceclient.DeregisterRequest{
+				Binding:        result.Binding,
+				CSeq:           result.NextCSeq,
+				AuthHeader:     result.AuthHeader,
+				AuthHeaderName: result.AuthHeaderName,
+			})
+		}
+		return errors.Join(err, flow.Close())
 	}
 }
 

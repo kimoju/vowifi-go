@@ -402,6 +402,56 @@ func TestRegisterSessionRetriesAuthenticatedMinExpires(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionDeregisterRetriesDigestChallenge(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-dereg", algorithm=MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=701;spi-s=702;port-c=5068;port-s=5069`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	session := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-dereg",
+		CNonce:       "cnonce",
+	}
+	result, err := session.Deregister(context.Background(), DeregisterRequest{
+		Binding: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
+			SecurityVerify: []string{"ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=501;spi-s=502;port-c=5064;port-s=5065"},
+		},
+		CSeq: 9,
+	})
+	if err != nil {
+		t.Fatalf("Deregister() error = %v", err)
+	}
+	if !result.Deregistered || result.Attempts != 2 || result.StatusCode != 200 {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("requests=%d, want 2", len(transport.requests))
+	}
+	first := transport.requests[0].Headers
+	if first["Expires"] != "0" || first["CSeq"] != "9 REGISTER" || !strings.Contains(first["Contact"], "expires=0") ||
+		first["Security-Client"] != "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063" ||
+		!strings.Contains(first["Security-Verify"], "spi-c=501") {
+		t.Fatalf("first deregister headers=%+v", first)
+	}
+	second := transport.requests[1].Headers
+	if second["Expires"] != "0" || second["CSeq"] != "10 REGISTER" || !strings.Contains(second["Authorization"], `nonce="nonce-dereg"`) ||
+		!strings.Contains(second["Security-Verify"], "spi-c=701") {
+		t.Fatalf("second deregister headers=%+v", second)
+	}
+}
+
 func TestSelectDigestChallengePrefersAKAv2(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	ch, err := SelectDigestChallenge(map[string][]string{

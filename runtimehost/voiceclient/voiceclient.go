@@ -91,13 +91,30 @@ type RegisterSession struct {
 }
 
 type RegisterResult struct {
-	Registered bool
-	StatusCode int
-	Reason     string
-	Attempts   int
-	Challenge  DigestChallenge
-	Binding    RegistrationBinding
-	AuthHeader string
+	Registered     bool
+	StatusCode     int
+	Reason         string
+	Attempts       int
+	Challenge      DigestChallenge
+	Binding        RegistrationBinding
+	AuthHeader     string
+	AuthHeaderName string
+	NextCSeq       int
+}
+
+type DeregisterRequest struct {
+	Binding        RegistrationBinding
+	CallID         string
+	CSeq           int
+	AuthHeader     string
+	AuthHeaderName string
+}
+
+type DeregisterResult struct {
+	Deregistered bool
+	StatusCode   int
+	Reason       string
+	Attempts     int
 }
 
 func ParseWWWAuthenticate(header string) (DigestChallenge, error) {
@@ -335,6 +352,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 			Reason:     resp.Reason,
 			Attempts:   attempts,
 			Binding:    buildRegistrationBinding(s.Profile, contactURI, resp, expires, securityClient, nil),
+			NextCSeq:   cseq + 1,
 		}, nil
 	}
 	if resp.StatusCode != 401 && resp.StatusCode != 407 {
@@ -376,13 +394,15 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if syncFailure {
 		if isSIPSuccess(resp2.StatusCode) {
 			return RegisterResult{
-				Registered: true,
-				StatusCode: resp2.StatusCode,
-				Reason:     resp2.Reason,
-				Attempts:   attempts,
-				Challenge:  ch,
-				Binding:    buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders),
-				AuthHeader: authz,
+				Registered:     true,
+				StatusCode:     resp2.StatusCode,
+				Reason:         resp2.Reason,
+				Attempts:       attempts,
+				Challenge:      ch,
+				Binding:        buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders),
+				AuthHeader:     authz,
+				AuthHeaderName: authzHeader,
+				NextCSeq:       cseq + 1,
 			}, nil
 		}
 		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
@@ -424,16 +444,102 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		}
 	}
 	result := RegisterResult{
-		Registered: isSIPSuccess(resp2.StatusCode),
-		StatusCode: resp2.StatusCode,
-		Reason:     resp2.Reason,
-		Attempts:   attempts,
-		Challenge:  ch,
-		Binding:    buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders),
-		AuthHeader: authz,
+		Registered:     isSIPSuccess(resp2.StatusCode),
+		StatusCode:     resp2.StatusCode,
+		Reason:         resp2.Reason,
+		Attempts:       attempts,
+		Challenge:      ch,
+		Binding:        buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders),
+		AuthHeader:     authz,
+		AuthHeaderName: authzHeader,
+		NextCSeq:       cseq + 1,
 	}
 	if !result.Registered {
 		return result, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
+	}
+	return result, nil
+}
+
+func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) (DeregisterResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.Transport == nil {
+		return DeregisterResult{}, errors.New("nil SIP register transport")
+	}
+	registrarURI := strings.TrimSpace(s.RegistrarURI)
+	contactURI := firstNonEmpty(req.Binding.ContactURI, s.ContactURI)
+	if registrarURI == "" || contactURI == "" {
+		return DeregisterResult{}, errors.New("registrar URI and contact URI are required")
+	}
+	callID := firstNonEmpty(req.CallID, s.CallID, "vowifi-go-register")
+	cseq := req.CSeq
+	if cseq <= 0 {
+		cseq = 1
+	}
+	attempts := 0
+	sendDeregister := func(cseq int, authHeaderName, authz string, challengeHeaders map[string][]string) (RegisterResponse, error) {
+		msg := RegisterMessage{
+			URI:     registrarURI,
+			Headers: BuildRegisterHeaders(s.Profile, contactURI, callID, strconv.Itoa(cseq)),
+		}
+		msg.Headers["Expires"] = "0"
+		msg.Headers["Contact"] = deregisterContactHeader(msg.Headers["Contact"])
+		if securityClient := strings.TrimSpace(req.Binding.SecurityClient); securityClient != "" {
+			msg.Headers["Security-Client"] = securityClient
+		}
+		if strings.TrimSpace(authHeaderName) != "" && strings.TrimSpace(authz) != "" {
+			msg.Headers[authHeaderName] = authz
+		}
+		if securityVerify := securityVerifyFromChallenge(challengeHeaders); securityVerify != "" {
+			msg.Headers["Security-Verify"] = securityVerify
+		} else if len(req.Binding.SecurityVerify) > 0 {
+			msg.Headers["Security-Verify"] = strings.Join(trimHeaderValues(req.Binding.SecurityVerify), ", ")
+		}
+		attempts++
+		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
+	}
+	authHeaderName := firstNonEmpty(req.AuthHeaderName, "Authorization")
+	resp, err := sendDeregister(cseq, authHeaderName, req.AuthHeader, nil)
+	if err != nil {
+		return DeregisterResult{Attempts: attempts}, err
+	}
+	if isSIPSuccess(resp.StatusCode) {
+		return DeregisterResult{Deregistered: true, StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, nil
+	}
+	if resp.StatusCode != 401 && resp.StatusCode != 407 {
+		result := DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}
+		return result, fmt.Errorf("%w: deregister %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
+	}
+	challengeHeader := "WWW-Authenticate"
+	authHeaderName = "Authorization"
+	if firstHeader(resp.Headers, challengeHeader) == "" {
+		challengeHeader = "Proxy-Authenticate"
+		authHeaderName = "Proxy-Authorization"
+	}
+	ch, err := SelectDigestChallenge(resp.Headers, challengeHeader)
+	if err != nil {
+		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
+	}
+	authInput, syncFailure, err := s.digestAuthInputForChallenge(ch, registrarURI)
+	if err != nil {
+		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
+	}
+	if syncFailure {
+		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, sim.ErrSyncFailure
+	}
+	authz, err := BuildDigestAuthorization(ch, authInput)
+	if err != nil {
+		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
+	}
+	cseq++
+	resp2, err := sendDeregister(cseq, authHeaderName, authz, resp.Headers)
+	if err != nil {
+		return DeregisterResult{Attempts: attempts}, err
+	}
+	result := DeregisterResult{Deregistered: isSIPSuccess(resp2.StatusCode), StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts}
+	if !result.Deregistered {
+		return result, fmt.Errorf("%w: deregister %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 	}
 	return result, nil
 }
@@ -604,6 +710,34 @@ func cloneRegisterMessage(msg RegisterMessage) RegisterMessage {
 		out.Headers[k] = v
 	}
 	return out
+}
+
+func deregisterContactHeader(contact string) string {
+	contact = strings.TrimSpace(contact)
+	if contact == "" {
+		return ""
+	}
+	parts := splitSemicolonParams(contact)
+	if len(parts) == 0 {
+		return contact + ";expires=0"
+	}
+	var out []string
+	replaced := false
+	for i, part := range parts {
+		if i > 0 {
+			key, _, ok := strings.Cut(part, "=")
+			if ok && strings.EqualFold(strings.TrimSpace(key), "expires") {
+				out = append(out, "expires=0")
+				replaced = true
+				continue
+			}
+		}
+		out = append(out, part)
+	}
+	if !replaced {
+		out = append(out, "expires=0")
+	}
+	return strings.Join(out, ";")
 }
 
 func decodeNonceBytes(nonce string) ([]byte, bool) {

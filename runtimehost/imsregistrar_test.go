@@ -269,14 +269,11 @@ func TestWireIMSRegistrarDefaultFlowReusesRegisterSocketForSMS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RegisterIMS() error = %v", err)
 	}
-	defer func() {
-		if res.Close != nil {
-			_ = res.Close(context.Background())
-		}
-	}()
-	if _, ok := res.VoiceTransport.(*voiceclient.WireSIPFlow); !ok {
+	flow, ok := res.VoiceTransport.(*voiceclient.WireSIPFlow)
+	if !ok {
 		t.Fatalf("VoiceTransport=%T, want *WireSIPFlow", res.VoiceTransport)
 	}
+	defer flow.Close()
 	smsResult, err := res.SMSTransport.SendSMSPart(context.Background(), messaging.SMSSendRequest{
 		Peer:      "+18005551212",
 		MessageID: "flow-sms",
@@ -295,6 +292,72 @@ func TestWireIMSRegistrarDefaultFlowReusesRegisterSocketForSMS(t *testing.T) {
 	if !strings.Contains(requests[0].wire, "REGISTER sip:ims.mnc280.mcc310.3gppnetwork.org SIP/2.0") ||
 		!strings.Contains(requests[1].wire, "MESSAGE sip:+18005551212@ims.mnc280.mcc310.3gppnetwork.org SIP/2.0") {
 		t.Fatalf("unexpected wires: %+v", requests)
+	}
+}
+
+func TestWireIMSRegistrarCloseDeregistersDefaultFlow(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	type seenRequest struct {
+		addr string
+		wire string
+	}
+	seen := make(chan []seenRequest, 1)
+	go func() {
+		var requests []seenRequest
+		buf := make([]byte, 65535)
+		for i := 0; i < 2; i++ {
+			_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				seen <- append(requests, seenRequest{wire: "read error: " + err.Error()})
+				return
+			}
+			requests = append(requests, seenRequest{addr: addr.String(), wire: string(append([]byte(nil), buf[:n]...))})
+			_, _ = pc.WriteTo([]byte("SIP/2.0 200 OK\r\nP-Associated-URI: <sip:user@ims.example>\r\nContent-Length: 0\r\n\r\n"), addr)
+		}
+		seen <- requests
+	}()
+
+	res, err := WireIMSRegistrar{
+		ServerAddr:     pc.LocalAddr().String(),
+		ContactHost:    "192.0.2.10",
+		Timeout:        time.Second,
+		MaxRetransmits: 1,
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-1",
+		TraceID:  "trace-close",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if res.Close == nil {
+		t.Fatal("Close=nil, want default flow cleanup")
+	}
+	if err := res.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	requests := <-seen
+	if len(requests) != 2 {
+		t.Fatalf("requests=%d %+v", len(requests), requests)
+	}
+	if requests[0].addr == "" || requests[0].addr != requests[1].addr {
+		t.Fatalf("REGISTER and deregister used different flows: %+v", requests)
+	}
+	if !strings.Contains(requests[0].wire, "REGISTER sip:ims.mnc280.mcc310.3gppnetwork.org SIP/2.0") ||
+		!strings.Contains(requests[0].wire, "Expires: 3600\r\n") {
+		t.Fatalf("register wire=%q", requests[0].wire)
+	}
+	if !strings.Contains(requests[1].wire, "REGISTER sip:ims.mnc280.mcc310.3gppnetwork.org SIP/2.0") ||
+		!strings.Contains(requests[1].wire, "Expires: 0\r\n") ||
+		!strings.Contains(requests[1].wire, "expires=0") ||
+		!strings.Contains(requests[1].wire, "CSeq: 2 REGISTER\r\n") {
+		t.Fatalf("deregister wire=%q", requests[1].wire)
 	}
 }
 
