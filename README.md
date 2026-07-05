@@ -91,9 +91,12 @@ protocol layers needed by VoHive:
   Reports, PLI/FIR/rapid resynchronization requests, NACK, REMB, transport-wide
   congestion control, SLI, XR, SDES, BYE, application-defined packets,
   clear-relay counters, and SRTP plaintext-stage event callbacks
+- inbound IMS voice agent helpers that bridge IMS-originated INVITEs to a local
+  SIP client, parse SDP answers, forward ACK/BYE/CANCEL dialog requests, and
+  support RTP relay allocation with IMS-offer/client-answer SDP rewriting
 
-Complete inbound IMS call handling is still implemented incrementally behind
-these APIs.
+Wire-level inbound IMS SIP listener and transaction adapters are still
+implemented incrementally behind these APIs.
 
 ## Development
 

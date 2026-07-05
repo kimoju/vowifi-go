@@ -125,19 +125,32 @@ type RTPRelaySession struct {
 }
 
 func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SDPInfo) (*RTPRelaySession, error) {
+	s, err := newRTPRelaySession(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.SetClientRemote(clientTarget); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func NewRTPRelaySessionForIMSRemote(ctx context.Context, cfg RTPRelayConfig, imsTarget SDPInfo) (*RTPRelaySession, error) {
+	s, err := newRTPRelaySession(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.SetIMSRemote(imsTarget); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func newRTPRelaySession(ctx context.Context, cfg RTPRelayConfig) (*RTPRelaySession, error) {
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	if strings.TrimSpace(clientTarget.ConnectionIP) == "" || clientTarget.MediaPort <= 0 {
-		return nil, fmt.Errorf("%w: client media target is incomplete", ErrRTPRelayConfig)
-	}
-	clientAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(clientTarget.ConnectionIP, strconv.Itoa(clientTarget.MediaPort)))
-	if err != nil {
-		return nil, err
-	}
-	clientRTCPAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(defaultRTCPIP(clientTarget), strconv.Itoa(defaultRTCPPort(clientTarget))))
-	if err != nil {
-		return nil, err
 	}
 	clientListenIP := firstVoiceNonEmpty(cfg.ClientListenIP, "0.0.0.0")
 	imsListenIP := firstVoiceNonEmpty(cfg.IMSListenIP, clientListenIP)
@@ -169,8 +182,6 @@ func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SD
 		imsConn:             imsConn,
 		clientRTCPConn:      clientRTCPConn,
 		imsRTCPConn:         imsRTCPConn,
-		clientTarget:        clientAddr,
-		clientRTCPTarget:    clientRTCPAddr,
 		clientAdvertiseIP:   advertiseIP(cfg.ClientAdvertiseIP, clientListenIP),
 		imsAdvertiseIP:      advertiseIP(cfg.IMSAdvertiseIP, imsListenIP),
 		bufferSize:          cfg.BufferSize,
@@ -209,20 +220,28 @@ func (s *RTPRelaySession) SetIMSRemote(info SDPInfo) error {
 	if s == nil {
 		return nil
 	}
-	if strings.TrimSpace(info.ConnectionIP) == "" || info.MediaPort <= 0 {
-		return fmt.Errorf("%w: IMS media target is incomplete", ErrRTPRelayConfig)
-	}
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(info.ConnectionIP, strconv.Itoa(info.MediaPort)))
-	if err != nil {
-		return err
-	}
-	rtcpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(defaultRTCPIP(info), strconv.Itoa(defaultRTCPPort(info))))
+	addr, rtcpAddr, err := resolveSDPEndpoint(info, "IMS")
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	s.imsTarget = addr
 	s.imsRTCPTarget = rtcpAddr
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *RTPRelaySession) SetClientRemote(info SDPInfo) error {
+	if s == nil {
+		return nil
+	}
+	addr, rtcpAddr, err := resolveSDPEndpoint(info, "client")
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.clientTarget = addr
+	s.clientRTCPTarget = rtcpAddr
 	s.mu.Unlock()
 	return nil
 }
@@ -408,7 +427,12 @@ func (s *RTPRelaySession) currentIMSRTCPTarget() *net.UDPAddr {
 }
 
 func (s *RTPRelaySession) currentClientTarget() *net.UDPAddr {
-	if s == nil || s.clientTarget == nil {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.clientTarget == nil {
 		return nil
 	}
 	cp := *s.clientTarget
@@ -416,7 +440,12 @@ func (s *RTPRelaySession) currentClientTarget() *net.UDPAddr {
 }
 
 func (s *RTPRelaySession) currentClientRTCPTarget() *net.UDPAddr {
-	if s == nil || s.clientRTCPTarget == nil {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.clientRTCPTarget == nil {
 		return nil
 	}
 	cp := *s.clientRTCPTarget
@@ -467,6 +496,21 @@ func udpLocalPort(conn *net.UDPConn) int {
 		return addr.Port
 	}
 	return 0
+}
+
+func resolveSDPEndpoint(info SDPInfo, label string) (*net.UDPAddr, *net.UDPAddr, error) {
+	if strings.TrimSpace(info.ConnectionIP) == "" || info.MediaPort <= 0 {
+		return nil, nil, fmt.Errorf("%w: %s media target is incomplete", ErrRTPRelayConfig, label)
+	}
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(strings.TrimSpace(info.ConnectionIP), strconv.Itoa(info.MediaPort)))
+	if err != nil {
+		return nil, nil, err
+	}
+	rtcpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(defaultRTCPIP(info), strconv.Itoa(defaultRTCPPort(info))))
+	if err != nil {
+		return nil, nil, err
+	}
+	return addr, rtcpAddr, nil
 }
 
 func defaultRTCPPort(info SDPInfo) int {
