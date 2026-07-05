@@ -201,7 +201,9 @@ func TestRTPRelaySessionAppliesSRTPTransforms(t *testing.T) {
 	if !bytes.Equal(gotPlain, imsPlain) {
 		t.Fatalf("client plain=%x, want %x", gotPlain, imsPlain)
 	}
-	stats := relay.Stats()
+	stats := waitRelayStats(t, relay, func(stats RTPRelayStats) bool {
+		return stats.ClientToIMSRTPPackets == 1 && stats.IMSToClientRTPPackets == 1
+	})
 	if stats.ClientToIMSRTPDrops != 0 || stats.IMSToClientRTPDrops != 0 || stats.ClientToIMSRTPPackets != 1 || stats.IMSToClientRTPPackets != 1 {
 		t.Fatalf("stats=%+v", stats)
 	}

@@ -17,6 +17,8 @@ var (
 	ErrInvalidAuthResponse = errors.New("invalid ikev2 auth response")
 )
 
+const maxAKAControlFollowups = 3
+
 type AuthConfig struct {
 	Transport        InitTransport
 	Init             InitResult
@@ -51,6 +53,7 @@ type AKAChallengeConfig struct {
 	Init      InitResult
 	Keys      IKEKeys
 	SIM       sim.AKAProvider
+	EAPKeys   eapaka.Keys
 	Identity  string
 	Request   eapaka.Packet
 	ChildSPI  []byte
@@ -60,16 +63,22 @@ type AKAChallengeConfig struct {
 }
 
 type AKAChallengeResult struct {
-	RequestBytes  []byte
-	ResponseBytes []byte
-	ResponseInner []Payload
-	EAPResponse   eapaka.Packet
-	EAPNext       *eapaka.Packet
-	EAPKeys       eapaka.Keys
-	ChildSA       *ChildSAResult
-	SyncFailure   bool
-	KDFNegotiated bool
-	NextMessageID uint32
+	RequestBytes          []byte
+	ResponseBytes         []byte
+	ResponseInner         []Payload
+	EAPResponse           eapaka.Packet
+	EAPNext               *eapaka.Packet
+	EAPKeys               eapaka.Keys
+	EAPNotifications      []eapaka.Packet
+	EAPClientError        bool
+	ChildSA               *ChildSAResult
+	SyncFailure           bool
+	KDFNegotiated         bool
+	NextMessageID         uint32
+	FollowupRequestBytes  [][]byte
+	FollowupResponseBytes [][]byte
+	FinalResponseBytes    []byte
+	FinalResponseInner    []Payload
 }
 
 func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, error) {
@@ -192,7 +201,17 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	var eapKeys eapaka.Keys
 	var syncFailure bool
 	var kdfNegotiated bool
-	if response, negotiated, err := eapaka.BuildAKAPrimeKDFNegotiationResponse(cfg.Request); err != nil {
+	var clientError bool
+	var notifications []eapaka.Packet
+	if response, handled, err := buildAKAControlResponse(cfg.Request, cfg.EAPKeys); err != nil {
+		return AKAChallengeResult{}, err
+	} else if handled {
+		eapResp = response
+		clientError = response.Subtype == eapaka.SubtypeClientError
+		if response.Subtype == eapaka.SubtypeNotification {
+			notifications = append(notifications, cloneEAPPacket(cfg.Request))
+		}
+	} else if response, negotiated, err := eapaka.BuildAKAPrimeKDFNegotiationResponse(cfg.Request); err != nil {
 		return AKAChallengeResult{}, err
 	} else if negotiated {
 		eapResp = response
@@ -245,30 +264,148 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	if err != nil {
 		return AKAChallengeResult{}, err
 	}
-	out := AKAChallengeResult{
-		RequestBytes:  append([]byte(nil), reqBytes...),
-		ResponseBytes: append([]byte(nil), respBytes...),
-		ResponseInner: clonePayloads(inner),
-		EAPResponse:   eapResp,
-		EAPKeys:       eapKeys,
-		SyncFailure:   syncFailure,
-		KDFNegotiated: kdfNegotiated,
-		NextMessageID: cfg.MessageID + 1,
+	controlKeys := eapKeys
+	if len(controlKeys.KAut) == 0 {
+		controlKeys = cfg.EAPKeys
 	}
-	if next, ok, err := firstEAPPacket(inner); err != nil {
+	resultEAPKeys := eapKeys
+	if len(resultEAPKeys.KAut) == 0 {
+		resultEAPKeys = cfg.EAPKeys
+	}
+	followups, err := runAKAControlFollowups(ctx, cfg, keys, inner, cfg.MessageID+1, controlKeys)
+	if err != nil {
+		return AKAChallengeResult{}, err
+	}
+	notifications = append(notifications, followups.Notifications...)
+	finalRespBytes := respBytes
+	finalInner := inner
+	nextMessageID := cfg.MessageID + 1
+	if len(followups.ResponseBytes) > 0 {
+		finalRespBytes = followups.ResponseBytes[len(followups.ResponseBytes)-1]
+		finalInner = followups.FinalInner
+		nextMessageID = followups.NextMessageID
+		clientError = clientError || followups.ClientError
+	}
+	out := AKAChallengeResult{
+		RequestBytes:          append([]byte(nil), reqBytes...),
+		ResponseBytes:         append([]byte(nil), respBytes...),
+		ResponseInner:         clonePayloads(inner),
+		EAPResponse:           eapResp,
+		EAPKeys:               resultEAPKeys,
+		EAPNotifications:      cloneEAPPackets(notifications),
+		EAPClientError:        clientError,
+		SyncFailure:           syncFailure,
+		KDFNegotiated:         kdfNegotiated,
+		NextMessageID:         nextMessageID,
+		FollowupRequestBytes:  cloneByteSlices(followups.RequestBytes),
+		FollowupResponseBytes: cloneByteSlices(followups.ResponseBytes),
+		FinalResponseBytes:    append([]byte(nil), finalRespBytes...),
+		FinalResponseInner:    clonePayloads(finalInner),
+	}
+	if next, ok, err := firstEAPPacket(finalInner); err != nil {
 		return AKAChallengeResult{}, err
 	} else if ok {
 		out.EAPNext = &next
 	}
-	if hasPayload(inner, PayloadSA) {
-		child, err := ParseChildSAResult(cfg.Init, inner, cfg.ChildSPI)
+	if hasPayload(finalInner, PayloadSA) {
+		child, err := ParseChildSAResult(cfg.Init, finalInner, cfg.ChildSPI)
 		if err != nil {
 			return AKAChallengeResult{}, err
 		}
-		child.NextMessageID = cfg.MessageID + 1
+		child.NextMessageID = nextMessageID
 		out.ChildSA = &child
 	}
 	return out, nil
+}
+
+type akaControlFollowups struct {
+	RequestBytes  [][]byte
+	ResponseBytes [][]byte
+	FinalInner    []Payload
+	NextMessageID uint32
+	Notifications []eapaka.Packet
+	ClientError   bool
+}
+
+func runAKAControlFollowups(ctx context.Context, cfg AKAChallengeConfig, keys IKEKeys, initialInner []Payload, messageID uint32, eapKeys eapaka.Keys) (akaControlFollowups, error) {
+	out := akaControlFollowups{
+		FinalInner:    clonePayloads(initialInner),
+		NextMessageID: messageID,
+	}
+	for i := 0; i < maxAKAControlFollowups; i++ {
+		next, ok, err := firstEAPPacket(out.FinalInner)
+		if err != nil {
+			return akaControlFollowups{}, err
+		}
+		if !ok {
+			return out, nil
+		}
+		response, handled, err := buildAKAControlResponse(next, eapKeys)
+		if err != nil {
+			return akaControlFollowups{}, err
+		}
+		if !handled {
+			return out, nil
+		}
+		if response.Subtype == eapaka.SubtypeNotification {
+			out.Notifications = append(out.Notifications, cloneEAPPacket(next))
+		}
+		if response.Subtype == eapaka.SubtypeClientError {
+			out.ClientError = true
+		}
+		raw, err := response.MarshalBinary()
+		if err != nil {
+			return akaControlFollowups{}, err
+		}
+		iv, err := authIV(cfg.Random, keys.Profile, nil)
+		if err != nil {
+			return akaControlFollowups{}, err
+		}
+		_, reqBytes, err := ProtectMessage(authHeader(cfg.Init, out.NextMessageID, true), keys, true, []Payload{EAPPayload(raw)}, iv)
+		if err != nil {
+			return akaControlFollowups{}, err
+		}
+		respBytes, err := cfg.Transport.ExchangeIKE(ctx, reqBytes)
+		if err != nil {
+			return akaControlFollowups{}, err
+		}
+		_, inner, err := unprotectAuthResponse(respBytes, cfg.Init, keys, out.NextMessageID)
+		if err != nil {
+			return akaControlFollowups{}, err
+		}
+		out.RequestBytes = append(out.RequestBytes, append([]byte(nil), reqBytes...))
+		out.ResponseBytes = append(out.ResponseBytes, append([]byte(nil), respBytes...))
+		out.FinalInner = clonePayloads(inner)
+		out.NextMessageID++
+	}
+	next, ok, err := firstEAPPacket(out.FinalInner)
+	if err != nil {
+		return akaControlFollowups{}, err
+	}
+	if ok {
+		if _, handled, err := buildAKAControlResponse(next, eapKeys); err != nil {
+			return akaControlFollowups{}, err
+		} else if handled {
+			return akaControlFollowups{}, fmt.Errorf("%w: too many EAP-AKA control followups", ErrInvalidAuthResponse)
+		}
+	}
+	return out, nil
+}
+
+func buildAKAControlResponse(request eapaka.Packet, keys eapaka.Keys) (eapaka.Packet, bool, error) {
+	if response, handled, err := eapaka.BuildNotificationResponse(request); err != nil {
+		if errors.Is(err, eapaka.ErrInvalidKeyMaterial) && len(keys.KAut) > 0 {
+			return eapaka.BuildAuthenticatedNotificationResponse(request, keys.KAut)
+		}
+		return eapaka.Packet{}, handled, err
+	} else if handled {
+		return response, true, nil
+	}
+	if request.Code == eapaka.CodeRequest && request.Subtype != eapaka.SubtypeChallenge {
+		response, err := eapaka.BuildClientErrorResponse(request, eapaka.ClientErrorUnableToProcessPacket)
+		return response, true, err
+	}
+	return eapaka.Packet{}, false, nil
 }
 
 func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
@@ -392,6 +529,35 @@ func clonePayloads(in []Payload) []Payload {
 			Body:        append([]byte(nil), p.Body...),
 		}
 	}
+	return out
+}
+
+func cloneByteSlices(in [][]byte) [][]byte {
+	out := make([][]byte, len(in))
+	for i, item := range in {
+		out[i] = append([]byte(nil), item...)
+	}
+	return out
+}
+
+func cloneEAPPackets(in []eapaka.Packet) []eapaka.Packet {
+	out := make([]eapaka.Packet, len(in))
+	for i, packet := range in {
+		out[i] = cloneEAPPacket(packet)
+	}
+	return out
+}
+
+func cloneEAPPacket(packet eapaka.Packet) eapaka.Packet {
+	out := packet
+	out.Attributes = make([]eapaka.Attribute, len(packet.Attributes))
+	for i, attr := range packet.Attributes {
+		out.Attributes[i] = eapaka.Attribute{
+			Type: attr.Type,
+			Data: append([]byte(nil), attr.Data...),
+		}
+	}
+	out.Data = append([]byte(nil), packet.Data...)
 	return out
 }
 
