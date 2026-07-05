@@ -47,6 +47,51 @@ func TestDeriveKeysAndBuildChallengeResponse(t *testing.T) {
 	}
 }
 
+func TestBuildChallengeResponseWithCheckcode(t *testing.T) {
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	transcript := identityTranscriptPackets(t, identity)
+	req := signedChallengeRequestWithCheckcode(t, identity, aka, transcript)
+	resp, keys, err := BuildChallengeResponseWithCheckcode(identity, req, aka, transcript)
+	if err != nil {
+		t.Fatalf("BuildChallengeResponseWithCheckcode() error = %v", err)
+	}
+	attr, ok := FindAttribute(resp.Attributes, AttributeCheckcode)
+	if !ok {
+		t.Fatal("missing AT_CHECKCODE")
+	}
+	if err := VerifyCheckcodeAttribute(attr, transcript); err != nil {
+		t.Fatalf("VerifyCheckcodeAttribute(response) error = %v", err)
+	}
+	raw, err := resp.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	if err := VerifyMAC(keys.KAut, raw, nil); err != nil {
+		t.Fatalf("VerifyMAC(response) error = %v", err)
+	}
+}
+
+func TestBuildChallengeResponseRejectsBadCheckcode(t *testing.T) {
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	transcript := identityTranscriptPackets(t, identity)
+	req := signedChallengeRequestWithCheckcode(t, identity, aka, transcript)
+	badTranscript := identityTranscriptPackets(t, identity+"x")
+	_, _, err := BuildChallengeResponseWithCheckcode(identity, req, aka, badTranscript)
+	if !errors.Is(err, ErrInvalidCheckcode) {
+		t.Fatalf("BuildChallengeResponseWithCheckcode() err=%v, want ErrInvalidCheckcode", err)
+	}
+}
+
 func TestDeriveAKAPrimeKeysRFC9048Vector(t *testing.T) {
 	identity := "0555444333222111"
 	networkName := "WLAN"
@@ -419,6 +464,61 @@ func signedChallengeRequest(t *testing.T, identity string, aka sim.AKAResult) Pa
 	}
 	req.Attributes[len(req.Attributes)-1] = MACAttribute(mac)
 	return req
+}
+
+func signedChallengeRequestWithCheckcode(t *testing.T, identity string, aka sim.AKAResult, transcript [][]byte) Packet {
+	t.Helper()
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	req := Packet{
+		Code:       CodeRequest,
+		Identifier: 7,
+		Type:       TypeAKA,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{
+			RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
+			AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
+			CheckcodeAttributeForPackets(transcript),
+			MACAttribute(nil),
+		},
+	}
+	raw, err := req.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	req.Attributes[len(req.Attributes)-1] = MACAttribute(mac)
+	return req
+}
+
+func identityTranscriptPackets(t *testing.T, identity string) [][]byte {
+	t.Helper()
+	request, err := (Packet{
+		Code:       CodeRequest,
+		Identifier: 6,
+		Type:       TypeAKA,
+		Subtype:    SubtypeIdentity,
+		Attributes: []Attribute{FullAuthIDReqAttribute()},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(request) error = %v", err)
+	}
+	response, err := (Packet{
+		Code:       CodeResponse,
+		Identifier: 6,
+		Type:       TypeAKA,
+		Subtype:    SubtypeIdentity,
+		Attributes: []Attribute{IdentityAttribute(identity)},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(response) error = %v", err)
+	}
+	return [][]byte{request, response}
 }
 
 func signedAKAPrimeChallengeRequest(t *testing.T, identity, networkName string, aka sim.AKAResult) Packet {

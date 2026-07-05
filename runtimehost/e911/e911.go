@@ -181,17 +181,19 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 		return ws, nil
 	}
 	var eapKeys *eapaka.Keys
+	var identityTranscript [][]byte
 	for challengeResponses := 0; result.HasChallenge(); challengeResponses++ {
 		if challengeResponses >= maxEntitlementChallengeResponses {
 			return WebsheetRequest{}, ErrChallengeNotImplemented
 		}
-		answerBody, nextEAPKeys, err := buildEntitlementChallengeAnswer(req, result, eapKeys)
+		answerBody, nextEAPKeys, nextIdentityTranscript, err := buildEntitlementChallengeAnswer(req, result, eapKeys, identityTranscript)
 		if err != nil {
 			return WebsheetRequest{}, err
 		}
 		if nextEAPKeys != nil {
 			eapKeys = nextEAPKeys
 		}
+		identityTranscript = nextIdentityTranscript
 		answer, err := json.Marshal([]map[string]any{answerBody})
 		if err != nil {
 			return WebsheetRequest{}, err
@@ -223,7 +225,7 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 	return WebsheetRequest{}, fmt.Errorf("e911 entitlement response did not include websheet data")
 }
 
-func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapKeys *eapaka.Keys) (map[string]any, *eapaka.Keys, error) {
+func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapKeys *eapaka.Keys, identityTranscript [][]byte) (map[string]any, *eapaka.Keys, [][]byte, error) {
 	answerBody := map[string]any{
 		"message-id":    2,
 		"operation":     "emergency-address-update",
@@ -231,54 +233,65 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 		"sip-username":  req.Identity.SIPUsername,
 		"terminal-imei": req.Identity.IMEI,
 	}
-	if relay, ok, err := buildEAPRelayIdentityAnswer(result, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI)); err != nil {
-		return nil, nil, err
+	nextIdentityTranscript := cloneByteSlices(identityTranscript)
+	if relay, raw, ok, err := buildEAPRelayIdentityAnswer(result, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI)); err != nil {
+		return nil, nil, nil, err
 	} else if ok {
 		answerBody["eap-relay-packet"] = relay
-		return answerBody, nil, nil
+		if len(result.EAPPacketRaw) > 0 {
+			nextIdentityTranscript = append(nextIdentityTranscript, append([]byte(nil), result.EAPPacketRaw...))
+		} else if result.EAPPacket != nil {
+			requestRaw, err := result.EAPPacket.MarshalBinary()
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			nextIdentityTranscript = append(nextIdentityTranscript, requestRaw)
+		}
+		nextIdentityTranscript = append(nextIdentityTranscript, append([]byte(nil), raw...))
+		return answerBody, nil, nextIdentityTranscript, nil
 	}
 	if relay, negotiated, err := buildEAPRelayKDFNegotiationAnswer(result); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	} else if negotiated {
 		answerBody["eap-relay-packet"] = relay
-		return answerBody, nil, nil
+		return answerBody, nil, nextIdentityTranscript, nil
 	}
 	if relay, ok, err := buildEAPRelayNotificationAnswer(result, eapKeys); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	} else if ok {
 		answerBody["eap-relay-packet"] = relay
-		return answerBody, nil, nil
+		return answerBody, nil, nextIdentityTranscript, nil
 	}
 	if result.EAPPacket != nil && result.EAPPacket.Subtype != eapaka.SubtypeChallenge {
 		relay, err := buildEAPRelayClientErrorAnswer(result, eapaka.ClientErrorUnableToProcessPacket)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		answerBody["eap-relay-packet"] = relay
-		return answerBody, nil, nil
+		return answerBody, nil, nextIdentityTranscript, nil
 	}
 	if req.AKAProvider == nil {
-		return nil, nil, ErrChallengeNotImplemented
+		return nil, nil, nil, ErrChallengeNotImplemented
 	}
 	aka, err := req.AKAProvider.CalculateAKA(result.RAND, result.AUTN)
 	syncFailure := errors.Is(err, sim.ErrSyncFailure)
 	authFailure := errors.Is(err, sim.ErrAuthFailure)
 	if err != nil && !syncFailure && !authFailure {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if syncFailure && len(aka.AUTS) == 0 {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if authFailure {
 		if result.EAPPacket == nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		relay, err := buildEAPRelayAuthenticationRejectAnswer(result)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		answerBody["eap-relay-packet"] = relay
-		return answerBody, nil, nil
+		return answerBody, nil, nextIdentityTranscript, nil
 	}
 	answerBody["aka-res"] = strings.ToUpper(hex.EncodeToString(aka.RES))
 	answerBody["aka-ck"] = strings.ToUpper(hex.EncodeToString(aka.CK))
@@ -286,16 +299,16 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 	answerBody["aka-auts"] = strings.ToUpper(hex.EncodeToString(aka.AUTS))
 	var nextEAPKeys *eapaka.Keys
 	if result.EAPPacket != nil {
-		relay, keys, err := buildEAPRelayAnswer(result, aka, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI), syncFailure)
+		relay, keys, err := buildEAPRelayAnswer(result, aka, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI), syncFailure, nextIdentityTranscript)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if relay != "" {
 			answerBody["eap-relay-packet"] = relay
 			nextEAPKeys = keys
 		}
 	}
-	return answerBody, nextEAPKeys, nil
+	return answerBody, nextEAPKeys, nextIdentityTranscript, nil
 }
 
 func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req *HTTPRequest) (*HTTPResponse, error) {
@@ -335,6 +348,7 @@ type entitlementResult struct {
 	AUTN              []byte
 	ChallengeRequired bool
 	EAPPacket         *eapaka.Packet
+	EAPPacketRaw      []byte
 }
 
 func (r entitlementResult) HasChallenge() bool {
@@ -417,6 +431,7 @@ func parseEAPRelayPacket(v any, out *entitlementResult) {
 	}
 	p := packet
 	out.EAPPacket = &p
+	out.EAPPacketRaw = append([]byte(nil), raw...)
 	rand16, autn16, err := eapaka.ChallengeRANDAndAUTN(packet)
 	if err != nil {
 		return
@@ -429,17 +444,17 @@ func parseEAPRelayPacket(v any, out *entitlementResult) {
 	}
 }
 
-func buildEAPRelayIdentityAnswer(result entitlementResult, identity string) (string, bool, error) {
+func buildEAPRelayIdentityAnswer(result entitlementResult, identity string) (string, []byte, bool, error) {
 	if result.EAPPacket == nil {
-		return "", false, nil
+		return "", nil, false, nil
 	}
 	request := *result.EAPPacket
 	if request.Code != eapaka.CodeRequest || request.Subtype != eapaka.SubtypeIdentity {
-		return "", false, nil
+		return "", nil, false, nil
 	}
 	identity = strings.TrimSpace(identity)
 	if identity == "" {
-		return "", true, ErrChallengeNotImplemented
+		return "", nil, true, ErrChallengeNotImplemented
 	}
 	packet := eapaka.Packet{
 		Code:       eapaka.CodeResponse,
@@ -450,12 +465,12 @@ func buildEAPRelayIdentityAnswer(result entitlementResult, identity string) (str
 	}
 	raw, err := packet.MarshalBinary()
 	if err != nil {
-		return "", true, err
+		return "", nil, true, err
 	}
-	return base64.StdEncoding.EncodeToString(raw), true, nil
+	return base64.StdEncoding.EncodeToString(raw), raw, true, nil
 }
 
-func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity string, syncFailure bool) (string, *eapaka.Keys, error) {
+func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity string, syncFailure bool, identityTranscript [][]byte) (string, *eapaka.Keys, error) {
 	if result.EAPPacket == nil {
 		return "", nil, nil
 	}
@@ -465,7 +480,7 @@ func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity s
 	if syncFailure {
 		packet, err = eapaka.BuildSynchronizationFailureResponse(*result.EAPPacket, aka.AUTS)
 	} else {
-		response, responseKeys, responseErr := eapaka.BuildChallengeResponse(strings.TrimSpace(identity), *result.EAPPacket, aka)
+		response, responseKeys, responseErr := eapaka.BuildChallengeResponseWithCheckcode(strings.TrimSpace(identity), *result.EAPPacket, aka, identityTranscript)
 		packet, err = response, responseErr
 		if responseErr == nil {
 			keys = &responseKeys
@@ -479,6 +494,17 @@ func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity s
 		return "", nil, err
 	}
 	return base64.StdEncoding.EncodeToString(raw), keys, nil
+}
+
+func cloneByteSlices(in [][]byte) [][]byte {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([][]byte, len(in))
+	for i, item := range in {
+		out[i] = append([]byte(nil), item...)
+	}
+	return out
 }
 
 func buildEAPRelayAuthenticationRejectAnswer(result entitlementResult) (string, error) {

@@ -211,8 +211,19 @@ func TestStartEmergencyAddressUpdateHandlesEAPRelayAuthenticationReject(t *testi
 
 func TestStartEmergencyAddressUpdateHandlesEAPRelayIdentityThenChallenge(t *testing.T) {
 	identity := "310280233641503@private.att.net"
-	identityRequest := eapRelayIdentityRequest(t)
-	relayPacket := signedEAPRelayChallenge(t, identity, e911AKAResult())
+	identityRequest, identityRequestRaw := eapRelayIdentityRequestRaw(t)
+	identityResponseRaw, err := (eapaka.Packet{
+		Code:       eapaka.CodeResponse,
+		Identifier: 6,
+		Type:       eapaka.TypeAKA,
+		Subtype:    eapaka.SubtypeIdentity,
+		Attributes: []eapaka.Attribute{eapaka.IdentityAttribute(identity)},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(identity response) error = %v", err)
+	}
+	identityTranscript := [][]byte{identityRequestRaw, identityResponseRaw}
+	relayPacket := signedEAPRelayChallengeWithCheckcode(t, identity, e911AKAResult(), identityTranscript)
 	client := &fakeHTTPClient{responses: []*HTTPResponse{
 		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":12,"eap-relay-packet":"` + identityRequest + `"}`)},
 		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":13,"eap-relay-packet":"` + relayPacket + `"}`)},
@@ -261,6 +272,13 @@ func TestStartEmergencyAddressUpdateHandlesEAPRelayIdentityThenChallenge(t *test
 	secondPacket := decodeRelayPacket(t, second)
 	if secondPacket.Code != eapaka.CodeResponse || secondPacket.Subtype != eapaka.SubtypeChallenge {
 		t.Fatalf("challenge relay response=%+v", secondPacket)
+	}
+	checkcodeAttr, ok := eapaka.FindAttribute(secondPacket.Attributes, eapaka.AttributeCheckcode)
+	if !ok {
+		t.Fatal("challenge relay response missing AT_CHECKCODE")
+	}
+	if err := eapaka.VerifyCheckcodeAttribute(checkcodeAttr, identityTranscript); err != nil {
+		t.Fatalf("VerifyCheckcodeAttribute(response) error = %v", err)
 	}
 	if aka.calls != 1 {
 		t.Fatalf("AKA calls=%d, want one AKA calculation after identity", aka.calls)
@@ -527,6 +545,12 @@ func e911AKAResult() sim.AKAResult {
 
 func eapRelayIdentityRequest(t *testing.T) string {
 	t.Helper()
+	encoded, _ := eapRelayIdentityRequestRaw(t)
+	return encoded
+}
+
+func eapRelayIdentityRequestRaw(t *testing.T) (string, []byte) {
+	t.Helper()
 	packet := eapaka.Packet{
 		Code:       eapaka.CodeRequest,
 		Identifier: 6,
@@ -538,7 +562,7 @@ func eapRelayIdentityRequest(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("MarshalBinary() error = %v", err)
 	}
-	return base64.StdEncoding.EncodeToString(raw)
+	return base64.StdEncoding.EncodeToString(raw), raw
 }
 
 func eapRelayNotificationRequest(t *testing.T, code uint16) string {
@@ -571,6 +595,40 @@ func signedEAPRelayChallenge(t *testing.T, identity string, aka sim.AKAResult) s
 		Attributes: []eapaka.Attribute{
 			eapaka.RANDAttribute(bytesFrom(0x10, 16)),
 			eapaka.AUTNAttribute(bytesFrom(0x40, 16)),
+			eapaka.MACAttribute(nil),
+		},
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := eapaka.CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	packet.Attributes[len(packet.Attributes)-1] = eapaka.MACAttribute(mac)
+	raw, err = packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func signedEAPRelayChallengeWithCheckcode(t *testing.T, identity string, aka sim.AKAResult, transcript [][]byte) string {
+	t.Helper()
+	keys, err := eapaka.DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 7,
+		Type:       eapaka.TypeAKA,
+		Subtype:    eapaka.SubtypeChallenge,
+		Attributes: []eapaka.Attribute{
+			eapaka.RANDAttribute(bytesFrom(0x10, 16)),
+			eapaka.AUTNAttribute(bytesFrom(0x40, 16)),
+			eapaka.CheckcodeAttributeForPackets(transcript),
 			eapaka.MACAttribute(nil),
 		},
 	}

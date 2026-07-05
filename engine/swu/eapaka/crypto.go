@@ -105,6 +105,10 @@ func DeriveAKAPrimeKeys(identity, networkName string, autn16 []byte, aka sim.AKA
 }
 
 func BuildChallengeResponse(identity string, request Packet, aka sim.AKAResult) (Packet, Keys, error) {
+	return BuildChallengeResponseWithCheckcode(identity, request, aka, nil)
+}
+
+func BuildChallengeResponseWithCheckcode(identity string, request Packet, aka sim.AKAResult, identityPackets [][]byte) (Packet, Keys, error) {
 	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
 		return Packet{}, Keys{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
 	}
@@ -122,9 +126,16 @@ func BuildChallengeResponse(identity string, request Packet, aka sim.AKAResult) 
 	if err := verifyChallengeMAC(request.Type, keys.KAut, requestRaw); err != nil {
 		return Packet{}, Keys{}, err
 	}
+	includeCheckcode, err := verifyChallengeCheckcode(request, identityPackets)
+	if err != nil {
+		return Packet{}, Keys{}, err
+	}
 	responseAttrs := []Attribute{RESAttribute(aka.RES)}
 	if request.Type == TypeAKAPrime {
 		responseAttrs = append(responseAttrs, KDFAttribute(selectedKDF))
+	}
+	if includeCheckcode {
+		responseAttrs = append(responseAttrs, CheckcodeAttributeForPackets(identityPackets))
 	}
 	responseAttrs = append(responseAttrs, MACAttribute(nil))
 	response := Packet{
@@ -144,6 +155,17 @@ func BuildChallengeResponse(identity string, request Packet, aka sim.AKAResult) 
 	}
 	response.Attributes[len(response.Attributes)-1] = MACAttribute(mac)
 	return response, keys, nil
+}
+
+func verifyChallengeCheckcode(request Packet, identityPackets [][]byte) (bool, error) {
+	attr, ok := FindAttribute(request.Attributes, AttributeCheckcode)
+	if !ok {
+		return false, nil
+	}
+	if err := VerifyCheckcodeAttribute(attr, identityPackets); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func BuildAKAPrimeKDFNegotiationResponse(request Packet) (Packet, bool, error) {

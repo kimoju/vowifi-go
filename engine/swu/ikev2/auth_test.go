@@ -153,6 +153,8 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 	localSPI := []byte{0x01, 0x02, 0x03, 0x04}
 	random := bytes.NewReader(append(localSPI, bytes.Repeat([]byte{0x44}, 256)...))
 	exchanges := 0
+	var identityRequestRaw []byte
+	var identityTranscript [][]byte
 	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
 		msg, inner, err := UnprotectMessage(request, init.Keys, true)
 		if err != nil {
@@ -174,6 +176,7 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
+			identityRequestRaw = append([]byte(nil), rawReq...)
 			exchanges++
 			_, rawResp, err := ProtectMessage(authHeader(init, 1, false), init.Keys, false, []Payload{EAPPayload(rawReq)}, bytes.Repeat([]byte{0x91}, init.Keys.Profile.EncryptionBlockSize))
 			return rawResp, err
@@ -185,7 +188,8 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 			if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeIdentity {
 				t.Fatalf("identity response=%+v", pkt)
 			}
-			challenge := signedAKAChallenge(t, identity, aka)
+			identityTranscript = [][]byte{append([]byte(nil), identityRequestRaw...), append([]byte(nil), inner[0].Body...)}
+			challenge := signedAKAChallengeWithCheckcode(t, identity, aka, identityTranscript)
 			rawChallenge, err := challenge.MarshalBinary()
 			if err != nil {
 				return nil, err
@@ -206,6 +210,13 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 				return nil, err
 			}
 			if err := eapaka.VerifyMAC(eapKeys.KAut, raw, nil); err != nil {
+				return nil, err
+			}
+			checkcodeAttr, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeCheckcode)
+			if !ok {
+				t.Fatal("missing AT_CHECKCODE")
+			}
+			if err := eapaka.VerifyCheckcodeAttribute(checkcodeAttr, identityTranscript); err != nil {
 				return nil, err
 			}
 			notification := signedAKANotification(t, 14, eapKeys, eapaka.NotificationSuccess)
@@ -1063,6 +1074,36 @@ func signedAKAChallenge(t *testing.T, identity string, aka sim.AKAResult) eapaka
 		Attributes: []eapaka.Attribute{
 			eapaka.RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
 			eapaka.AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
+			eapaka.MACAttribute(nil),
+		},
+	}
+	raw, err := challenge.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := eapaka.CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	challenge.Attributes[len(challenge.Attributes)-1] = eapaka.MACAttribute(mac)
+	return challenge
+}
+
+func signedAKAChallengeWithCheckcode(t *testing.T, identity string, aka sim.AKAResult, transcript [][]byte) eapaka.Packet {
+	t.Helper()
+	keys, err := eapaka.DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	challenge := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 10,
+		Type:       eapaka.TypeAKA,
+		Subtype:    eapaka.SubtypeChallenge,
+		Attributes: []eapaka.Attribute{
+			eapaka.RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
+			eapaka.AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
+			eapaka.CheckcodeAttributeForPackets(transcript),
 			eapaka.MACAttribute(nil),
 		},
 	}

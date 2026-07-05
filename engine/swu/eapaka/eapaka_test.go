@@ -179,6 +179,35 @@ func TestNotificationAndClientErrorAttributes(t *testing.T) {
 	}
 }
 
+func TestCheckcodeAttribute(t *testing.T) {
+	packets := [][]byte{
+		{CodeRequest, 1, 0, 8, TypeAKA, SubtypeIdentity, 0, 0},
+		{CodeResponse, 1, 0, 8, TypeAKA, SubtypeIdentity, 0, 0},
+	}
+	attr := CheckcodeAttributeForPackets(packets)
+	value, err := attr.CheckcodeValue()
+	if err != nil {
+		t.Fatalf("CheckcodeValue() error = %v", err)
+	}
+	if len(value) != 20 {
+		t.Fatalf("checkcode length=%d, want 20", len(value))
+	}
+	if err := VerifyCheckcodeAttribute(attr, packets); err != nil {
+		t.Fatalf("VerifyCheckcodeAttribute() error = %v", err)
+	}
+	if err := VerifyCheckcodeAttribute(attr, [][]byte{packets[1], packets[0]}); !errors.Is(err, ErrInvalidCheckcode) {
+		t.Fatalf("VerifyCheckcodeAttribute(reordered) err=%v, want ErrInvalidCheckcode", err)
+	}
+
+	empty := CheckcodeAttributeForPackets(nil)
+	if value, err := empty.CheckcodeValue(); err != nil || len(value) != 0 {
+		t.Fatalf("empty CheckcodeValue() value=%x err=%v", value, err)
+	}
+	if err := VerifyCheckcodeAttribute(empty, nil); err != nil {
+		t.Fatalf("VerifyCheckcodeAttribute(empty) error = %v", err)
+	}
+}
+
 func TestAKAChallengeAttributes(t *testing.T) {
 	raw, err := (Packet{
 		Code:       CodeRequest,

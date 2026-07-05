@@ -48,21 +48,23 @@ type AuthResult struct {
 	IdentityResponseInner []Payload
 	EAPRequest            *eapaka.Packet
 	EAPAfterIdentity      *eapaka.Packet
+	IdentityTranscript    [][]byte
 	NextMessageID         uint32
 }
 
 type AKAChallengeConfig struct {
-	Transport InitTransport
-	Init      InitResult
-	Keys      IKEKeys
-	SIM       sim.AKAProvider
-	EAPKeys   eapaka.Keys
-	Identity  string
-	Request   eapaka.Packet
-	ChildSPI  []byte
-	MessageID uint32
-	Random    io.Reader
-	IV        []byte
+	Transport          InitTransport
+	Init               InitResult
+	Keys               IKEKeys
+	SIM                sim.AKAProvider
+	EAPKeys            eapaka.Keys
+	Identity           string
+	Request            eapaka.Packet
+	IdentityTranscript [][]byte
+	ChildSPI           []byte
+	MessageID          uint32
+	Random             io.Reader
+	IV                 []byte
 }
 
 type AKAChallengeResult struct {
@@ -127,6 +129,7 @@ type EAPIdentityExchange struct {
 	ResponseBytes []byte
 	ResponseInner []Payload
 	EAPNext       *eapaka.Packet
+	Transcript    [][]byte
 	NextMessageID uint32
 }
 
@@ -169,7 +172,7 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	if err != nil {
 		return AuthResult{}, err
 	}
-	eapReq, hasEAP, err := firstEAPPacket(initialInnerResp)
+	eapReq, eapReqRaw, hasEAP, err := firstEAPPacketWithRaw(initialInnerResp)
 	if err != nil {
 		return AuthResult{}, err
 	}
@@ -223,6 +226,7 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	out.IdentityRequestBytes = append([]byte(nil), identityReqBytes...)
 	out.IdentityResponseBytes = append([]byte(nil), identityRespBytes...)
 	out.IdentityResponseInner = clonePayloads(identityInnerResp)
+	out.IdentityTranscript = cloneByteSlices([][]byte{eapReqRaw, identityPacket})
 	out.NextMessageID = messageID + 2
 	if nextEAP, ok, err := firstEAPPacket(identityInnerResp); err != nil {
 		return AuthResult{}, err
@@ -274,6 +278,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 	if identity == "" {
 		identity = strings.TrimSpace(string(cfg.InitiatorID.Data))
 	}
+	identityTranscript := cloneByteSlices(auth.IdentityTranscript)
 	for i := 0; i < maxFullAuthEAPExchanges; i++ {
 		if next == nil {
 			return out, fmt.Errorf("%w: IKE_AUTH did not complete EAP", ErrInvalidAuthResponse)
@@ -295,19 +300,25 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			return out, fmt.Errorf("%w: unexpected EAP code %d", ErrInvalidAuthResponse, next.Code)
 		}
 		if next.Subtype == eapaka.SubtypeIdentity {
+			_, requestRaw, _, err := firstEAPPacketWithRaw(out.FinalResponseInner)
+			if err != nil {
+				return FullAuthResult{}, err
+			}
 			exchange, err := runIKEAuthIdentityExchange(ctx, identityExchangeConfig{
-				Transport: cfg.Transport,
-				Init:      cfg.Init,
-				Keys:      cfg.Keys,
-				Random:    cfg.Random,
-				Request:   *next,
-				Identity:  identity,
-				MessageID: out.NextMessageID,
+				Transport:  cfg.Transport,
+				Init:       cfg.Init,
+				Keys:       cfg.Keys,
+				Random:     cfg.Random,
+				Request:    *next,
+				RequestRaw: requestRaw,
+				Identity:   identity,
+				MessageID:  out.NextMessageID,
 			})
 			if err != nil {
 				return FullAuthResult{}, err
 			}
 			out.IdentityExchanges = append(out.IdentityExchanges, exchange)
+			identityTranscript = append(identityTranscript, exchange.Transcript...)
 			out.NextMessageID = exchange.NextMessageID
 			out.FinalResponseBytes = append([]byte(nil), exchange.ResponseBytes...)
 			out.FinalResponseInner = clonePayloads(exchange.ResponseInner)
@@ -321,16 +332,17 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			continue
 		}
 		challenge, err := RunIKE_AUTH_AKAChallenge(ctx, AKAChallengeConfig{
-			Transport: cfg.Transport,
-			Init:      cfg.Init,
-			Keys:      cfg.Keys,
-			SIM:       cfg.SIM,
-			EAPKeys:   out.EAPKeys,
-			Identity:  identity,
-			Request:   *next,
-			ChildSPI:  localChildSPI,
-			MessageID: out.NextMessageID,
-			Random:    cfg.Random,
+			Transport:          cfg.Transport,
+			Init:               cfg.Init,
+			Keys:               cfg.Keys,
+			SIM:                cfg.SIM,
+			EAPKeys:            out.EAPKeys,
+			Identity:           identity,
+			Request:            *next,
+			IdentityTranscript: identityTranscript,
+			ChildSPI:           localChildSPI,
+			MessageID:          out.NextMessageID,
+			Random:             cfg.Random,
 		})
 		if err != nil {
 			return FullAuthResult{}, err
@@ -422,7 +434,7 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 			if identity == "" {
 				return AKAChallengeResult{}, fmt.Errorf("%w: identity is empty", ErrInvalidAuthConfig)
 			}
-			eapResp, eapKeys, err = eapaka.BuildChallengeResponse(identity, cfg.Request, aka)
+			eapResp, eapKeys, err = eapaka.BuildChallengeResponseWithCheckcode(identity, cfg.Request, aka, cfg.IdentityTranscript)
 			if err != nil {
 				return AKAChallengeResult{}, err
 			}
@@ -594,13 +606,14 @@ func buildAKAControlResponse(request eapaka.Packet, keys eapaka.Keys) (eapaka.Pa
 }
 
 type identityExchangeConfig struct {
-	Transport InitTransport
-	Init      InitResult
-	Keys      IKEKeys
-	Random    io.Reader
-	Request   eapaka.Packet
-	Identity  string
-	MessageID uint32
+	Transport  InitTransport
+	Init       InitResult
+	Keys       IKEKeys
+	Random     io.Reader
+	Request    eapaka.Packet
+	RequestRaw []byte
+	Identity   string
+	MessageID  uint32
 }
 
 func runIKEAuthIdentityExchange(ctx context.Context, cfg identityExchangeConfig) (EAPIdentityExchange, error) {
@@ -623,6 +636,14 @@ func runIKEAuthIdentityExchange(ctx context.Context, cfg identityExchangeConfig)
 	}
 	if err := validateKeySet(keys); err != nil {
 		return EAPIdentityExchange{}, err
+	}
+	requestRaw := append([]byte(nil), cfg.RequestRaw...)
+	if len(requestRaw) == 0 {
+		encoded, err := cfg.Request.MarshalBinary()
+		if err != nil {
+			return EAPIdentityExchange{}, err
+		}
+		requestRaw = encoded
 	}
 	response := eapaka.Packet{
 		Code:       eapaka.CodeResponse,
@@ -657,6 +678,7 @@ func runIKEAuthIdentityExchange(ctx context.Context, cfg identityExchangeConfig)
 		RequestBytes:  append([]byte(nil), reqBytes...),
 		ResponseBytes: append([]byte(nil), respBytes...),
 		ResponseInner: clonePayloads(inner),
+		Transcript:    cloneByteSlices([][]byte{requestRaw, raw}),
 		NextMessageID: cfg.MessageID + 1,
 	}
 	if next, ok, err := firstEAPPacket(inner); err != nil {
@@ -748,17 +770,22 @@ func unprotectAuthResponse(raw []byte, init InitResult, keys IKEKeys, messageID 
 }
 
 func firstEAPPacket(payloads []Payload) (eapaka.Packet, bool, error) {
+	pkt, _, ok, err := firstEAPPacketWithRaw(payloads)
+	return pkt, ok, err
+}
+
+func firstEAPPacketWithRaw(payloads []Payload) (eapaka.Packet, []byte, bool, error) {
 	for _, p := range payloads {
 		if p.Type != PayloadEAP {
 			continue
 		}
 		pkt, err := eapaka.ParsePacket(p.Body)
 		if err != nil {
-			return eapaka.Packet{}, false, err
+			return eapaka.Packet{}, nil, false, err
 		}
-		return pkt, true, nil
+		return pkt, append([]byte(nil), p.Body...), true, nil
 	}
-	return eapaka.Packet{}, false, nil
+	return eapaka.Packet{}, nil, false, nil
 }
 
 func authFinalResponse(auth AuthResult) ([]Payload, []byte) {

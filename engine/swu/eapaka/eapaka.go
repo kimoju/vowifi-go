@@ -1,6 +1,8 @@
 package eapaka
 
 import (
+	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -48,6 +50,8 @@ const (
 	AttributeClientErrorCode uint8 = 22
 	AttributeKDFInput        uint8 = 23
 	AttributeKDF             uint8 = 24
+	AttributeCheckcode       uint8 = 134
+	AttributeResultInd       uint8 = 135
 )
 
 const (
@@ -69,6 +73,7 @@ const (
 var (
 	ErrInvalidPacket    = errors.New("invalid eap-aka packet")
 	ErrInvalidAttribute = errors.New("invalid eap-aka attribute")
+	ErrInvalidCheckcode = errors.New("invalid eap-aka checkcode")
 )
 
 type Packet struct {
@@ -271,6 +276,25 @@ func ClientErrorCodeAttribute(code uint16) Attribute {
 	return Attribute{Type: AttributeClientErrorCode, Data: b[:]}
 }
 
+func CheckcodeAttribute(checkcode []byte) Attribute {
+	return FixedAttribute(AttributeCheckcode, checkcode)
+}
+
+func CheckcodeAttributeForPackets(packets [][]byte) Attribute {
+	if len(packets) == 0 {
+		return CheckcodeAttribute(nil)
+	}
+	return CheckcodeAttribute(IdentityCheckcode(packets))
+}
+
+func IdentityCheckcode(packets [][]byte) []byte {
+	h := sha1.New()
+	for _, packet := range packets {
+		_, _ = h.Write(packet)
+	}
+	return h.Sum(nil)
+}
+
 func FindAttribute(attrs []Attribute, attributeType uint8) (Attribute, bool) {
 	for _, attr := range attrs {
 		if attr.Type == attributeType {
@@ -354,6 +378,35 @@ func (a Attribute) NotificationValue() (uint16, error) {
 
 func (a Attribute) ClientErrorCodeValue() (uint16, error) {
 	return a.directUint16Value()
+}
+
+func (a Attribute) CheckcodeValue() ([]byte, error) {
+	switch len(a.Data) {
+	case 2:
+		return nil, nil
+	case 22:
+		return append([]byte(nil), a.Data[2:]...), nil
+	default:
+		return nil, fmt.Errorf("%w: checkcode value length %d", ErrInvalidAttribute, len(a.Data))
+	}
+}
+
+func VerifyCheckcodeAttribute(attr Attribute, packets [][]byte) error {
+	value, err := attr.CheckcodeValue()
+	if err != nil {
+		return err
+	}
+	if len(value) == 0 {
+		if len(packets) == 0 {
+			return nil
+		}
+		return ErrInvalidCheckcode
+	}
+	expected := IdentityCheckcode(packets)
+	if subtle.ConstantTimeCompare(value, expected) != 1 {
+		return ErrInvalidCheckcode
+	}
+	return nil
 }
 
 func (a Attribute) directUint16Value() (uint16, error) {
