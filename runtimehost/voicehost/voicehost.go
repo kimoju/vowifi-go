@@ -58,11 +58,12 @@ type OutboundCallRequest struct {
 }
 
 type OutboundCallResult struct {
-	Accepted   bool
-	StatusCode int
-	Reason     string
-	LocalSDP   SDPInfo
-	RawSDP     []byte
+	Accepted                   bool
+	StatusCode                 int
+	Reason                     string
+	RegistrationRecoveryNeeded bool
+	LocalSDP                   SDPInfo
+	RawSDP                     []byte
 }
 
 type DialogInfo struct {
@@ -90,12 +91,13 @@ type DialogInfoRequest struct {
 }
 
 type DialogInfoResult struct {
-	Accepted    bool
-	StatusCode  int
-	Reason      string
-	ContentType string
-	Body        []byte
-	Headers     map[string]string
+	Accepted                   bool
+	StatusCode                 int
+	Reason                     string
+	RegistrationRecoveryNeeded bool
+	ContentType                string
+	Body                       []byte
+	Headers                    map[string]string
 }
 
 type DialogUpdateRequest struct {
@@ -107,12 +109,13 @@ type DialogUpdateRequest struct {
 }
 
 type DialogUpdateResult struct {
-	Accepted    bool
-	StatusCode  int
-	Reason      string
-	ContentType string
-	Body        []byte
-	Headers     map[string]string
+	Accepted                   bool
+	StatusCode                 int
+	Reason                     string
+	RegistrationRecoveryNeeded bool
+	ContentType                string
+	Body                       []byte
+	Headers                    map[string]string
 }
 
 type DialogReinviteRequest struct {
@@ -124,12 +127,13 @@ type DialogReinviteRequest struct {
 }
 
 type DialogReinviteResult struct {
-	Accepted    bool
-	StatusCode  int
-	Reason      string
-	ContentType string
-	Body        []byte
-	Headers     map[string]string
+	Accepted                   bool
+	StatusCode                 int
+	Reason                     string
+	RegistrationRecoveryNeeded bool
+	ContentType                string
+	Body                       []byte
+	Headers                    map[string]string
 }
 
 type Gateway struct {

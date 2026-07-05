@@ -164,6 +164,9 @@ protocol layers needed by VoHive:
 - IMS in-dialog SIP INFO forwarding for outbound and inbound voice dialogs,
   including DTMF-style payloads, Info-Package propagation, response body/header
   mapping, and dialog CSeq advancement
+- outbound IMS voice/dialog results flag recoverable registration or route
+  failures such as 481, 503, and other transient IMS 5xx responses so the host
+  can trigger IMS re-registration before retrying media or dialog operations
 - local softphone in-dialog SIP UPDATE forwarding to IMS dialogs, including
   session refresh/media renegotiation SDP validation, RTP relay endpoint
   rewriting, response body/header mapping, remote Contact refresh, and dialog

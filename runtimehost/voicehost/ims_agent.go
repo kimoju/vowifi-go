@@ -118,7 +118,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		})
 		if err != nil {
 			a.deleteDialog(strings.TrimSpace(req.CallID))
-			return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed"}, err
+			return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if resp.StatusCode == 422 && !retriedSessionInterval {
 			if minSE := minSEHeader(resp.Headers); minSE > cfg.SessionExpires {
@@ -145,9 +145,10 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		}
 		a.deleteDialog(strings.TrimSpace(req.CallID))
 		return OutboundCallResult{
-			Accepted:   false,
-			StatusCode: outboundStatusCode(resp.StatusCode, 486),
-			Reason:     firstVoiceNonEmpty(resp.Reason, fmt.Sprintf("IMS rejected call: %d", resp.StatusCode)),
+			Accepted:                   false,
+			StatusCode:                 outboundStatusCode(resp.StatusCode, 486),
+			Reason:                     firstVoiceNonEmpty(resp.Reason, fmt.Sprintf("IMS rejected call: %d", resp.StatusCode)),
+			RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
 		}, nil
 	}
 	if routeSet := recordRouteSet(resp.Headers); len(routeSet) > 0 {
@@ -281,15 +282,16 @@ func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoReq
 	a.mu.Unlock()
 	resp, err := a.Transport.RoundTripRequest(ctx, info)
 	if err != nil {
-		return DialogInfoResult{Accepted: false, Reason: "IMS INFO failed"}, err
+		return DialogInfoResult{Accepted: false, Reason: "IMS INFO failed", RegistrationRecoveryNeeded: true}, err
 	}
 	return DialogInfoResult{
-		Accepted:    resp.StatusCode >= 200 && resp.StatusCode < 300,
-		StatusCode:  outboundStatusCode(resp.StatusCode, 500),
-		Reason:      firstVoiceNonEmpty(resp.Reason, "OK"),
-		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
-		Body:        append([]byte(nil), resp.Body...),
-		Headers:     firstValueSIPHeaders(resp.Headers),
+		Accepted:                   resp.StatusCode >= 200 && resp.StatusCode < 300,
+		StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
+		Reason:                     firstVoiceNonEmpty(resp.Reason, "OK"),
+		RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+		ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:                       append([]byte(nil), resp.Body...),
+		Headers:                    firstValueSIPHeaders(resp.Headers),
 	}, nil
 }
 
@@ -338,7 +340,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 	a.mu.Unlock()
 	resp, err := a.Transport.RoundTripRequest(ctx, update)
 	if err != nil {
-		return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE failed"}, err
+		return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE failed", RegistrationRecoveryNeeded: true}, err
 	}
 	if resp.StatusCode == 422 {
 		if retryCfg, ok := retryDialogConfigForMinSE(cfg, update.Headers, resp.Headers); ok {
@@ -361,7 +363,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 			a.mu.Unlock()
 			resp, err = a.Transport.RoundTripRequest(ctx, retryUpdate)
 			if err != nil {
-				return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE retry failed"}, err
+				return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE retry failed", RegistrationRecoveryNeeded: true}, err
 			}
 		}
 	}
@@ -386,12 +388,13 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 		a.mu.Unlock()
 	}
 	return DialogUpdateResult{
-		Accepted:    accepted,
-		StatusCode:  outboundStatusCode(resp.StatusCode, 500),
-		Reason:      firstVoiceNonEmpty(resp.Reason, "OK"),
-		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
-		Body:        resultBody,
-		Headers:     firstValueSIPHeaders(resp.Headers),
+		Accepted:                   accepted,
+		StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
+		Reason:                     firstVoiceNonEmpty(resp.Reason, "OK"),
+		RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+		ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:                       resultBody,
+		Headers:                    firstValueSIPHeaders(resp.Headers),
 	}, nil
 }
 
@@ -463,7 +466,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 		return nil
 	})
 	if err != nil {
-		return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE failed"}, err
+		return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE failed", RegistrationRecoveryNeeded: true}, err
 	}
 	if resp.StatusCode == 422 {
 		if retryCfg, ok := retryDialogConfigForMinSE(cfg, invite.Headers, resp.Headers); ok {
@@ -513,7 +516,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 				return nil
 			})
 			if err != nil {
-				return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE retry failed"}, err
+				return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE retry failed", RegistrationRecoveryNeeded: true}, err
 			}
 		}
 	}
@@ -525,10 +528,11 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			}
 		}
 		return DialogReinviteResult{
-			Accepted:   false,
-			StatusCode: outboundStatusCode(resp.StatusCode, 488),
-			Reason:     firstVoiceNonEmpty(resp.Reason, "re-INVITE rejected"),
-			Headers:    firstValueSIPHeaders(resp.Headers),
+			Accepted:                   false,
+			StatusCode:                 outboundStatusCode(resp.StatusCode, 488),
+			Reason:                     firstVoiceNonEmpty(resp.Reason, "re-INVITE rejected"),
+			RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+			Headers:                    firstValueSIPHeaders(resp.Headers),
 		}, nil
 	}
 	ackCfg := activeCfg
@@ -722,6 +726,15 @@ func outboundStatusCode(code, fallback int) int {
 		return code
 	}
 	return fallback
+}
+
+func imsRegistrationRecoveryNeededStatus(code int) bool {
+	switch code {
+	case 408, 430, 480, 481, 500, 502, 503, 504, 580:
+		return true
+	default:
+		return code >= 500 && code < 600
+	}
 }
 
 func minSEHeader(headers map[string][]string) int {

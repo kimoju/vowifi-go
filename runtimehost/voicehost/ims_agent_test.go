@@ -126,6 +126,9 @@ func TestIMSOutboundAgentSendsInDialogInfoAndAdvancesCSeq(t *testing.T) {
 	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "info-ok" {
 		t.Fatalf("SendDialogInfo() result=%+v err=%v", result, err)
 	}
+	if result.RegistrationRecoveryNeeded {
+		t.Fatalf("successful INFO requested registration recovery: %+v", result)
+	}
 	if len(transport.requests) != 2 || transport.requests[1].Method != "INFO" {
 		t.Fatalf("requests=%+v", transport.requests)
 	}
@@ -140,6 +143,48 @@ func TestIMSOutboundAgentSendsInDialogInfoAndAdvancesCSeq(t *testing.T) {
 	}
 	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
 		t.Fatalf("BYE after INFO=%+v", transport.requests)
+	}
+}
+
+func TestIMSOutboundAgentDialogInfo481RequestsRegistrationRecovery(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{StatusCode: 481, Reason: "Call/Transaction Does Not Exist"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-info-recover",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogInfo(context.Background(), DialogInfoRequest{
+		CallID:      "call-info-recover",
+		ContentType: "application/dtmf-relay",
+		InfoPackage: "dtmf",
+		Body:        []byte("Signal=1\r\nDuration=160\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("SendDialogInfo() error = %v", err)
+	}
+	if result.Accepted || result.StatusCode != 481 || !result.RegistrationRecoveryNeeded {
+		t.Fatalf("SendDialogInfo() result=%+v", result)
 	}
 }
 
@@ -191,6 +236,9 @@ func TestIMSOutboundAgentSendsInDialogUpdateAndAdvancesCSeq(t *testing.T) {
 	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "update-ok" || !strings.Contains(string(result.Body), "m=audio 49180") {
 		t.Fatalf("SendDialogUpdate() result=%+v err=%v", result, err)
 	}
+	if result.RegistrationRecoveryNeeded {
+		t.Fatalf("successful UPDATE requested registration recovery: %+v", result)
+	}
 	if len(transport.requests) != 2 || transport.requests[1].Method != "UPDATE" {
 		t.Fatalf("requests=%+v", transport.requests)
 	}
@@ -206,6 +254,45 @@ func TestIMSOutboundAgentSendsInDialogUpdateAndAdvancesCSeq(t *testing.T) {
 	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
 		transport.requests[2].URI != "sip:updated@198.51.100.2:5060" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
 		t.Fatalf("BYE after UPDATE=%+v", transport.requests)
+	}
+}
+
+func TestIMSOutboundAgentDialogUpdate503RequestsRegistrationRecovery(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{StatusCode: 503, Reason: "Service Unavailable"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-update-recover",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogUpdate(context.Background(), DialogUpdateRequest{
+		CallID: "call-update-recover",
+	})
+	if err != nil {
+		t.Fatalf("SendDialogUpdate() error = %v", err)
+	}
+	if result.Accepted || result.StatusCode != 503 || !result.RegistrationRecoveryNeeded {
+		t.Fatalf("SendDialogUpdate() result=%+v", result)
 	}
 }
 
@@ -402,6 +489,9 @@ func TestIMSOutboundAgentSendsInDialogReinviteAndAdvancesCSeq(t *testing.T) {
 	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "reinvite-ok" || !strings.Contains(string(result.Body), "m=audio 49180") {
 		t.Fatalf("SendDialogReinvite() result=%+v err=%v", result, err)
 	}
+	if result.RegistrationRecoveryNeeded {
+		t.Fatalf("successful re-INVITE requested registration recovery: %+v", result)
+	}
 	if len(transport.requests) != 2 || transport.requests[1].Method != "INVITE" {
 		t.Fatalf("requests=%+v", transport.requests)
 	}
@@ -423,6 +513,56 @@ func TestIMSOutboundAgentSendsInDialogReinviteAndAdvancesCSeq(t *testing.T) {
 		transport.requests[2].URI != "sip:updated@198.51.100.2:5060" ||
 		transport.requests[2].Headers["CSeq"] != "3 BYE" {
 		t.Fatalf("BYE after re-INVITE=%+v", transport.requests)
+	}
+}
+
+func TestIMSOutboundAgentDialogReinvite481RequestsRegistrationRecovery(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 481,
+			Reason:     "Call/Transaction Does Not Exist",
+			Headers:    map[string][]string{"To": {"<sip:+18005551212@ims.example>;tag=gone-tag"}},
+		},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-reinvite-recover",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogReinvite(context.Background(), DialogReinviteRequest{
+		CallID:      "call-reinvite-recover",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("192.0.2.60", 4010)),
+	})
+	if err != nil {
+		t.Fatalf("SendDialogReinvite() error = %v", err)
+	}
+	if result.Accepted || result.StatusCode != 481 || !result.RegistrationRecoveryNeeded {
+		t.Fatalf("SendDialogReinvite() result=%+v", result)
+	}
+	if len(transport.writes) != 2 || transport.writes[1].Method != "ACK" ||
+		transport.writes[1].Headers["CSeq"] != "2 ACK" ||
+		!strings.Contains(transport.writes[1].Headers["To"], "gone-tag") {
+		t.Fatalf("ACK writes=%+v", transport.writes)
 	}
 }
 
@@ -678,6 +818,9 @@ func TestIMSOutboundAgentRejectedInviteAcksFinalResponse(t *testing.T) {
 	if result.Accepted || result.StatusCode != 486 || result.Reason != "Busy Here" {
 		t.Fatalf("result=%+v", result)
 	}
+	if result.RegistrationRecoveryNeeded {
+		t.Fatalf("busy rejection requested registration recovery: %+v", result)
+	}
 	if len(transport.requests) != 1 || transport.requests[0].Method != "INVITE" {
 		t.Fatalf("requests=%+v", transport.requests)
 	}
@@ -690,6 +833,36 @@ func TestIMSOutboundAgentRejectedInviteAcksFinalResponse(t *testing.T) {
 	}
 	if ack.Headers["Via"] == "" || ack.Headers["Via"] != transport.requests[0].Headers["Via"] {
 		t.Fatalf("ACK Via=%q INVITE Via=%q", ack.Headers["Via"], transport.requests[0].Headers["Via"])
+	}
+}
+
+func TestIMSOutboundAgentInvite503RequestsRegistrationRecovery(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 503,
+		Reason:     "Service Unavailable",
+		Headers:    map[string][]string{"To": {"<sip:+18005551212@ims.example>;tag=unavailable-tag"}},
+	}}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-invite-recover",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	})
+	if err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	if result.Accepted || result.StatusCode != 503 || !result.RegistrationRecoveryNeeded {
+		t.Fatalf("StartOutboundCall() result=%+v", result)
+	}
+	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
 	}
 }
 
