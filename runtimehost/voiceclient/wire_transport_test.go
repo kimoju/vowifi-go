@@ -370,6 +370,55 @@ func TestWireSIPTransportStopsInviteRetransmitAfterProvisional(t *testing.T) {
 	}
 }
 
+func TestWireSIPTransportReportsReliableProvisional(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		_, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		_, _ = pc.WriteTo([]byte("SIP/2.0 183 Session Progress\r\nRequire: 100rel\r\nRSeq: 7\r\nContent-Length: 0\r\n\r\n"), addr)
+		_, _ = pc.WriteTo([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"), addr)
+	}()
+
+	var provisionals []SIPResponse
+	resp, err := WireSIPTransport{
+		Network:    "udp",
+		ServerAddr: pc.LocalAddr().String(),
+		Timeout:    time.Second,
+	}.RoundTripInvite(context.Background(), SIPRequestMessage{
+		Method: "INVITE",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"To":           "<sip:callee@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Call-ID":      "provisional-callback",
+			"CSeq":         "1 INVITE",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Max-Forwards": "70",
+		},
+	}, func(ctx context.Context, req SIPRequestMessage, resp SIPResponse) error {
+		provisionals = append(provisionals, resp)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RoundTripInvite() error = %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("response=%+v", resp)
+	}
+	if len(provisionals) != 1 || provisionals[0].StatusCode != 183 || firstHeader(provisionals[0].Headers, "RSeq") != "7" {
+		t.Fatalf("provisionals=%+v", provisionals)
+	}
+}
+
 func TestWireSIPTransportInviteWaitsForFinalResponseAndWritesAck(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

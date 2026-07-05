@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -79,7 +80,22 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if err != nil {
 		return OutboundCallResult{Accepted: false, Reason: "build IMS INVITE failed"}, err
 	}
-	resp, err := a.Transport.RoundTripRequest(ctx, invite)
+	nextCSeq := cfg.CSeq + 1
+	resp, err := a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
+		prack, ok, err := buildReliableProvisionalPRACK(cfg, provisional, nextCSeq)
+		if err != nil || !ok {
+			return err
+		}
+		prackResp, err := a.Transport.RoundTripRequest(ctx, prack)
+		if err != nil {
+			return fmt.Errorf("IMS PRACK failed: %w", err)
+		}
+		if prackResp.StatusCode < 200 || prackResp.StatusCode >= 300 {
+			return fmt.Errorf("IMS PRACK rejected: %d %s", prackResp.StatusCode, strings.TrimSpace(prackResp.Reason))
+		}
+		nextCSeq++
+		return nil
+	})
 	if err != nil {
 		return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed"}, err
 	}
@@ -120,7 +136,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		a.dialogs = make(map[string]imsDialogState)
 	}
 	byeCfg := cfg
-	byeCfg.CSeq = 2
+	byeCfg.CSeq = nextCSeq
 	a.dialogs[strings.TrimSpace(req.CallID)] = imsDialogState{cfg: byeCfg, relay: relay}
 	a.mu.Unlock()
 	closeRelayOnError = false
@@ -167,6 +183,66 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	delete(a.dialogs, callID)
 	a.mu.Unlock()
 	return nil
+}
+
+func (a *IMSOutboundAgent) roundTripInvite(ctx context.Context, invite voiceclient.SIPRequestMessage, onProvisional func(voiceclient.SIPResponse) error) (voiceclient.SIPResponse, error) {
+	if a == nil || a.Transport == nil {
+		return voiceclient.SIPResponse{}, ErrIMSVoiceAgentNotReady
+	}
+	if inviteTransport, ok := a.Transport.(voiceclient.SIPInviteTransport); ok {
+		return inviteTransport.RoundTripInvite(ctx, invite, func(_ context.Context, _ voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
+			if onProvisional == nil {
+				return nil
+			}
+			return onProvisional(resp)
+		})
+	}
+	return a.Transport.RoundTripRequest(ctx, invite)
+}
+
+func buildReliableProvisionalPRACK(cfg voiceclient.DialogRequestConfig, resp voiceclient.SIPResponse, cseq int) (voiceclient.SIPRequestMessage, bool, error) {
+	if resp.StatusCode <= 100 || resp.StatusCode >= 200 {
+		return voiceclient.SIPRequestMessage{}, false, nil
+	}
+	rseq := firstVoiceHeader(resp.Headers, "RSeq")
+	if strings.TrimSpace(rseq) == "" || !headerHasToken(resp.Headers, "Require", "100rel") {
+		return voiceclient.SIPRequestMessage{}, false, nil
+	}
+	prackCfg := cfg
+	prackCfg.CSeq = cseq
+	prackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+		prackCfg.RemoteTargetURI = contact
+	}
+	prack, err := voiceclient.BuildPrackRequest(prackCfg, strings.TrimSpace(rseq)+" "+strconv.Itoa(outboundInviteCSeq(cfg.CSeq))+" INVITE")
+	return prack, err == nil, err
+}
+
+func outboundInviteCSeq(cseq int) int {
+	if cseq <= 0 {
+		return 1
+	}
+	return cseq
+}
+
+func headerHasToken(headers map[string][]string, name, token string) bool {
+	token = strings.ToLower(strings.TrimSpace(token))
+	if token == "" {
+		return false
+	}
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				if strings.EqualFold(strings.TrimSpace(part), token) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (a *IMSOutboundAgent) remoteURI(callee string) string {

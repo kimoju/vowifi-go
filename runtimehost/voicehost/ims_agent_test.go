@@ -79,6 +79,72 @@ func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{
+		provisionals: []voiceclient.SIPResponse{
+			{
+				StatusCode: 183,
+				Reason:     "Session Progress",
+				Headers: map[string][]string{
+					"To":      {"<sip:+18005551212@ims.example>;tag=early-tag"},
+					"Contact": {"<sip:early@198.51.100.1:5060>"},
+					"Require": {"100rel"},
+					"RSeq":    {"42"},
+				},
+			},
+		},
+		responses: []voiceclient.SIPResponse{
+			{StatusCode: 200, Reason: "OK"},
+			{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers: map[string][]string{
+					"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+					"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+				},
+				Body: []byte(sampleSDP("203.0.113.10", 49170)),
+			},
+			{StatusCode: 200, Reason: "OK"},
+		},
+	}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID:    "call-100rel",
+		Callee:    "+18005551212",
+		RawSDP:    []byte(sampleSDP("192.0.2.50", 4002)),
+		RemoteSDP: SDPInfo{ConnectionIP: "192.0.2.50", MediaPort: 4002},
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("StartOutboundCall() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[0].Method != "INVITE" || transport.requests[1].Method != "PRACK" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	prack := transport.requests[1]
+	if prack.Headers["RAck"] != "42 1 INVITE" || prack.Headers["CSeq"] != "2 PRACK" {
+		t.Fatalf("PRACK=%+v", prack)
+	}
+	if prack.URI != "sip:early@198.51.100.1:5060" || !strings.Contains(prack.Headers["To"], "early-tag") {
+		t.Fatalf("PRACK target/dialog=%+v", prack)
+	}
+	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" {
+		t.Fatalf("writes=%+v", transport.writes)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-100rel"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE requests=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentRejectedInviteDoesNotAck(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 486, Reason: "Busy Here"}}}
 	agent := &IMSOutboundAgent{
@@ -197,19 +263,37 @@ func TestIMSOutboundAgentUsesRTPRelayWhenConfigured(t *testing.T) {
 }
 
 type fakeIMSVoiceTransport struct {
-	requests  []voiceclient.SIPRequestMessage
-	writes    []voiceclient.SIPRequestMessage
-	responses []voiceclient.SIPResponse
+	requests     []voiceclient.SIPRequestMessage
+	writes       []voiceclient.SIPRequestMessage
+	provisionals []voiceclient.SIPResponse
+	responses    []voiceclient.SIPResponse
 }
 
 func (t *fakeIMSVoiceTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
 	t.requests = append(t.requests, msg)
+	return t.nextResponse(), nil
+}
+
+func (t *fakeIMSVoiceTransport) RoundTripInvite(ctx context.Context, msg voiceclient.SIPRequestMessage, onProvisional voiceclient.ProvisionalResponseHandler) (voiceclient.SIPResponse, error) {
+	t.requests = append(t.requests, msg)
+	for _, resp := range t.provisionals {
+		if onProvisional != nil {
+			if err := onProvisional(ctx, msg, resp); err != nil {
+				return voiceclient.SIPResponse{}, err
+			}
+		}
+	}
+	t.provisionals = nil
+	return t.nextResponse(), nil
+}
+
+func (t *fakeIMSVoiceTransport) nextResponse() voiceclient.SIPResponse {
 	if len(t.responses) == 0 {
-		return voiceclient.SIPResponse{StatusCode: 500, Reason: "empty"}, nil
+		return voiceclient.SIPResponse{StatusCode: 500, Reason: "empty"}
 	}
 	resp := t.responses[0]
 	t.responses = t.responses[1:]
-	return resp, nil
+	return resp
 }
 
 func (t *fakeIMSVoiceTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {

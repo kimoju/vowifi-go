@@ -16,6 +16,12 @@ type SIPRequestTransport interface {
 	WriteRequest(context.Context, SIPRequestMessage) error
 }
 
+type ProvisionalResponseHandler func(context.Context, SIPRequestMessage, SIPResponse) error
+
+type SIPInviteTransport interface {
+	RoundTripInvite(context.Context, SIPRequestMessage, ProvisionalResponseHandler) (SIPResponse, error)
+}
+
 type WireSIPTransport struct {
 	Network               string
 	ServerAddr            string
@@ -27,6 +33,14 @@ type WireSIPTransport struct {
 }
 
 func (t WireSIPTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMessage) (SIPResponse, error) {
+	return t.roundTripRequest(ctx, msg, nil)
+}
+
+func (t WireSIPTransport) RoundTripInvite(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
+	return t.roundTripRequest(ctx, msg, onProvisional)
+}
+
+func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -47,7 +61,7 @@ func (t WireSIPTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMe
 	}
 	if strings.HasPrefix(network, "tcp") {
 		reader := bufio.NewReader(conn)
-		return readFinalSIPResponse(reader, msg.Method)
+		return readFinalSIPResponse(ctx, reader, msg, onProvisional)
 	}
 	buf := make([]byte, 65535)
 	interval := sipRetransmitInterval(timeout, t.RetransmitInterval)
@@ -92,6 +106,11 @@ func (t WireSIPTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMe
 		}
 		if !isProvisionalResponse(resp.StatusCode, msg.Method) {
 			return resp, nil
+		}
+		if onProvisional != nil {
+			if err := onProvisional(ctx, msg, resp); err != nil {
+				return SIPResponse{}, err
+			}
 		}
 		gotResponse = true
 	}
@@ -162,7 +181,7 @@ func (t WireSIPTransport) dial(ctx context.Context, msg SIPRequestMessage) (net.
 	return conn, network, timeout, nil
 }
 
-func readFinalSIPResponse(reader *bufio.Reader, method string) (SIPResponse, error) {
+func readFinalSIPResponse(ctx context.Context, reader *bufio.Reader, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	for {
 		raw, err := readSIPStreamMessage(reader)
 		if err != nil {
@@ -172,8 +191,13 @@ func readFinalSIPResponse(reader *bufio.Reader, method string) (SIPResponse, err
 		if err != nil {
 			return SIPResponse{}, err
 		}
-		if !isProvisionalResponse(resp.StatusCode, method) {
+		if !isProvisionalResponse(resp.StatusCode, msg.Method) {
 			return resp, nil
+		}
+		if onProvisional != nil {
+			if err := onProvisional(ctx, msg, resp); err != nil {
+				return SIPResponse{}, err
+			}
 		}
 	}
 }
