@@ -1,11 +1,75 @@
 package ikev2
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 )
 
 var ErrInvalidInformational = errors.New("invalid ikev2 informational exchange")
+
+type InformationalConfig struct {
+	Transport     InitTransport
+	Init          InitResult
+	Keys          IKEKeys
+	MessageID     uint32
+	FromResponder bool
+	Payloads      []Payload
+	Random        io.Reader
+	IV            []byte
+}
+
+type InformationalResult struct {
+	RequestBytes  []byte
+	ResponseBytes []byte
+	ResponseInner []Payload
+	NextMessageID uint32
+}
+
+func RunInformationalExchange(ctx context.Context, cfg InformationalConfig) (InformationalResult, error) {
+	if cfg.Transport == nil {
+		return InformationalResult{}, fmt.Errorf("%w: transport is nil", ErrInvalidInformational)
+	}
+	keys := cfg.Keys
+	if keys.Profile.RequiredLength() == 0 {
+		keys = cfg.Init.Keys
+	}
+	if err := validateKeySet(keys); err != nil {
+		return InformationalResult{}, err
+	}
+	if cfg.Init.InitiatorSPI == 0 || cfg.Init.ResponderSPI == 0 {
+		return InformationalResult{}, fmt.Errorf("%w: missing IKE SPIs", ErrInvalidInformational)
+	}
+	iv, err := informationalIV(cfg.Random, keys.Profile, cfg.IV)
+	if err != nil {
+		return InformationalResult{}, err
+	}
+	requestFromInitiator := !cfg.FromResponder
+	_, reqBytes, err := BuildInformationalRequestFrom(cfg.Init, keys, cfg.MessageID, requestFromInitiator, cfg.Payloads, iv)
+	if err != nil {
+		return InformationalResult{}, err
+	}
+	respBytes, err := cfg.Transport.ExchangeIKE(ctx, reqBytes)
+	if err != nil {
+		return InformationalResult{}, err
+	}
+	_, inner, err := ParseInformationalResponseFrom(respBytes, cfg.Init, keys, cfg.MessageID, !requestFromInitiator)
+	if err != nil {
+		return InformationalResult{}, err
+	}
+	return InformationalResult{
+		RequestBytes:  append([]byte(nil), reqBytes...),
+		ResponseBytes: append([]byte(nil), respBytes...),
+		ResponseInner: clonePayloads(inner),
+		NextMessageID: cfg.MessageID + 1,
+	}, nil
+}
+
+func RunLivenessCheck(ctx context.Context, cfg InformationalConfig) (InformationalResult, error) {
+	cfg.Payloads = nil
+	return RunInformationalExchange(ctx, cfg)
+}
 
 func BuildInformationalRequest(init InitResult, keys IKEKeys, messageID uint32, inner []Payload, iv []byte) (Message, []byte, error) {
 	return BuildInformationalRequestFrom(init, keys, messageID, true, inner, iv)
@@ -86,4 +150,14 @@ func validateInformationalHeader(h Header, init InitResult, messageID uint32, fr
 		return fmt.Errorf("%w: unexpected flags", ErrInvalidInformational)
 	}
 	return nil
+}
+
+func informationalIV(random io.Reader, profile KeyMaterialProfile, override []byte) ([]byte, error) {
+	if len(override) > 0 {
+		if len(override) != profile.EncryptionBlockSize {
+			return nil, fmt.Errorf("%w: IV length %d != %d", ErrInvalidInformational, len(override), profile.EncryptionBlockSize)
+		}
+		return append([]byte(nil), override...), nil
+	}
+	return RandomIV(random, profile)
 }

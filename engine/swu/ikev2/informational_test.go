@@ -2,6 +2,7 @@ package ikev2
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"testing"
@@ -109,6 +110,55 @@ func TestInformationalRejectsUnexpectedHeader(t *testing.T) {
 	}
 }
 
+func TestRunInformationalExchangeSendsLivenessCheck(t *testing.T) {
+	init, keys := informationalFixture(t)
+	transport := &informationalExchangeTransport{
+		t:                    t,
+		init:                 init,
+		keys:                 keys,
+		messageID:            13,
+		requestFromInitiator: true,
+	}
+	res, err := RunLivenessCheck(context.Background(), InformationalConfig{
+		Transport: transport,
+		Init:      init,
+		Keys:      keys,
+		MessageID: 13,
+		IV:        bytes.Repeat([]byte{0x77}, keys.Profile.EncryptionBlockSize),
+	})
+	if err != nil {
+		t.Fatalf("RunLivenessCheck() error = %v", err)
+	}
+	if transport.requests != 1 || len(transport.requestInner) != 0 {
+		t.Fatalf("transport requests=%d inner=%+v", transport.requests, transport.requestInner)
+	}
+	if len(res.RequestBytes) == 0 || len(res.ResponseBytes) == 0 || len(res.ResponseInner) != 0 || res.NextMessageID != 14 {
+		t.Fatalf("res=%+v", res)
+	}
+}
+
+func TestRunInformationalExchangeRejectsBadResponse(t *testing.T) {
+	init, keys := informationalFixture(t)
+	transport := &informationalExchangeTransport{
+		t:                    t,
+		init:                 init,
+		keys:                 keys,
+		messageID:            14,
+		requestFromInitiator: true,
+		badResponseMessageID: true,
+	}
+	_, err := RunInformationalExchange(context.Background(), InformationalConfig{
+		Transport: transport,
+		Init:      init,
+		Keys:      keys,
+		MessageID: 14,
+		IV:        bytes.Repeat([]byte{0x78}, keys.Profile.EncryptionBlockSize),
+	})
+	if !errors.Is(err, ErrInvalidInformational) {
+		t.Fatalf("RunInformationalExchange() err=%v, want ErrInvalidInformational", err)
+	}
+}
+
 func informationalFixture(t *testing.T) (InitResult, IKEKeys) {
 	t.Helper()
 	profile, err := KeyMaterialProfileFromSA(DefaultIKEProposal())
@@ -124,4 +174,42 @@ func informationalFixture(t *testing.T) (InitResult, IKEKeys) {
 		ResponderSPI: 0x1112131415161718,
 		Keys:         keys,
 	}, keys
+}
+
+type informationalExchangeTransport struct {
+	t                    *testing.T
+	init                 InitResult
+	keys                 IKEKeys
+	messageID            uint32
+	requestFromInitiator bool
+	responseInner        []Payload
+	badResponseMessageID bool
+	requests             int
+	requestInner         []Payload
+}
+
+func (tr *informationalExchangeTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
+	tr.t.Helper()
+	_, inner, err := ParseInformationalRequestFrom(request, tr.init, tr.keys, tr.messageID, tr.requestFromInitiator)
+	if err != nil {
+		tr.t.Fatalf("ParseInformationalRequestFrom() error = %v", err)
+	}
+	tr.requests++
+	tr.requestInner = clonePayloads(inner)
+	messageID := tr.messageID
+	if tr.badResponseMessageID {
+		messageID++
+	}
+	_, raw, err := BuildInformationalResponseFrom(
+		tr.init,
+		tr.keys,
+		messageID,
+		!tr.requestFromInitiator,
+		tr.responseInner,
+		bytes.Repeat([]byte{0x79}, tr.keys.Profile.EncryptionBlockSize),
+	)
+	if err != nil {
+		tr.t.Fatalf("BuildInformationalResponseFrom() error = %v", err)
+	}
+	return raw, nil
 }

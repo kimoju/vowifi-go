@@ -148,6 +148,31 @@ func ESPDeletePayload(spis ...[]byte) (Payload, error) {
 	return DeletePayload(Delete{ProtocolID: ProtocolESP, SPIs: copied})
 }
 
+func ChildSADeletePayload(child ChildSAResult) (Payload, error) {
+	if len(child.LocalSPI) == 0 {
+		return Payload{}, fmt.Errorf("%w: missing local child SPI", ErrInvalidDelete)
+	}
+	return ESPDeletePayload(child.LocalSPI)
+}
+
+func TeardownDeletePayloads(child ChildSAResult, includeIKESA bool) ([]Payload, error) {
+	var out []Payload
+	if len(child.LocalSPI) > 0 {
+		payload, err := ChildSADeletePayload(child)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, payload)
+	}
+	if includeIKESA {
+		out = append(out, IKEDeletePayload())
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: no SAs selected", ErrInvalidDelete)
+	}
+	return out, nil
+}
+
 func validateDelete(d Delete) error {
 	switch d.ProtocolID {
 	case ProtocolIKE:

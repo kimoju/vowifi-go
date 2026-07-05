@@ -55,8 +55,9 @@ protocol layers needed by VoHive:
   key material derivation
 - IKEv2 key material split into SK_d/SK_ai/SK_ar/SK_ei/SK_er/SK_pi/SK_pr plus
   AES-CBC/HMAC protected SK payload construction and verification
-- IKEv2 encrypted INFORMATIONAL helpers for empty DPD liveness probes and
-  DELETE payloads for IKE/ESP/AH SA teardown
+- IKEv2 encrypted INFORMATIONAL exchange runner for empty DPD liveness probes
+  and DELETE payloads for IKE/ESP/AH SA teardown, plus SWu close-handler
+  wiring for graceful CHILD_SA/IKE_SA deletion
 - encrypted IKE_AUTH EAP-Identity exchange scaffolding, including IDi, CP,
   CHILD_SA/TSi/TSr request payloads, responder EAP parsing, and
   EAP-Response/Identity transmission

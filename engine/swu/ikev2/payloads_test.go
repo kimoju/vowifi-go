@@ -84,6 +84,33 @@ func TestDeletePayloadRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestTeardownDeletePayloadsUsesLocalChildSPI(t *testing.T) {
+	payloads, err := TeardownDeletePayloads(ChildSAResult{
+		LocalSPI:  []byte{0x11, 0x22, 0x33, 0x44},
+		RemoteSPI: []byte{0xaa, 0xbb, 0xcc, 0xdd},
+	}, true)
+	if err != nil {
+		t.Fatalf("TeardownDeletePayloads() error = %v", err)
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("payloads=%+v", payloads)
+	}
+	childDelete, err := ParseDelete(payloads[0].Body)
+	if err != nil {
+		t.Fatalf("ParseDelete(child) error = %v", err)
+	}
+	if childDelete.ProtocolID != ProtocolESP || len(childDelete.SPIs) != 1 || hex.EncodeToString(childDelete.SPIs[0]) != "11223344" {
+		t.Fatalf("childDelete=%+v", childDelete)
+	}
+	ikeDelete, err := ParseDelete(payloads[1].Body)
+	if err != nil {
+		t.Fatalf("ParseDelete(ike) error = %v", err)
+	}
+	if ikeDelete.ProtocolID != ProtocolIKE || len(ikeDelete.SPIs) != 0 {
+		t.Fatalf("ikeDelete=%+v", ikeDelete)
+	}
+}
+
 func TestKeyExchangePayload(t *testing.T) {
 	payload := KeyExchangePayload(DHGroupCurve25519, []byte{1, 2, 3})
 	if payload.Type != PayloadKE || hex.EncodeToString(payload.Body) != "001f0000010203" {
