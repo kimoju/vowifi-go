@@ -219,6 +219,9 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 			if err := eapaka.VerifyCheckcodeAttribute(checkcodeAttr, identityTranscript); err != nil {
 				return nil, err
 			}
+			if _, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeResultInd); !ok {
+				t.Fatal("missing AT_RESULT_IND")
+			}
 			notification := signedAKANotification(t, 14, eapKeys, eapaka.NotificationSuccess)
 			rawNotification, err := notification.MarshalBinary()
 			if err != nil {
@@ -1104,6 +1107,7 @@ func signedAKAChallengeWithCheckcode(t *testing.T, identity string, aka sim.AKAR
 			eapaka.RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
 			eapaka.AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
 			eapaka.CheckcodeAttributeForPackets(transcript),
+			eapaka.ResultIndAttribute(),
 			eapaka.MACAttribute(nil),
 		},
 	}

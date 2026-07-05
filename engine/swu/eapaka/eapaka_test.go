@@ -208,6 +208,24 @@ func TestCheckcodeAttribute(t *testing.T) {
 	}
 }
 
+func TestResultIndAttribute(t *testing.T) {
+	attr := ResultIndAttribute()
+	if attr.Type != AttributeResultInd {
+		t.Fatalf("type=%d, want AT_RESULT_IND", attr.Type)
+	}
+	if len(attr.Data) != 2 || attr.Data[0] != 0 || attr.Data[1] != 0 {
+		t.Fatalf("data=%x, want reserved zero bytes", attr.Data)
+	}
+	raw, err := attr.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	want := "87010000"
+	if hex.EncodeToString(raw) != want {
+		t.Fatalf("AT_RESULT_IND=%x, want %s", raw, want)
+	}
+}
+
 func TestAKAChallengeAttributes(t *testing.T) {
 	raw, err := (Packet{
 		Code:       CodeRequest,

@@ -137,6 +137,9 @@ func BuildChallengeResponseWithCheckcode(identity string, request Packet, aka si
 	if includeCheckcode {
 		responseAttrs = append(responseAttrs, CheckcodeAttributeForPackets(identityPackets))
 	}
+	if _, ok := FindAttribute(request.Attributes, AttributeResultInd); ok {
+		responseAttrs = append(responseAttrs, ResultIndAttribute())
+	}
 	responseAttrs = append(responseAttrs, MACAttribute(nil))
 	response := Packet{
 		Code:       CodeResponse,

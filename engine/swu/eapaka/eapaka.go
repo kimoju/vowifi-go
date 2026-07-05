@@ -280,6 +280,10 @@ func CheckcodeAttribute(checkcode []byte) Attribute {
 	return FixedAttribute(AttributeCheckcode, checkcode)
 }
 
+func ResultIndAttribute() Attribute {
+	return FixedAttribute(AttributeResultInd, nil)
+}
+
 func CheckcodeAttributeForPackets(packets [][]byte) Attribute {
 	if len(packets) == 0 {
 		return CheckcodeAttribute(nil)
