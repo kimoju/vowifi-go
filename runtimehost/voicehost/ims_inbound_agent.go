@@ -165,6 +165,9 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
 	}
+	if routeSet := recordRouteSet(resp.Headers); len(routeSet) > 0 {
+		cfg.RouteSet = routeSet
+	}
 	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, inviteCSeq: inboundCSeq(req.CSeq), relay: relay})
 	closeRelayOnError = false
 	return InboundCallResult{

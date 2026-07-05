@@ -14,8 +14,9 @@ func TestIMSInboundAgentInviteAckAndBye(t *testing.T) {
 			StatusCode: 200,
 			Reason:     "OK",
 			Headers: map[string][]string{
-				"To":      {"<sip:user@ims.example>;tag=client-tag"},
-				"Contact": {"<sip:client@192.0.2.50:5060>"},
+				"To":           {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact":      {"<sip:client@192.0.2.50:5060>"},
+				"Record-Route": {"<sip:client-proxy1.example;lr>, <sip:client-proxy2.example;lr>"},
 			},
 			Body: []byte(sampleSDP("192.0.2.50", 4002)),
 		},
@@ -69,6 +70,9 @@ func TestIMSInboundAgentInviteAckAndBye(t *testing.T) {
 	if transport.writes[0].URI != "sip:client@192.0.2.50:5060" || !strings.Contains(transport.writes[0].Headers["To"], "client-tag") {
 		t.Fatalf("ACK=%+v", transport.writes[0])
 	}
+	if transport.writes[0].Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" {
+		t.Fatalf("ACK Route=%q", transport.writes[0].Headers["Route"])
+	}
 
 	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-1"}); err != nil {
 		t.Fatalf("EndInboundCall() error = %v", err)
@@ -79,6 +83,9 @@ func TestIMSInboundAgentInviteAckAndBye(t *testing.T) {
 	bye := transport.requests[1]
 	if bye.URI != "sip:client@192.0.2.50:5060" || bye.Headers["CSeq"] != "2 BYE" {
 		t.Fatalf("BYE=%+v", bye)
+	}
+	if bye.Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" {
+		t.Fatalf("BYE Route=%q", bye.Headers["Route"])
 	}
 }
 
@@ -132,8 +139,9 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 			StatusCode: 200,
 			Reason:     "OK",
 			Headers: map[string][]string{
-				"To":      {"<sip:user@ims.example>;tag=client-tag"},
-				"Contact": {"<sip:client@192.0.2.50:5060>"},
+				"To":           {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact":      {"<sip:client@192.0.2.50:5060>"},
+				"Record-Route": {"<sip:client-proxy1.example;lr>, <sip:client-proxy2.example;lr>"},
 			},
 			Body: []byte(sampleSDP("192.0.2.50", 4002)),
 		},
@@ -168,6 +176,9 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	if len(transport.requests) != 2 || transport.requests[1].Method != "PRACK" || transport.requests[1].Headers["RAck"] != "1 1 INVITE" {
 		t.Fatalf("PRACK requests=%+v", transport.requests)
 	}
+	if transport.requests[1].Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" {
+		t.Fatalf("PRACK Route=%q", transport.requests[1].Headers["Route"])
+	}
 	if err := agent.AckInboundCall(context.Background(), DialogInfo{CallID: "in-call-update"}); err != nil {
 		t.Fatalf("AckInboundCall() error = %v", err)
 	}
@@ -187,6 +198,9 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	}
 	if len(transport.requests) != 3 || transport.requests[2].Method != "UPDATE" || !strings.Contains(string(transport.requests[2].Body), "m=audio 49172 RTP/AVP") {
 		t.Fatalf("UPDATE requests=%+v", transport.requests)
+	}
+	if transport.requests[2].Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" {
+		t.Fatalf("UPDATE Route=%q", transport.requests[2].Headers["Route"])
 	}
 }
 
