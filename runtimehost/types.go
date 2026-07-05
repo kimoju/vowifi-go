@@ -233,30 +233,32 @@ const StartModeMain = "main"
 type TunnelManagerFactory func(StartRequest) (swu.TunnelManager, error)
 
 type StartRequest struct {
-	Mode                 string
-	DeviceID             string
-	TraceID              string
-	Profile              identity.Profile
-	Prepared             *identity.PreparedSession
-	NetworkMode          string
-	VoiceGateway         *voicehost.Gateway
-	SIM                  SIMAdapter
-	Access               ModemAccess
-	Dataplane            DataplanePolicy
-	Proxy                *ProxyConfig
-	TunnelManager        swu.TunnelManager
-	TunnelManagerFactory TunnelManagerFactory
-	IMSRegistrar         IMSRegistrar
-	VoiceTransport       voiceclient.SIPRequestTransport
-	VoiceUserAgent       string
-	VoiceSessionExpires  int
-	VoiceMediaRelay      *voicehost.RTPRelayConfig
-	SMSTransport         messaging.SMSTransport
-	USSDTransport        messaging.USSDTransport
-	DeliveryStore        messaging.DeliveryStore
-	Dispatch             eventhost.Dispatcher
-	BeforeStart          func(context.Context, SessionConfig) error
-	ShouldRun            func() bool
+	Mode                       string
+	DeviceID                   string
+	TraceID                    string
+	Profile                    identity.Profile
+	Prepared                   *identity.PreparedSession
+	NetworkMode                string
+	VoiceGateway               *voicehost.Gateway
+	SIM                        SIMAdapter
+	Access                     ModemAccess
+	Dataplane                  DataplanePolicy
+	Proxy                      *ProxyConfig
+	EAPReauthentication        swu.EAPReauthenticationState
+	OnEAPReauthenticationState func(swu.EAPReauthenticationState)
+	TunnelManager              swu.TunnelManager
+	TunnelManagerFactory       TunnelManagerFactory
+	IMSRegistrar               IMSRegistrar
+	VoiceTransport             voiceclient.SIPRequestTransport
+	VoiceUserAgent             string
+	VoiceSessionExpires        int
+	VoiceMediaRelay            *voicehost.RTPRelayConfig
+	SMSTransport               messaging.SMSTransport
+	USSDTransport              messaging.USSDTransport
+	DeliveryStore              messaging.DeliveryStore
+	Dispatch                   eventhost.Dispatcher
+	BeforeStart                func(context.Context, SessionConfig) error
+	ShouldRun                  func() bool
 }
 
 type Instance struct {
@@ -895,7 +897,9 @@ func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 	}
 	return swu.NewTUNIKETunnelManager(
 		swu.IKEPacketTunnelManagerConfig{
-			SIM: req.SIM,
+			SIM:                     req.SIM,
+			Reauthentication:        req.EAPReauthentication,
+			OnReauthenticationState: req.OnEAPReauthenticationState,
 		},
 		swu.TUNTunnelManagerConfig{
 			TUN:                 swu.TUNDeviceConfig{Name: strings.TrimSpace(req.Dataplane.TUNName)},

@@ -60,6 +60,8 @@ type IKEPacketTunnelManagerConfig struct {
 	RemotePort               uint16
 	UseNonESPMarker          bool
 	EAPIdentity              string
+	Reauthentication         EAPReauthenticationState
+	OnReauthenticationState  func(EAPReauthenticationState)
 	InitiatorID              ikev2.Identity
 	IKETransportFactory      IKETransportFactory
 	ESPTransportFactory      IKEESPTransportFactory
@@ -161,19 +163,27 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	if authRunner == nil {
 		authRunner = ikev2.RunIKE_AUTH_Full
 	}
+	reauth := m.Config.Reauthentication.clone()
+	if !reauth.Usable() {
+		reauth = EAPReauthenticationState{}
+	}
 	auth, err := authRunner(ctx, ikev2.FullAuthConfig{
-		Transport:     transport,
-		Init:          init,
-		Keys:          init.Keys,
-		SIM:           provider,
-		InitiatorID:   initiatorID,
-		EAPIdentity:   identity,
-		ChildSA:       m.Config.ChildSA,
-		ChildSPI:      childSPI,
-		TSi:           m.Config.TSi,
-		TSr:           m.Config.TSr,
-		Configuration: m.Config.Configuration,
-		Random:        random,
+		Transport:          transport,
+		Init:               init,
+		Keys:               init.Keys,
+		SIM:                provider,
+		EAPKeys:            reauth.Keys,
+		InitiatorID:        initiatorID,
+		EAPIdentity:        identity,
+		EAPReauthIdentity:  reauth.Identity,
+		EAPReauthCounter:   reauth.Counter,
+		EAPReauthCounterOK: reauth.CounterOK,
+		ChildSA:            m.Config.ChildSA,
+		ChildSPI:           childSPI,
+		TSi:                m.Config.TSi,
+		TSr:                m.Config.TSr,
+		Configuration:      m.Config.Configuration,
+		Random:             random,
 	})
 	if err != nil {
 		return nil, err
@@ -182,6 +192,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		return nil, fmt.Errorf("%w: IKE_AUTH completed without CHILD_SA", ErrTunnelNotReady)
 	}
 	child := *auth.ChildSA
+	m.updateReauthenticationState(auth)
 	espTransport, err := m.espTransport(cfg, espCfg)
 	if err != nil {
 		return nil, err
@@ -215,6 +226,45 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		return nil, fmt.Errorf("%w: packet session factory returned nil", ErrInvalidIKETunnelManager)
 	}
 	return session, nil
+}
+
+func (m *IKEPacketTunnelManager) updateReauthenticationState(auth ikev2.FullAuthResult) {
+	if m == nil || len(auth.EAPKeys.KAut) == 0 || len(auth.EAPKeys.KEncr) == 0 {
+		return
+	}
+	current := m.Config.Reauthentication.clone()
+	next := current
+	if strings.TrimSpace(auth.EAPNextReauthID) != "" {
+		next.Identity = strings.TrimSpace(auth.EAPNextReauthID)
+	}
+	if strings.TrimSpace(auth.EAPNextPseudonym) != "" {
+		next.NextPseudonym = strings.TrimSpace(auth.EAPNextPseudonym)
+	}
+	if strings.TrimSpace(next.Identity) == "" {
+		return
+	}
+	next.Keys = cloneEAPAKAKeys(auth.EAPKeys)
+	next.Reauthenticated = auth.EAPReauthenticated
+	next.CounterTooSmall = auth.EAPReauthCounterTooSmall
+	switch {
+	case auth.EAPReauthenticated:
+		next.Counter = auth.EAPReauthCounter
+		next.CounterOK = true
+		next.LastAcceptedCounter = auth.EAPReauthCounter
+	case auth.EAPReauthCounterTooSmall:
+		next.CounterOK = current.CounterOK
+		next.LastRejectedCounter = auth.EAPReauthCounter
+	default:
+		next.Counter = 0
+		next.CounterOK = true
+		next.LastAcceptedCounter = 0
+		next.LastRejectedCounter = 0
+	}
+	next = next.clone()
+	m.Config.Reauthentication = next
+	if m.Config.OnReauthenticationState != nil {
+		m.Config.OnReauthenticationState(next.clone())
+	}
 }
 
 func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string) (IKETransportConfig, ESPTransportConfig) {

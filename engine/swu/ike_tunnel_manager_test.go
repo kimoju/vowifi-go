@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
+	"github.com/iniwex5/vowifi-go/engine/swu/eapaka"
 	"github.com/iniwex5/vowifi-go/engine/swu/ikev2"
 )
 
@@ -161,6 +162,210 @@ func TestIKEPacketTunnelManagerDerivesEPDGAndAKAIdentity(t *testing.T) {
 	}
 	if session.Result().EPDGAddress != wantEPDG {
 		t.Fatalf("result EPDG=%q", session.Result().EPDGAddress)
+	}
+}
+
+func TestIKEPacketTunnelManagerCarriesReauthenticationState(t *testing.T) {
+	initialKeys := eapaka.Keys{
+		MK:    bytes.Repeat([]byte{0x01}, 20),
+		KEncr: bytes.Repeat([]byte{0x02}, eapaka.KeyLengthKEncr),
+		KAut:  bytes.Repeat([]byte{0x03}, eapaka.KeyLengthKAut),
+		MSK:   bytes.Repeat([]byte{0x04}, eapaka.KeyLengthMSK),
+		EMSK:  bytes.Repeat([]byte{0x05}, eapaka.KeyLengthEMSK),
+	}
+	nextKeys := initialKeys
+	nextKeys.MSK = bytes.Repeat([]byte{0x06}, eapaka.KeyLengthMSK)
+	nextKeys.EMSK = bytes.Repeat([]byte{0x07}, eapaka.KeyLengthEMSK)
+	var gotAuth ikev2.FullAuthConfig
+	var gotState EAPReauthenticationState
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
+		SIM:          ikeTunnelAKAProvider{},
+		ChildSPI:     []byte{0x11, 0x22, 0x33, 0x44},
+		Transport:    ikeTunnelNoopTransport{},
+		ESPTransport: &captureESPPacketTransport{},
+		Reauthentication: EAPReauthenticationState{
+			Identity:  "reauth-2",
+			Counter:   2,
+			CounterOK: true,
+			Keys:      initialKeys,
+		},
+		OnReauthenticationState: func(state EAPReauthenticationState) {
+			gotState = state
+		},
+		InitRunner: func(ctx context.Context, cfg ikev2.InitConfig) (ikev2.InitResult, error) {
+			return ikev2.InitResult{}, nil
+		},
+		AuthRunner: func(ctx context.Context, cfg ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
+			gotAuth = cfg
+			child := packetChildSA(true)
+			child.LocalSPI = append([]byte(nil), cfg.ChildSPI...)
+			return ikev2.FullAuthResult{
+				ChildSA:            &child,
+				EAPKeys:            nextKeys,
+				EAPNextReauthID:    "reauth-3",
+				EAPNextPseudonym:   "pseudo-3",
+				EAPReauthenticated: true,
+				EAPReauthCounter:   3,
+				NextMessageID:      2,
+			}, nil
+		},
+	})
+
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:    "dev-1",
+		Mode:        DataplaneModeUserspace,
+		EPDGAddress: "epdg.example",
+		IMSI:        "310280233641503",
+		MCC:         "310",
+		MNC:         "280",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	if gotAuth.EAPReauthIdentity != "reauth-2" || gotAuth.EAPReauthCounter != 2 || !gotAuth.EAPReauthCounterOK {
+		t.Fatalf("auth reauth config identity=%q counter=%d ok=%t", gotAuth.EAPReauthIdentity, gotAuth.EAPReauthCounter, gotAuth.EAPReauthCounterOK)
+	}
+	if !bytes.Equal(gotAuth.EAPKeys.MSK, initialKeys.MSK) {
+		t.Fatalf("auth EAP keys were not carried")
+	}
+	if gotState.Identity != "reauth-3" || gotState.NextPseudonym != "pseudo-3" || gotState.Counter != 3 || !gotState.CounterOK || !gotState.Reauthenticated {
+		t.Fatalf("callback state=%+v", gotState)
+	}
+	if !bytes.Equal(gotState.Keys.MSK, nextKeys.MSK) || !bytes.Equal(manager.Config.Reauthentication.Keys.EMSK, nextKeys.EMSK) {
+		t.Fatalf("updated keys callback=%+v manager=%+v", gotState.Keys, manager.Config.Reauthentication.Keys)
+	}
+	gotState.Keys.MSK[0] = 0xff
+	if manager.Config.Reauthentication.Keys.MSK[0] == 0xff {
+		t.Fatal("callback state leaked key slice into manager state")
+	}
+}
+
+func TestIKEPacketTunnelManagerIgnoresIncompleteReauthenticationState(t *testing.T) {
+	initialKeys := eapaka.Keys{
+		MK:    bytes.Repeat([]byte{0x01}, 20),
+		KEncr: bytes.Repeat([]byte{0x02}, eapaka.KeyLengthKEncr),
+		KAut:  bytes.Repeat([]byte{0x03}, eapaka.KeyLengthKAut),
+		MSK:   bytes.Repeat([]byte{0x04}, eapaka.KeyLengthMSK),
+		EMSK:  bytes.Repeat([]byte{0x05}, eapaka.KeyLengthEMSK),
+	}
+	var gotAuth ikev2.FullAuthConfig
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
+		SIM:          ikeTunnelAKAProvider{},
+		ChildSPI:     []byte{0x11, 0x22, 0x33, 0x44},
+		Transport:    ikeTunnelNoopTransport{},
+		ESPTransport: &captureESPPacketTransport{},
+		Reauthentication: EAPReauthenticationState{
+			Counter:   9,
+			CounterOK: true,
+			Keys:      initialKeys,
+		},
+		InitRunner: func(ctx context.Context, cfg ikev2.InitConfig) (ikev2.InitResult, error) {
+			return ikev2.InitResult{}, nil
+		},
+		AuthRunner: func(ctx context.Context, cfg ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
+			gotAuth = cfg
+			child := packetChildSA(true)
+			child.LocalSPI = append([]byte(nil), cfg.ChildSPI...)
+			return ikev2.FullAuthResult{
+				ChildSA:         &child,
+				EAPKeys:         initialKeys,
+				EAPNextReauthID: "reauth-1",
+				NextMessageID:   2,
+			}, nil
+		},
+	})
+
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:    "dev-1",
+		Mode:        DataplaneModeUserspace,
+		EPDGAddress: "epdg.example",
+		IMSI:        "310280233641503",
+		MCC:         "310",
+		MNC:         "280",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	if gotAuth.EAPReauthIdentity != "" || gotAuth.EAPReauthCounter != 0 || gotAuth.EAPReauthCounterOK {
+		t.Fatalf("auth reauth config identity=%q counter=%d ok=%t", gotAuth.EAPReauthIdentity, gotAuth.EAPReauthCounter, gotAuth.EAPReauthCounterOK)
+	}
+	if len(gotAuth.EAPKeys.KAut) != 0 || len(gotAuth.EAPKeys.KEncr) != 0 {
+		t.Fatalf("incomplete EAP keys were carried: %+v", gotAuth.EAPKeys)
+	}
+	if manager.Config.Reauthentication.Identity != "reauth-1" || manager.Config.Reauthentication.Counter != 0 || !manager.Config.Reauthentication.CounterOK {
+		t.Fatalf("updated state=%+v", manager.Config.Reauthentication)
+	}
+}
+
+func TestIKEPacketTunnelManagerResetsReauthenticationCounterAfterFullAuth(t *testing.T) {
+	previousKeys := eapaka.Keys{
+		MK:    bytes.Repeat([]byte{0x01}, 20),
+		KEncr: bytes.Repeat([]byte{0x02}, eapaka.KeyLengthKEncr),
+		KAut:  bytes.Repeat([]byte{0x03}, eapaka.KeyLengthKAut),
+		MSK:   bytes.Repeat([]byte{0x04}, eapaka.KeyLengthMSK),
+		EMSK:  bytes.Repeat([]byte{0x05}, eapaka.KeyLengthEMSK),
+	}
+	nextKeys := eapaka.Keys{
+		MK:    bytes.Repeat([]byte{0x11}, 20),
+		KEncr: bytes.Repeat([]byte{0x12}, eapaka.KeyLengthKEncr),
+		KAut:  bytes.Repeat([]byte{0x13}, eapaka.KeyLengthKAut),
+		MSK:   bytes.Repeat([]byte{0x14}, eapaka.KeyLengthMSK),
+		EMSK:  bytes.Repeat([]byte{0x15}, eapaka.KeyLengthEMSK),
+	}
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
+		SIM:          ikeTunnelAKAProvider{},
+		ChildSPI:     []byte{0x11, 0x22, 0x33, 0x44},
+		Transport:    ikeTunnelNoopTransport{},
+		ESPTransport: &captureESPPacketTransport{},
+		Reauthentication: EAPReauthenticationState{
+			Identity:            "old-reauth",
+			Counter:             9,
+			CounterOK:           true,
+			Keys:                previousKeys,
+			LastAcceptedCounter: 9,
+			LastRejectedCounter: 4,
+		},
+		InitRunner: func(ctx context.Context, cfg ikev2.InitConfig) (ikev2.InitResult, error) {
+			return ikev2.InitResult{}, nil
+		},
+		AuthRunner: func(ctx context.Context, cfg ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
+			if cfg.EAPReauthIdentity != "old-reauth" || cfg.EAPReauthCounter != 9 || !cfg.EAPReauthCounterOK {
+				t.Fatalf("auth reauth config identity=%q counter=%d ok=%t", cfg.EAPReauthIdentity, cfg.EAPReauthCounter, cfg.EAPReauthCounterOK)
+			}
+			child := packetChildSA(true)
+			child.LocalSPI = append([]byte(nil), cfg.ChildSPI...)
+			return ikev2.FullAuthResult{
+				ChildSA:         &child,
+				EAPKeys:         nextKeys,
+				EAPNextReauthID: "new-reauth",
+				NextMessageID:   2,
+			}, nil
+		},
+	})
+
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:    "dev-1",
+		Mode:        DataplaneModeUserspace,
+		EPDGAddress: "epdg.example",
+		IMSI:        "310280233641503",
+		MCC:         "310",
+		MNC:         "280",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	state := manager.Config.Reauthentication
+	if state.Identity != "new-reauth" || state.Counter != 0 || !state.CounterOK || state.LastAcceptedCounter != 0 || state.LastRejectedCounter != 0 {
+		t.Fatalf("updated state=%+v", state)
+	}
+	if !bytes.Equal(state.Keys.MSK, nextKeys.MSK) {
+		t.Fatalf("updated keys=%+v", state.Keys)
 	}
 }
 

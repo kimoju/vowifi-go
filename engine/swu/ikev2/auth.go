@@ -98,40 +98,48 @@ type AKAChallengeResult struct {
 }
 
 type FullAuthConfig struct {
-	Transport        InitTransport
-	Init             InitResult
-	Keys             IKEKeys
-	SIM              sim.AKAProvider
-	InitiatorID      Identity
-	EAPIdentity      string
-	ChildSA          SecurityAssociation
-	ChildSPI         []byte
-	TSi              TrafficSelectors
-	TSr              TrafficSelectors
-	Configuration    Configuration
-	Random           io.Reader
-	InitialIV        []byte
-	EAPIdentityIV    []byte
-	InitialMessageID uint32
+	Transport          InitTransport
+	Init               InitResult
+	Keys               IKEKeys
+	SIM                sim.AKAProvider
+	EAPKeys            eapaka.Keys
+	InitiatorID        Identity
+	EAPIdentity        string
+	EAPReauthIdentity  string
+	EAPReauthCounter   uint16
+	EAPReauthCounterOK bool
+	ChildSA            SecurityAssociation
+	ChildSPI           []byte
+	TSi                TrafficSelectors
+	TSr                TrafficSelectors
+	Configuration      Configuration
+	Random             io.Reader
+	InitialIV          []byte
+	EAPIdentityIV      []byte
+	EAPReauthIV        []byte
+	InitialMessageID   uint32
 }
 
 type FullAuthResult struct {
-	Auth               AuthResult
-	IdentityExchanges  []EAPIdentityExchange
-	AKAChallenges      []AKAChallengeResult
-	ChildSA            *ChildSAResult
-	EAPKeys            eapaka.Keys
-	EAPLast            *eapaka.Packet
-	EAPNotifications   []eapaka.Packet
-	EAPClientError     bool
-	EAPNextPseudonym   string
-	EAPNextReauthID    string
-	SyncFailure        bool
-	AuthFailure        bool
-	KDFNegotiations    int
-	NextMessageID      uint32
-	FinalResponseBytes []byte
-	FinalResponseInner []Payload
+	Auth                     AuthResult
+	IdentityExchanges        []EAPIdentityExchange
+	AKAChallenges            []AKAChallengeResult
+	ChildSA                  *ChildSAResult
+	EAPKeys                  eapaka.Keys
+	EAPLast                  *eapaka.Packet
+	EAPNotifications         []eapaka.Packet
+	EAPClientError           bool
+	EAPNextPseudonym         string
+	EAPNextReauthID          string
+	EAPReauthenticated       bool
+	EAPReauthCounter         uint16
+	EAPReauthCounterTooSmall bool
+	SyncFailure              bool
+	AuthFailure              bool
+	KDFNegotiations          int
+	NextMessageID            uint32
+	FinalResponseBytes       []byte
+	FinalResponseInner       []Payload
 }
 
 type EAPIdentityExchange struct {
@@ -275,6 +283,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 	finalInner, finalBytes := authFinalResponse(auth)
 	out := FullAuthResult{
 		Auth:               auth,
+		EAPKeys:            cfg.EAPKeys,
 		NextMessageID:      auth.NextMessageID,
 		FinalResponseBytes: append([]byte(nil), finalBytes...),
 		FinalResponseInner: clonePayloads(finalInner),
@@ -343,18 +352,25 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			next = exchange.EAPNext
 			continue
 		}
+		challengeIdentity := identity
+		if next.Subtype == eapaka.SubtypeReauthentication && strings.TrimSpace(cfg.EAPReauthIdentity) != "" {
+			challengeIdentity = strings.TrimSpace(cfg.EAPReauthIdentity)
+		}
 		challenge, err := RunIKE_AUTH_AKAChallenge(ctx, AKAChallengeConfig{
 			Transport:          cfg.Transport,
 			Init:               cfg.Init,
 			Keys:               cfg.Keys,
 			SIM:                cfg.SIM,
 			EAPKeys:            out.EAPKeys,
-			Identity:           identity,
+			Identity:           challengeIdentity,
 			Request:            *next,
 			IdentityTranscript: identityTranscript,
 			ChildSPI:           localChildSPI,
 			MessageID:          out.NextMessageID,
 			Random:             cfg.Random,
+			EAPReauthIV:        cfg.EAPReauthIV,
+			EAPReauthCounter:   cfg.EAPReauthCounter,
+			EAPReauthCounterOK: cfg.EAPReauthCounterOK,
 		})
 		if err != nil {
 			return FullAuthResult{}, err
@@ -371,6 +387,11 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		if challenge.EAPNextReauthID != "" {
 			out.EAPNextReauthID = challenge.EAPNextReauthID
 		}
+		out.EAPReauthenticated = out.EAPReauthenticated || challenge.EAPReauthenticated
+		if challenge.EAPReauthCounter != 0 {
+			out.EAPReauthCounter = challenge.EAPReauthCounter
+		}
+		out.EAPReauthCounterTooSmall = out.EAPReauthCounterTooSmall || challenge.EAPReauthCounterTooSmall
 		out.SyncFailure = out.SyncFailure || challenge.SyncFailure
 		out.AuthFailure = out.AuthFailure || challenge.AuthFailure
 		if challenge.KDFNegotiated {

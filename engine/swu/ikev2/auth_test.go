@@ -406,6 +406,110 @@ func TestRunIKEAuthFullNegotiatesAKAPrimeKDF(t *testing.T) {
 	}
 }
 
+func TestRunIKEAuthFullHandlesInitialReauthentication(t *testing.T) {
+	init := fakeInitResult(t)
+	fullIdentity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	reauthIdentity := "reauth-2"
+	aka := simAKAResult()
+	eapKeys, err := eapaka.DeriveKeys(fullIdentity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	reauthRequest := signedAKAReauthenticationRequest(t, eapaka.TypeAKA, eapKeys, 3, nonceS, []eapaka.Attribute{
+		eapaka.NextReauthIDAttribute("reauth-3"),
+	}, nil)
+	exchanges := 0
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(request, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		switch exchanges {
+		case 0:
+			if msg.Header.MessageID != 1 || len(inner) == 0 {
+				t.Fatalf("initial auth header=%+v inner=%+v", msg.Header, inner)
+			}
+			raw, err := reauthRequest.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 1, false), init.Keys, false, []Payload{EAPPayload(raw)}, bytes.Repeat([]byte{0xa1}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 1:
+			if msg.Header.MessageID != 2 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+				t.Fatalf("reauth response header=%+v inner=%+v", msg.Header, inner)
+			}
+			pkt, err := eapaka.ParsePacket(inner[0].Body)
+			if err != nil {
+				return nil, err
+			}
+			if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeReauthentication {
+				t.Fatalf("reauth response=%+v", pkt)
+			}
+			raw, err := pkt.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			if err := eapaka.VerifyMAC(eapKeys.KAut, raw, nonceS); err != nil {
+				return nil, err
+			}
+			attrs := decryptedAKAReauthenticationResponseAttrs(t, eapKeys, pkt)
+			counterAttr, ok := eapaka.FindAttribute(attrs, eapaka.AttributeCounter)
+			if !ok {
+				t.Fatalf("missing AT_COUNTER in %+v", attrs)
+			}
+			counter, err := counterAttr.CounterValue()
+			if err != nil {
+				return nil, err
+			}
+			if counter != 3 {
+				t.Fatalf("counter=%d", counter)
+			}
+			payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xde, 0xad, 0xda, 0x7a})
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 2, false), init.Keys, false, payloads, bytes.Repeat([]byte{0xa2}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		default:
+			return nil, errors.New("unexpected extra exchange")
+		}
+	})
+	res, err := RunIKE_AUTH_Full(context.Background(), FullAuthConfig{
+		Transport:          transport,
+		Init:               init,
+		EAPKeys:            eapKeys,
+		InitiatorID:        Identity{Type: IDRFC822Addr, Data: []byte(fullIdentity)},
+		EAPIdentity:        fullIdentity,
+		EAPReauthIdentity:  reauthIdentity,
+		EAPReauthCounter:   2,
+		EAPReauthCounterOK: true,
+		ChildSPI:           []byte{0xca, 0xfe, 0xba, 0xbe},
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_Full(reauth) error = %v", err)
+	}
+	if exchanges != 2 || len(res.IdentityExchanges) != 0 || len(res.AKAChallenges) != 1 {
+		t.Fatalf("exchanges=%d identity=%d aka=%d", exchanges, len(res.IdentityExchanges), len(res.AKAChallenges))
+	}
+	if !res.EAPReauthenticated || res.EAPReauthCounterTooSmall || res.EAPReauthCounter != 3 || res.EAPNextReauthID != "reauth-3" {
+		t.Fatalf("reauth result=%+v", res)
+	}
+	expectedKeys, err := eapaka.DeriveReauthenticationKeys(reauthIdentity, eapKeys, 3, nonceS)
+	if err != nil {
+		t.Fatalf("DeriveReauthenticationKeys() error = %v", err)
+	}
+	if !bytes.Equal(res.EAPKeys.MSK, expectedKeys.MSK) || !bytes.Equal(res.EAPKeys.EMSK, expectedKeys.EMSK) {
+		t.Fatalf("EAP keys=%+v expected=%+v", res.EAPKeys, expectedKeys)
+	}
+	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xda, 0x7a}) || res.NextMessageID != 3 {
+		t.Fatalf("result=%+v", res)
+	}
+}
+
 func TestRunIKEAuthAKAChallenge(t *testing.T) {
 	init := fakeInitResult(t)
 	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"

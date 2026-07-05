@@ -11,6 +11,7 @@ import (
 
 	swusim "github.com/iniwex5/vowifi-go/engine/sim"
 	"github.com/iniwex5/vowifi-go/engine/swu"
+	"github.com/iniwex5/vowifi-go/engine/swu/eapaka"
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
@@ -349,9 +350,21 @@ func TestStartDoesNotAutoBuildTunnelForImplicitDataplane(t *testing.T) {
 }
 
 func TestDefaultTunnelManagerForStartEnablesTUNRoutingProtection(t *testing.T) {
+	reauthState := swu.EAPReauthenticationState{
+		Identity:  "reauth-2",
+		Counter:   2,
+		CounterOK: true,
+		Keys: eapaka.Keys{
+			KEncr: []byte("0123456789abcdef"),
+			KAut:  []byte("fedcba9876543210"),
+		},
+	}
+	var callbackState swu.EAPReauthenticationState
 	manager, err := defaultTunnelManagerForStart(StartRequest{
-		DeviceID: "dev-1",
-		SIM:      &runtimeSIMAdapter{},
+		DeviceID:                   "dev-1",
+		SIM:                        &runtimeSIMAdapter{},
+		EAPReauthentication:        reauthState,
+		OnEAPReauthenticationState: func(state swu.EAPReauthenticationState) { callbackState = state },
 		Dataplane: DataplanePolicy{
 			Mode:      swu.DataplaneModeUserspace,
 			TUNName:   "vohive0",
@@ -371,6 +384,17 @@ func TestDefaultTunnelManagerForStartEnablesTUNRoutingProtection(t *testing.T) {
 	}
 	if !tunManager.Config.DefaultRoutes || !tunManager.Config.ProtectEPDGRoutes {
 		t.Fatalf("default route/protect flags = %t/%t", tunManager.Config.DefaultRoutes, tunManager.Config.ProtectEPDGRoutes)
+	}
+	ikeManager, ok := tunManager.Config.Base.(*swu.IKEPacketTunnelManager)
+	if !ok {
+		t.Fatalf("base manager=%T, want *swu.IKEPacketTunnelManager", tunManager.Config.Base)
+	}
+	if ikeManager.Config.Reauthentication.Identity != "reauth-2" || ikeManager.Config.Reauthentication.Counter != 2 || ikeManager.Config.OnReauthenticationState == nil {
+		t.Fatalf("reauth config=%+v callback set=%t", ikeManager.Config.Reauthentication, ikeManager.Config.OnReauthenticationState != nil)
+	}
+	ikeManager.Config.OnReauthenticationState(swu.EAPReauthenticationState{Identity: "reauth-3"})
+	if callbackState.Identity != "reauth-3" {
+		t.Fatalf("callback state=%+v", callbackState)
 	}
 	if len(tunManager.Config.Routes) != 1 || tunManager.Config.Routes[0].Table != "200" {
 		t.Fatalf("routes=%+v", tunManager.Config.Routes)
