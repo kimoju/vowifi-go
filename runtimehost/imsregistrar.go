@@ -183,6 +183,7 @@ type imsRegistrationMaintenance struct {
 	nextCSeq       int
 	authHeader     string
 	authHeaderName string
+	authState      voiceclient.DigestAuthState
 	cancel         context.CancelFunc
 	done           chan struct{}
 	wg             sync.WaitGroup
@@ -206,6 +207,7 @@ func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voicec
 		nextCSeq:       nextCSeq,
 		authHeader:     result.AuthHeader,
 		authHeaderName: result.AuthHeaderName,
+		authState:      result.AuthState,
 	}
 	if result.Registered && (!config.DisableRefresh || !config.DisableKeepalive) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -267,6 +269,7 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 		CSeq:           m.nextCSeq,
 		AuthHeader:     m.authHeader,
 		AuthHeaderName: m.authHeaderName,
+		AuthState:      m.authState,
 	}
 	m.registered = false
 	m.mu.Unlock()
@@ -331,6 +334,7 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 		CSeq:           m.nextCSeq,
 		AuthHeader:     m.authHeader,
 		AuthHeaderName: m.authHeaderName,
+		AuthState:      m.authState,
 	}
 	m.mu.Unlock()
 
@@ -345,6 +349,7 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 		m.nextCSeq = result.NextCSeq
 		m.authHeader = result.AuthHeader
 		m.authHeaderName = result.AuthHeaderName
+		m.authState = result.AuthState
 	}
 	m.mu.Unlock()
 	return nil

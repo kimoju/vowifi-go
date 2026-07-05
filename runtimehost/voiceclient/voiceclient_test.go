@@ -495,6 +495,94 @@ func TestRegisterSessionRefreshUsesExistingBindingAndAuth(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionRefreshAndDeregisterAdvanceDigestNonceCount(t *testing.T) {
+	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {challenge},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=701;spi-s=702;port-c=5068;port-s=5069`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"P-Associated-URI": {`<sip:user@example>`},
+				"Contact":          {`<sip:user@192.0.2.10:5060>;expires=1200`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact": {`<sip:user@192.0.2.10:5060>;expires=900`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	session := RegisterSession{
+		Transport:    transport,
+		AKAProvider:  &registerAKAProvider{},
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-auth-state",
+		CNonce:       "cnonce",
+	}
+	registered, err := session.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !registered.Registered || !registered.AuthState.Usable() || registered.AuthState.nextNC != 2 {
+		t.Fatalf("registered=%+v", registered)
+	}
+	refreshed, err := session.Refresh(context.Background(), RefreshRequest{
+		Binding:        registered.Binding,
+		CSeq:           registered.NextCSeq,
+		AuthHeader:     registered.AuthHeader,
+		AuthHeaderName: registered.AuthHeaderName,
+		AuthState:      registered.AuthState,
+	})
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if !refreshed.Refreshed || !refreshed.AuthState.Usable() || refreshed.AuthState.nextNC != 3 {
+		t.Fatalf("refreshed=%+v", refreshed)
+	}
+	deregistered, err := session.Deregister(context.Background(), DeregisterRequest{
+		Binding:        refreshed.Binding,
+		CSeq:           refreshed.NextCSeq,
+		AuthHeader:     refreshed.AuthHeader,
+		AuthHeaderName: refreshed.AuthHeaderName,
+		AuthState:      refreshed.AuthState,
+	})
+	if err != nil {
+		t.Fatalf("Deregister() error = %v", err)
+	}
+	if !deregistered.Deregistered {
+		t.Fatalf("deregistered=%+v", deregistered)
+	}
+	if len(transport.requests) != 4 {
+		t.Fatalf("requests=%d, want 4", len(transport.requests))
+	}
+	if auth := transport.requests[1].Headers["Authorization"]; !strings.Contains(auth, "nc=00000001") {
+		t.Fatalf("register Authorization=%s", auth)
+	}
+	if auth := transport.requests[2].Headers["Authorization"]; !strings.Contains(auth, "nc=00000002") || auth == registered.AuthHeader {
+		t.Fatalf("refresh Authorization=%s registered=%s", auth, registered.AuthHeader)
+	}
+	if auth := transport.requests[3].Headers["Authorization"]; !strings.Contains(auth, "nc=00000003") {
+		t.Fatalf("deregister Authorization=%s", auth)
+	}
+	if transport.requests[2].Headers["CSeq"] != "3 REGISTER" || transport.requests[3].Headers["CSeq"] != "4 REGISTER" {
+		t.Fatalf("CSeq refresh=%q deregister=%q", transport.requests[2].Headers["CSeq"], transport.requests[3].Headers["CSeq"])
+	}
+}
+
 func TestRegisterSessionRefreshRetriesDigestChallenge(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{

@@ -486,6 +486,119 @@ func TestWireIMSRegistrarRefreshesRegistrationAndCloseUsesLatestCSeq(t *testing.
 	}
 }
 
+func TestWireIMSRegistrarRefreshAndCloseAdvanceDigestNonceCount(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	rawNonce := append(runtimeBytesFrom(0x10, 16), runtimeBytesFrom(0x40, 16)...)
+	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	type seenRequest struct {
+		addr string
+		wire string
+	}
+	seen := make(chan []seenRequest, 1)
+	refreshed := make(chan struct{}, 1)
+	go func() {
+		var requests []seenRequest
+		buf := make([]byte, 65535)
+		for i := 0; i < 5; i++ {
+			_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				seen <- append(requests, seenRequest{wire: "read error: " + err.Error()})
+				return
+			}
+			wire := string(append([]byte(nil), buf[:n]...))
+			requests = append(requests, seenRequest{addr: addr.String(), wire: wire})
+			if i == 0 {
+				resp := "SIP/2.0 401 Unauthorized\r\n" +
+					"WWW-Authenticate: " + challenge + "\r\n" +
+					"Security-Server: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=202;port-c=5062;port-s=5063\r\n" +
+					"Content-Length: 0\r\n\r\n"
+				_, _ = pc.WriteTo([]byte(resp), addr)
+				continue
+			}
+			resp := "SIP/2.0 200 OK\r\n" +
+				"P-Associated-URI: <sip:user@ims.example>\r\n" +
+				"Contact: <sip:user@192.0.2.10:5060>;expires=60\r\n" +
+				"Content-Length: 0\r\n\r\n"
+			_, _ = pc.WriteTo([]byte(resp), addr)
+			if i == 2 {
+				refreshed <- struct{}{}
+			}
+			if strings.Contains(wire, "Expires: 0\r\n") {
+				seen <- requests
+				return
+			}
+		}
+		seen <- requests
+	}()
+
+	res, err := WireIMSRegistrar{
+		ServerAddr:            pc.LocalAddr().String(),
+		ContactHost:           "192.0.2.10",
+		ContactPort:           5060,
+		Expires:               60,
+		RefreshInterval:       100 * time.Millisecond,
+		RefreshRetryInterval:  100 * time.Millisecond,
+		Timeout:               time.Second,
+		MaxRetransmits:        1,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+		DisableKeepalive:      true,
+		CNonce:                "cnonce",
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-1",
+		TraceID:  "trace-refresh-auth",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		SIM:      &wireIMSRegistrarSIM{},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if res.Close == nil {
+		t.Fatal("Close=nil, want default flow cleanup")
+	}
+	select {
+	case <-refreshed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for authenticated refresh REGISTER")
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := res.Close(closeCtx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	requests := <-seen
+	if len(requests) < 4 {
+		t.Fatalf("requests=%d %+v", len(requests), requests)
+	}
+	for i := range requests {
+		if requests[i].addr == "" || requests[i].addr != requests[0].addr {
+			t.Fatalf("REGISTER lifecycle used different flows: %+v", requests)
+		}
+	}
+	if strings.Contains(requests[0].wire, "Authorization:") {
+		t.Fatalf("initial REGISTER unexpectedly authenticated: %q", requests[0].wire)
+	}
+	if !strings.Contains(requests[1].wire, "Authorization: Digest") || !strings.Contains(requests[1].wire, "nc=00000001") ||
+		!strings.Contains(requests[1].wire, "CSeq: 2 REGISTER\r\n") {
+		t.Fatalf("authenticated REGISTER wire=%q", requests[1].wire)
+	}
+	if !strings.Contains(requests[2].wire, "nc=00000002") || !strings.Contains(requests[2].wire, "CSeq: 3 REGISTER\r\n") ||
+		!strings.Contains(requests[2].wire, "Expires: 60\r\n") {
+		t.Fatalf("refresh wire=%q", requests[2].wire)
+	}
+	last := requests[len(requests)-1]
+	if !strings.Contains(last.wire, "nc=00000003") || !strings.Contains(last.wire, "CSeq: 4 REGISTER\r\n") ||
+		!strings.Contains(last.wire, "Expires: 0\r\n") {
+		t.Fatalf("deregister wire=%q", last.wire)
+	}
+}
+
 func TestWireIMSRegistrarCloseDeregistersDefaultFlow(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

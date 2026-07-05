@@ -46,6 +46,14 @@ type DigestAuthInput struct {
 	AUTS     []byte
 }
 
+type DigestAuthState struct {
+	challenge  DigestChallenge
+	input      DigestAuthInput
+	headerName string
+	nextNC     int
+	lastHeader string
+}
+
 type RegistrationBinding struct {
 	ContactURI        string
 	PublicIdentity    string
@@ -99,6 +107,7 @@ type RegisterResult struct {
 	Binding        RegistrationBinding
 	AuthHeader     string
 	AuthHeaderName string
+	AuthState      DigestAuthState
 	NextCSeq       int
 }
 
@@ -108,6 +117,7 @@ type DeregisterRequest struct {
 	CSeq           int
 	AuthHeader     string
 	AuthHeaderName string
+	AuthState      DigestAuthState
 }
 
 type DeregisterResult struct {
@@ -124,6 +134,7 @@ type RefreshRequest struct {
 	Expires        int
 	AuthHeader     string
 	AuthHeaderName string
+	AuthState      DigestAuthState
 }
 
 type RefreshResult struct {
@@ -134,6 +145,7 @@ type RefreshResult struct {
 	Binding        RegistrationBinding
 	AuthHeader     string
 	AuthHeaderName string
+	AuthState      DigestAuthState
 	NextCSeq       int
 }
 
@@ -248,6 +260,68 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 		parts = append(parts, `auts="`+base64.StdEncoding.EncodeToString(in.AUTS)+`"`)
 	}
 	return strings.Join(parts, ", "), nil
+}
+
+func (s DigestAuthState) Usable() bool {
+	return strings.TrimSpace(s.challenge.Realm) != "" &&
+		strings.TrimSpace(s.challenge.Nonce) != "" &&
+		strings.TrimSpace(s.input.Username) != "" &&
+		len(s.input.AUTS) == 0
+}
+
+func (s DigestAuthState) Build(method, uri string) (string, DigestAuthState, error) {
+	if !s.Usable() {
+		return "", s, ErrInvalidChallenge
+	}
+	next := s.clone()
+	input := next.input
+	if strings.TrimSpace(method) != "" {
+		input.Method = strings.ToUpper(strings.TrimSpace(method))
+	}
+	if strings.TrimSpace(uri) != "" {
+		input.URI = strings.TrimSpace(uri)
+	}
+	nc := next.nextNC
+	if nc <= 0 {
+		nc = input.NC
+	}
+	if nc <= 0 {
+		nc = 1
+	}
+	input.NC = nc
+	authz, err := BuildDigestAuthorization(next.challenge, input)
+	if err != nil {
+		return "", s, err
+	}
+	next.input = input
+	next.input.AUTS = append([]byte(nil), input.AUTS...)
+	next.nextNC = nc + 1
+	next.lastHeader = authz
+	return authz, next, nil
+}
+
+func (s DigestAuthState) clone() DigestAuthState {
+	s.input.AUTS = append([]byte(nil), s.input.AUTS...)
+	return s
+}
+
+func newDigestAuthState(headerName string, ch DigestChallenge, input DigestAuthInput, authz string) DigestAuthState {
+	nextNC := input.NC + 1
+	if nextNC <= 1 {
+		nextNC = 2
+	}
+	return DigestAuthState{
+		challenge:  ch,
+		input:      cloneDigestAuthInput(input),
+		headerName: firstNonEmpty(headerName, "Authorization"),
+		nextNC:     nextNC,
+		lastHeader: strings.TrimSpace(authz),
+	}
+}
+
+func cloneDigestAuthInput(input DigestAuthInput) DigestAuthInput {
+	input.AUTS = append([]byte(nil), input.AUTS...)
+	return input
 }
 
 func BuildAKADigestPassword(algorithm string, aka sim.AKAResult) (string, error) {
@@ -397,6 +471,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if err != nil {
 		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, Challenge: ch}, err
 	}
+	currentAuthInput := authzInput
 	authz, err := BuildDigestAuthorization(ch, authzInput)
 	if err != nil {
 		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, Challenge: ch}, err
@@ -411,6 +486,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if err != nil {
 		return RegisterResult{Attempts: attempts, Challenge: ch, AuthHeader: authz}, err
 	}
+	currentAuthInput = authzInput
 	if syncFailure {
 		if isSIPSuccess(resp2.StatusCode) {
 			return RegisterResult{
@@ -422,6 +498,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 				Binding:        buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders),
 				AuthHeader:     authz,
 				AuthHeaderName: authzHeader,
+				AuthState:      newDigestAuthState(authzHeader, ch, currentAuthInput, authz),
 				NextCSeq:       cseq + 1,
 			}, nil
 		}
@@ -451,6 +528,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		}
 		ch = nextChallenge
 		authzHeader = nextAuthzHeader
+		currentAuthInput = nextAuthInput
 		nextChallengeHeaders := resp2.Headers
 		securityHeaders = nextChallengeHeaders
 		cseq++
@@ -462,6 +540,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		if err != nil {
 			return RegisterResult{Attempts: attempts, Challenge: ch, AuthHeader: authz}, err
 		}
+		currentAuthInput = nextAuthInput
 	}
 	result := RegisterResult{
 		Registered:     isSIPSuccess(resp2.StatusCode),
@@ -472,6 +551,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		Binding:        buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders),
 		AuthHeader:     authz,
 		AuthHeaderName: authzHeader,
+		AuthState:      newDigestAuthState(authzHeader, ch, currentAuthInput, authz),
 		NextCSeq:       cseq + 1,
 	}
 	if !result.Registered {
@@ -519,8 +599,11 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 		attempts++
 		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
 	}
-	authHeaderName := firstNonEmpty(req.AuthHeaderName, "Authorization")
-	resp, err := sendDeregister(cseq, authHeaderName, req.AuthHeader, nil)
+	authHeaderName, authz, _, err := nextDigestAuthorization(req.AuthState, "REGISTER", registrarURI, req.AuthHeaderName, req.AuthHeader)
+	if err != nil {
+		return DeregisterResult{Attempts: attempts}, err
+	}
+	resp, err := sendDeregister(cseq, authHeaderName, authz, nil)
 	if err != nil {
 		return DeregisterResult{Attempts: attempts}, err
 	}
@@ -548,7 +631,7 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 	if syncFailure {
 		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, sim.ErrSyncFailure
 	}
-	authz, err := BuildDigestAuthorization(ch, authInput)
+	authz, err = BuildDigestAuthorization(ch, authInput)
 	if err != nil {
 		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
 	}
@@ -612,8 +695,11 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		attempts++
 		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
 	}
-	authHeaderName := firstNonEmpty(req.AuthHeaderName, "Authorization")
-	resp, err := sendRefresh(cseq, authHeaderName, req.AuthHeader, nil)
+	authHeaderName, authz, authState, err := nextDigestAuthorization(req.AuthState, "REGISTER", registrarURI, req.AuthHeaderName, req.AuthHeader)
+	if err != nil {
+		return RefreshResult{Attempts: attempts}, err
+	}
+	resp, err := sendRefresh(cseq, authHeaderName, authz, nil)
 	if err != nil {
 		return RefreshResult{Attempts: attempts}, err
 	}
@@ -625,8 +711,9 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 			Reason:         resp.Reason,
 			Attempts:       attempts,
 			Binding:        binding,
-			AuthHeader:     req.AuthHeader,
+			AuthHeader:     authz,
 			AuthHeaderName: authHeaderName,
+			AuthState:      authState,
 			NextCSeq:       cseq + 1,
 		}, nil
 	}
@@ -651,10 +738,11 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if syncFailure {
 		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, sim.ErrSyncFailure
 	}
-	authz, err := BuildDigestAuthorization(ch, authInput)
+	authz, err = BuildDigestAuthorization(ch, authInput)
 	if err != nil {
 		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
 	}
+	authState = newDigestAuthState(authHeaderName, ch, authInput, authz)
 	cseq++
 	resp2, err := sendRefresh(cseq, authHeaderName, authz, resp.Headers)
 	if err != nil {
@@ -669,6 +757,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		Binding:        resultBinding,
 		AuthHeader:     authz,
 		AuthHeaderName: authHeaderName,
+		AuthState:      authState,
 		NextCSeq:       cseq + 1,
 	}
 	if !result.Refreshed {
@@ -682,6 +771,18 @@ func (s RegisterSession) securityClientAgreement() SecurityAgreement {
 		return DefaultSecurityClientAgreement(s.SecurityRandom)
 	}
 	return completeSecurityAgreement(s.SecurityClient)
+}
+
+func nextDigestAuthorization(state DigestAuthState, method, uri, fallbackName, fallbackHeader string) (string, string, DigestAuthState, error) {
+	headerName := firstNonEmpty(state.headerName, fallbackName, "Authorization")
+	if state.Usable() {
+		authz, next, err := state.Build(method, uri)
+		if err != nil {
+			return headerName, "", state, err
+		}
+		return firstNonEmpty(next.headerName, headerName), authz, next, nil
+	}
+	return firstNonEmpty(fallbackName, headerName), strings.TrimSpace(fallbackHeader), state.clone(), nil
 }
 
 func securityClientFromBinding(binding RegistrationBinding) SecurityAgreement {
