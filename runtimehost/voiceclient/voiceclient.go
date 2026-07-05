@@ -272,26 +272,65 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		expires = 3600
 	}
 
-	msg := RegisterMessage{
-		URI:     registrarURI,
-		Headers: BuildRegisterHeaders(s.Profile, contactURI, callID, "1"),
+	attempts := 0
+	cseq := 1
+	sendRegister := func(cseq int, authHeaderName, authz string, challengeHeaders map[string][]string) (RegisterResponse, error) {
+		msg := RegisterMessage{
+			URI:     registrarURI,
+			Headers: BuildRegisterHeaders(s.Profile, contactURI, callID, strconv.Itoa(cseq)),
+		}
+		msg.Headers["Expires"] = strconv.Itoa(expires)
+		if strings.TrimSpace(authHeaderName) != "" && strings.TrimSpace(authz) != "" {
+			msg.Headers[authHeaderName] = authz
+		}
+		if securityVerify := securityVerifyFromChallenge(challengeHeaders); securityVerify != "" {
+			msg.Headers["Security-Verify"] = securityVerify
+		}
+		attempts++
+		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
 	}
-	msg.Headers["Expires"] = strconv.Itoa(expires)
-	resp, err := s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
+	retryMinExpires := func(resp RegisterResponse, authHeaderName, authz string, challengeHeaders map[string][]string, authInput *DigestAuthInput, ch DigestChallenge) (RegisterResponse, string, bool, error) {
+		if resp.StatusCode != 423 {
+			return resp, authz, false, nil
+		}
+		minExpires := minExpiresHeader(resp.Headers)
+		if minExpires <= expires {
+			return resp, authz, false, nil
+		}
+		expires = minExpires
+		nextAuthz := authz
+		if authInput != nil {
+			authInput.NC++
+			var err error
+			nextAuthz, err = BuildDigestAuthorization(ch, *authInput)
+			if err != nil {
+				return resp, authz, true, err
+			}
+		}
+		cseq++
+		nextResp, err := sendRegister(cseq, authHeaderName, nextAuthz, challengeHeaders)
+		return nextResp, nextAuthz, true, err
+	}
+
+	resp, err := sendRegister(cseq, "", "", nil)
 	if err != nil {
 		return RegisterResult{}, err
+	}
+	resp, _, _, err = retryMinExpires(resp, "", "", nil, nil, DigestChallenge{})
+	if err != nil {
+		return RegisterResult{Attempts: attempts}, err
 	}
 	if isSIPSuccess(resp.StatusCode) {
 		return RegisterResult{
 			Registered: true,
 			StatusCode: resp.StatusCode,
 			Reason:     resp.Reason,
-			Attempts:   1,
+			Attempts:   attempts,
 			Binding:    BuildRegistrationBinding(s.Profile, contactURI, resp, expires),
 		}, nil
 	}
 	if resp.StatusCode != 401 && resp.StatusCode != 407 {
-		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
+		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
 	}
 
 	headerName := "WWW-Authenticate"
@@ -304,27 +343,26 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	}
 	ch, err := SelectDigestChallenge(resp.Headers, headerName)
 	if err != nil {
-		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1}, err
+		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
 	}
 
 	authzInput, syncFailure, err := s.digestAuthInputForChallenge(ch, registrarURI)
 	if err != nil {
-		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
+		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, Challenge: ch}, err
 	}
 	authz, err := BuildDigestAuthorization(ch, authzInput)
 	if err != nil {
-		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
+		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, Challenge: ch}, err
 	}
 
-	msg.Headers = BuildRegisterHeaders(s.Profile, contactURI, callID, "2")
-	msg.Headers["Expires"] = strconv.Itoa(expires)
-	msg.Headers[authzHeader] = authz
-	if securityVerify := securityVerifyFromChallenge(resp.Headers); securityVerify != "" {
-		msg.Headers["Security-Verify"] = securityVerify
-	}
-	resp2, err := s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
+	cseq++
+	resp2, err := sendRegister(cseq, authzHeader, authz, resp.Headers)
 	if err != nil {
-		return RegisterResult{Attempts: 2, Challenge: ch}, err
+		return RegisterResult{Attempts: attempts, Challenge: ch}, err
+	}
+	resp2, authz, _, err = retryMinExpires(resp2, authzHeader, authz, resp.Headers, &authzInput, ch)
+	if err != nil {
+		return RegisterResult{Attempts: attempts, Challenge: ch, AuthHeader: authz}, err
 	}
 	if syncFailure {
 		if isSIPSuccess(resp2.StatusCode) {
@@ -332,14 +370,14 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 				Registered: true,
 				StatusCode: resp2.StatusCode,
 				Reason:     resp2.Reason,
-				Attempts:   2,
+				Attempts:   attempts,
 				Challenge:  ch,
 				Binding:    BuildRegistrationBinding(s.Profile, contactURI, resp2, expires),
 				AuthHeader: authz,
 			}, nil
 		}
 		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
-			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: ch, AuthHeader: authz}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: ch, AuthHeader: authz}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 		}
 		nextHeaderName := "WWW-Authenticate"
 		nextAuthzHeader := "Authorization"
@@ -349,43 +387,40 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		}
 		nextChallenge, err := SelectDigestChallenge(resp2.Headers, nextHeaderName)
 		if err != nil {
-			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: ch, AuthHeader: authz}, err
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: ch, AuthHeader: authz}, err
 		}
 		nextAuthInput, nextSyncFailure, err := s.digestAuthInputForChallenge(nextChallenge, registrarURI)
 		if err != nil {
-			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: nextChallenge, AuthHeader: authz}, err
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: nextChallenge, AuthHeader: authz}, err
 		}
 		if nextSyncFailure {
-			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: nextChallenge, AuthHeader: authz}, sim.ErrSyncFailure
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: nextChallenge, AuthHeader: authz}, sim.ErrSyncFailure
 		}
 		authz, err = BuildDigestAuthorization(nextChallenge, nextAuthInput)
 		if err != nil {
-			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: nextChallenge, AuthHeader: authz}, err
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: nextChallenge, AuthHeader: authz}, err
 		}
 		ch = nextChallenge
 		authzHeader = nextAuthzHeader
-		msg.Headers = BuildRegisterHeaders(s.Profile, contactURI, callID, "3")
-		msg.Headers["Expires"] = strconv.Itoa(expires)
-		msg.Headers[authzHeader] = authz
-		if securityVerify := securityVerifyFromChallenge(resp2.Headers); securityVerify != "" {
-			msg.Headers["Security-Verify"] = securityVerify
-		}
-		resp2, err = s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
+		nextChallengeHeaders := resp2.Headers
+		cseq++
+		resp2, err = sendRegister(cseq, authzHeader, authz, nextChallengeHeaders)
 		if err != nil {
-			return RegisterResult{Attempts: 3, Challenge: ch, AuthHeader: authz}, err
+			return RegisterResult{Attempts: attempts, Challenge: ch, AuthHeader: authz}, err
+		}
+		resp2, authz, _, err = retryMinExpires(resp2, authzHeader, authz, nextChallengeHeaders, &nextAuthInput, ch)
+		if err != nil {
+			return RegisterResult{Attempts: attempts, Challenge: ch, AuthHeader: authz}, err
 		}
 	}
 	result := RegisterResult{
 		Registered: isSIPSuccess(resp2.StatusCode),
 		StatusCode: resp2.StatusCode,
 		Reason:     resp2.Reason,
-		Attempts:   2,
+		Attempts:   attempts,
 		Challenge:  ch,
 		Binding:    BuildRegistrationBinding(s.Profile, contactURI, resp2, expires),
 		AuthHeader: authz,
-	}
-	if syncFailure {
-		result.Attempts = 3
 	}
 	if !result.Registered {
 		return result, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
@@ -701,6 +736,15 @@ func registrationExpires(headers map[string][]string, contactURI string, fallbac
 	}
 	if fallback > 0 {
 		return fallback
+	}
+	return 0
+}
+
+func minExpiresHeader(headers map[string][]string) int {
+	for _, value := range rawHeaderValues(headers, "Min-Expires") {
+		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && n > 0 {
+			return n
+		}
 	}
 	return 0
 }

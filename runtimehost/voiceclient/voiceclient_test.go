@@ -266,6 +266,103 @@ func TestRegisterSessionHandlesAKASynchronizationFailure(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionRetriesMinExpiresBeforeChallenge(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 423,
+			Reason:     "Interval Too Brief",
+			Headers:    map[string][]string{"Min-Expires": {"1200"}},
+		},
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-min", algorithm=MD5, qop="auth"`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+		},
+	}}
+	result, err := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-min",
+		CNonce:       "cnonce",
+		Expires:      600,
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || result.Attempts != 3 || result.Binding.Expires != 1200 {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 3 {
+		t.Fatalf("requests=%d, want 3", len(transport.requests))
+	}
+	if transport.requests[0].Headers["Expires"] != "600" || transport.requests[0].Headers["CSeq"] != "1 REGISTER" {
+		t.Fatalf("first request=%+v", transport.requests[0].Headers)
+	}
+	if transport.requests[1].Headers["Expires"] != "1200" || transport.requests[1].Headers["CSeq"] != "2 REGISTER" || transport.requests[1].Headers["Authorization"] != "" {
+		t.Fatalf("min-expires retry=%+v", transport.requests[1].Headers)
+	}
+	if transport.requests[2].Headers["Expires"] != "1200" || transport.requests[2].Headers["CSeq"] != "3 REGISTER" || !strings.Contains(transport.requests[2].Headers["Authorization"], "Digest") {
+		t.Fatalf("auth request=%+v", transport.requests[2].Headers)
+	}
+}
+
+func TestRegisterSessionRetriesAuthenticatedMinExpires(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-auth-min", algorithm=MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=555;spi-s=666`},
+			},
+		},
+		{
+			StatusCode: 423,
+			Reason:     "Interval Too Brief",
+			Headers:    map[string][]string{"Min-Expires": {"900"}},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+		},
+	}}
+	result, err := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-auth-min",
+		CNonce:       "cnonce",
+		Expires:      600,
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || result.Attempts != 3 || result.Binding.Expires != 900 {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 3 {
+		t.Fatalf("requests=%d, want 3", len(transport.requests))
+	}
+	if transport.requests[1].Headers["Expires"] != "600" || transport.requests[1].Headers["CSeq"] != "2 REGISTER" || !strings.Contains(transport.requests[1].Headers["Authorization"], "nc=00000001") {
+		t.Fatalf("first auth request=%+v", transport.requests[1].Headers)
+	}
+	if transport.requests[2].Headers["Expires"] != "900" || transport.requests[2].Headers["CSeq"] != "3 REGISTER" || !strings.Contains(transport.requests[2].Headers["Authorization"], "nc=00000002") {
+		t.Fatalf("min-expires auth retry=%+v", transport.requests[2].Headers)
+	}
+	if got := transport.requests[2].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=555") {
+		t.Fatalf("Security-Verify=%q", got)
+	}
+}
+
 func TestSelectDigestChallengePrefersAKAv2(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	ch, err := SelectDigestChallenge(map[string][]string{
