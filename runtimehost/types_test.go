@@ -238,6 +238,100 @@ func TestStartEstablishesTunnelWhenManagerProvided(t *testing.T) {
 	}
 }
 
+func TestStartBuildsTunnelManagerForExplicitUserspaceDataplane(t *testing.T) {
+	manager := &runtimeTunnelManager{session: &runtimeTunnelSession{result: swu.TunnelResult{
+		Ready:            true,
+		Mode:             swu.DataplaneModeUserspace,
+		EPDGAddress:      "epdg.example",
+		LocalInnerIP:     "10.0.0.2",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+		Reason:           "auto tunnel ready",
+	}}}
+	var factoryCalled bool
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID: "dev-1",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane: DataplanePolicy{
+			Mode: swu.DataplaneModeUserspace,
+		},
+		TunnelManagerFactory: func(req StartRequest) (swu.TunnelManager, error) {
+			factoryCalled = true
+			if req.DeviceID != "dev-1" || req.Dataplane.Mode != swu.DataplaneModeUserspace {
+				t.Fatalf("factory request=%+v", req)
+			}
+			return manager, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if !factoryCalled {
+		t.Fatalf("TunnelManagerFactory was not called")
+	}
+	if !inst.State().TunnelReady || inst.State().LastReason != "auto tunnel ready" {
+		t.Fatalf("state=%+v", inst.State())
+	}
+}
+
+func TestStartDoesNotAutoBuildTunnelForImplicitDataplane(t *testing.T) {
+	var factoryCalled bool
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID: "dev-1",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		TunnelManagerFactory: func(req StartRequest) (swu.TunnelManager, error) {
+			factoryCalled = true
+			return &runtimeTunnelManager{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if factoryCalled {
+		t.Fatalf("TunnelManagerFactory called for implicit dataplane mode")
+	}
+	if inst.State().TunnelReady {
+		t.Fatalf("state=%+v, want tunnel not ready", inst.State())
+	}
+}
+
+func TestStartPassesTunnelResultToIMSRegistrar(t *testing.T) {
+	manager := &runtimeTunnelManager{session: &runtimeTunnelSession{result: swu.TunnelResult{
+		Ready:             true,
+		Mode:              swu.DataplaneModeUserspace,
+		EPDGAddress:       "epdg.example",
+		LocalInnerIP:      "10.0.0.2",
+		RemoteInnerIP:     "10.0.0.1",
+		IKEEstablished:    true,
+		IPsecEstablished:  true,
+		ChildSAIdentifier: "11111111/22222222",
+		Reason:            "ike ipsec ready",
+	}}}
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
+		Registered: true,
+		StatusCode: 200,
+		Reason:     "ims registered",
+	}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: manager,
+		IMSRegistrar:  registrar,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if !inst.State().TunnelReady || !inst.State().IMSReady {
+		t.Fatalf("state=%+v", inst.State())
+	}
+	if registrar.config.Tunnel.LocalInnerIP != "10.0.0.2" ||
+		registrar.config.Tunnel.RemoteInnerIP != "10.0.0.1" ||
+		registrar.config.Tunnel.ChildSAIdentifier != "11111111/22222222" {
+		t.Fatalf("registrar tunnel=%+v", registrar.config.Tunnel)
+	}
+}
+
 func TestStartRejectsIncompleteTunnel(t *testing.T) {
 	manager := &runtimeTunnelManager{session: &runtimeTunnelSession{result: swu.TunnelResult{
 		Ready:          true,

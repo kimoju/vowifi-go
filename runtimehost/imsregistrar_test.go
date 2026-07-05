@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
+	"github.com/iniwex5/vowifi-go/engine/swu"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
 	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
@@ -154,6 +155,38 @@ func TestWireIMSRegistrarHandlesAKADigestChallenge(t *testing.T) {
 	}
 	if got := strings.ToUpper(hex.EncodeToString(simAdapter.rand)); got != strings.ToUpper(hex.EncodeToString(runtimeBytesFrom(0x10, 16))) {
 		t.Fatalf("RAND=%s", got)
+	}
+}
+
+func TestWireIMSRegistrarUsesTunnelInnerIPForContact(t *testing.T) {
+	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers: map[string][]string{
+			"P-Associated-URI": {"<sip:310280233641503@ims.mnc280.mcc310.3gppnetwork.org>"},
+		},
+	}}}
+	res, err := WireIMSRegistrar{
+		Transport:   transport,
+		ContactPort: 5064,
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-1",
+		TraceID:  "trace-1",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Tunnel:   swu.TunnelResult{LocalInnerIP: "10.0.0.2"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if !res.Registered || res.Profile.LocalIP != "10.0.0.2" {
+		t.Fatalf("result=%+v", res)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("requests=%d", len(transport.requests))
+	}
+	contact := transport.requests[0].Headers["Contact"]
+	if !strings.Contains(contact, "<sip:310280233641503@10.0.0.2:5064>") {
+		t.Fatalf("Contact=%q", contact)
 	}
 }
 

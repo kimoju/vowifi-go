@@ -177,7 +177,16 @@ type ProxyConfig struct {
 }
 
 type DataplanePolicy struct {
-	Mode string
+	Mode                 string
+	TUNName              string
+	TUNMTU               int
+	DisableTUNRouting    bool
+	TUNAddresses         []string
+	TUNEPDGExclusions    []swu.EPDGRouteExclusion
+	TUNRoutes            []swu.TUNRoute
+	TUNRules             []swu.TUNRule
+	TunnelManager        swu.TunnelManager
+	TunnelManagerFactory TunnelManagerFactory
 }
 
 type SessionConfig struct {
@@ -198,6 +207,7 @@ type IMSRegistrationConfig struct {
 	Access      ModemAccess
 	NetworkMode string
 	Dataplane   DataplanePolicy
+	Tunnel      swu.TunnelResult
 	Proxy       *ProxyConfig
 }
 
@@ -219,30 +229,33 @@ type IMSRegistrar interface {
 
 const StartModeMain = "main"
 
+type TunnelManagerFactory func(StartRequest) (swu.TunnelManager, error)
+
 type StartRequest struct {
-	Mode                string
-	DeviceID            string
-	TraceID             string
-	Profile             identity.Profile
-	Prepared            *identity.PreparedSession
-	NetworkMode         string
-	VoiceGateway        *voicehost.Gateway
-	SIM                 SIMAdapter
-	Access              ModemAccess
-	Dataplane           DataplanePolicy
-	Proxy               *ProxyConfig
-	TunnelManager       swu.TunnelManager
-	IMSRegistrar        IMSRegistrar
-	VoiceTransport      voiceclient.SIPRequestTransport
-	VoiceUserAgent      string
-	VoiceSessionExpires int
-	VoiceMediaRelay     *voicehost.RTPRelayConfig
-	SMSTransport        messaging.SMSTransport
-	USSDTransport       messaging.USSDTransport
-	DeliveryStore       messaging.DeliveryStore
-	Dispatch            eventhost.Dispatcher
-	BeforeStart         func(context.Context, SessionConfig) error
-	ShouldRun           func() bool
+	Mode                 string
+	DeviceID             string
+	TraceID              string
+	Profile              identity.Profile
+	Prepared             *identity.PreparedSession
+	NetworkMode          string
+	VoiceGateway         *voicehost.Gateway
+	SIM                  SIMAdapter
+	Access               ModemAccess
+	Dataplane            DataplanePolicy
+	Proxy                *ProxyConfig
+	TunnelManager        swu.TunnelManager
+	TunnelManagerFactory TunnelManagerFactory
+	IMSRegistrar         IMSRegistrar
+	VoiceTransport       voiceclient.SIPRequestTransport
+	VoiceUserAgent       string
+	VoiceSessionExpires  int
+	VoiceMediaRelay      *voicehost.RTPRelayConfig
+	SMSTransport         messaging.SMSTransport
+	USSDTransport        messaging.USSDTransport
+	DeliveryStore        messaging.DeliveryStore
+	Dispatch             eventhost.Dispatcher
+	BeforeStart          func(context.Context, SessionConfig) error
+	ShouldRun            func() bool
 }
 
 type Instance struct {
@@ -291,12 +304,16 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	var tunnel swu.TunnelSession
 	var tunnelResult swu.TunnelResult
 	var tunnelReady bool
-	if req.TunnelManager != nil && strings.TrimSpace(req.Dataplane.Mode) != swu.DataplaneModeDisabled {
+	tunnelManager, err := tunnelManagerForStart(req)
+	if err != nil {
+		return nil, err
+	}
+	if tunnelManager != nil && strings.TrimSpace(req.Dataplane.Mode) != swu.DataplaneModeDisabled {
 		tunnelConfig := buildTunnelConfig(req, modem)
 		if err := tunnelConfig.Validate(); err != nil {
 			return nil, err
 		}
-		session, err := req.TunnelManager.EstablishTunnel(ctx, tunnelConfig)
+		session, err := tunnelManager.EstablishTunnel(ctx, tunnelConfig)
 		if err != nil {
 			return nil, fmt.Errorf("SWU tunnel establishment failed: %w", err)
 		}
@@ -324,6 +341,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 			Access:      req.Access,
 			NetworkMode: req.NetworkMode,
 			Dataplane:   req.Dataplane,
+			Tunnel:      tunnelResult,
 			Proxy:       req.Proxy,
 		}
 		res, err := req.IMSRegistrar.RegisterIMS(ctx, imsCfg)
@@ -763,6 +781,66 @@ func cloneRuntimeHeaderMap(headers map[string]string) map[string]string {
 	out := make(map[string]string, len(headers))
 	for key, value := range headers {
 		out[key] = value
+	}
+	return out
+}
+
+func tunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
+	if req.TunnelManager != nil {
+		return req.TunnelManager, nil
+	}
+	if req.Dataplane.TunnelManager != nil {
+		return req.Dataplane.TunnelManager, nil
+	}
+	if !explicitUserspaceDataplane(req.Dataplane.Mode) {
+		return nil, nil
+	}
+	factory := req.TunnelManagerFactory
+	if factory == nil {
+		factory = req.Dataplane.TunnelManagerFactory
+	}
+	if factory == nil {
+		factory = defaultTunnelManagerForStart
+	}
+	manager, err := factory(req)
+	if err != nil {
+		return nil, err
+	}
+	if manager == nil {
+		return nil, errors.New("SWU tunnel manager factory returned nil")
+	}
+	return manager, nil
+}
+
+func explicitUserspaceDataplane(mode string) bool {
+	return strings.TrimSpace(mode) == swu.DataplaneModeUserspace
+}
+
+func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
+	if req.SIM == nil {
+		return nil, errors.New("SWU tunnel manager requires SIM AKA provider")
+	}
+	return swu.NewTUNIKETunnelManager(
+		swu.IKEPacketTunnelManagerConfig{
+			SIM: req.SIM,
+		},
+		swu.TUNTunnelManagerConfig{
+			TUN:                 swu.TUNDeviceConfig{Name: strings.TrimSpace(req.Dataplane.TUNName)},
+			DisableRouting:      req.Dataplane.DisableTUNRouting,
+			MTU:                 req.Dataplane.TUNMTU,
+			Addresses:           append([]string(nil), req.Dataplane.TUNAddresses...),
+			EPDGRouteExclusions: cloneRuntimeEPDGRouteExclusions(req.Dataplane.TUNEPDGExclusions),
+			Routes:              append([]swu.TUNRoute(nil), req.Dataplane.TUNRoutes...),
+			Rules:               append([]swu.TUNRule(nil), req.Dataplane.TUNRules...),
+		},
+	), nil
+}
+
+func cloneRuntimeEPDGRouteExclusions(in []swu.EPDGRouteExclusion) []swu.EPDGRouteExclusion {
+	out := make([]swu.EPDGRouteExclusion, len(in))
+	for i, item := range in {
+		out[i] = item
+		out[i].Tables = append([]string(nil), item.Tables...)
 	}
 	return out
 }

@@ -98,6 +98,9 @@ protocol layers needed by VoHive:
 - composable SWu TUN tunnel manager that wraps an IKE PacketSession, opens a
   TUN device, applies Linux routing/address setup, starts the bidirectional
   packet pump, and rolls back/cleans up routes, device, and session state
+- runtime startup wiring that builds the default userspace SWu TUN/IKE manager
+  for explicit userspace dataplane requests and forwards the negotiated tunnel
+  inner address into IMS REGISTER Contact construction
 - Linux TUN dataplane routing helpers for MTU/link setup, inner address
   assignment, route installation, policy rule installation, cleanup, and
   best-effort rollback through the `ip` command boundary

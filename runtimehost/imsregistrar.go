@@ -190,7 +190,7 @@ func (r WireIMSRegistrar) profileFromConfig(cfg IMSRegistrationConfig) (voicecli
 		IMPI:      impi,
 		IMPU:      impu,
 		Domain:    domain,
-		LocalIP:   strings.TrimSpace(r.ContactHost),
+		LocalIP:   firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP),
 		UserAgent: firstRuntimeNonEmpty(r.UserAgent, "vowifi-go"),
 	}, nil
 }
