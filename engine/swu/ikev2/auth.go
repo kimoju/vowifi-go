@@ -68,6 +68,7 @@ type AKAChallengeResult struct {
 	EAPKeys       eapaka.Keys
 	ChildSA       *ChildSAResult
 	SyncFailure   bool
+	KDFNegotiated bool
 	NextMessageID uint32
 }
 
@@ -177,9 +178,6 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	if cfg.Transport == nil {
 		return AKAChallengeResult{}, fmt.Errorf("%w: transport is nil", ErrInvalidAuthConfig)
 	}
-	if cfg.SIM == nil {
-		return AKAChallengeResult{}, fmt.Errorf("%w: SIM provider is nil", ErrInvalidAuthConfig)
-	}
 	keys := cfg.Keys
 	if keys.Profile.RequiredLength() == 0 {
 		keys = cfg.Init.Keys
@@ -190,30 +188,41 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	if cfg.MessageID == 0 {
 		return AKAChallengeResult{}, fmt.Errorf("%w: message_id is zero", ErrInvalidAuthConfig)
 	}
-	rand16, autn16, err := eapaka.ChallengeRANDAndAUTN(cfg.Request)
-	if err != nil {
-		return AKAChallengeResult{}, err
-	}
-	aka, err := cfg.SIM.CalculateAKA(rand16, autn16)
 	var eapResp eapaka.Packet
 	var eapKeys eapaka.Keys
 	var syncFailure bool
-	if err != nil {
-		if errors.Is(err, sim.ErrSyncFailure) && len(aka.AUTS) > 0 {
-			eapResp, err = eapaka.BuildSynchronizationFailureResponse(cfg.Request, aka.AUTS)
-			syncFailure = true
-		}
-		if err != nil {
-			return AKAChallengeResult{}, err
-		}
+	var kdfNegotiated bool
+	if response, negotiated, err := eapaka.BuildAKAPrimeKDFNegotiationResponse(cfg.Request); err != nil {
+		return AKAChallengeResult{}, err
+	} else if negotiated {
+		eapResp = response
+		kdfNegotiated = true
 	} else {
-		identity := strings.TrimSpace(cfg.Identity)
-		if identity == "" {
-			return AKAChallengeResult{}, fmt.Errorf("%w: identity is empty", ErrInvalidAuthConfig)
+		if cfg.SIM == nil {
+			return AKAChallengeResult{}, fmt.Errorf("%w: SIM provider is nil", ErrInvalidAuthConfig)
 		}
-		eapResp, eapKeys, err = eapaka.BuildChallengeResponse(identity, cfg.Request, aka)
+		rand16, autn16, err := eapaka.ChallengeRANDAndAUTN(cfg.Request)
 		if err != nil {
 			return AKAChallengeResult{}, err
+		}
+		aka, err := cfg.SIM.CalculateAKA(rand16, autn16)
+		if err != nil {
+			if errors.Is(err, sim.ErrSyncFailure) && len(aka.AUTS) > 0 {
+				eapResp, err = eapaka.BuildSynchronizationFailureResponse(cfg.Request, aka.AUTS)
+				syncFailure = true
+			}
+			if err != nil {
+				return AKAChallengeResult{}, err
+			}
+		} else {
+			identity := strings.TrimSpace(cfg.Identity)
+			if identity == "" {
+				return AKAChallengeResult{}, fmt.Errorf("%w: identity is empty", ErrInvalidAuthConfig)
+			}
+			eapResp, eapKeys, err = eapaka.BuildChallengeResponse(identity, cfg.Request, aka)
+			if err != nil {
+				return AKAChallengeResult{}, err
+			}
 		}
 	}
 	eapRaw, err := eapResp.MarshalBinary()
@@ -243,6 +252,7 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 		EAPResponse:   eapResp,
 		EAPKeys:       eapKeys,
 		SyncFailure:   syncFailure,
+		KDFNegotiated: kdfNegotiated,
 		NextMessageID: cfg.MessageID + 1,
 	}
 	if next, ok, err := firstEAPPacket(inner); err != nil {

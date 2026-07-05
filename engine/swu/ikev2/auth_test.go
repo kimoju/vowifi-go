@@ -308,6 +308,79 @@ func TestRunIKEAuthAKAPrimeChallenge(t *testing.T) {
 	}
 }
 
+func TestRunIKEAuthAKAPrimeKDFNegotiation(t *testing.T) {
+	init := fakeInitResult(t)
+	challenge := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 12,
+		Type:       eapaka.TypeAKAPrime,
+		Subtype:    eapaka.SubtypeChallenge,
+		Attributes: []eapaka.Attribute{
+			eapaka.KDFAttribute(99),
+			eapaka.KDFAttribute(eapaka.AKAPrimeKDFDefault),
+			eapaka.KDFInputAttribute("WLAN"),
+		},
+	}
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(request, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+			t.Fatalf("request header=%+v inner=%+v", msg.Header, inner)
+		}
+		pkt, err := eapaka.ParsePacket(inner[0].Body)
+		if err != nil {
+			return nil, err
+		}
+		if pkt.Code != eapaka.CodeResponse || pkt.Type != eapaka.TypeAKAPrime || pkt.Subtype != eapaka.SubtypeChallenge {
+			t.Fatalf("packet=%+v", pkt)
+		}
+		if len(pkt.Attributes) != 1 || pkt.Attributes[0].Type != eapaka.AttributeKDF {
+			t.Fatalf("attributes=%+v, want only AT_KDF", pkt.Attributes)
+		}
+		kdf, err := pkt.Attributes[0].KDFValue()
+		if err != nil {
+			return nil, err
+		}
+		if kdf != eapaka.AKAPrimeKDFDefault {
+			t.Fatalf("AT_KDF=%d", kdf)
+		}
+		next, err := (eapaka.Packet{
+			Code:       eapaka.CodeRequest,
+			Identifier: 13,
+			Type:       eapaka.TypeAKAPrime,
+			Subtype:    eapaka.SubtypeChallenge,
+			Attributes: []eapaka.Attribute{
+				eapaka.KDFAttribute(eapaka.AKAPrimeKDFDefault),
+				eapaka.KDFAttribute(99),
+				eapaka.KDFInputAttribute("WLAN"),
+			},
+		}).MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(next)}, bytes.Repeat([]byte{0x72}, init.Keys.Profile.EncryptionBlockSize))
+		return rawResp, err
+	})
+	res, err := RunIKE_AUTH_AKAChallenge(context.Background(), AKAChallengeConfig{
+		Transport: transport,
+		Init:      init,
+		Request:   challenge,
+		MessageID: 3,
+		IV:        bytes.Repeat([]byte{0x71}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_AKAChallenge(KDF negotiation) error = %v", err)
+	}
+	if !res.KDFNegotiated || res.SyncFailure || res.EAPResponse.Type != eapaka.TypeAKAPrime {
+		t.Fatalf("result=%+v", res)
+	}
+	if len(res.EAPResponse.Attributes) != 1 || res.EAPNext == nil || res.EAPNext.Identifier != 13 || res.NextMessageID != 4 {
+		t.Fatalf("response=%+v next=%+v nextMessageID=%d", res.EAPResponse, res.EAPNext, res.NextMessageID)
+	}
+}
+
 func TestRunIKEAuthAKAChallengeSyncFailure(t *testing.T) {
 	init := fakeInitResult(t)
 	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"

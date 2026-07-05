@@ -240,7 +240,7 @@ func KDFInputAttribute(networkName string) Attribute {
 func KDFAttribute(kdf uint16) Attribute {
 	var b [2]byte
 	binary.BigEndian.PutUint16(b[:], kdf)
-	return FixedAttribute(AttributeKDF, b[:])
+	return Attribute{Type: AttributeKDF, Data: b[:]}
 }
 
 func FindAttribute(attrs []Attribute, attributeType uint8) (Attribute, bool) {
@@ -311,11 +311,13 @@ func (a Attribute) KDFInputValue() (string, error) {
 }
 
 func (a Attribute) KDFValue() (uint16, error) {
-	value, err := a.FixedValue(2)
-	if err != nil {
-		return 0, err
+	if len(a.Data) == 2 {
+		return binary.BigEndian.Uint16(a.Data), nil
 	}
-	return binary.BigEndian.Uint16(value), nil
+	if len(a.Data) >= 4 && a.Data[0] == 0 && a.Data[1] == 0 {
+		return binary.BigEndian.Uint16(a.Data[2:4]), nil
+	}
+	return 0, ErrInvalidAttribute
 }
 
 func fixed16Values(a Attribute) ([][]byte, error) {

@@ -146,6 +146,37 @@ func BuildChallengeResponse(identity string, request Packet, aka sim.AKAResult) 
 	return response, keys, nil
 }
 
+func BuildAKAPrimeKDFNegotiationResponse(request Packet) (Packet, bool, error) {
+	if request.Type != TypeAKAPrime {
+		return Packet{}, false, nil
+	}
+	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
+		return Packet{}, false, fmt.Errorf("%w: not an AKA' challenge", ErrInvalidAKAChallenge)
+	}
+	values, err := kdfValues(request.Attributes)
+	if err != nil {
+		return Packet{}, false, err
+	}
+	if len(values) == 0 {
+		return Packet{}, false, fmt.Errorf("%w: missing AT_KDF", ErrInvalidAKAChallenge)
+	}
+	if values[0] == AKAPrimeKDFDefault {
+		return Packet{}, false, nil
+	}
+	for _, value := range values[1:] {
+		if value == AKAPrimeKDFDefault {
+			return Packet{
+				Code:       CodeResponse,
+				Identifier: request.Identifier,
+				Type:       TypeAKAPrime,
+				Subtype:    SubtypeChallenge,
+				Attributes: []Attribute{KDFAttribute(AKAPrimeKDFDefault)},
+			}, true, nil
+		}
+	}
+	return Packet{}, false, fmt.Errorf("%w: offered %v", ErrUnsupportedKDF, values)
+}
+
 func BuildSynchronizationFailureResponse(request Packet, auts []byte) (Packet, error) {
 	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
 		return Packet{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
@@ -324,13 +355,29 @@ func deriveChallengeKeys(identity string, request Packet, aka sim.AKAResult) (Ke
 }
 
 func firstKDFValue(attrs []Attribute) (uint16, error) {
+	values, err := kdfValues(attrs)
+	if err != nil {
+		return 0, err
+	}
+	if len(values) == 0 {
+		return 0, fmt.Errorf("%w: missing AT_KDF", ErrInvalidAKAChallenge)
+	}
+	return values[0], nil
+}
+
+func kdfValues(attrs []Attribute) ([]uint16, error) {
+	var values []uint16
 	for _, attr := range attrs {
 		if attr.Type != AttributeKDF {
 			continue
 		}
-		return attr.KDFValue()
+		value, err := attr.KDFValue()
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, value)
 	}
-	return 0, fmt.Errorf("%w: missing AT_KDF", ErrInvalidAKAChallenge)
+	return values, nil
 }
 
 func challengeKDFInput(attrs []Attribute) (string, error) {

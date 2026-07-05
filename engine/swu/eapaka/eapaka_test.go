@@ -98,6 +98,16 @@ func TestAKAPrimeKDFAttributes(t *testing.T) {
 	if parsed.Type != TypeAKAPrime || parsed.Attributes[0].Type != AttributeKDFInput || parsed.Attributes[1].Type != AttributeKDF {
 		t.Fatalf("parsed=%+v", parsed)
 	}
+	if len(parsed.Attributes[1].Data) != 2 {
+		t.Fatalf("AT_KDF data length=%d, want 2", len(parsed.Attributes[1].Data))
+	}
+	kdf, err := parsed.Attributes[1].KDFValue()
+	if err != nil {
+		t.Fatalf("KDFValue() error = %v", err)
+	}
+	if kdf != 1 {
+		t.Fatalf("AT_KDF=%d", kdf)
+	}
 	networkName, err := parsed.Attributes[0].VariableValue()
 	if err != nil {
 		t.Fatalf("VariableValue() error = %v", err)

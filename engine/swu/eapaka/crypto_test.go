@@ -132,6 +132,69 @@ func TestBuildAKAPrimeChallengeResponseRequiresKDFInput(t *testing.T) {
 	}
 }
 
+func TestBuildAKAPrimeKDFNegotiationResponse(t *testing.T) {
+	req := Packet{
+		Code:       CodeRequest,
+		Identifier: 12,
+		Type:       TypeAKAPrime,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{
+			KDFAttribute(99),
+			KDFAttribute(AKAPrimeKDFDefault),
+			KDFInputAttribute("WLAN"),
+		},
+	}
+	resp, negotiated, err := BuildAKAPrimeKDFNegotiationResponse(req)
+	if err != nil {
+		t.Fatalf("BuildAKAPrimeKDFNegotiationResponse() error = %v", err)
+	}
+	if !negotiated {
+		t.Fatal("negotiated=false")
+	}
+	if resp.Code != CodeResponse || resp.Identifier != req.Identifier || resp.Type != TypeAKAPrime || resp.Subtype != SubtypeChallenge {
+		t.Fatalf("response=%+v", resp)
+	}
+	if len(resp.Attributes) != 1 || resp.Attributes[0].Type != AttributeKDF {
+		t.Fatalf("attributes=%+v, want only AT_KDF", resp.Attributes)
+	}
+	kdf, err := resp.Attributes[0].KDFValue()
+	if err != nil {
+		t.Fatalf("KDFValue() error = %v", err)
+	}
+	if kdf != AKAPrimeKDFDefault {
+		t.Fatalf("AT_KDF=%d", kdf)
+	}
+}
+
+func TestBuildAKAPrimeKDFNegotiationResponseSkipsWhenFirstSupported(t *testing.T) {
+	resp, negotiated, err := BuildAKAPrimeKDFNegotiationResponse(Packet{
+		Code:       CodeRequest,
+		Identifier: 12,
+		Type:       TypeAKAPrime,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{KDFAttribute(AKAPrimeKDFDefault), KDFAttribute(99)},
+	})
+	if err != nil {
+		t.Fatalf("BuildAKAPrimeKDFNegotiationResponse() error = %v", err)
+	}
+	if negotiated || resp.Code != 0 {
+		t.Fatalf("response=%+v negotiated=%v, want no negotiation", resp, negotiated)
+	}
+}
+
+func TestBuildAKAPrimeKDFNegotiationResponseRejectsUnsupportedOffer(t *testing.T) {
+	_, _, err := BuildAKAPrimeKDFNegotiationResponse(Packet{
+		Code:       CodeRequest,
+		Identifier: 12,
+		Type:       TypeAKAPrime,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{KDFAttribute(99)},
+	})
+	if !errors.Is(err, ErrUnsupportedKDF) {
+		t.Fatalf("BuildAKAPrimeKDFNegotiationResponse() err=%v, want ErrUnsupportedKDF", err)
+	}
+}
+
 func TestBuildChallengeResponseRejectsBadRequestMAC(t *testing.T) {
 	identity := "user@example.com"
 	aka := sim.AKAResult{RES: []byte{1}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}
