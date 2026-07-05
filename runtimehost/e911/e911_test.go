@@ -42,6 +42,15 @@ func (f *fakeAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, er
 	return e911AKAResult(), nil
 }
 
+type authFailureAKAProvider struct {
+	calls int
+}
+
+func (p *authFailureAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, error) {
+	p.calls++
+	return sim.AKAResult{}, sim.ErrAuthFailure
+}
+
 func TestStartEmergencyAddressUpdateReturnsWebsheetFromEntitlementToken(t *testing.T) {
 	client := &fakeHTTPClient{responses: []*HTTPResponse{{
 		StatusCode: 200,
@@ -157,6 +166,46 @@ func TestStartEmergencyAddressUpdateHandlesEAPRelayChallenge(t *testing.T) {
 	}
 	if bits != 32 || strings.ToUpper(hex.EncodeToString(res)) != "11223344" {
 		t.Fatalf("RES bits=%d value=%s", bits, strings.ToUpper(hex.EncodeToString(res)))
+	}
+}
+
+func TestStartEmergencyAddressUpdateHandlesEAPRelayAuthenticationReject(t *testing.T) {
+	identity := "310280233641503@private.att.net"
+	relayPacket := signedEAPRelayChallenge(t, identity, e911AKAResult())
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":18,"eap-relay-packet":"` + relayPacket + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+	aka := &authFailureAKAProvider{}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity:    Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280", SIPUsername: identity},
+		AKAProvider: aka,
+		Client:      client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=1" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	if aka.calls != 1 || len(client.requests) != 2 {
+		t.Fatalf("AKA calls=%d requests=%d", aka.calls, len(client.requests))
+	}
+	answer := decodeEntitlementAnswer(t, client.requests[1].Body)
+	if _, ok := answer["aka-res"]; ok {
+		t.Fatalf("authentication reject answer must not include AKA RES: %s", client.requests[1].Body)
+	}
+	packet := decodeRelayPacket(t, answer)
+	if packet.Code != eapaka.CodeResponse || packet.Subtype != eapaka.SubtypeAuthenticationReject || len(packet.Attributes) != 0 {
+		t.Fatalf("authentication reject relay response=%+v", packet)
 	}
 }
 

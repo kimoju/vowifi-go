@@ -262,11 +262,23 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 	}
 	aka, err := req.AKAProvider.CalculateAKA(result.RAND, result.AUTN)
 	syncFailure := errors.Is(err, sim.ErrSyncFailure)
-	if err != nil && !syncFailure {
+	authFailure := errors.Is(err, sim.ErrAuthFailure)
+	if err != nil && !syncFailure && !authFailure {
 		return nil, nil, err
 	}
 	if syncFailure && len(aka.AUTS) == 0 {
 		return nil, nil, err
+	}
+	if authFailure {
+		if result.EAPPacket == nil {
+			return nil, nil, err
+		}
+		relay, err := buildEAPRelayAuthenticationRejectAnswer(result)
+		if err != nil {
+			return nil, nil, err
+		}
+		answerBody["eap-relay-packet"] = relay
+		return answerBody, nil, nil
 	}
 	answerBody["aka-res"] = strings.ToUpper(hex.EncodeToString(aka.RES))
 	answerBody["aka-ck"] = strings.ToUpper(hex.EncodeToString(aka.CK))
@@ -467,6 +479,21 @@ func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity s
 		return "", nil, err
 	}
 	return base64.StdEncoding.EncodeToString(raw), keys, nil
+}
+
+func buildEAPRelayAuthenticationRejectAnswer(result entitlementResult) (string, error) {
+	if result.EAPPacket == nil {
+		return "", nil
+	}
+	packet, err := eapaka.BuildAuthenticationRejectResponse(*result.EAPPacket)
+	if err != nil {
+		return "", err
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
 func buildEAPRelayKDFNegotiationAnswer(result entitlementResult) (string, bool, error) {

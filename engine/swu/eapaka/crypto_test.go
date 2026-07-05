@@ -348,6 +348,17 @@ func TestBuildSynchronizationFailureResponse(t *testing.T) {
 	}
 }
 
+func TestBuildAuthenticationRejectResponse(t *testing.T) {
+	req := Packet{Code: CodeRequest, Identifier: 4, Type: TypeAKA, Subtype: SubtypeChallenge}
+	resp, err := BuildAuthenticationRejectResponse(req)
+	if err != nil {
+		t.Fatalf("BuildAuthenticationRejectResponse() error = %v", err)
+	}
+	if resp.Code != CodeResponse || resp.Identifier != 4 || resp.Type != TypeAKA || resp.Subtype != SubtypeAuthenticationReject || len(resp.Attributes) != 0 {
+		t.Fatalf("response=%+v", resp)
+	}
+}
+
 func TestBuildSynchronizationFailureResponseCopiesAKAPrimeKDF(t *testing.T) {
 	req := Packet{
 		Code:    CodeRequest,

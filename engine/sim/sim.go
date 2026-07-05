@@ -2,7 +2,10 @@ package sim
 
 import "errors"
 
-var ErrSyncFailure = errors.New("aka sync failure")
+var (
+	ErrSyncFailure = errors.New("aka sync failure")
+	ErrAuthFailure = errors.New("aka authentication failure")
+)
 
 type AKAResult struct {
 	RES  []byte

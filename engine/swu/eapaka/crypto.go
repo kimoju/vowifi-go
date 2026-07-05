@@ -177,6 +177,25 @@ func BuildAKAPrimeKDFNegotiationResponse(request Packet) (Packet, bool, error) {
 	return Packet{}, false, fmt.Errorf("%w: offered %v", ErrUnsupportedKDF, values)
 }
 
+func BuildAuthenticationRejectResponse(request Packet) (Packet, error) {
+	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
+		return Packet{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
+	}
+	if !isAKAType(request.Type) {
+		return Packet{}, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+	}
+	eapType := request.Type
+	if eapType == 0 {
+		eapType = TypeAKA
+	}
+	return Packet{
+		Code:       CodeResponse,
+		Identifier: request.Identifier,
+		Type:       eapType,
+		Subtype:    SubtypeAuthenticationReject,
+	}, nil
+}
+
 func BuildNotificationResponse(request Packet) (Packet, bool, error) {
 	return buildNotificationResponse(request, nil, false)
 }

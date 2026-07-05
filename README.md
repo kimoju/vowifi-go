@@ -94,7 +94,8 @@ protocol layers needed by VoHive:
 - EAP-AKA full-auth key derivation, EAP-AKA' CK'/IK' and PRF' key material,
   AT_KDF negotiation, AT_MAC verification/generation, AT_RAND/AT_AUTN challenge
   extraction, SIM AKA RES response, AUTS synchronization-failure response,
-  EAP-AKA Notification ACK, and Client-Error handling over encrypted IKE_AUTH
+  AUTN MAC-failure Authentication-Reject response, EAP-AKA Notification ACK,
+  and Client-Error handling over encrypted IKE_AUTH
 - final IKE_AUTH CHILD_SA result parsing with responder ESP SPI,
   configuration/traffic selector extraction, and RFC 7296 ESP outbound/inbound
   key material derivation from SK_d and IKE_SA_INIT nonces

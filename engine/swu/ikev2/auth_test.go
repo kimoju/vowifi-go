@@ -959,6 +959,49 @@ func TestRunIKEAuthAKAChallengeSyncFailure(t *testing.T) {
 	}
 }
 
+func TestRunIKEAuthAKAChallengeAuthenticationReject(t *testing.T) {
+	init := fakeInitResult(t)
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	challenge := signedAKAChallenge(t, identity, simAKAResult())
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(request, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+			t.Fatalf("request header=%+v inner=%+v", msg.Header, inner)
+		}
+		pkt, err := eapaka.ParsePacket(inner[0].Body)
+		if err != nil {
+			return nil, err
+		}
+		if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeAuthenticationReject || len(pkt.Attributes) != 0 {
+			t.Fatalf("authentication reject packet=%+v", pkt)
+		}
+		failure, err := (eapaka.Packet{Code: eapaka.CodeFailure, Identifier: pkt.Identifier}).MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(failure)}, bytes.Repeat([]byte{0x54}, init.Keys.Profile.EncryptionBlockSize))
+		return rawResp, err
+	})
+	res, err := RunIKE_AUTH_AKAChallenge(context.Background(), AKAChallengeConfig{
+		Transport: transport,
+		Init:      init,
+		SIM:       akaProviderStub{err: sim.ErrAuthFailure},
+		Identity:  identity,
+		Request:   challenge,
+		MessageID: 3,
+		IV:        bytes.Repeat([]byte{0x53}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_AKAChallenge() error = %v", err)
+	}
+	if !res.AuthFailure || res.SyncFailure || res.EAPResponse.Subtype != eapaka.SubtypeAuthenticationReject || res.EAPNext == nil || res.EAPNext.Code != eapaka.CodeFailure {
+		t.Fatalf("result=%+v", res)
+	}
+}
+
 func TestBuildIKEAuthInitialPayloadsRejectsMissingID(t *testing.T) {
 	_, err := BuildIKEAuthInitialPayloads(AuthConfig{})
 	if !errors.Is(err, ErrInvalidIdentity) {

@@ -76,6 +76,7 @@ type AKAChallengeResult struct {
 	EAPClientError        bool
 	ChildSA               *ChildSAResult
 	SyncFailure           bool
+	AuthFailure           bool
 	KDFNegotiated         bool
 	NextMessageID         uint32
 	FollowupRequestBytes  [][]byte
@@ -112,6 +113,7 @@ type FullAuthResult struct {
 	EAPNotifications   []eapaka.Packet
 	EAPClientError     bool
 	SyncFailure        bool
+	AuthFailure        bool
 	KDFNegotiations    int
 	NextMessageID      uint32
 	FinalResponseBytes []byte
@@ -340,6 +342,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		out.EAPNotifications = append(out.EAPNotifications, challenge.EAPNotifications...)
 		out.EAPClientError = out.EAPClientError || challenge.EAPClientError
 		out.SyncFailure = out.SyncFailure || challenge.SyncFailure
+		out.AuthFailure = out.AuthFailure || challenge.AuthFailure
 		if challenge.KDFNegotiated {
 			out.KDFNegotiations++
 		}
@@ -376,6 +379,7 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	var eapResp eapaka.Packet
 	var eapKeys eapaka.Keys
 	var syncFailure bool
+	var authFailure bool
 	var kdfNegotiated bool
 	var clientError bool
 	var notifications []eapaka.Packet
@@ -402,9 +406,13 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 		}
 		aka, err := cfg.SIM.CalculateAKA(rand16, autn16)
 		if err != nil {
-			if errors.Is(err, sim.ErrSyncFailure) && len(aka.AUTS) > 0 {
+			switch {
+			case errors.Is(err, sim.ErrSyncFailure) && len(aka.AUTS) > 0:
 				eapResp, err = eapaka.BuildSynchronizationFailureResponse(cfg.Request, aka.AUTS)
 				syncFailure = true
+			case errors.Is(err, sim.ErrAuthFailure):
+				eapResp, err = eapaka.BuildAuthenticationRejectResponse(cfg.Request)
+				authFailure = true
 			}
 			if err != nil {
 				return AKAChallengeResult{}, err
@@ -471,6 +479,7 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 		EAPNotifications:      cloneEAPPackets(notifications),
 		EAPClientError:        clientError,
 		SyncFailure:           syncFailure,
+		AuthFailure:           authFailure,
 		KDFNegotiated:         kdfNegotiated,
 		NextMessageID:         nextMessageID,
 		FollowupRequestBytes:  cloneByteSlices(followups.RequestBytes),

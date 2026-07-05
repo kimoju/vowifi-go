@@ -136,7 +136,7 @@ func ParseUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAResult, error) {
 		}
 		return AKAResult{AUTS: append([]byte(nil), data...)}, swusim.ErrSyncFailure
 	case 0xDD:
-		return AKAResult{}, errors.New("AKA MAC failure")
+		return AKAResult{}, swusim.ErrAuthFailure
 	default:
 		return AKAResult{}, fmt.Errorf("unknown AKA response tag: 0x%02X", body[0])
 	}

@@ -128,6 +128,11 @@ func TestBuildAndParseUSIMAuth(t *testing.T) {
 	if !errors.Is(err, swusim.ErrSyncFailure) || hex.EncodeToString(res.AUTS) != "aabb" {
 		t.Fatalf("sync failure = %+v err=%v, want AUTS and ErrSyncFailure", res, err)
 	}
+
+	_, err = ParseUSIMAuthResponse([]byte{0xDD, 0x00}, 0x90, 0x00)
+	if !errors.Is(err, swusim.ErrAuthFailure) {
+		t.Fatalf("auth failure err=%v, want ErrAuthFailure", err)
+	}
 }
 
 func bytesFrom(start byte, n int) []byte {
