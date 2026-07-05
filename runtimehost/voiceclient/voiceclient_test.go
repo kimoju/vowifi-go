@@ -242,6 +242,27 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if bye.Method != "BYE" || bye.Headers["CSeq"] != "3 BYE" || bye.Headers["Contact"] != "" {
 		t.Fatalf("bye=%+v", bye)
 	}
+	update, err := BuildUpdateRequest(cfg, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatalf("BuildUpdateRequest() error = %v", err)
+	}
+	if update.Method != "UPDATE" || update.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" || update.Headers["Content-Type"] != "application/sdp" || update.Headers["Session-Expires"] != "1800" {
+		t.Fatalf("update=%+v", update)
+	}
+	prack, err := BuildPrackRequest(cfg, "1 1 INVITE")
+	if err != nil {
+		t.Fatalf("BuildPrackRequest() error = %v", err)
+	}
+	if prack.Method != "PRACK" || prack.Headers["RAck"] != "1 1 INVITE" || prack.Headers["CSeq"] != "3 PRACK" {
+		t.Fatalf("prack=%+v", prack)
+	}
+	options, err := BuildOptionsRequest(cfg)
+	if err != nil {
+		t.Fatalf("BuildOptionsRequest() error = %v", err)
+	}
+	if options.Method != "OPTIONS" || options.Headers["Accept"] != "application/sdp" || options.Headers["Supported"] == "" {
+		t.Fatalf("options=%+v", options)
+	}
 }
 
 func TestRegisterSessionRejectsFailedSecondRegister(t *testing.T) {

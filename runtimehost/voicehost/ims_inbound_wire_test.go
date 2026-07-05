@@ -241,20 +241,90 @@ func TestIMSInboundWireServerReplaysCachedInviteTransaction(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerDispatchesPrackUpdateAndOptions(t *testing.T) {
+	transport := newWireInboundTransport([]voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+			Body:       []byte(sampleSDP("127.0.0.1", 4002)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"Contact": {"<sip:client@127.0.0.1:5070>"}},
+			Body:       []byte(sampleSDP("127.0.0.1", 4004)),
+		},
+	})
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		ContactURI: "sip:vowifi@127.0.0.1:5060",
+	}
+	invite := parseWireIncoming(t, wireIMSInvite("wire-call-dialog", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170))))
+	responses, err := server.HandleRequest(context.Background(), invite)
+	if err != nil {
+		t.Fatalf("HandleRequest(INVITE) error = %v", err)
+	}
+	if len(responses) != 2 || responses[1].StatusCode != 200 {
+		t.Fatalf("INVITE responses=%+v", responses)
+	}
+	_ = transport.readRequest(t)
+
+	prack := parseWireIncoming(t, wireIMSRequest("wire-call-dialog", "PRACK", 2, nil, "RAck: 1 1 INVITE\r\n"))
+	responses, err = server.HandleRequest(context.Background(), prack)
+	if err != nil {
+		t.Fatalf("HandleRequest(PRACK) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 {
+		t.Fatalf("PRACK responses=%+v", responses)
+	}
+	prackReq := transport.readRequest(t)
+	if prackReq.Method != "PRACK" || prackReq.Headers["RAck"] != "1 1 INVITE" {
+		t.Fatalf("client PRACK=%+v", prackReq)
+	}
+
+	update := parseWireIncoming(t, wireIMSRequest("wire-call-dialog", "UPDATE", 3, []byte(sampleSDP("203.0.113.20", 49172))))
+	responses, err = server.HandleRequest(context.Background(), update)
+	if err != nil {
+		t.Fatalf("HandleRequest(UPDATE) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 || !strings.Contains(string(responses[0].Body), "m=audio 4004 RTP/AVP") {
+		t.Fatalf("UPDATE responses=%+v body=%q", responses, responses[0].Body)
+	}
+	updateReq := transport.readRequest(t)
+	if updateReq.Method != "UPDATE" || !strings.Contains(string(updateReq.Body), "m=audio 49172 RTP/AVP") {
+		t.Fatalf("client UPDATE=%+v", updateReq)
+	}
+
+	options := parseWireIncoming(t, wireIMSRequest("wire-options", "OPTIONS", 1, nil))
+	responses, err = server.HandleRequest(context.Background(), options)
+	if err != nil {
+		t.Fatalf("HandleRequest(OPTIONS) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 || !strings.Contains(responses[0].Headers["Allow"], "UPDATE") || responses[0].Headers["Contact"] == "" {
+		t.Fatalf("OPTIONS responses=%+v", responses)
+	}
+}
+
 func TestIMSInboundWireServerRejectsUnsupportedMethod(t *testing.T) {
 	server := &IMSInboundWireServer{}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
-		Method: "OPTIONS",
+		Method: "MESSAGE",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
 			"Call-ID": {"call-options"},
-			"CSeq":    {"1 OPTIONS"},
+			"CSeq":    {"1 MESSAGE"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("HandleRequest() error = %v", err)
 	}
-	if len(responses) != 1 || responses[0].StatusCode != 405 || !strings.Contains(responses[0].Headers["Allow"], "INVITE") {
+	if len(responses) != 1 || responses[0].StatusCode != 405 || !strings.Contains(responses[0].Headers["Allow"], "UPDATE") {
 		t.Fatalf("responses=%+v", responses)
 	}
 }
@@ -314,6 +384,10 @@ func (t *wireInboundTransport) readWrite(tb testing.TB) voiceclient.SIPRequestMe
 }
 
 func wireIMSInvite(callID, method string, cseq int, body []byte) []byte {
+	return wireIMSRequest(callID, method, cseq, body)
+}
+
+func wireIMSRequest(callID, method string, cseq int, body []byte, extraHeaders ...string) []byte {
 	method = strings.ToUpper(strings.TrimSpace(method))
 	if method == "" {
 		method = "INVITE"
@@ -326,12 +400,24 @@ func wireIMSInvite(callID, method string, cseq int, body []byte) []byte {
 	b.WriteString("Call-ID: " + callID + "\r\n")
 	b.WriteString("CSeq: " + strconv.Itoa(cseq) + " " + method + "\r\n")
 	b.WriteString("Contact: <sip:ims@203.0.113.10:5060>\r\n")
+	for _, header := range extraHeaders {
+		b.WriteString(header)
+	}
 	if len(body) > 0 {
 		b.WriteString("Content-Type: application/sdp\r\n")
 	}
 	b.WriteString("Content-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n")
 	b.Write(body)
 	return []byte(b.String())
+}
+
+func parseWireIncoming(t *testing.T, raw []byte) voiceclient.SIPIncomingRequest {
+	t.Helper()
+	req, err := voiceclient.ParseSIPRequest(raw)
+	if err != nil {
+		t.Fatalf("ParseSIPRequest() error = %v", err)
+	}
+	return req
 }
 
 func readUDPWireResponse(t *testing.T, conn net.Conn) voiceclient.SIPResponse {

@@ -67,6 +67,43 @@ func BuildCancelRequest(cfg DialogRequestConfig) (SIPRequestMessage, error) {
 	return buildDialogRequest("CANCEL", cfg, nil)
 }
 
+func BuildUpdateRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage, error) {
+	msg, err := buildDialogRequest("UPDATE", cfg, sdp)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	msg.Headers["Supported"] = "timer, replaces, outbound"
+	if cfg.SessionExpires > 0 {
+		msg.Headers["Session-Expires"] = strconv.Itoa(cfg.SessionExpires)
+	}
+	if len(sdp) > 0 {
+		msg.Headers["Content-Type"] = "application/sdp"
+		msg.Headers["Accept"] = "application/sdp"
+	}
+	return msg, nil
+}
+
+func BuildPrackRequest(cfg DialogRequestConfig, rack string) (SIPRequestMessage, error) {
+	msg, err := buildDialogRequest("PRACK", cfg, nil)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	if strings.TrimSpace(rack) != "" {
+		msg.Headers["RAck"] = strings.TrimSpace(rack)
+	}
+	return msg, nil
+}
+
+func BuildOptionsRequest(cfg DialogRequestConfig) (SIPRequestMessage, error) {
+	msg, err := buildDialogRequest("OPTIONS", cfg, nil)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	msg.Headers["Accept"] = "application/sdp"
+	msg.Headers["Supported"] = "100rel, timer, replaces, outbound"
+	return msg, nil
+}
+
 func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SIPRequestMessage, error) {
 	method = strings.ToUpper(strings.TrimSpace(method))
 	if method == "" {

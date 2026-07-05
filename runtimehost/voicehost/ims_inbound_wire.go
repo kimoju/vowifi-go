@@ -114,6 +114,12 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 			return nil, ErrIMSInboundAgentNotReady
 		}
 		return nil, s.Agent.AckInboundCall(ctx, DialogInfo{CallID: wireCallID(req)})
+	case "UPDATE":
+		responses, err = s.handleUpdate(ctx, req)
+	case "PRACK":
+		responses, err = s.handlePrack(ctx, req)
+	case "OPTIONS":
+		responses = []IMSInboundWireResponse{s.withResponseHeaders(s.optionsResponse())}
 	case "BYE":
 		if s == nil || s.Agent == nil {
 			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
@@ -136,13 +142,59 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}
 	default:
 		resp := wireResponse(405, "Method Not Allowed")
-		resp.Headers["Allow"] = "INVITE, ACK, CANCEL, BYE"
+		resp.Headers["Allow"] = "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS"
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(resp)}
 	}
 	if key != "" && len(responses) > 0 {
 		s.storeTransaction(key, responses)
 	}
 	return responses, err
+}
+
+func (s *IMSInboundWireServer) handleUpdate(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	if s == nil || s.Agent == nil {
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+	}
+	result, err := s.Agent.HandleInboundUpdate(ctx, InboundDialogRequest{
+		CallID:  wireCallID(req),
+		CSeq:    wireCSeq(req),
+		RawSDP:  append([]byte(nil), req.Body...),
+		Headers: cloneSIPHeaders(req.Headers),
+		RAck:    firstVoiceHeader(req.Headers, "RAck"),
+	})
+	final := wireResponse(inboundStatusCode(result.StatusCode, 500), firstVoiceNonEmpty(result.Reason, "Server Internal Error"))
+	if result.Accepted {
+		final.StatusCode = inboundStatusCode(result.StatusCode, 200)
+		final.Reason = firstVoiceNonEmpty(result.Reason, "OK")
+		final.Body = append([]byte(nil), result.RawSDP...)
+		if len(final.Body) > 0 {
+			final.Headers["Content-Type"] = "application/sdp"
+		}
+		final.Headers["Contact"] = "<" + s.contactURI() + ">"
+	}
+	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err
+}
+
+func (s *IMSInboundWireServer) handlePrack(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	if s == nil || s.Agent == nil {
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+	}
+	result, err := s.Agent.HandleInboundPrack(ctx, InboundDialogRequest{
+		CallID:  wireCallID(req),
+		CSeq:    wireCSeq(req),
+		Headers: cloneSIPHeaders(req.Headers),
+		RAck:    firstVoiceHeader(req.Headers, "RAck"),
+	})
+	final := wireResponse(inboundStatusCode(result.StatusCode, 500), firstVoiceNonEmpty(result.Reason, "Server Internal Error"))
+	if result.Accepted {
+		final.StatusCode = inboundStatusCode(result.StatusCode, 200)
+		final.Reason = firstVoiceNonEmpty(result.Reason, "OK")
+		final.Body = append([]byte(nil), result.RawSDP...)
+		if len(final.Body) > 0 {
+			final.Headers["Content-Type"] = "application/sdp"
+		}
+	}
+	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err
 }
 
 func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
@@ -240,6 +292,15 @@ func writeStreamSIPResponse(conn net.Conn, req voiceclient.SIPIncomingRequest, r
 
 func wireResponse(statusCode int, reason string) IMSInboundWireResponse {
 	return IMSInboundWireResponse{StatusCode: statusCode, Reason: reason, Headers: make(map[string]string)}
+}
+
+func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
+	resp := wireResponse(200, "OK")
+	resp.Headers["Allow"] = "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS"
+	resp.Headers["Supported"] = "100rel, timer, replaces, outbound"
+	resp.Headers["Accept"] = "application/sdp"
+	resp.Headers["Contact"] = "<" + s.contactURI() + ">"
+	return resp
 }
 
 func (s *IMSInboundWireServer) withResponseHeaders(resp IMSInboundWireResponse) IMSInboundWireResponse {

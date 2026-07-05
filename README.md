@@ -98,6 +98,9 @@ protocol layers needed by VoHive:
   parsing, provisional/final response construction, incoming INVITE/ACK/BYE/
   CANCEL dispatch, response To-tagging, transaction response caching for
   retransmitted requests, and loopback-tested socket handling
+- IMS in-dialog interworking for UPDATE, PRACK, and OPTIONS, including SDP
+  session refresh forwarding, RAck propagation, RTP relay endpoint rewriting
+  for UPDATE offers/answers, and local OPTIONS capability responses
 
 Full SIP transaction timer state machines and advanced IMS feature interworking
 are still implemented incrementally behind these APIs.
