@@ -18,10 +18,13 @@ import (
 var ErrInvalidSIPMessage = errors.New("invalid SIP message")
 
 type WireRegisterTransport struct {
-	Network    string
-	ServerAddr string
-	LocalAddr  string
-	Timeout    time.Duration
+	Network               string
+	ServerAddr            string
+	LocalAddr             string
+	Timeout               time.Duration
+	RetransmitInterval    time.Duration
+	MaxRetransmitInterval time.Duration
+	MaxRetransmits        int
 }
 
 func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg RegisterMessage) (RegisterResponse, error) {
@@ -79,11 +82,34 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 		return RegisterResponse{}, err
 	}
 	buf := make([]byte, 65535)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return RegisterResponse{}, err
+	interval := sipRetransmitInterval(timeout, t.RetransmitInterval)
+	maxInterval := sipMaxRetransmitInterval(timeout, t.MaxRetransmitInterval)
+	deadline := time.Now().Add(timeout)
+	retransmits := 0
+	for {
+		if err := conn.SetReadDeadline(nextSIPReadDeadline(deadline, interval)); err != nil {
+			return RegisterResponse{}, err
+		}
+		n, err := conn.Read(buf)
+		if err == nil {
+			return ParseSIPResponse(buf[:n])
+		}
+		if ctx.Err() != nil {
+			return RegisterResponse{}, ctx.Err()
+		}
+		if !isSIPTimeout(err) || !time.Now().Before(deadline) {
+			return RegisterResponse{}, err
+		}
+		if shouldSIPRetransmit(retransmits, t.MaxRetransmits) {
+			if _, writeErr := conn.Write(wire); writeErr != nil {
+				return RegisterResponse{}, writeErr
+			}
+			retransmits++
+			interval = nextSIPRetransmitInterval(interval, maxInterval)
+			continue
+		}
+		interval = time.Until(deadline)
 	}
-	return ParseSIPResponse(buf[:n])
 }
 
 func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target string, timeout time.Duration, msg RegisterMessage) (RegisterResponse, error) {
@@ -506,6 +532,57 @@ func contentLength(headers map[string][]string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func sipRetransmitInterval(timeout, configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	if timeout > 0 && timeout < 500*time.Millisecond {
+		return timeout
+	}
+	return 500 * time.Millisecond
+}
+
+func sipMaxRetransmitInterval(timeout, configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	if timeout > 0 && timeout < 4*time.Second {
+		return timeout
+	}
+	return 4 * time.Second
+}
+
+func nextSIPReadDeadline(deadline time.Time, interval time.Duration) time.Time {
+	if interval <= 0 {
+		return deadline
+	}
+	next := time.Now().Add(interval)
+	if deadline.IsZero() || next.Before(deadline) {
+		return next
+	}
+	return deadline
+}
+
+func nextSIPRetransmitInterval(interval, maxInterval time.Duration) time.Duration {
+	if interval <= 0 {
+		return maxInterval
+	}
+	next := interval * 2
+	if maxInterval > 0 && next > maxInterval {
+		return maxInterval
+	}
+	return next
+}
+
+func shouldSIPRetransmit(done, max int) bool {
+	return max <= 0 || done < max
+}
+
+func isSIPTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func sipURIAddr(uri string) (string, error) {

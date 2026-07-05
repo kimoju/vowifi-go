@@ -147,6 +147,62 @@ func TestWireRegisterTransportRoundTripRegisterOverUDP(t *testing.T) {
 	}
 }
 
+func TestWireRegisterTransportRetransmitsUDPRegister(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	seen := make(chan []string, 1)
+	go func() {
+		var requests []string
+		buf := make([]byte, 65535)
+		for i := 0; i < 2; i++ {
+			_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				seen <- append(requests, "read error: "+err.Error())
+				return
+			}
+			requests = append(requests, string(append([]byte(nil), buf[:n]...)))
+			if i == 1 {
+				_, _ = pc.WriteTo([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"), addr)
+			}
+		}
+		seen <- requests
+	}()
+
+	resp, err := WireRegisterTransport{
+		Network:               "udp",
+		ServerAddr:            pc.LocalAddr().String(),
+		Timeout:               time.Second,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+		MaxRetransmits:        2,
+	}.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "retransmit-register",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRegister() error = %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("response=%+v", resp)
+	}
+	requests := <-seen
+	if len(requests) != 2 || !strings.Contains(requests[0], "REGISTER sip:ims.example") || requests[0] != requests[1] {
+		t.Fatalf("requests=%d %v", len(requests), requests)
+	}
+}
+
 func TestWireRegisterTransportRoundTripOverTCP(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -196,6 +252,121 @@ func TestWireRegisterTransportRoundTripOverTCP(t *testing.T) {
 	req := <-requestCh
 	if !strings.Contains(req, "Via: SIP/2.0/TCP") || !strings.Contains(req, "Content-Length: 0") {
 		t.Fatalf("TCP request=%q", req)
+	}
+}
+
+func TestWireSIPTransportRetransmitsUDPInvite(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	seen := make(chan []string, 1)
+	go func() {
+		var requests []string
+		buf := make([]byte, 65535)
+		for i := 0; i < 2; i++ {
+			_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				seen <- append(requests, "read error: "+err.Error())
+				return
+			}
+			requests = append(requests, string(append([]byte(nil), buf[:n]...)))
+			if i == 1 {
+				_, _ = pc.WriteTo([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"), addr)
+			}
+		}
+		seen <- requests
+	}()
+
+	resp, err := WireSIPTransport{
+		Network:               "udp",
+		ServerAddr:            pc.LocalAddr().String(),
+		Timeout:               time.Second,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+		MaxRetransmits:        2,
+	}.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "INVITE",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"To":           "<sip:callee@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Call-ID":      "retransmit-invite",
+			"CSeq":         "1 INVITE",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRequest() error = %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("response=%+v", resp)
+	}
+	requests := <-seen
+	if len(requests) != 2 || !strings.Contains(requests[0], "INVITE sip:callee@example") || requests[0] != requests[1] {
+		t.Fatalf("requests=%d %v", len(requests), requests)
+	}
+}
+
+func TestWireSIPTransportStopsInviteRetransmitAfterProvisional(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	seen := make(chan []string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			seen <- []string{"read error: " + err.Error()}
+			return
+		}
+		first := string(append([]byte(nil), buf[:n]...))
+		_, _ = pc.WriteTo([]byte("SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n"), addr)
+		_ = pc.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+		n, _, err = pc.ReadFrom(buf)
+		if err == nil {
+			seen <- []string{first, "unexpected retransmit: " + string(append([]byte(nil), buf[:n]...))}
+			return
+		}
+		_, _ = pc.WriteTo([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"), addr)
+		seen <- []string{first}
+	}()
+
+	resp, err := WireSIPTransport{
+		Network:               "udp",
+		ServerAddr:            pc.LocalAddr().String(),
+		Timeout:               time.Second,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+	}.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "INVITE",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"To":           "<sip:callee@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Call-ID":      "provisional-invite",
+			"CSeq":         "1 INVITE",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRequest() error = %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("response=%+v", resp)
+	}
+	requests := <-seen
+	if len(requests) != 1 || !strings.Contains(requests[0], "INVITE sip:callee@example") {
+		t.Fatalf("requests=%d %v", len(requests), requests)
 	}
 }
 

@@ -29,6 +29,9 @@ protocol layers needed by VoHive:
   AKA nonce extraction, Digest/AKAv1-MD5 and AKAv2-MD5 authorization material,
   Security-Verify echoing, wire-level UDP/TCP REGISTER transport, and IMS
   registration binding parsing
+- SIP UDP client transaction retransmission for REGISTER and IMS dialog
+  requests, with configurable T1/T2-style backoff and INVITE provisional
+  response handling
 - IMS REGISTER session flow with 401/407 authentication retry, associated URI,
   Service-Route, Path, Security-Server, and Contact expiry capture, plus a
   runtime `IMSRegistrar` adapter for the wire transport

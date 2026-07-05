@@ -17,10 +17,13 @@ type SIPRequestTransport interface {
 }
 
 type WireSIPTransport struct {
-	Network    string
-	ServerAddr string
-	LocalAddr  string
-	Timeout    time.Duration
+	Network               string
+	ServerAddr            string
+	LocalAddr             string
+	Timeout               time.Duration
+	RetransmitInterval    time.Duration
+	MaxRetransmitInterval time.Duration
+	MaxRetransmits        int
 }
 
 func (t WireSIPTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMessage) (SIPResponse, error) {
@@ -47,9 +50,40 @@ func (t WireSIPTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMe
 		return readFinalSIPResponse(reader, msg.Method)
 	}
 	buf := make([]byte, 65535)
+	interval := sipRetransmitInterval(timeout, t.RetransmitInterval)
+	maxInterval := sipMaxRetransmitInterval(timeout, t.MaxRetransmitInterval)
+	deadline := time.Now().Add(timeout)
+	retransmits := 0
+	gotResponse := false
+	retransmitExhausted := false
 	for {
+		readInterval := interval
+		if gotResponse || retransmitExhausted {
+			readInterval = time.Until(deadline)
+		}
+		if err := conn.SetReadDeadline(nextSIPReadDeadline(deadline, readInterval)); err != nil {
+			return SIPResponse{}, err
+		}
 		n, err := conn.Read(buf)
 		if err != nil {
+			if ctx.Err() != nil {
+				return SIPResponse{}, ctx.Err()
+			}
+			if !isSIPTimeout(err) || !time.Now().Before(deadline) {
+				return SIPResponse{}, err
+			}
+			if !gotResponse && !retransmitExhausted && shouldSIPRetransmit(retransmits, t.MaxRetransmits) {
+				if _, writeErr := conn.Write(wire); writeErr != nil {
+					return SIPResponse{}, writeErr
+				}
+				retransmits++
+				interval = nextSIPRetransmitInterval(interval, maxInterval)
+				continue
+			}
+			if !gotResponse {
+				retransmitExhausted = true
+				continue
+			}
 			return SIPResponse{}, err
 		}
 		resp, err := ParseSIPResponse(buf[:n])
@@ -59,6 +93,7 @@ func (t WireSIPTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMe
 		if !isProvisionalResponse(resp.StatusCode, msg.Method) {
 			return resp, nil
 		}
+		gotResponse = true
 	}
 }
 
