@@ -329,6 +329,22 @@ func DecryptEncryptedAttributes(kEncr []byte, ivAttr, encrypted Attribute) ([]At
 	return DecryptAttributes(kEncr, iv, encrypted)
 }
 
+func DecryptChallengeEncryptedAttributes(request Packet, keys Keys) ([]Attribute, bool, error) {
+	ivAttr, hasIV := FindAttribute(request.Attributes, AttributeIV)
+	encryptedAttr, hasEncrypted := FindAttribute(request.Attributes, AttributeEncrData)
+	if !hasIV && !hasEncrypted {
+		return nil, false, nil
+	}
+	if !hasIV || !hasEncrypted {
+		return nil, true, fmt.Errorf("%w: incomplete AT_IV/AT_ENCR_DATA pair", ErrInvalidEncryptedData)
+	}
+	attrs, err := DecryptEncryptedAttributes(keys.KEncr, ivAttr, encryptedAttr)
+	if err != nil {
+		return nil, true, err
+	}
+	return attrs, true, nil
+}
+
 func ChallengeRANDAndAUTN(request Packet) (rand16, autn16 []byte, err error) {
 	randAttr, ok := FindAttribute(request.Attributes, AttributeRAND)
 	if !ok {

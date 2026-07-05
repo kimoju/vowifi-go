@@ -160,6 +160,41 @@ func TestEncryptDecryptAttributes(t *testing.T) {
 	}
 }
 
+func TestDecryptChallengeEncryptedAttributes(t *testing.T) {
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	iv := bytes.Repeat([]byte{0x33}, 16)
+	encrypted, err := EncryptAttributes(keys.KEncr, iv, []Attribute{
+		VariableAttribute(AttributeNextReauthID, []byte("reauth-1")),
+	})
+	if err != nil {
+		t.Fatalf("EncryptAttributes() error = %v", err)
+	}
+	req := signedChallengeRequestWithEncryptedAttrs(t, identity, aka, IVAttribute(iv), encrypted)
+	attrs, ok, err := DecryptChallengeEncryptedAttributes(req, keys)
+	if err != nil {
+		t.Fatalf("DecryptChallengeEncryptedAttributes() error = %v", err)
+	}
+	if !ok || len(attrs) != 1 || attrs[0].Type != AttributeNextReauthID {
+		t.Fatalf("ok=%v attrs=%+v", ok, attrs)
+	}
+	value, err := attrs[0].VariableValue()
+	if err != nil {
+		t.Fatalf("VariableValue() error = %v", err)
+	}
+	if string(value) != "reauth-1" {
+		t.Fatalf("next reauth=%q", string(value))
+	}
+}
+
 func TestDecryptAttributesRejectsBadPadding(t *testing.T) {
 	kEncr := bytes.Repeat([]byte{0x11}, 16)
 	iv := bytes.Repeat([]byte{0x22}, 16)
@@ -604,6 +639,37 @@ func signedChallengeRequestWithResultInd(t *testing.T, identity string, aka sim.
 			ResultIndAttribute(),
 			MACAttribute(nil),
 		},
+	}
+	raw, err := req.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	req.Attributes[len(req.Attributes)-1] = MACAttribute(mac)
+	return req
+}
+
+func signedChallengeRequestWithEncryptedAttrs(t *testing.T, identity string, aka sim.AKAResult, attrs ...Attribute) Packet {
+	t.Helper()
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	challengeAttrs := []Attribute{
+		RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
+		AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
+	}
+	challengeAttrs = append(challengeAttrs, attrs...)
+	challengeAttrs = append(challengeAttrs, MACAttribute(nil))
+	req := Packet{
+		Code:       CodeRequest,
+		Identifier: 7,
+		Type:       TypeAKA,
+		Subtype:    SubtypeChallenge,
+		Attributes: challengeAttrs,
 	}
 	raw, err := req.MarshalBinary()
 	if err != nil {

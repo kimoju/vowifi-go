@@ -68,23 +68,24 @@ type AKAChallengeConfig struct {
 }
 
 type AKAChallengeResult struct {
-	RequestBytes          []byte
-	ResponseBytes         []byte
-	ResponseInner         []Payload
-	EAPResponse           eapaka.Packet
-	EAPNext               *eapaka.Packet
-	EAPKeys               eapaka.Keys
-	EAPNotifications      []eapaka.Packet
-	EAPClientError        bool
-	ChildSA               *ChildSAResult
-	SyncFailure           bool
-	AuthFailure           bool
-	KDFNegotiated         bool
-	NextMessageID         uint32
-	FollowupRequestBytes  [][]byte
-	FollowupResponseBytes [][]byte
-	FinalResponseBytes    []byte
-	FinalResponseInner    []Payload
+	RequestBytes           []byte
+	ResponseBytes          []byte
+	ResponseInner          []Payload
+	EAPResponse            eapaka.Packet
+	EAPNext                *eapaka.Packet
+	EAPKeys                eapaka.Keys
+	EAPEncryptedAttributes []eapaka.Attribute
+	EAPNotifications       []eapaka.Packet
+	EAPClientError         bool
+	ChildSA                *ChildSAResult
+	SyncFailure            bool
+	AuthFailure            bool
+	KDFNegotiated          bool
+	NextMessageID          uint32
+	FollowupRequestBytes   [][]byte
+	FollowupResponseBytes  [][]byte
+	FinalResponseBytes     []byte
+	FinalResponseInner     []Payload
 }
 
 type FullAuthConfig struct {
@@ -395,6 +396,7 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	var kdfNegotiated bool
 	var clientError bool
 	var notifications []eapaka.Packet
+	var encryptedAttributes []eapaka.Attribute
 	if response, handled, err := buildAKAControlResponse(cfg.Request, cfg.EAPKeys); err != nil {
 		return AKAChallengeResult{}, err
 	} else if handled {
@@ -437,6 +439,11 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 			eapResp, eapKeys, err = eapaka.BuildChallengeResponseWithCheckcode(identity, cfg.Request, aka, cfg.IdentityTranscript)
 			if err != nil {
 				return AKAChallengeResult{}, err
+			}
+			if attrs, _, err := eapaka.DecryptChallengeEncryptedAttributes(cfg.Request, eapKeys); err != nil {
+				return AKAChallengeResult{}, err
+			} else if len(attrs) > 0 {
+				encryptedAttributes = attrs
 			}
 		}
 	}
@@ -483,21 +490,22 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 		clientError = clientError || followups.ClientError
 	}
 	out := AKAChallengeResult{
-		RequestBytes:          append([]byte(nil), reqBytes...),
-		ResponseBytes:         append([]byte(nil), respBytes...),
-		ResponseInner:         clonePayloads(inner),
-		EAPResponse:           eapResp,
-		EAPKeys:               resultEAPKeys,
-		EAPNotifications:      cloneEAPPackets(notifications),
-		EAPClientError:        clientError,
-		SyncFailure:           syncFailure,
-		AuthFailure:           authFailure,
-		KDFNegotiated:         kdfNegotiated,
-		NextMessageID:         nextMessageID,
-		FollowupRequestBytes:  cloneByteSlices(followups.RequestBytes),
-		FollowupResponseBytes: cloneByteSlices(followups.ResponseBytes),
-		FinalResponseBytes:    append([]byte(nil), finalRespBytes...),
-		FinalResponseInner:    clonePayloads(finalInner),
+		RequestBytes:           append([]byte(nil), reqBytes...),
+		ResponseBytes:          append([]byte(nil), respBytes...),
+		ResponseInner:          clonePayloads(inner),
+		EAPResponse:            eapResp,
+		EAPKeys:                resultEAPKeys,
+		EAPEncryptedAttributes: cloneEAPAttributes(encryptedAttributes),
+		EAPNotifications:       cloneEAPPackets(notifications),
+		EAPClientError:         clientError,
+		SyncFailure:            syncFailure,
+		AuthFailure:            authFailure,
+		KDFNegotiated:          kdfNegotiated,
+		NextMessageID:          nextMessageID,
+		FollowupRequestBytes:   cloneByteSlices(followups.RequestBytes),
+		FollowupResponseBytes:  cloneByteSlices(followups.ResponseBytes),
+		FinalResponseBytes:     append([]byte(nil), finalRespBytes...),
+		FinalResponseInner:     clonePayloads(finalInner),
 	}
 	if next, ok, err := firstEAPPacket(finalInner); err != nil {
 		return AKAChallengeResult{}, err
@@ -893,14 +901,19 @@ func cloneEAPPacketPtr(packet *eapaka.Packet) *eapaka.Packet {
 
 func cloneEAPPacket(packet eapaka.Packet) eapaka.Packet {
 	out := packet
-	out.Attributes = make([]eapaka.Attribute, len(packet.Attributes))
-	for i, attr := range packet.Attributes {
-		out.Attributes[i] = eapaka.Attribute{
+	out.Attributes = cloneEAPAttributes(packet.Attributes)
+	out.Data = append([]byte(nil), packet.Data...)
+	return out
+}
+
+func cloneEAPAttributes(in []eapaka.Attribute) []eapaka.Attribute {
+	out := make([]eapaka.Attribute, len(in))
+	for i, attr := range in {
+		out[i] = eapaka.Attribute{
 			Type: attr.Type,
 			Data: append([]byte(nil), attr.Data...),
 		}
 	}
-	out.Data = append([]byte(nil), packet.Data...)
 	return out
 }
 
