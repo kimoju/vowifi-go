@@ -328,6 +328,16 @@ func TestParseAndBuildSDP(t *testing.T) {
 	}
 }
 
+func TestParseSDPUnspecifiedConnectionMeansInactive(t *testing.T) {
+	info, err := ParseSDP([]byte("v=0\r\nc=IN IP4 0.0.0.0\r\nm=audio 4002 RTP/AVP 0\r\n"))
+	if err != nil {
+		t.Fatalf("ParseSDP() error = %v", err)
+	}
+	if info.ConnectionIP != "0.0.0.0" || info.Direction != "inactive" {
+		t.Fatalf("info=%+v", info)
+	}
+}
+
 func newInviteRequest(callID, callee, sdp string) *sip.Request {
 	req := sip.NewRequest(sip.INVITE, sip.Uri{Scheme: "sip", User: callee, Host: "ims.example"})
 	appendCommonHeaders(req, callID, callee)

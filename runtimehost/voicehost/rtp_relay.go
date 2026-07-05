@@ -83,7 +83,10 @@ type RTPRelaySession struct {
 	mu            sync.RWMutex
 	imsTarget     *net.UDPAddr
 	imsRTCPTarget *net.UDPAddr
+	imsDirection  string
 	closed        bool
+
+	clientDirection string
 
 	clientAdvertiseIP string
 	imsAdvertiseIP    string
@@ -193,10 +196,10 @@ func newRTPRelaySession(ctx context.Context, cfg RTPRelayConfig) (*RTPRelaySessi
 		s.bufferSize = 2048
 	}
 	s.wg.Add(4)
-	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, &s.clientToIMSRTPPackets, &s.clientToIMSRTPBytes, &s.clientToIMSRTPDrops, s.transforms.ClientToIMSRTP, "")
-	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes, &s.imsToClientRTPDrops, s.transforms.IMSToClientRTP, "")
-	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes, &s.clientToIMSRTCPDrops, s.transforms.ClientToIMSRTCP, RTCPFeedbackClientToIMS)
-	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes, &s.imsToClientRTCPDrops, s.transforms.IMSToClientRTCP, RTCPFeedbackIMSToClient)
+	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, s.allowClientToIMSRTP, &s.clientToIMSRTPPackets, &s.clientToIMSRTPBytes, &s.clientToIMSRTPDrops, s.transforms.ClientToIMSRTP, "")
+	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, s.allowIMSToClientRTP, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes, &s.imsToClientRTPDrops, s.transforms.IMSToClientRTP, "")
+	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, nil, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes, &s.clientToIMSRTCPDrops, s.transforms.ClientToIMSRTCP, RTCPFeedbackClientToIMS)
+	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, nil, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes, &s.imsToClientRTCPDrops, s.transforms.IMSToClientRTCP, RTCPFeedbackIMSToClient)
 	return s, nil
 }
 
@@ -227,6 +230,7 @@ func (s *RTPRelaySession) SetIMSRemote(info SDPInfo) error {
 	s.mu.Lock()
 	s.imsTarget = addr
 	s.imsRTCPTarget = rtcpAddr
+	s.imsDirection = normalizeSDPDirection(info.Direction)
 	s.mu.Unlock()
 	return nil
 }
@@ -242,6 +246,7 @@ func (s *RTPRelaySession) SetClientRemote(info SDPInfo) error {
 	s.mu.Lock()
 	s.clientTarget = addr
 	s.clientRTCPTarget = rtcpAddr
+	s.clientDirection = normalizeSDPDirection(info.Direction)
 	s.mu.Unlock()
 	return nil
 }
@@ -335,7 +340,7 @@ func (s *RTPRelaySession) Close() error {
 	return err
 }
 
-func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, packets, bytes, drops *atomic.Uint64, transform RTPRelayTransform, rtcpDirection RTCPFeedbackDirection) {
+func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, allow func() bool, packets, bytes, drops *atomic.Uint64, transform RTPRelayTransform, rtcpDirection RTCPFeedbackDirection) {
 	defer s.wg.Done()
 	buf := make([]byte, s.bufferSize)
 	for {
@@ -350,6 +355,10 @@ func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn
 		}
 		dst := target()
 		if dst == nil {
+			continue
+		}
+		if allow != nil && !allow() {
+			drops.Add(1)
 			continue
 		}
 		packet := append([]byte(nil), buf[:n]...)
@@ -370,6 +379,55 @@ func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn
 		}
 		packets.Add(1)
 		bytes.Add(uint64(len(packet)))
+	}
+}
+
+func (s *RTPRelaySession) allowClientToIMSRTP() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	clientDirection := s.clientDirection
+	imsDirection := s.imsDirection
+	s.mu.RUnlock()
+	return sdpDirectionAllowsSend(clientDirection) && sdpDirectionAllowsReceive(imsDirection)
+}
+
+func (s *RTPRelaySession) allowIMSToClientRTP() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	clientDirection := s.clientDirection
+	imsDirection := s.imsDirection
+	s.mu.RUnlock()
+	return sdpDirectionAllowsSend(imsDirection) && sdpDirectionAllowsReceive(clientDirection)
+}
+
+func normalizeSDPDirection(direction string) string {
+	switch strings.ToLower(strings.TrimSpace(direction)) {
+	case "sendonly", "recvonly", "inactive":
+		return strings.ToLower(strings.TrimSpace(direction))
+	default:
+		return "sendrecv"
+	}
+}
+
+func sdpDirectionAllowsSend(direction string) bool {
+	switch normalizeSDPDirection(direction) {
+	case "sendrecv", "sendonly":
+		return true
+	default:
+		return false
+	}
+}
+
+func sdpDirectionAllowsReceive(direction string) bool {
+	switch normalizeSDPDirection(direction) {
+	case "sendrecv", "recvonly":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -501,6 +559,9 @@ func udpLocalPort(conn *net.UDPConn) int {
 func resolveSDPEndpoint(info SDPInfo, label string) (*net.UDPAddr, *net.UDPAddr, error) {
 	if strings.TrimSpace(info.ConnectionIP) == "" || info.MediaPort <= 0 {
 		return nil, nil, fmt.Errorf("%w: %s media target is incomplete", ErrRTPRelayConfig, label)
+	}
+	if ip := net.ParseIP(strings.TrimSpace(info.ConnectionIP)); ip != nil && ip.IsUnspecified() {
+		return nil, nil, nil
 	}
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(strings.TrimSpace(info.ConnectionIP), strconv.Itoa(info.MediaPort)))
 	if err != nil {

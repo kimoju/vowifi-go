@@ -97,6 +97,74 @@ func TestRTPRelaySessionForwardsBidirectionalPackets(t *testing.T) {
 	}
 }
 
+func TestRTPRelaySessionAppliesSDPMediaDirection(t *testing.T) {
+	clientPeer := listenTestUDP(t)
+	defer clientPeer.Close()
+	clientRTCPPeer := listenTestUDP(t)
+	defer clientRTCPPeer.Close()
+	imsPeer := listenTestUDP(t)
+	defer imsPeer.Close()
+	imsRTCPPeer := listenTestUDP(t)
+	defer imsRTCPPeer.Close()
+
+	clientAddr := clientPeer.LocalAddr().(*net.UDPAddr)
+	clientRTCPAddr := clientRTCPPeer.LocalAddr().(*net.UDPAddr)
+	imsAddr := imsPeer.LocalAddr().(*net.UDPAddr)
+	imsRTCPAddr := imsRTCPPeer.LocalAddr().(*net.UDPAddr)
+	relay, err := NewRTPRelaySession(context.Background(), RTPRelayConfig{
+		ClientListenIP:    "127.0.0.1",
+		ClientAdvertiseIP: "127.0.0.1",
+		IMSListenIP:       "127.0.0.1",
+		IMSAdvertiseIP:    "127.0.0.1",
+	}, SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: clientAddr.Port, RTCPPort: clientRTCPAddr.Port, Direction: "sendrecv"})
+	if err != nil {
+		t.Fatalf("NewRTPRelaySession() error = %v", err)
+	}
+	defer relay.Close()
+	if err := relay.SetIMSRemote(SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: imsAddr.Port, RTCPPort: imsRTCPAddr.Port, Direction: "sendrecv"}); err != nil {
+		t.Fatalf("SetIMSRemote() error = %v", err)
+	}
+	clientEndpoint := udpAddrFromSDP(t, relay.ClientEndpoint())
+	imsEndpoint := udpAddrFromSDP(t, relay.IMSEndpoint())
+
+	if _, err := clientPeer.WriteToUDP([]byte{0x10}, clientEndpoint); err != nil {
+		t.Fatalf("client initial WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, imsPeer); !bytes.Equal(got, []byte{0x10}) {
+		t.Fatalf("IMS initial got=%x", got)
+	}
+
+	if err := relay.SetClientRemote(SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: clientAddr.Port, RTCPPort: clientRTCPAddr.Port, Direction: "recvonly"}); err != nil {
+		t.Fatalf("SetClientRemote(recvonly) error = %v", err)
+	}
+	if _, err := clientPeer.WriteToUDP([]byte{0x11}, clientEndpoint); err != nil {
+		t.Fatalf("client recvonly WriteToUDP() error = %v", err)
+	}
+	expectNoTestUDP(t, imsPeer)
+
+	if _, err := imsPeer.WriteToUDP([]byte{0x22}, imsEndpoint); err != nil {
+		t.Fatalf("ims WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, clientPeer); !bytes.Equal(got, []byte{0x22}) {
+		t.Fatalf("client recvonly got=%x", got)
+	}
+
+	if err := relay.SetIMSRemote(SDPInfo{ConnectionIP: "0.0.0.0", MediaPort: imsAddr.Port}); err != nil {
+		t.Fatalf("SetIMSRemote(0.0.0.0) error = %v", err)
+	}
+	if _, err := clientPeer.WriteToUDP([]byte{0x12}, clientEndpoint); err != nil {
+		t.Fatalf("client zero-target WriteToUDP() error = %v", err)
+	}
+	expectNoTestUDP(t, imsPeer)
+
+	stats := waitRelayStats(t, relay, func(stats RTPRelayStats) bool {
+		return stats.ClientToIMSRTPPackets == 1 && stats.ClientToIMSRTPDrops >= 1 && stats.IMSToClientRTPPackets == 1
+	})
+	if stats.ClientToIMSRTPPackets != 1 || stats.ClientToIMSRTPDrops < 1 || stats.IMSToClientRTPPackets != 1 {
+		t.Fatalf("direction stats=%+v", stats)
+	}
+}
+
 func TestRTPRelaySessionRewritesSDP(t *testing.T) {
 	clientPeer := listenTestUDP(t)
 	defer clientPeer.Close()
@@ -301,6 +369,21 @@ func readTestUDP(t *testing.T, conn *net.UDPConn) ([]byte, *net.UDPAddr) {
 		t.Fatalf("ReadFromUDP() error = %v", err)
 	}
 	return append([]byte(nil), buf[:n]...), addr
+}
+
+func expectNoTestUDP(t *testing.T, conn *net.UDPConn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	buf := make([]byte, 128)
+	n, addr, err := conn.ReadFromUDP(buf)
+	if err == nil {
+		t.Fatalf("unexpected UDP packet from %v: %x", addr, buf[:n])
+	}
+	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("ReadFromUDP() error = %v, want timeout", err)
+	}
 }
 
 func readRTCPFeedbackEvent(t *testing.T, events <-chan RTCPFeedbackEvent) RTCPFeedbackEvent {

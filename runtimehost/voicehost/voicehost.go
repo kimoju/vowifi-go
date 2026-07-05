@@ -553,7 +553,8 @@ func ParseSDP(body []byte) (SDPInfo, error) {
 	if out.ConnectionIP == "" {
 		out.ConnectionIP = "127.0.0.1"
 	}
-	if ip := net.ParseIP(out.ConnectionIP); ip == nil {
+	ip := net.ParseIP(out.ConnectionIP)
+	if ip == nil {
 		return SDPInfo{}, errors.New("invalid SDP connection IP")
 	}
 	if m := sdpMediaRE.FindStringSubmatch(text); len(m) == 3 {
@@ -580,7 +581,11 @@ func ParseSDP(body []byte) (SDPInfo, error) {
 		out.Direction = strings.TrimSpace(m[1])
 	}
 	if out.Direction == "" {
-		out.Direction = "sendrecv"
+		if ip.IsUnspecified() {
+			out.Direction = "inactive"
+		} else {
+			out.Direction = "sendrecv"
+		}
 	}
 	return out, nil
 }
