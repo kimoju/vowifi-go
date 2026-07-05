@@ -160,6 +160,64 @@ func TestStartEmergencyAddressUpdateHandlesEAPRelayChallenge(t *testing.T) {
 	}
 }
 
+func TestStartEmergencyAddressUpdateHandlesEAPRelayIdentityThenChallenge(t *testing.T) {
+	identity := "310280233641503@private.att.net"
+	identityRequest := eapRelayIdentityRequest(t)
+	relayPacket := signedEAPRelayChallenge(t, identity, e911AKAResult())
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":12,"eap-relay-packet":"` + identityRequest + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":13,"eap-relay-packet":"` + relayPacket + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+	aka := &fakeAKAProvider{}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity:    Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280", SIPUsername: identity},
+		AKAProvider: aka,
+		Client:      client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=1" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	if len(client.requests) != 3 {
+		t.Fatalf("requests=%d, want identity response, AKA response, websheet", len(client.requests))
+	}
+	first := decodeEntitlementAnswer(t, client.requests[1].Body)
+	firstPacket := decodeRelayPacket(t, first)
+	if firstPacket.Code != eapaka.CodeResponse || firstPacket.Subtype != eapaka.SubtypeIdentity {
+		t.Fatalf("identity relay response=%+v", firstPacket)
+	}
+	idAttr, ok := eapaka.FindAttribute(firstPacket.Attributes, eapaka.AttributeIdentity)
+	if !ok {
+		t.Fatalf("identity relay response missing AT_IDENTITY: %+v", firstPacket)
+	}
+	gotIdentity, err := idAttr.IdentityValue()
+	if err != nil {
+		t.Fatalf("IdentityValue() error = %v", err)
+	}
+	if gotIdentity != identity {
+		t.Fatalf("identity=%q, want %q", gotIdentity, identity)
+	}
+	second := decodeEntitlementAnswer(t, client.requests[2].Body)
+	secondPacket := decodeRelayPacket(t, second)
+	if secondPacket.Code != eapaka.CodeResponse || secondPacket.Subtype != eapaka.SubtypeChallenge {
+		t.Fatalf("challenge relay response=%+v", secondPacket)
+	}
+	if aka.calls != 1 {
+		t.Fatalf("AKA calls=%d, want one AKA calculation after identity", aka.calls)
+	}
+}
+
 func TestStartEmergencyAddressUpdateHandlesEAPRelayAKAPrimeKDFNegotiation(t *testing.T) {
 	identity := "310280233641503@private.att.net"
 	kdfOffer := eapRelayAKAPrimeKDFOffer(t, "WLAN", []uint16{99, eapaka.AKAPrimeKDFDefault})
@@ -271,6 +329,22 @@ func e911AKAResult() sim.AKAResult {
 		CK:  bytesFrom(0xA0, 16),
 		IK:  bytesFrom(0xB0, 16),
 	}
+}
+
+func eapRelayIdentityRequest(t *testing.T) string {
+	t.Helper()
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 6,
+		Type:       eapaka.TypeAKA,
+		Subtype:    eapaka.SubtypeIdentity,
+		Attributes: []eapaka.Attribute{eapaka.AnyIDReqAttribute()},
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
 }
 
 func signedEAPRelayChallenge(t *testing.T, identity string, aka sim.AKAResult) string {

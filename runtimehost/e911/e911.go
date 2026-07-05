@@ -225,6 +225,12 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult) (map
 		"sip-username":  req.Identity.SIPUsername,
 		"terminal-imei": req.Identity.IMEI,
 	}
+	if relay, ok, err := buildEAPRelayIdentityAnswer(result, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI)); err != nil {
+		return nil, err
+	} else if ok {
+		answerBody["eap-relay-packet"] = relay
+		return answerBody, nil
+	}
 	if relay, negotiated, err := buildEAPRelayKDFNegotiationAnswer(result); err != nil {
 		return nil, err
 	} else if negotiated {
@@ -292,7 +298,7 @@ type entitlementResult struct {
 }
 
 func (r entitlementResult) HasChallenge() bool {
-	return len(r.RAND) == 16 && len(r.AUTN) == 16
+	return (len(r.RAND) == 16 && len(r.AUTN) == 16) || r.EAPPacket != nil
 }
 
 func parseEntitlementResponse(body []byte) (entitlementResult, error) {
@@ -369,6 +375,8 @@ func parseEAPRelayPacket(v any, out *entitlementResult) {
 	if err != nil {
 		return
 	}
+	p := packet
+	out.EAPPacket = &p
 	rand16, autn16, err := eapaka.ChallengeRANDAndAUTN(packet)
 	if err != nil {
 		return
@@ -379,8 +387,32 @@ func parseEAPRelayPacket(v any, out *entitlementResult) {
 	if len(out.AUTN) == 0 {
 		out.AUTN = autn16
 	}
-	p := packet
-	out.EAPPacket = &p
+}
+
+func buildEAPRelayIdentityAnswer(result entitlementResult, identity string) (string, bool, error) {
+	if result.EAPPacket == nil {
+		return "", false, nil
+	}
+	request := *result.EAPPacket
+	if request.Code != eapaka.CodeRequest || request.Subtype != eapaka.SubtypeIdentity {
+		return "", false, nil
+	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return "", true, ErrChallengeNotImplemented
+	}
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeResponse,
+		Identifier: request.Identifier,
+		Type:       request.Type,
+		Subtype:    eapaka.SubtypeIdentity,
+		Attributes: []eapaka.Attribute{eapaka.IdentityAttribute(identity)},
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		return "", true, err
+	}
+	return base64.StdEncoding.EncodeToString(raw), true, nil
 }
 
 func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity string, syncFailure bool) (string, error) {
