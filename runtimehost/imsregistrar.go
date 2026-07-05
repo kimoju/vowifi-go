@@ -42,6 +42,8 @@ type WireIMSRegistrar struct {
 	RefreshInterval       time.Duration
 	RefreshLead           time.Duration
 	RefreshRetryInterval  time.Duration
+	DisableKeepalive      bool
+	KeepaliveInterval     time.Duration
 	UserAgent             string
 	CallID                string
 	CNonce                string
@@ -183,6 +185,7 @@ type imsRegistrationMaintenance struct {
 	authHeaderName string
 	cancel         context.CancelFunc
 	done           chan struct{}
+	wg             sync.WaitGroup
 	closed         bool
 }
 
@@ -204,11 +207,28 @@ func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voicec
 		authHeader:     result.AuthHeader,
 		authHeaderName: result.AuthHeaderName,
 	}
-	if result.Registered && !config.DisableRefresh {
+	if result.Registered && (!config.DisableRefresh || !config.DisableKeepalive) {
 		ctx, cancel := context.WithCancel(context.Background())
 		m.cancel = cancel
 		m.done = make(chan struct{})
-		go m.refreshLoop(ctx)
+		if !config.DisableRefresh {
+			m.wg.Add(1)
+			go func() {
+				defer m.wg.Done()
+				m.refreshLoop(ctx)
+			}()
+		}
+		if !config.DisableKeepalive {
+			m.wg.Add(1)
+			go func() {
+				defer m.wg.Done()
+				m.keepaliveLoop(ctx)
+			}()
+		}
+		go func() {
+			m.wg.Wait()
+			close(m.done)
+		}()
 	}
 	return m
 }
@@ -259,7 +279,6 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 }
 
 func (m *imsRegistrationMaintenance) refreshLoop(ctx context.Context) {
-	defer close(m.done)
 	for {
 		if !m.wait(ctx, m.refreshDelay()) {
 			return
@@ -272,6 +291,20 @@ func (m *imsRegistrationMaintenance) refreshLoop(ctx context.Context) {
 				continue
 			}
 			break
+		}
+	}
+}
+
+func (m *imsRegistrationMaintenance) keepaliveLoop(ctx context.Context) {
+	for {
+		if !m.wait(ctx, m.keepaliveInterval()) {
+			return
+		}
+		if !m.isRegistered() {
+			continue
+		}
+		if err := m.flow.SendCRLFKeepalive(ctx); err != nil && (ctx.Err() != nil || errors.Is(err, voiceclient.ErrSIPFlowClosed)) {
+			return
 		}
 	}
 }
@@ -317,6 +350,12 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 	return nil
 }
 
+func (m *imsRegistrationMaintenance) isRegistered() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.registered
+}
+
 func (m *imsRegistrationMaintenance) refreshDelay() time.Duration {
 	if m.config.RefreshInterval > 0 {
 		return m.config.RefreshInterval
@@ -356,6 +395,13 @@ func (m *imsRegistrationMaintenance) refreshRetryInterval() time.Duration {
 		return m.config.RefreshRetryInterval
 	}
 	return 30 * time.Second
+}
+
+func (m *imsRegistrationMaintenance) keepaliveInterval() time.Duration {
+	if m.config.KeepaliveInterval > 0 {
+		return m.config.KeepaliveInterval
+	}
+	return 25 * time.Second
 }
 
 func (r WireIMSRegistrar) smsTransport(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, binding voiceclient.RegistrationBinding, voiceTransport voiceclient.SIPRequestTransport) messaging.SMSTransport {
