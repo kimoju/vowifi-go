@@ -211,6 +211,252 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentPropagatesSessionTimerHeaders(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":              {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact":         {"<sip:client@192.0.2.50:5060>"},
+				"Session-Expires": {"1200;refresher=uac"},
+				"Min-SE":          {"90"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Session-Expires": {"600;refresher=uas"},
+				"Min-SE":          {"120"},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-session-timer",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+		Headers: map[string][]string{
+			"Session-Expires": {"1800;refresher=uas"},
+			"Min-SE":          {"90"},
+		},
+	})
+	if err != nil || !result.Accepted || result.Headers["Session-Expires"] != "1200;refresher=uac" || result.Headers["Min-SE"] != "90" {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 1 || transport.requests[0].Headers["Session-Expires"] != "1800;refresher=uas" ||
+		transport.requests[0].Headers["Min-SE"] != "90" {
+		t.Fatalf("client INVITE=%+v", transport.requests)
+	}
+	update, err := agent.HandleInboundUpdate(context.Background(), InboundDialogRequest{
+		CallID: "in-call-session-timer",
+		CSeq:   3,
+		Headers: map[string][]string{
+			"Session-Expires": {"600;refresher=uac"},
+			"Min-SE":          {"120"},
+		},
+	})
+	if err != nil || !update.Accepted || update.Headers["Session-Expires"] != "600;refresher=uas" || update.Headers["Min-SE"] != "120" {
+		t.Fatalf("HandleInboundUpdate() result=%+v err=%v", update, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "UPDATE" ||
+		transport.requests[1].Headers["Session-Expires"] != "600;refresher=uac" ||
+		transport.requests[1].Headers["Min-SE"] != "120" {
+		t.Fatalf("client UPDATE=%+v", transport.requests)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-session-timer"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+}
+
+func TestIMSInboundAgentRetriesInviteSessionTimerMinSE(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 422,
+			Reason:     "Session Interval Too Small",
+			Headers: map[string][]string{
+				"To":     {"<sip:user@ims.example>;tag=too-small"},
+				"Min-SE": {"900"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":              {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact":         {"<sip:client@192.0.2.50:5060>"},
+				"Session-Expires": {"900;refresher=uas"},
+				"Min-SE":          {"900"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 422,
+			Reason:     "Session Interval Too Small",
+			Headers: map[string][]string{
+				"To":     {"<sip:user@ims.example>;tag=too-small-reinvite"},
+				"Min-SE": {"1200"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Session-Expires": {"1200;refresher=uac"},
+				"Min-SE":          {"1200"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4004)),
+		},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-session-retry",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		CSeq:      1,
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+		Headers: map[string][]string{
+			"Session-Expires": {"300;refresher=uas"},
+			"Min-SE":          {"90"},
+		},
+	})
+	if err != nil || !result.Accepted || result.Headers["Session-Expires"] != "900;refresher=uas" {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[0].Headers["CSeq"] != "1 INVITE" ||
+		transport.requests[0].Headers["Session-Expires"] != "300;refresher=uas" ||
+		transport.requests[1].Headers["CSeq"] != "2 INVITE" ||
+		transport.requests[1].Headers["Session-Expires"] != "900;refresher=uas" ||
+		transport.requests[1].Headers["Min-SE"] != "900" {
+		t.Fatalf("initial INVITEs=%+v", transport.requests)
+	}
+	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" ||
+		transport.writes[0].Headers["CSeq"] != "1 ACK" ||
+		!strings.Contains(transport.writes[0].Headers["To"], "too-small") {
+		t.Fatalf("rejected INVITE ACKs=%+v", transport.writes)
+	}
+	if err := agent.AckInboundCall(context.Background(), DialogInfo{CallID: "in-call-session-retry"}); err != nil {
+		t.Fatalf("AckInboundCall(initial) error = %v", err)
+	}
+	if len(transport.writes) != 2 || transport.writes[1].Headers["CSeq"] != "2 ACK" {
+		t.Fatalf("accepted INVITE ACKs=%+v", transport.writes)
+	}
+
+	reinvite, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-session-retry",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		CSeq:      5,
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49172)),
+		Headers: map[string][]string{
+			"Session-Expires": {"600;refresher=uac"},
+			"Min-SE":          {"90"},
+		},
+	})
+	if err != nil || !reinvite.Accepted || reinvite.Headers["Session-Expires"] != "1200;refresher=uac" {
+		t.Fatalf("HandleInboundInvite(re-INVITE) result=%+v err=%v", reinvite, err)
+	}
+	if len(transport.requests) != 4 || transport.requests[2].Headers["CSeq"] != "5 INVITE" ||
+		transport.requests[2].Headers["Session-Expires"] != "600;refresher=uac" ||
+		transport.requests[3].Headers["CSeq"] != "6 INVITE" ||
+		transport.requests[3].Headers["Session-Expires"] != "1200;refresher=uac" ||
+		transport.requests[3].Headers["Min-SE"] != "1200" {
+		t.Fatalf("re-INVITEs=%+v", transport.requests)
+	}
+	if len(transport.writes) != 3 || transport.writes[2].Method != "ACK" ||
+		transport.writes[2].Headers["CSeq"] != "5 ACK" ||
+		!strings.Contains(transport.writes[2].Headers["To"], "too-small-reinvite") {
+		t.Fatalf("rejected re-INVITE ACKs=%+v", transport.writes)
+	}
+	if err := agent.AckInboundCall(context.Background(), DialogInfo{CallID: "in-call-session-retry"}); err != nil {
+		t.Fatalf("AckInboundCall(re-INVITE) error = %v", err)
+	}
+	if len(transport.writes) != 4 || transport.writes[3].Headers["CSeq"] != "6 ACK" {
+		t.Fatalf("accepted re-INVITE ACKs=%+v", transport.writes)
+	}
+}
+
+func TestIMSInboundAgentRetriesUpdateSessionTimerMinSE(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 422,
+			Reason:     "Session Interval Too Small",
+			Headers: map[string][]string{
+				"Min-SE": {"900"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Session-Expires": {"900;refresher=uas"},
+				"Min-SE":          {"900"},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-update-session-retry",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	update, err := agent.HandleInboundUpdate(context.Background(), InboundDialogRequest{
+		CallID: "in-call-update-session-retry",
+		CSeq:   3,
+		Headers: map[string][]string{
+			"Session-Expires": {"300;refresher=uac"},
+			"Min-SE":          {"90"},
+		},
+	})
+	if err != nil || !update.Accepted || update.Headers["Session-Expires"] != "900;refresher=uas" {
+		t.Fatalf("HandleInboundUpdate() result=%+v err=%v", update, err)
+	}
+	if len(transport.requests) != 3 || transport.requests[1].Method != "UPDATE" ||
+		transport.requests[1].Headers["CSeq"] != "3 UPDATE" ||
+		transport.requests[1].Headers["Session-Expires"] != "300;refresher=uac" ||
+		transport.requests[2].Method != "UPDATE" ||
+		transport.requests[2].Headers["CSeq"] != "4 UPDATE" ||
+		transport.requests[2].Headers["Session-Expires"] != "900;refresher=uac" ||
+		transport.requests[2].Headers["Min-SE"] != "900" {
+		t.Fatalf("client UPDATE retry=%+v", transport.requests)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-update-session-retry"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 4 || transport.requests[3].Headers["CSeq"] != "5 BYE" {
+		t.Fatalf("client BYE=%+v", transport.requests)
+	}
+}
+
 func TestIMSInboundAgentForwardsInDialogInfoToClient(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

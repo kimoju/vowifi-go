@@ -45,6 +45,7 @@ type InboundCallResult struct {
 	Reason     string
 	LocalSDP   SDPInfo
 	RawSDP     []byte
+	Headers    map[string]string
 }
 
 type InboundDialogRequest struct {
@@ -119,15 +120,33 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		CSeq:            inboundCSeq(req.CSeq),
 		UserAgent:       firstVoiceNonEmpty(a.UserAgent, a.Profile.UserAgent, "vowifi-go"),
 	}
-	invite, err := voiceclient.BuildInviteRequest(cfg, offerBody)
-	if err != nil {
-		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client INVITE failed"}, err
-	}
-	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, inviteCSeq: cfg.CSeq, relay: relay})
-	resp, err := a.roundTripClientInvite(ctx, invite)
-	if err != nil {
-		a.deleteInboundDialog(callID)
-		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client INVITE failed"}, err
+	applyInboundSessionIntervalHeaders(&cfg, req.Headers)
+	var invite voiceclient.SIPRequestMessage
+	var resp voiceclient.SIPResponse
+	retriedSessionInterval := false
+	for {
+		invite, err = voiceclient.BuildInviteRequest(cfg, offerBody)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client INVITE failed"}, err
+		}
+		a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, inviteCSeq: cfg.CSeq, relay: relay})
+		resp, err = a.roundTripClientInvite(ctx, invite)
+		if err != nil {
+			a.deleteInboundDialog(callID)
+			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client INVITE failed"}, err
+		}
+		if resp.StatusCode == 422 && !retriedSessionInterval {
+			if retryCfg, ok := retryDialogConfigForMinSE(cfg, invite.Headers, resp.Headers); ok {
+				if err := a.ackRejectedClientInvite(ctx, cfg, invite, resp); err != nil {
+					a.deleteInboundDialog(callID)
+					return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "client INVITE session interval ACK failed"}, err
+				}
+				cfg = retryCfg
+				retriedSessionInterval = true
+				continue
+			}
+		}
+		break
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp.StatusCode >= 300 {
@@ -141,6 +160,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 			Accepted:   false,
 			StatusCode: inboundStatusCode(resp.StatusCode, 486),
 			Reason:     firstVoiceNonEmpty(resp.Reason, "Busy Here"),
+			Headers:    firstValueSIPHeaders(resp.Headers),
 		}, nil
 	}
 	localSDP, err := ParseSDP(resp.Body)
@@ -168,7 +188,8 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 	if routeSet := recordRouteSet(resp.Headers); len(routeSet) > 0 {
 		cfg.RouteSet = routeSet
 	}
-	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, inviteCSeq: inboundCSeq(req.CSeq), relay: relay})
+	applyInboundNegotiatedSessionInterval(&cfg, resp.Headers)
+	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, inviteCSeq: cfg.CSeq, relay: relay})
 	closeRelayOnError = false
 	return InboundCallResult{
 		Accepted:   true,
@@ -176,6 +197,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		Reason:     firstVoiceNonEmpty(resp.Reason, "OK"),
 		LocalSDP:   localSDP,
 		RawSDP:     answerBody,
+		Headers:    firstValueSIPHeaders(resp.Headers),
 	}, nil
 }
 
@@ -184,6 +206,7 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 	reinviteCSeq := inboundCSeq(req.CSeq)
 	cfg := state.clientCfg
 	cfg.CSeq = reinviteCSeq
+	applyInboundSessionIntervalHeaders(&cfg, req.Headers)
 	body := append([]byte(nil), req.RawSDP...)
 	if len(body) > 0 && state.relay != nil {
 		remoteSDP, offerBody, err := inboundOfferSDP(req)
@@ -195,15 +218,32 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 		}
 		body = RewriteSDPMediaEndpoint(offerBody, state.relay.ClientEndpoint())
 	}
-	invite, err := voiceclient.BuildInviteRequest(cfg, body)
-	if err != nil {
-		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client re-INVITE failed"}, err
-	}
-	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, reinviteCSeq)
-	a.storeInboundDialog(callID, state)
-	resp, err := a.roundTripClientInvite(ctx, invite)
-	if err != nil {
-		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client re-INVITE failed"}, err
+	var invite voiceclient.SIPRequestMessage
+	var resp voiceclient.SIPResponse
+	var err error
+	retriedSessionInterval := false
+	for {
+		invite, err = voiceclient.BuildInviteRequest(cfg, body)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client re-INVITE failed"}, err
+		}
+		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		a.storeInboundDialog(callID, state)
+		resp, err = a.roundTripClientInvite(ctx, invite)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client re-INVITE failed"}, err
+		}
+		if resp.StatusCode == 422 && !retriedSessionInterval {
+			if retryCfg, ok := retryDialogConfigForMinSE(cfg, invite.Headers, resp.Headers); ok {
+				if err := a.ackRejectedClientInvite(ctx, cfg, invite, resp); err != nil {
+					return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "client re-INVITE session interval ACK failed"}, err
+				}
+				cfg = retryCfg
+				retriedSessionInterval = true
+				continue
+			}
+		}
+		break
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp.StatusCode >= 300 {
@@ -211,9 +251,9 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 				return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "client re-INVITE rejected ACK failed"}, err
 			}
 		}
-		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 488), Reason: firstVoiceNonEmpty(resp.Reason, "re-INVITE rejected")}, nil
+		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 488), Reason: firstVoiceNonEmpty(resp.Reason, "re-INVITE rejected"), Headers: firstValueSIPHeaders(resp.Headers)}, nil
 	}
-	result := InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...)}
+	result := InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...), Headers: firstValueSIPHeaders(resp.Headers)}
 	if len(resp.Body) > 0 {
 		localSDP, err := ParseSDP(resp.Body)
 		if err != nil {
@@ -234,9 +274,10 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
 	}
-	cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, reinviteCSeq)
+	applyInboundNegotiatedSessionInterval(&cfg, resp.Headers)
+	cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 	state.clientCfg = cfg
-	state.inviteCSeq = reinviteCSeq
+	state.inviteCSeq = cfg.CSeq
 	a.storeInboundDialog(callID, state)
 	return result, nil
 }
@@ -274,6 +315,32 @@ func (a *IMSInboundAgent) ackRejectedClientInvite(ctx context.Context, cfg voice
 	return a.ClientTransport.WriteRequest(ctx, ack)
 }
 
+func applyInboundSessionIntervalHeaders(cfg *voiceclient.DialogRequestConfig, headers map[string][]string) {
+	if cfg == nil {
+		return
+	}
+	cfg.SessionExpires = 0
+	cfg.SessionRefresher = ""
+	cfg.MinSE = 0
+	if interval := sessionExpiresResponseHeader(headers); interval.Expires > 0 {
+		cfg.SessionExpires = interval.Expires
+		cfg.SessionRefresher = interval.Refresher
+	}
+	if minSE := minSEHeader(headers); minSE > 0 {
+		cfg.MinSE = minSE
+	}
+}
+
+func applyInboundNegotiatedSessionInterval(cfg *voiceclient.DialogRequestConfig, headers map[string][]string) {
+	if cfg == nil {
+		return
+	}
+	applyNegotiatedSessionInterval(cfg, headers)
+	if minSE := minSEHeader(headers); minSE > 0 {
+		cfg.MinSE = minSE
+	}
+}
+
 func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDialogRequest) (InboundCallResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -292,6 +359,7 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 	cfg := state.clientCfg
 	updateCSeq := inboundCSeq(req.CSeq)
 	cfg.CSeq = updateCSeq
+	applyInboundSessionIntervalHeaders(&cfg, req.Headers)
 	body := append([]byte(nil), req.RawSDP...)
 	if len(body) > 0 && state.relay != nil {
 		remoteSDP, offerBody, err := inboundDialogSDP(req)
@@ -303,20 +371,34 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 		}
 		body = RewriteSDPMediaEndpoint(offerBody, state.relay.ClientEndpoint())
 	}
-	update, err := voiceclient.BuildUpdateRequest(cfg, body)
-	if err != nil {
-		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client UPDATE failed"}, err
-	}
-	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, updateCSeq)
-	a.storeInboundDialog(callID, state)
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, update)
-	if err != nil {
-		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client UPDATE failed"}, err
+	var update voiceclient.SIPRequestMessage
+	var resp voiceclient.SIPResponse
+	var err error
+	retriedSessionInterval := false
+	for {
+		update, err = voiceclient.BuildUpdateRequest(cfg, body)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client UPDATE failed"}, err
+		}
+		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		a.storeInboundDialog(callID, state)
+		resp, err = a.ClientTransport.RoundTripRequest(ctx, update)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client UPDATE failed"}, err
+		}
+		if resp.StatusCode == 422 && !retriedSessionInterval {
+			if retryCfg, ok := retryDialogConfigForMinSE(cfg, update.Headers, resp.Headers); ok {
+				cfg = retryCfg
+				retriedSessionInterval = true
+				continue
+			}
+		}
+		break
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 488), Reason: firstVoiceNonEmpty(resp.Reason, "UPDATE rejected")}, nil
+		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 488), Reason: firstVoiceNonEmpty(resp.Reason, "UPDATE rejected"), Headers: firstValueSIPHeaders(resp.Headers)}, nil
 	}
-	result := InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...)}
+	result := InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...), Headers: firstValueSIPHeaders(resp.Headers)}
 	if len(resp.Body) > 0 {
 		localSDP, err := ParseSDP(resp.Body)
 		if err != nil {
@@ -337,7 +419,8 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
 	}
-	cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, updateCSeq)
+	applyInboundNegotiatedSessionInterval(&cfg, resp.Headers)
+	cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 	state.clientCfg = cfg
 	a.storeInboundDialog(callID, state)
 	return result, nil
@@ -374,7 +457,7 @@ func (a *IMSInboundAgent) HandleInboundPrack(ctx context.Context, req InboundDia
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 500), Reason: firstVoiceNonEmpty(resp.Reason, "PRACK rejected")}, nil
 	}
-	return InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...)}, nil
+	return InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...), Headers: firstValueSIPHeaders(resp.Headers)}, nil
 }
 
 func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequest) (IMSInfoResult, error) {

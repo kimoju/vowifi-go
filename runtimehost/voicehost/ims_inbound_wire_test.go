@@ -311,6 +311,84 @@ func TestIMSInboundWireServerDispatchesPrackUpdateAndOptions(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerPropagatesSessionTimerHeaders(t *testing.T) {
+	transport := newWireInboundTransport([]voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":              {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact":         {"<sip:client@127.0.0.1:5070>"},
+				"Session-Expires": {"1200;refresher=uac"},
+				"Min-SE":          {"90"},
+			},
+			Body: []byte(sampleSDP("127.0.0.1", 4002)),
+		},
+		{
+			StatusCode: 422,
+			Reason:     "Session Interval Too Small",
+			Headers: map[string][]string{
+				"Min-SE": {"900"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Session-Expires": {"900;refresher=uas"},
+				"Min-SE":          {"900"},
+			},
+		},
+	})
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		ContactURI: "sip:vowifi@127.0.0.1:5060",
+	}
+	invite := parseWireIncoming(t, wireIMSRequest("wire-call-session-timer", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170)),
+		"Session-Expires: 1800;refresher=uas\r\n",
+		"Min-SE: 90\r\n"))
+	responses, err := server.HandleRequest(context.Background(), invite)
+	if err != nil {
+		t.Fatalf("HandleRequest(INVITE) error = %v", err)
+	}
+	if len(responses) != 2 || responses[1].StatusCode != 200 ||
+		responses[1].Headers["Session-Expires"] != "1200;refresher=uac" ||
+		responses[1].Headers["Min-SE"] != "90" {
+		t.Fatalf("INVITE responses=%+v", responses)
+	}
+	clientInvite := transport.readRequest(t)
+	if clientInvite.Headers["Session-Expires"] != "1800;refresher=uas" || clientInvite.Headers["Min-SE"] != "90" {
+		t.Fatalf("client INVITE=%+v", clientInvite)
+	}
+
+	update := parseWireIncoming(t, wireIMSRequest("wire-call-session-timer", "UPDATE", 3, nil,
+		"Session-Expires: 300;refresher=uac\r\n",
+		"Min-SE: 900\r\n"))
+	responses, err = server.HandleRequest(context.Background(), update)
+	if err != nil {
+		t.Fatalf("HandleRequest(UPDATE) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 ||
+		responses[0].Headers["Session-Expires"] != "900;refresher=uas" ||
+		responses[0].Headers["Min-SE"] != "900" {
+		t.Fatalf("UPDATE responses=%+v", responses)
+	}
+	clientUpdate := transport.readRequest(t)
+	if clientUpdate.Headers["Session-Expires"] != "300;refresher=uac" || clientUpdate.Headers["Min-SE"] != "900" {
+		t.Fatalf("client UPDATE=%+v", clientUpdate)
+	}
+	retryUpdate := transport.readRequest(t)
+	if retryUpdate.Headers["CSeq"] != "4 UPDATE" ||
+		retryUpdate.Headers["Session-Expires"] != "900;refresher=uac" ||
+		retryUpdate.Headers["Min-SE"] != "900" {
+		t.Fatalf("client retry UPDATE=%+v", retryUpdate)
+	}
+}
+
 func TestIMSInboundWireServerDispatchesReinviteAndAck(t *testing.T) {
 	transport := newWireInboundTransport([]voiceclient.SIPResponse{
 		{

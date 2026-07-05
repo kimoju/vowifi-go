@@ -307,6 +307,7 @@ func (s *IMSInboundWireServer) handleUpdate(ctx context.Context, req voiceclient
 		}
 		final.Headers["Contact"] = "<" + s.contactURI() + ">"
 	}
+	applyInboundWireResultHeaders(final.Headers, result.Headers)
 	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err
 }
 
@@ -329,6 +330,7 @@ func (s *IMSInboundWireServer) handlePrack(ctx context.Context, req voiceclient.
 			final.Headers["Content-Type"] = "application/sdp"
 		}
 	}
+	applyInboundWireResultHeaders(final.Headers, result.Headers)
 	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err
 }
 
@@ -360,8 +362,23 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 			final.Headers["Content-Type"] = "application/sdp"
 		}
 	}
+	applyInboundWireResultHeaders(final.Headers, result.Headers)
 	responses = append(responses, s.withResponseHeaders(final))
 	return responses, err
+}
+
+func applyInboundWireResultHeaders(dst map[string]string, src map[string]string) {
+	if dst == nil {
+		return
+	}
+	for key, value := range src {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		dst[key] = value
+	}
 }
 
 func (s *IMSInboundWireServer) handlePacket(ctx context.Context, pc net.PacketConn, addr net.Addr, raw []byte) {

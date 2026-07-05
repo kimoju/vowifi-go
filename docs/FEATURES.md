@@ -198,11 +198,12 @@ protocol layers needed by VoHive:
   `sendonly`, `recvonly`, `inactive`, and legacy `c=0.0.0.0` hold handling to
   RTP forwarding while keeping RTCP feedback/report paths available, including
   disabled `m=audio 0` streams without leaking relay endpoints
-- IMS Session-Expires timer negotiation across initial INVITE, UPDATE, and
-  re-INVITE paths, including `refresher=uac/uas` preservation, 422 Min-SE
-  retry handling, dialog-state updates from 2xx responses, and softphone
-  response header propagation, plus automatic empty UPDATE session refreshes
-  when the negotiated refresher role is `uac`
+- IMS Session-Expires timer negotiation across outbound and IMS-originated
+  inbound initial INVITE, UPDATE, and re-INVITE paths, including
+  `refresher=uac/uas` preservation, 422 Min-SE retry handling, dialog-state
+  updates from 2xx responses, softphone response header propagation, and
+  automatic empty UPDATE session refreshes when the negotiated refresher role
+  is `uac`
 - in-dialog re-INVITE handling for IMS-originated media renegotiation, including
   local client forwarding, SDP answer rewriting, Contact refresh, and ACK CSeq
   tracking for the latest successful INVITE transaction
