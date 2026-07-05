@@ -68,6 +68,9 @@ protocol layers needed by VoHive:
 - encrypted IKE_AUTH EAP-Identity exchange scaffolding, including IDi, CP,
   CHILD_SA/TSi/TSr request payloads, responder EAP parsing, and
   EAP-Response/Identity transmission
+- high-level encrypted IKE_AUTH EAP-AKA/AKA' orchestration that drives
+  Identity, AKA' KDF negotiation, AKA challenge, EAP control follow-ups, and
+  final CHILD_SA parsing as one flow
 - EAP-AKA full-auth key derivation, EAP-AKA' CK'/IK' and PRF' key material,
   AT_KDF negotiation, AT_MAC verification/generation, AT_RAND/AT_AUTN challenge
   extraction, SIM AKA RES response, AUTS synchronization-failure response,

@@ -142,6 +142,256 @@ func TestRunIKEAuthEAPIdentity(t *testing.T) {
 	}
 }
 
+func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
+	init := fakeInitResult(t)
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := simAKAResult()
+	eapKeys, err := eapaka.DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	localSPI := []byte{0x01, 0x02, 0x03, 0x04}
+	random := bytes.NewReader(append(localSPI, bytes.Repeat([]byte{0x44}, 256)...))
+	exchanges := 0
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(request, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		switch exchanges {
+		case 0:
+			if msg.Header.MessageID != 1 || !bytes.Equal(gotTypes(inner), []byte{PayloadIDi, PayloadCP, PayloadSA, PayloadTSi, PayloadTSr}) {
+				t.Fatalf("initial auth header=%+v inner types=%v", msg.Header, gotTypes(inner))
+			}
+			req := eapaka.Packet{
+				Code:       eapaka.CodeRequest,
+				Identifier: 9,
+				Type:       eapaka.TypeAKA,
+				Subtype:    eapaka.SubtypeIdentity,
+				Attributes: []eapaka.Attribute{eapaka.FullAuthIDReqAttribute()},
+			}
+			rawReq, err := req.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 1, false), init.Keys, false, []Payload{EAPPayload(rawReq)}, bytes.Repeat([]byte{0x91}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 1:
+			if msg.Header.MessageID != 2 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+				t.Fatalf("identity auth header=%+v inner=%+v", msg.Header, inner)
+			}
+			pkt := parseTestEAP(t, inner[0].Body)
+			if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeIdentity {
+				t.Fatalf("identity response=%+v", pkt)
+			}
+			challenge := signedAKAChallenge(t, identity, aka)
+			rawChallenge, err := challenge.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 2, false), init.Keys, false, []Payload{EAPPayload(rawChallenge)}, bytes.Repeat([]byte{0x92}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 2:
+			if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+				t.Fatalf("challenge auth header=%+v inner=%+v", msg.Header, inner)
+			}
+			pkt := parseTestEAP(t, inner[0].Body)
+			if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeChallenge {
+				t.Fatalf("challenge response=%+v", pkt)
+			}
+			raw, err := pkt.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			if err := eapaka.VerifyMAC(eapKeys.KAut, raw, nil); err != nil {
+				return nil, err
+			}
+			notification := signedAKANotification(t, 14, eapKeys, eapaka.NotificationSuccess)
+			rawNotification, err := notification.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(rawNotification)}, bytes.Repeat([]byte{0x93}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 3:
+			if msg.Header.MessageID != 4 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+				t.Fatalf("notification auth header=%+v inner=%+v", msg.Header, inner)
+			}
+			pkt := parseTestEAP(t, inner[0].Body)
+			if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeNotification {
+				t.Fatalf("notification response=%+v", pkt)
+			}
+			raw, err := pkt.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			if err := eapaka.VerifyMAC(eapKeys.KAut, raw, nil); err != nil {
+				return nil, err
+			}
+			payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xde, 0xad, 0xbe, 0xef})
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 4, false), init.Keys, false, payloads, bytes.Repeat([]byte{0x94}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		default:
+			return nil, errors.New("unexpected extra exchange")
+		}
+	})
+
+	res, err := RunIKE_AUTH_Full(context.Background(), FullAuthConfig{
+		Transport:   transport,
+		Init:        init,
+		SIM:         akaProviderStub{result: aka},
+		InitiatorID: Identity{Type: IDRFC822Addr, Data: []byte(identity)},
+		EAPIdentity: identity,
+		Random:      random,
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_Full() error = %v", err)
+	}
+	if exchanges != 4 {
+		t.Fatalf("exchanges=%d, want 4", exchanges)
+	}
+	if len(res.IdentityExchanges) != 0 || len(res.AKAChallenges) != 1 || len(res.EAPNotifications) != 1 {
+		t.Fatalf("identity exchanges=%d aka=%d notifications=%d", len(res.IdentityExchanges), len(res.AKAChallenges), len(res.EAPNotifications))
+	}
+	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.LocalSPI, localSPI) || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Fatalf("child SA=%+v", res.ChildSA)
+	}
+	if len(res.EAPKeys.KAut) != eapaka.KeyLengthKAut || res.EAPLast == nil || res.EAPLast.Code != eapaka.CodeSuccess || res.NextMessageID != 5 {
+		t.Fatalf("result=%+v", res)
+	}
+}
+
+func TestRunIKEAuthFullNegotiatesAKAPrimeKDF(t *testing.T) {
+	init := fakeInitResult(t)
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	networkName := "WLAN"
+	aka := simAKAResult()
+	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
+	exchanges := 0
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(request, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		switch exchanges {
+		case 0:
+			if msg.Header.MessageID != 1 {
+				t.Fatalf("initial auth header=%+v", msg.Header)
+			}
+			req := eapaka.Packet{
+				Code:       eapaka.CodeRequest,
+				Identifier: 20,
+				Type:       eapaka.TypeAKA,
+				Subtype:    eapaka.SubtypeIdentity,
+				Attributes: []eapaka.Attribute{eapaka.FullAuthIDReqAttribute()},
+			}
+			rawReq, err := req.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 1, false), init.Keys, false, []Payload{EAPPayload(rawReq)}, bytes.Repeat([]byte{0x95}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 1:
+			if msg.Header.MessageID != 2 || parseTestEAP(t, inner[0].Body).Subtype != eapaka.SubtypeIdentity {
+				t.Fatalf("identity exchange header=%+v inner=%+v", msg.Header, inner)
+			}
+			kdfOffer := eapaka.Packet{
+				Code:       eapaka.CodeRequest,
+				Identifier: 21,
+				Type:       eapaka.TypeAKAPrime,
+				Subtype:    eapaka.SubtypeChallenge,
+				Attributes: []eapaka.Attribute{
+					eapaka.RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
+					eapaka.AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
+					eapaka.KDFInputAttribute(networkName),
+					eapaka.KDFAttribute(99),
+					eapaka.KDFAttribute(eapaka.AKAPrimeKDFDefault),
+				},
+			}
+			rawOffer, err := kdfOffer.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 2, false), init.Keys, false, []Payload{EAPPayload(rawOffer)}, bytes.Repeat([]byte{0x96}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 2:
+			if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+				t.Fatalf("kdf exchange header=%+v inner=%+v", msg.Header, inner)
+			}
+			pkt := parseTestEAP(t, inner[0].Body)
+			if pkt.Type != eapaka.TypeAKAPrime || pkt.Subtype != eapaka.SubtypeChallenge || len(pkt.Attributes) != 1 || pkt.Attributes[0].Type != eapaka.AttributeKDF {
+				t.Fatalf("kdf response=%+v", pkt)
+			}
+			challenge := signedAKAPrimeChallenge(t, identity, networkName, aka)
+			rawChallenge, err := challenge.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(rawChallenge)}, bytes.Repeat([]byte{0x97}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 3:
+			if msg.Header.MessageID != 4 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+				t.Fatalf("aka prime exchange header=%+v inner=%+v", msg.Header, inner)
+			}
+			pkt := parseTestEAP(t, inner[0].Body)
+			if pkt.Type != eapaka.TypeAKAPrime || pkt.Subtype != eapaka.SubtypeChallenge {
+				t.Fatalf("AKA' response=%+v", pkt)
+			}
+			keys, err := eapaka.DeriveAKAPrimeKeys(identity, networkName, bytes.Repeat([]byte{0xb2}, 16), aka)
+			if err != nil {
+				return nil, err
+			}
+			raw, err := pkt.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			if err := eapaka.VerifyAKAPrimeMAC(keys.KAut, raw, nil); err != nil {
+				return nil, err
+			}
+			payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xde, 0xad, 0xca, 0xfe})
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 4, false), init.Keys, false, payloads, bytes.Repeat([]byte{0x98}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		default:
+			return nil, errors.New("unexpected extra exchange")
+		}
+	})
+
+	res, err := RunIKE_AUTH_Full(context.Background(), FullAuthConfig{
+		Transport:   transport,
+		Init:        init,
+		SIM:         akaProviderStub{result: aka},
+		InitiatorID: Identity{Type: IDRFC822Addr, Data: []byte(identity)},
+		EAPIdentity: identity,
+		ChildSPI:    localSPI,
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_Full(AKA') error = %v", err)
+	}
+	if exchanges != 4 || res.KDFNegotiations != 1 || len(res.AKAChallenges) != 2 {
+		t.Fatalf("exchanges=%d kdf=%d aka=%d", exchanges, res.KDFNegotiations, len(res.AKAChallenges))
+	}
+	if len(res.EAPKeys.KAut) != eapaka.KeyLengthAKAPrimeKAut || len(res.EAPKeys.KRe) != eapaka.KeyLengthKRe {
+		t.Fatalf("EAP keys=%+v", res.EAPKeys)
+	}
+	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xca, 0xfe}) || res.NextMessageID != 5 {
+		t.Fatalf("result=%+v", res)
+	}
+}
+
 func TestRunIKEAuthAKAChallenge(t *testing.T) {
 	init := fakeInitResult(t)
 	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
@@ -839,6 +1089,40 @@ func signedAKAPrimeChallenge(t *testing.T, identity, networkName string, aka sim
 	}
 	challenge.Attributes[len(challenge.Attributes)-1] = eapaka.MACAttribute(mac)
 	return challenge
+}
+
+func authSuccessChildPayloads(t *testing.T, identifier uint8, remoteSPI []byte) ([]Payload, error) {
+	t.Helper()
+	success, err := (eapaka.Packet{Code: eapaka.CodeSuccess, Identifier: identifier}).MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	saPayload, err := SecurityAssociationPayload(DefaultESPProposal(remoteSPI))
+	if err != nil {
+		return nil, err
+	}
+	tsiPayload, err := TrafficSelectorsPayload(PayloadTSi, IPv4AnyTrafficSelectors())
+	if err != nil {
+		return nil, err
+	}
+	tsrPayload, err := TrafficSelectorsPayload(PayloadTSr, IPv4AnyTrafficSelectors())
+	if err != nil {
+		return nil, err
+	}
+	cpPayload, err := ConfigurationPayload(Configuration{Type: CFGReply, Attributes: []ConfigurationAttribute{{Type: ConfigInternalIPv4Address, Value: []byte{10, 0, 0, 2}}}})
+	if err != nil {
+		return nil, err
+	}
+	return []Payload{EAPPayload(success), saPayload, tsiPayload, tsrPayload, cpPayload}, nil
+}
+
+func parseTestEAP(t *testing.T, raw []byte) eapaka.Packet {
+	t.Helper()
+	packet, err := eapaka.ParsePacket(raw)
+	if err != nil {
+		t.Fatalf("ParsePacket() error = %v", err)
+	}
+	return packet
 }
 
 func gotTypes(payloads []Payload) []byte {
