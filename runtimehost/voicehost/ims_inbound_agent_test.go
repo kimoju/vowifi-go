@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
@@ -130,6 +131,111 @@ func TestIMSInboundAgentRejectedInvite(t *testing.T) {
 	}
 	if len(transport.writes) != 1 {
 		t.Fatalf("writes=%+v, want only rejected INVITE ACK", transport.writes)
+	}
+}
+
+func TestIMSInboundAgentCancelEarlyInviteTerminatesRequest(t *testing.T) {
+	transport := newCancelAwareInboundTransport()
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	type inviteResult struct {
+		result InboundCallResult
+		err    error
+	}
+	resultCh := make(chan inviteResult, 1)
+	go func() {
+		result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+			CallID:    "in-call-cancel",
+			CallerURI: "sip:+18005551212@ims.example",
+			CalleeURI: "sip:user@ims.example",
+			CSeq:      1,
+			RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+		})
+		resultCh <- inviteResult{result: result, err: err}
+	}()
+
+	invite := transport.readInvite(t)
+	if invite.Method != "INVITE" || invite.Headers["Via"] == "" {
+		t.Fatalf("client INVITE=%+v", invite)
+	}
+	cancelCh := make(chan error, 1)
+	go func() {
+		cancelCh <- agent.CancelInboundCall(context.Background(), DialogInfo{CallID: "in-call-cancel"})
+	}()
+	cancel := transport.readCancel(t)
+	if cancel.Method != "CANCEL" || cancel.Headers["CSeq"] != "1 CANCEL" || cancel.Headers["Via"] != invite.Headers["Via"] {
+		t.Fatalf("client CANCEL=%+v INVITE Via=%q", cancel, invite.Headers["Via"])
+	}
+	transport.respondCancel(voiceclient.SIPResponse{StatusCode: 200, Reason: "OK"})
+	select {
+	case err := <-cancelCh:
+		if err != nil {
+			t.Fatalf("CancelInboundCall() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CancelInboundCall() did not return")
+	}
+
+	transport.respondInvite(voiceclient.SIPResponse{
+		StatusCode: 487,
+		Reason:     "Request Terminated",
+		Headers: map[string][]string{
+			"To": {"<sip:user@ims.example>;tag=canceled"},
+		},
+	})
+	select {
+	case got := <-resultCh:
+		if got.err != nil || got.result.Accepted || got.result.StatusCode != 487 || got.result.Reason != "Request Terminated" {
+			t.Fatalf("HandleInboundInvite() result=%+v err=%v", got.result, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HandleInboundInvite() did not return")
+	}
+	ack := transport.readWrite(t)
+	if ack.Method != "ACK" || ack.Headers["CSeq"] != "1 ACK" || ack.Headers["Via"] != invite.Headers["Via"] ||
+		!strings.Contains(ack.Headers["To"], "canceled") {
+		t.Fatalf("client ACK=%+v", ack)
+	}
+}
+
+func TestIMSInboundAgentCancelEstablishedDialogNoops(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-cancel-established",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	if err := agent.CancelInboundCall(context.Background(), DialogInfo{CallID: "in-call-cancel-established"}); err != nil {
+		t.Fatalf("CancelInboundCall(established) error = %v", err)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("requests=%+v, want no established-dialog CANCEL", transport.requests)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-cancel-established"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
 	}
 }
 
@@ -737,4 +843,100 @@ func TestIMSInboundAgentUsesRTPRelay(t *testing.T) {
 	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-relay"}); err != nil {
 		t.Fatalf("EndInboundCall() error = %v", err)
 	}
+}
+
+type cancelAwareInboundTransport struct {
+	invites     chan voiceclient.SIPRequestMessage
+	cancels     chan voiceclient.SIPRequestMessage
+	writes      chan voiceclient.SIPRequestMessage
+	inviteResps chan voiceclient.SIPResponse
+	cancelResps chan voiceclient.SIPResponse
+}
+
+func newCancelAwareInboundTransport() *cancelAwareInboundTransport {
+	return &cancelAwareInboundTransport{
+		invites:     make(chan voiceclient.SIPRequestMessage, 8),
+		cancels:     make(chan voiceclient.SIPRequestMessage, 8),
+		writes:      make(chan voiceclient.SIPRequestMessage, 8),
+		inviteResps: make(chan voiceclient.SIPResponse, 8),
+		cancelResps: make(chan voiceclient.SIPResponse, 8),
+	}
+}
+
+func (t *cancelAwareInboundTransport) RoundTripInvite(ctx context.Context, msg voiceclient.SIPRequestMessage, onProvisional voiceclient.ProvisionalResponseHandler) (voiceclient.SIPResponse, error) {
+	if msg.Headers != nil && msg.Headers["Via"] == "" {
+		msg.Headers["Via"] = "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-inbound-invite;rport"
+	}
+	t.invites <- msg
+	select {
+	case resp := <-t.inviteResps:
+		return resp, nil
+	case <-ctx.Done():
+		return voiceclient.SIPResponse{}, ctx.Err()
+	}
+}
+
+func (t *cancelAwareInboundTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	if strings.EqualFold(msg.Method, "CANCEL") {
+		t.cancels <- msg
+		select {
+		case resp := <-t.cancelResps:
+			return resp, nil
+		case <-ctx.Done():
+			return voiceclient.SIPResponse{}, ctx.Err()
+		}
+	}
+	t.invites <- msg
+	select {
+	case resp := <-t.inviteResps:
+		return resp, nil
+	case <-ctx.Done():
+		return voiceclient.SIPResponse{}, ctx.Err()
+	}
+}
+
+func (t *cancelAwareInboundTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
+	t.writes <- msg
+	return nil
+}
+
+func (t *cancelAwareInboundTransport) readInvite(tb testing.TB) voiceclient.SIPRequestMessage {
+	tb.Helper()
+	select {
+	case msg := <-t.invites:
+		return msg
+	case <-time.After(time.Second):
+		tb.Fatalf("timed out waiting for client INVITE")
+		return voiceclient.SIPRequestMessage{}
+	}
+}
+
+func (t *cancelAwareInboundTransport) readCancel(tb testing.TB) voiceclient.SIPRequestMessage {
+	tb.Helper()
+	select {
+	case msg := <-t.cancels:
+		return msg
+	case <-time.After(time.Second):
+		tb.Fatalf("timed out waiting for client CANCEL")
+		return voiceclient.SIPRequestMessage{}
+	}
+}
+
+func (t *cancelAwareInboundTransport) readWrite(tb testing.TB) voiceclient.SIPRequestMessage {
+	tb.Helper()
+	select {
+	case msg := <-t.writes:
+		return msg
+	case <-time.After(time.Second):
+		tb.Fatalf("timed out waiting for client write")
+		return voiceclient.SIPRequestMessage{}
+	}
+}
+
+func (t *cancelAwareInboundTransport) respondInvite(resp voiceclient.SIPResponse) {
+	t.inviteResps <- resp
+}
+
+func (t *cancelAwareInboundTransport) respondCancel(resp voiceclient.SIPResponse) {
+	t.cancelResps <- resp
 }

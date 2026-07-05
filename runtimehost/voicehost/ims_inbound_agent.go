@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -59,8 +61,11 @@ type InboundDialogRequest struct {
 
 type imsInboundDialogState struct {
 	clientCfg  voiceclient.DialogRequestConfig
+	invite     voiceclient.SIPRequestMessage
 	inviteCSeq int
 	relay      *RTPRelaySession
+	early      bool
+	canceled   bool
 }
 
 func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCallRequest) (InboundCallResult, error) {
@@ -129,7 +134,8 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client INVITE failed"}, err
 		}
-		a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, inviteCSeq: cfg.CSeq, relay: relay})
+		ensureInboundClientInviteVia(&invite, cfg)
+		a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay, early: true})
 		resp, err = a.roundTripClientInvite(ctx, invite)
 		if err != nil {
 			a.deleteInboundDialog(callID)
@@ -147,6 +153,16 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 			}
 		}
 		break
+	}
+	if a.inboundDialogCanceled(callID) {
+		if resp.StatusCode >= 300 {
+			if err := a.ackRejectedClientInvite(ctx, cfg, invite, resp); err != nil {
+				a.deleteInboundDialog(callID)
+				return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "client INVITE canceled ACK failed"}, err
+			}
+		}
+		a.deleteInboundDialog(callID)
+		return InboundCallResult{Accepted: false, StatusCode: 487, Reason: "Request Terminated"}, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp.StatusCode >= 300 {
@@ -189,7 +205,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		cfg.RouteSet = routeSet
 	}
 	applyInboundNegotiatedSessionInterval(&cfg, resp.Headers)
-	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, inviteCSeq: cfg.CSeq, relay: relay})
+	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay})
 	closeRelayOnError = false
 	return InboundCallResult{
 		Accepted:   true,
@@ -227,6 +243,7 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client re-INVITE failed"}, err
 		}
+		ensureInboundClientInviteVia(&invite, cfg)
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		a.storeInboundDialog(callID, state)
 		resp, err = a.roundTripClientInvite(ctx, invite)
@@ -313,6 +330,66 @@ func (a *IMSInboundAgent) ackRejectedClientInvite(ctx context.Context, cfg voice
 	}
 	copyDialogHeader(ack.Headers, invite.Headers, "Via")
 	return a.ClientTransport.WriteRequest(ctx, ack)
+}
+
+func ensureInboundClientInviteVia(invite *voiceclient.SIPRequestMessage, cfg voiceclient.DialogRequestConfig) {
+	if invite == nil {
+		return
+	}
+	if invite.Headers == nil {
+		invite.Headers = make(map[string]string)
+	}
+	if strings.TrimSpace(invite.Headers["Via"]) != "" {
+		return
+	}
+	hostPort := inboundViaHostPort(firstVoiceNonEmpty(cfg.ContactURI, cfg.Registration.ContactURI, cfg.LocalURI))
+	branch := inboundViaBranch(cfg.CallID, strconv.Itoa(cfg.CSeq), invite.Method, invite.URI)
+	invite.Headers["Via"] = "SIP/2.0/UDP " + hostPort + ";branch=" + branch + ";rport"
+}
+
+func inboundViaHostPort(uri string) string {
+	value := strings.Trim(strings.TrimSpace(uri), "<>")
+	if value == "" {
+		return "127.0.0.1"
+	}
+	if scheme := strings.IndexByte(value, ':'); scheme >= 0 {
+		value = value[scheme+1:]
+	}
+	if at := strings.LastIndexByte(value, '@'); at >= 0 {
+		value = value[at+1:]
+	}
+	if semi := strings.IndexByte(value, ';'); semi >= 0 {
+		value = value[:semi]
+	}
+	if q := strings.IndexByte(value, '?'); q >= 0 {
+		value = value[:q]
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "127.0.0.1"
+	}
+	return value
+}
+
+func inboundViaBranch(parts ...string) string {
+	h := fnv.New32a()
+	for _, part := range parts {
+		_, _ = h.Write([]byte(strings.TrimSpace(part)))
+		_, _ = h.Write([]byte{0})
+	}
+	return "z9hG4bK-vowifi-" + strconv.FormatUint(uint64(h.Sum32()), 16)
+}
+
+func cloneSIPRequestMessage(msg voiceclient.SIPRequestMessage) voiceclient.SIPRequestMessage {
+	out := msg
+	out.Body = append([]byte(nil), msg.Body...)
+	if msg.Headers != nil {
+		out.Headers = make(map[string]string, len(msg.Headers))
+		for key, value := range msg.Headers {
+			out.Headers[key] = value
+		}
+	}
+	return out
 }
 
 func applyInboundSessionIntervalHeaders(cfg *voiceclient.DialogRequestConfig, headers map[string][]string) {
@@ -516,10 +593,14 @@ func (a *IMSInboundAgent) CancelInboundCall(ctx context.Context, info DialogInfo
 	if !ok {
 		return nil
 	}
+	if !state.early || state.canceled {
+		return nil
+	}
 	cancel, err := voiceclient.BuildCancelRequest(state.clientCfg)
 	if err != nil {
 		return err
 	}
+	copyDialogHeader(cancel.Headers, state.invite.Headers, "Via")
 	resp, err := a.ClientTransport.RoundTripRequest(ctx, cancel)
 	if err != nil {
 		return err
@@ -527,7 +608,8 @@ func (a *IMSInboundAgent) CancelInboundCall(ctx context.Context, info DialogInfo
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("client CANCEL rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
-	a.closeInboundDialog(strings.TrimSpace(info.CallID))
+	state.canceled = true
+	a.storeInboundDialog(strings.TrimSpace(info.CallID), state)
 	return nil
 }
 
@@ -641,6 +723,11 @@ func (a *IMSInboundAgent) inboundDialog(callID string) (imsInboundDialogState, b
 	defer a.mu.Unlock()
 	state, ok := a.dialogs[strings.TrimSpace(callID)]
 	return state, ok
+}
+
+func (a *IMSInboundAgent) inboundDialogCanceled(callID string) bool {
+	state, ok := a.inboundDialog(callID)
+	return ok && state.canceled
 }
 
 func (a *IMSInboundAgent) deleteInboundDialog(callID string) {

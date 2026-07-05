@@ -184,6 +184,88 @@ func TestIMSInboundWireServerSendsTryingBeforeClientFinal(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerCancelsPendingInvite(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+	client, err := net.Dial("udp", pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	transport := newCancelAwareInboundTransport()
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		LocalTag:       "ue-tag",
+		ContactURI:     "sip:vowifi@127.0.0.1:5060",
+		ReadTimeout:    50 * time.Millisecond,
+		TransactionTTL: time.Second,
+	}
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.ServePacket(ctx, pc)
+	}()
+
+	invite := wireIMSInvite("wire-call-cancel", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170)))
+	if _, err := client.Write(invite); err != nil {
+		t.Fatalf("client INVITE Write() error = %v", err)
+	}
+	trying := readUDPWireResponse(t, client)
+	if trying.StatusCode != 100 || firstVoiceHeader(trying.Headers, "CSeq") != "1 INVITE" {
+		t.Fatalf("trying=%+v", trying)
+	}
+	clientInvite := transport.readInvite(t)
+	if clientInvite.Method != "INVITE" {
+		t.Fatalf("client INVITE=%+v", clientInvite)
+	}
+
+	if _, err := client.Write(wireIMSInvite("wire-call-cancel", "CANCEL", 1, nil)); err != nil {
+		t.Fatalf("client CANCEL Write() error = %v", err)
+	}
+	clientCancel := transport.readCancel(t)
+	if clientCancel.Method != "CANCEL" || clientCancel.Headers["Via"] != clientInvite.Headers["Via"] {
+		t.Fatalf("client CANCEL=%+v INVITE Via=%q", clientCancel, clientInvite.Headers["Via"])
+	}
+	transport.respondCancel(voiceclient.SIPResponse{StatusCode: 200, Reason: "OK"})
+	cancelOK := readUDPWireResponse(t, client)
+	if cancelOK.StatusCode != 200 || firstVoiceHeader(cancelOK.Headers, "CSeq") != "1 CANCEL" {
+		t.Fatalf("CANCEL response=%+v", cancelOK)
+	}
+
+	transport.respondInvite(voiceclient.SIPResponse{
+		StatusCode: 487,
+		Reason:     "Request Terminated",
+		Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=canceled"}},
+	})
+	terminated := readUDPWireResponse(t, client)
+	if terminated.StatusCode != 487 || firstVoiceHeader(terminated.Headers, "CSeq") != "1 INVITE" {
+		t.Fatalf("INVITE final=%+v", terminated)
+	}
+	clientACK := transport.readWrite(t)
+	if clientACK.Method != "ACK" || clientACK.Headers["Via"] != clientInvite.Headers["Via"] {
+		t.Fatalf("client ACK=%+v INVITE Via=%q", clientACK, clientInvite.Headers["Via"])
+	}
+
+	cancelCtx()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ServePacket() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("ServePacket() did not stop")
+	}
+}
+
 func TestIMSInboundWireServerServesTCPInvite(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -691,6 +773,7 @@ func TestIMSInboundWireServerReturnsAgentByeCancelErrors(t *testing.T) {
 			RemoteTag:       "client-remote",
 			CSeq:            1,
 		},
+		early: true,
 	})
 	server := &IMSInboundWireServer{Agent: agent}
 
