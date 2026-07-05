@@ -95,6 +95,9 @@ protocol layers needed by VoHive:
 - userspace dataplane packet pump and Linux TUN device integration, bridging
   inner IP packets from a TUN device into ESP and writing decrypted ESP payloads
   back to the TUN device
+- composable SWu TUN tunnel manager that wraps an IKE PacketSession, opens a
+  TUN device, applies Linux routing/address setup, starts the bidirectional
+  packet pump, and rolls back/cleans up routes, device, and session state
 - Linux TUN dataplane routing helpers for MTU/link setup, inner address
   assignment, route installation, policy rule installation, cleanup, and
   best-effort rollback through the `ip` command boundary
