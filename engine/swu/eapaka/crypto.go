@@ -357,6 +357,9 @@ func ParseReauthenticationRequest(request Packet, keys Keys) (ReauthenticationRe
 	if !isAKAType(request.Type) {
 		return ReauthenticationRequest{}, fmt.Errorf("%w: EAP type %d", ErrInvalidReauth, request.Type)
 	}
+	if err := validateReauthenticationMethod(request.Type, keys); err != nil {
+		return ReauthenticationRequest{}, err
+	}
 	raw, err := request.MarshalBinary()
 	if err != nil {
 		return ReauthenticationRequest{}, err
@@ -397,6 +400,107 @@ func ParseReauthenticationRequest(request Packet, keys Keys) (ReauthenticationRe
 		IdentityState:       state,
 		EncryptedAttributes: cloneAttributes(attrs),
 	}, nil
+}
+
+func DeriveReauthenticationKeys(identity string, previous Keys, counter uint16, nonceS []byte) (Keys, error) {
+	if identity == "" {
+		return Keys{}, fmt.Errorf("%w: identity is empty", ErrInvalidKeyMaterial)
+	}
+	if len(previous.KEncr) == 0 || len(previous.KAut) == 0 {
+		return Keys{}, fmt.Errorf("%w: TEKs are empty", ErrInvalidKeyMaterial)
+	}
+	if len(nonceS) != 16 {
+		return Keys{}, fmt.Errorf("%w: NONCE_S length %d", ErrInvalidReauth, len(nonceS))
+	}
+	var counterBytes [2]byte
+	binary.BigEndian.PutUint16(counterBytes[:], counter)
+
+	if len(previous.KRe) > 0 {
+		if len(previous.KRe) != KeyLengthKRe {
+			return Keys{}, fmt.Errorf("%w: K_re length %d", ErrInvalidKeyMaterial, len(previous.KRe))
+		}
+		seed := make([]byte, 0, len("EAP-AKA' re-auth")+len(identity)+2+len(nonceS))
+		seed = append(seed, []byte("EAP-AKA' re-auth")...)
+		seed = append(seed, []byte(identity)...)
+		seed = append(seed, counterBytes[:]...)
+		seed = append(seed, nonceS...)
+		stream := prfPrimeSHA256(previous.KRe, seed, KeyLengthMSK+KeyLengthEMSK)
+		return reauthenticationKeys(previous, stream, stream), nil
+	}
+
+	if len(previous.MK) == 0 {
+		return Keys{}, fmt.Errorf("%w: MK is empty", ErrInvalidKeyMaterial)
+	}
+	seedInput := make([]byte, 0, len(identity)+2+len(nonceS)+len(previous.MK))
+	seedInput = append(seedInput, []byte(identity)...)
+	seedInput = append(seedInput, counterBytes[:]...)
+	seedInput = append(seedInput, nonceS...)
+	seedInput = append(seedInput, previous.MK...)
+	seed := sha1.Sum(seedInput)
+	stream := fips1862PRF(seed[:], KeyLengthMSK+KeyLengthEMSK)
+	return reauthenticationKeys(previous, previous.MK, stream), nil
+}
+
+func BuildReauthenticationResponse(identity string, request Packet, keys Keys, iv []byte) (Packet, Keys, error) {
+	parsed, err := ParseReauthenticationRequest(request, keys)
+	if err != nil {
+		return Packet{}, Keys{}, err
+	}
+	nextKeys, err := DeriveReauthenticationKeys(identity, keys, parsed.Counter, parsed.NonceS)
+	if err != nil {
+		return Packet{}, Keys{}, err
+	}
+	response, err := buildReauthenticationResponsePacket(request, keys, iv, parsed, []Attribute{
+		CounterAttribute(parsed.Counter),
+	})
+	if err != nil {
+		return Packet{}, Keys{}, err
+	}
+	return response, nextKeys, nil
+}
+
+func BuildReauthenticationCounterTooSmallResponse(request Packet, keys Keys, iv []byte) (Packet, error) {
+	parsed, err := ParseReauthenticationRequest(request, keys)
+	if err != nil {
+		return Packet{}, err
+	}
+	return buildReauthenticationResponsePacket(request, keys, iv, parsed, []Attribute{
+		CounterTooSmallAttribute(),
+		CounterAttribute(parsed.Counter),
+	})
+}
+
+func buildReauthenticationResponsePacket(request Packet, keys Keys, iv []byte, parsed ReauthenticationRequest, encryptedAttrs []Attribute) (Packet, error) {
+	encrypted, err := EncryptAttributes(keys.KEncr, iv, encryptedAttrs)
+	if err != nil {
+		return Packet{}, err
+	}
+	attrs := []Attribute{IVAttribute(iv), encrypted}
+	if _, ok := FindAttribute(request.Attributes, AttributeResultInd); ok {
+		attrs = append(attrs, ResultIndAttribute())
+	}
+	attrs = append(attrs, MACAttribute(nil))
+	eapType := request.Type
+	if eapType == 0 {
+		eapType = TypeAKA
+	}
+	response := Packet{
+		Code:       CodeResponse,
+		Identifier: request.Identifier,
+		Type:       eapType,
+		Subtype:    SubtypeReauthentication,
+		Attributes: attrs,
+	}
+	raw, err := response.MarshalBinary()
+	if err != nil {
+		return Packet{}, err
+	}
+	mac, err := calculatePacketMAC(response.Type, keys.KAut, raw, parsed.NonceS)
+	if err != nil {
+		return Packet{}, err
+	}
+	response.Attributes[len(response.Attributes)-1] = MACAttribute(mac)
+	return response, nil
 }
 
 func ChallengeRANDAndAUTN(request Packet) (rand16, autn16 []byte, err error) {
@@ -677,6 +781,39 @@ func cloneAttributes(attrs []Attribute) []Attribute {
 	return out
 }
 
+func validateReauthenticationMethod(eapType uint8, keys Keys) error {
+	switch eapType {
+	case TypeAKAPrime:
+		if len(keys.KRe) != KeyLengthKRe {
+			return fmt.Errorf("%w: K_re length %d", ErrInvalidKeyMaterial, len(keys.KRe))
+		}
+		if len(keys.KAut) != KeyLengthAKAPrimeKAut {
+			return fmt.Errorf("%w: AKA' K_aut length %d", ErrInvalidKeyMaterial, len(keys.KAut))
+		}
+	case 0, TypeAKA:
+		if len(keys.KRe) > 0 {
+			return fmt.Errorf("%w: EAP-AKA' key material used with EAP-AKA", ErrInvalidReauth)
+		}
+		if len(keys.KAut) != 0 && len(keys.KAut) != KeyLengthKAut {
+			return fmt.Errorf("%w: K_aut length %d", ErrInvalidKeyMaterial, len(keys.KAut))
+		}
+	}
+	return nil
+}
+
+func reauthenticationKeys(previous Keys, mk, stream []byte) Keys {
+	return Keys{
+		MK:      append([]byte(nil), mk...),
+		KEncr:   append([]byte(nil), previous.KEncr...),
+		KAut:    append([]byte(nil), previous.KAut...),
+		KRe:     append([]byte(nil), previous.KRe...),
+		CKPrime: append([]byte(nil), previous.CKPrime...),
+		IKPrime: append([]byte(nil), previous.IKPrime...),
+		MSK:     append([]byte(nil), stream[:KeyLengthMSK]...),
+		EMSK:    append([]byte(nil), stream[KeyLengthMSK:KeyLengthMSK+KeyLengthEMSK]...),
+	}
+}
+
 func encryptedDataBlock(kEncr, iv []byte) (cipher.Block, error) {
 	if len(kEncr) != aes.BlockSize {
 		return nil, fmt.Errorf("%w: K_encr length %d", ErrInvalidKeyMaterial, len(kEncr))
@@ -719,17 +856,25 @@ func stripEncryptedPadding(attrs []Attribute) ([]Attribute, error) {
 }
 
 func verifyChallengeMAC(eapType uint8, kAut, raw []byte) error {
-	if eapType == TypeAKAPrime {
-		return VerifyAKAPrimeMAC(kAut, raw, nil)
-	}
-	return VerifyMAC(kAut, raw, nil)
+	return verifyPacketMAC(eapType, kAut, raw, nil)
 }
 
 func calculateChallengeMAC(eapType uint8, kAut, raw []byte) ([]byte, error) {
+	return calculatePacketMAC(eapType, kAut, raw, nil)
+}
+
+func verifyPacketMAC(eapType uint8, kAut, raw, extra []byte) error {
 	if eapType == TypeAKAPrime {
-		return CalculateAKAPrimeMAC(kAut, raw, nil)
+		return VerifyAKAPrimeMAC(kAut, raw, extra)
 	}
-	return CalculateMAC(kAut, raw, nil)
+	return VerifyMAC(kAut, raw, extra)
+}
+
+func calculatePacketMAC(eapType uint8, kAut, raw, extra []byte) ([]byte, error) {
+	if eapType == TypeAKAPrime {
+		return CalculateAKAPrimeMAC(kAut, raw, extra)
+	}
+	return CalculateMAC(kAut, raw, extra)
 }
 
 func deriveAKAPrimeCKIK(networkName, sqnXorAK []byte, aka sim.AKAResult) []byte {

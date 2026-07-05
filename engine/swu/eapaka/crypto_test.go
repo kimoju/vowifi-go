@@ -230,6 +230,243 @@ func TestParseReauthenticationRequest(t *testing.T) {
 	}
 }
 
+func TestParseReauthenticationRequestRejectsMethodMismatch(t *testing.T) {
+	identity := "0555444333222111"
+	networkName := "WLAN"
+	aka := sim.AKAResult{
+		RES: mustHex(t, "28d7b0f2a2ec3de5"),
+		IK:  mustHex(t, "9744871ad32bf9bbd1dd5ce54e3e2e5a"),
+		CK:  mustHex(t, "5349fbe098649f948f5d2e973a81c00f"),
+	}
+	keys, err := DeriveAKAPrimeKeys(identity, networkName, mustHex(t, "bb52e91c747ac3ab2a5c23d15ee351d5"), aka)
+	if err != nil {
+		t.Fatalf("DeriveAKAPrimeKeys() error = %v", err)
+	}
+	request := signedReauthenticationRequestWithOptions(t, TypeAKA, keys, 1, []byte("0123456789abcdef"), nil, nil)
+	_, err = ParseReauthenticationRequest(request, keys)
+	if !errors.Is(err, ErrInvalidReauth) {
+		t.Fatalf("ParseReauthenticationRequest() err=%v, want ErrInvalidReauth", err)
+	}
+}
+
+func TestDeriveReauthenticationKeys(t *testing.T) {
+	identity := "reauth-identity@example"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	next, err := DeriveReauthenticationKeys(identity, keys, 12, nonceS)
+	if err != nil {
+		t.Fatalf("DeriveReauthenticationKeys() error = %v", err)
+	}
+	if len(next.MSK) != KeyLengthMSK || len(next.EMSK) != KeyLengthEMSK {
+		t.Fatalf("reauth key lengths MSK=%d EMSK=%d", len(next.MSK), len(next.EMSK))
+	}
+	if !bytes.Equal(next.MK, keys.MK) || !bytes.Equal(next.KEncr, keys.KEncr) || !bytes.Equal(next.KAut, keys.KAut) {
+		t.Fatalf("reauth keys did not preserve MK/TEKs")
+	}
+	if bytes.Equal(next.MSK, keys.MSK) || bytes.Equal(next.EMSK, keys.EMSK) {
+		t.Fatal("reauth MSK/EMSK should differ from full-auth MSK/EMSK")
+	}
+	again, err := DeriveReauthenticationKeys(identity, keys, 12, nonceS)
+	if err != nil {
+		t.Fatalf("DeriveReauthenticationKeys(again) error = %v", err)
+	}
+	if !bytes.Equal(again.MSK, next.MSK) || !bytes.Equal(again.EMSK, next.EMSK) {
+		t.Fatal("reauth derivation is not deterministic")
+	}
+}
+
+func TestDeriveAKAPrimeReauthenticationKeys(t *testing.T) {
+	fullIdentity := "0555444333222111"
+	reauthIdentity := "reauth-prime@example"
+	networkName := "WLAN"
+	autn := mustHex(t, "bb52e91c747ac3ab2a5c23d15ee351d5")
+	aka := sim.AKAResult{
+		RES: mustHex(t, "28d7b0f2a2ec3de5"),
+		IK:  mustHex(t, "9744871ad32bf9bbd1dd5ce54e3e2e5a"),
+		CK:  mustHex(t, "5349fbe098649f948f5d2e973a81c00f"),
+	}
+	keys, err := DeriveAKAPrimeKeys(fullIdentity, networkName, autn, aka)
+	if err != nil {
+		t.Fatalf("DeriveAKAPrimeKeys() error = %v", err)
+	}
+	nonceS := []byte("fedcba9876543210")
+	next, err := DeriveReauthenticationKeys(reauthIdentity, keys, 23, nonceS)
+	if err != nil {
+		t.Fatalf("DeriveReauthenticationKeys(AKA') error = %v", err)
+	}
+	if len(next.MK) != KeyLengthMSK+KeyLengthEMSK || len(next.MSK) != KeyLengthMSK || len(next.EMSK) != KeyLengthEMSK {
+		t.Fatalf("AKA' reauth key lengths MK=%d MSK=%d EMSK=%d", len(next.MK), len(next.MSK), len(next.EMSK))
+	}
+	if !bytes.Equal(next.KRe, keys.KRe) || !bytes.Equal(next.KEncr, keys.KEncr) || !bytes.Equal(next.KAut, keys.KAut) {
+		t.Fatalf("AKA' reauth keys did not preserve K_re/TEKs")
+	}
+	if bytes.Equal(next.MSK, keys.MSK) || bytes.Equal(next.EMSK, keys.EMSK) {
+		t.Fatal("AKA' reauth MSK/EMSK should differ from full-auth MSK/EMSK")
+	}
+	again, err := DeriveReauthenticationKeys(reauthIdentity, keys, 23, nonceS)
+	if err != nil {
+		t.Fatalf("DeriveReauthenticationKeys(AKA' again) error = %v", err)
+	}
+	if !bytes.Equal(again.MSK, next.MSK) || !bytes.Equal(again.EMSK, next.EMSK) {
+		t.Fatal("AKA' reauth derivation is not deterministic")
+	}
+}
+
+func TestBuildReauthenticationResponse(t *testing.T) {
+	identity := "reauth-identity@example"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	request := signedReauthenticationRequestWithOptions(t, TypeAKA, keys, 12, nonceS, nil, []Attribute{ResultIndAttribute()})
+	responseIV := bytes.Repeat([]byte{0x66}, 16)
+	response, next, err := BuildReauthenticationResponse(identity, request, keys, responseIV)
+	if err != nil {
+		t.Fatalf("BuildReauthenticationResponse() error = %v", err)
+	}
+	if response.Code != CodeResponse || response.Identifier != request.Identifier || response.Type != TypeAKA || response.Subtype != SubtypeReauthentication {
+		t.Fatalf("response=%+v", response)
+	}
+	if _, ok := FindAttribute(response.Attributes, AttributeResultInd); !ok {
+		t.Fatal("missing echoed AT_RESULT_IND")
+	}
+	raw, err := response.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(response) error = %v", err)
+	}
+	if err := VerifyMAC(keys.KAut, raw, nonceS); err != nil {
+		t.Fatalf("VerifyMAC(response) error = %v", err)
+	}
+	attrs := decryptedReauthenticationResponseAttributes(t, keys, response)
+	counterAttr, ok := FindAttribute(attrs, AttributeCounter)
+	if !ok {
+		t.Fatalf("missing encrypted AT_COUNTER in attrs=%+v", attrs)
+	}
+	counter, err := counterAttr.CounterValue()
+	if err != nil {
+		t.Fatalf("CounterValue() error = %v", err)
+	}
+	if counter != 12 {
+		t.Fatalf("encrypted counter=%d", counter)
+	}
+	if _, ok := FindAttribute(attrs, AttributeCounterTooSmall); ok {
+		t.Fatal("normal reauth response included AT_COUNTER_TOO_SMALL")
+	}
+	derived, err := DeriveReauthenticationKeys(identity, keys, 12, nonceS)
+	if err != nil {
+		t.Fatalf("DeriveReauthenticationKeys() error = %v", err)
+	}
+	if !bytes.Equal(next.MSK, derived.MSK) || !bytes.Equal(next.EMSK, derived.EMSK) {
+		t.Fatal("returned keys do not match reauth derivation")
+	}
+}
+
+func TestBuildAKAPrimeReauthenticationResponse(t *testing.T) {
+	fullIdentity := "0555444333222111"
+	reauthIdentity := "reauth-prime@example"
+	networkName := "WLAN"
+	aka := sim.AKAResult{
+		RES: mustHex(t, "28d7b0f2a2ec3de5"),
+		IK:  mustHex(t, "9744871ad32bf9bbd1dd5ce54e3e2e5a"),
+		CK:  mustHex(t, "5349fbe098649f948f5d2e973a81c00f"),
+	}
+	keys, err := DeriveAKAPrimeKeys(fullIdentity, networkName, mustHex(t, "bb52e91c747ac3ab2a5c23d15ee351d5"), aka)
+	if err != nil {
+		t.Fatalf("DeriveAKAPrimeKeys() error = %v", err)
+	}
+	nonceS := []byte("fedcba9876543210")
+	request := signedReauthenticationRequestWithOptions(t, TypeAKAPrime, keys, 23, nonceS, nil, nil)
+	response, next, err := BuildReauthenticationResponse(reauthIdentity, request, keys, bytes.Repeat([]byte{0x77}, 16))
+	if err != nil {
+		t.Fatalf("BuildReauthenticationResponse(AKA') error = %v", err)
+	}
+	if response.Code != CodeResponse || response.Type != TypeAKAPrime || response.Subtype != SubtypeReauthentication {
+		t.Fatalf("response=%+v", response)
+	}
+	raw, err := response.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(response) error = %v", err)
+	}
+	if err := VerifyAKAPrimeMAC(keys.KAut, raw, nonceS); err != nil {
+		t.Fatalf("VerifyAKAPrimeMAC(response) error = %v", err)
+	}
+	attrs := decryptedReauthenticationResponseAttributes(t, keys, response)
+	counterAttr, ok := FindAttribute(attrs, AttributeCounter)
+	if !ok {
+		t.Fatalf("missing encrypted AT_COUNTER in attrs=%+v", attrs)
+	}
+	counter, err := counterAttr.CounterValue()
+	if err != nil {
+		t.Fatalf("CounterValue() error = %v", err)
+	}
+	if counter != 23 {
+		t.Fatalf("encrypted counter=%d", counter)
+	}
+	if !bytes.Equal(next.KRe, keys.KRe) || bytes.Equal(next.MSK, keys.MSK) || bytes.Equal(next.EMSK, keys.EMSK) {
+		t.Fatalf("AKA' reauth keys=%+v", next)
+	}
+}
+
+func TestBuildReauthenticationCounterTooSmallResponse(t *testing.T) {
+	identity := "reauth-identity@example"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	request := signedReauthenticationRequest(t, keys, 2, nonceS, nil)
+	response, err := BuildReauthenticationCounterTooSmallResponse(request, keys, bytes.Repeat([]byte{0x88}, 16))
+	if err != nil {
+		t.Fatalf("BuildReauthenticationCounterTooSmallResponse() error = %v", err)
+	}
+	if response.Code != CodeResponse || response.Identifier != request.Identifier || response.Subtype != SubtypeReauthentication {
+		t.Fatalf("response=%+v", response)
+	}
+	raw, err := response.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(response) error = %v", err)
+	}
+	if err := VerifyMAC(keys.KAut, raw, nonceS); err != nil {
+		t.Fatalf("VerifyMAC(response) error = %v", err)
+	}
+	attrs := decryptedReauthenticationResponseAttributes(t, keys, response)
+	if tooSmall, ok := FindAttribute(attrs, AttributeCounterTooSmall); !ok {
+		t.Fatalf("missing encrypted AT_COUNTER_TOO_SMALL in attrs=%+v", attrs)
+	} else if err := tooSmall.CounterTooSmallValue(); err != nil {
+		t.Fatalf("CounterTooSmallValue() error = %v", err)
+	}
+	counterAttr, ok := FindAttribute(attrs, AttributeCounter)
+	if !ok {
+		t.Fatalf("missing encrypted AT_COUNTER in attrs=%+v", attrs)
+	}
+	counter, err := counterAttr.CounterValue()
+	if err != nil {
+		t.Fatalf("CounterValue() error = %v", err)
+	}
+	if counter != 2 {
+		t.Fatalf("encrypted counter=%d", counter)
+	}
+}
+
 func TestDecryptAttributesRejectsBadPadding(t *testing.T) {
 	kEncr := bytes.Repeat([]byte{0x11}, 16)
 	iv := bytes.Repeat([]byte{0x22}, 16)
@@ -720,34 +957,58 @@ func signedChallengeRequestWithEncryptedAttrs(t *testing.T, identity string, aka
 
 func signedReauthenticationRequest(t *testing.T, keys Keys, counter uint16, nonceS []byte, extra []Attribute) Packet {
 	t.Helper()
+	return signedReauthenticationRequestWithOptions(t, TypeAKA, keys, counter, nonceS, extra, nil)
+}
+
+func signedReauthenticationRequestWithOptions(t *testing.T, eapType uint8, keys Keys, counter uint16, nonceS []byte, encryptedExtra, topLevelExtra []Attribute) Packet {
+	t.Helper()
 	iv := bytes.Repeat([]byte{0x55}, 16)
 	encryptedAttrs := []Attribute{CounterAttribute(counter), NonceSAttribute(nonceS)}
-	encryptedAttrs = append(encryptedAttrs, extra...)
+	encryptedAttrs = append(encryptedAttrs, encryptedExtra...)
 	encrypted, err := EncryptAttributes(keys.KEncr, iv, encryptedAttrs)
 	if err != nil {
 		t.Fatalf("EncryptAttributes() error = %v", err)
 	}
+	attrs := []Attribute{
+		IVAttribute(iv),
+		encrypted,
+	}
+	attrs = append(attrs, topLevelExtra...)
+	attrs = append(attrs, MACAttribute(nil))
 	req := Packet{
 		Code:       CodeRequest,
 		Identifier: 15,
-		Type:       TypeAKA,
+		Type:       eapType,
 		Subtype:    SubtypeReauthentication,
-		Attributes: []Attribute{
-			IVAttribute(iv),
-			encrypted,
-			MACAttribute(nil),
-		},
+		Attributes: attrs,
 	}
 	raw, err := req.MarshalBinary()
 	if err != nil {
 		t.Fatalf("MarshalBinary() error = %v", err)
 	}
-	mac, err := CalculateMAC(keys.KAut, raw, nil)
+	mac, err := calculatePacketMAC(eapType, keys.KAut, raw, nil)
 	if err != nil {
-		t.Fatalf("CalculateMAC() error = %v", err)
+		t.Fatalf("calculatePacketMAC() error = %v", err)
 	}
 	req.Attributes[len(req.Attributes)-1] = MACAttribute(mac)
 	return req
+}
+
+func decryptedReauthenticationResponseAttributes(t *testing.T, keys Keys, response Packet) []Attribute {
+	t.Helper()
+	ivAttr, ok := FindAttribute(response.Attributes, AttributeIV)
+	if !ok {
+		t.Fatal("missing response AT_IV")
+	}
+	encryptedAttr, ok := FindAttribute(response.Attributes, AttributeEncrData)
+	if !ok {
+		t.Fatal("missing response AT_ENCR_DATA")
+	}
+	attrs, err := DecryptEncryptedAttributes(keys.KEncr, ivAttr, encryptedAttr)
+	if err != nil {
+		t.Fatalf("DecryptEncryptedAttributes(response) error = %v", err)
+	}
+	return attrs
 }
 
 func identityTranscriptPackets(t *testing.T, identity string) [][]byte {
