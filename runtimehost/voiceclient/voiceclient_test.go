@@ -1130,6 +1130,33 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	}
 }
 
+func TestBuildIMSDialogRequestsIncludeSessionRefresher(t *testing.T) {
+	cfg := DialogRequestConfig{
+		Profile:          IMSProfile{IMPU: "sip:user@example"},
+		Registration:     RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060"},
+		RemoteURI:        "sip:+18005551212@ims.example",
+		RemoteTargetURI:  "sip:+18005551212@pcscf.example",
+		CallID:           "call-timer",
+		SessionExpires:   1800,
+		SessionRefresher: "UAS",
+	}
+	invite, err := BuildInviteRequest(cfg, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatalf("BuildInviteRequest() error = %v", err)
+	}
+	if invite.Headers["Session-Expires"] != "1800;refresher=uas" {
+		t.Fatalf("INVITE Session-Expires=%q", invite.Headers["Session-Expires"])
+	}
+	cfg.SessionRefresher = "invalid"
+	update, err := BuildUpdateRequest(cfg, nil)
+	if err != nil {
+		t.Fatalf("BuildUpdateRequest() error = %v", err)
+	}
+	if update.Headers["Session-Expires"] != "1800" {
+		t.Fatalf("UPDATE Session-Expires=%q", update.Headers["Session-Expires"])
+	}
+}
+
 func TestRegisterSessionRejectsFailedSecondRegister(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{

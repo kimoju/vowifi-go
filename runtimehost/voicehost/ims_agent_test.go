@@ -352,7 +352,7 @@ func TestIMSOutboundAgentRetriesDialogUpdateWithMinSE(t *testing.T) {
 		CallID:      "call-update-minse",
 		ContentType: "application/sdp",
 		Body:        []byte(sampleSDP("192.0.2.60", 4010)),
-		Headers:     map[string]string{"Session-Expires": "600"},
+		Headers:     map[string]string{"Session-Expires": "600;refresher=uas"},
 	})
 	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "update-retry-ok" {
 		t.Fatalf("SendDialogUpdate() result=%+v err=%v", result, err)
@@ -362,10 +362,10 @@ func TestIMSOutboundAgentRetriesDialogUpdateWithMinSE(t *testing.T) {
 	}
 	firstUpdate := transport.requests[1]
 	retryUpdate := transport.requests[2]
-	if firstUpdate.Headers["CSeq"] != "2 UPDATE" || firstUpdate.Headers["Session-Expires"] != "600" || firstUpdate.Headers["Min-SE"] != "" {
+	if firstUpdate.Headers["CSeq"] != "2 UPDATE" || firstUpdate.Headers["Session-Expires"] != "600;refresher=uas" || firstUpdate.Headers["Min-SE"] != "" {
 		t.Fatalf("first UPDATE=%+v", firstUpdate)
 	}
-	if retryUpdate.Headers["CSeq"] != "3 UPDATE" || retryUpdate.Headers["Session-Expires"] != "1200" || retryUpdate.Headers["Min-SE"] != "1200" {
+	if retryUpdate.Headers["CSeq"] != "3 UPDATE" || retryUpdate.Headers["Session-Expires"] != "1200;refresher=uas" || retryUpdate.Headers["Min-SE"] != "1200" {
 		t.Fatalf("retry UPDATE=%+v", retryUpdate)
 	}
 	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-update-minse"}); err != nil {
@@ -375,6 +375,91 @@ func TestIMSOutboundAgentRetriesDialogUpdateWithMinSE(t *testing.T) {
 		transport.requests[3].URI != "sip:updated@198.51.100.3:5060" ||
 		transport.requests[3].Headers["CSeq"] != "4 BYE" {
 		t.Fatalf("BYE after UPDATE retry=%+v", transport.requests)
+	}
+}
+
+func TestIMSOutboundAgentCarriesNegotiatedSessionRefresher(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":              {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact":         {"<sip:carrier@198.51.100.1:5060>"},
+				"Session-Expires": {"1800;refresher=uas"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Session-Expires": {"1200;refresher=uac"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"To": {"<sip:+18005551212@ims.example>;tag=remote-tag"}},
+		},
+		{StatusCode: 200, Reason: "OK"},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport:        transport,
+		SessionExpires:   600,
+		SessionRefresher: "uac",
+		Profile:          voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-session-refresher",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	})
+	if err != nil || !result.Accepted || result.Headers["Session-Expires"] != "1800;refresher=uas" {
+		t.Fatalf("StartOutboundCall() result=%+v err=%v", result, err)
+	}
+	updateResult, err := agent.SendDialogUpdate(context.Background(), DialogUpdateRequest{
+		CallID: "call-session-refresher",
+	})
+	if err != nil || !updateResult.Accepted {
+		t.Fatalf("SendDialogUpdate() result=%+v err=%v", updateResult, err)
+	}
+	reinviteResult, err := agent.SendDialogReinvite(context.Background(), DialogReinviteRequest{
+		CallID: "call-session-refresher",
+	})
+	if err != nil || !reinviteResult.Accepted {
+		t.Fatalf("SendDialogReinvite() result=%+v err=%v", reinviteResult, err)
+	}
+	secondUpdateResult, err := agent.SendDialogUpdate(context.Background(), DialogUpdateRequest{
+		CallID: "call-session-refresher",
+	})
+	if err != nil || !secondUpdateResult.Accepted {
+		t.Fatalf("second SendDialogUpdate() result=%+v err=%v", secondUpdateResult, err)
+	}
+	if len(transport.requests) != 4 || transport.requests[0].Method != "INVITE" ||
+		transport.requests[1].Method != "UPDATE" || transport.requests[2].Method != "INVITE" ||
+		transport.requests[3].Method != "UPDATE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if transport.requests[0].Headers["Session-Expires"] != "600;refresher=uac" {
+		t.Fatalf("initial INVITE Session-Expires=%q", transport.requests[0].Headers["Session-Expires"])
+	}
+	if transport.requests[1].Headers["Session-Expires"] != "1800;refresher=uas" {
+		t.Fatalf("UPDATE Session-Expires=%q", transport.requests[1].Headers["Session-Expires"])
+	}
+	if transport.requests[2].Headers["Session-Expires"] != "1200;refresher=uac" {
+		t.Fatalf("re-INVITE Session-Expires=%q", transport.requests[2].Headers["Session-Expires"])
+	}
+	if transport.requests[3].Headers["Session-Expires"] != "" {
+		t.Fatalf("second UPDATE Session-Expires=%q, want timer disabled after 2xx without header", transport.requests[3].Headers["Session-Expires"])
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-session-refresher"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
 	}
 }
 

@@ -65,6 +65,7 @@ type OutboundCallResult struct {
 	RetryAfter                 time.Duration
 	LocalSDP                   SDPInfo
 	RawSDP                     []byte
+	Headers                    map[string]string
 }
 
 type DialogInfo struct {
@@ -326,6 +327,14 @@ func (g *Gateway) HandleClientInvite(deviceID string, req *sip.Request, tx sip.S
 	}
 	res := sip.NewResponseFromRequest(req, 200, "OK", body)
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	for key, value := range result.Headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
 	g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, State: DialogStateEstablished})
 	_ = tx.Respond(res)
 }

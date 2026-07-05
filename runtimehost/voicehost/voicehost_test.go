@@ -97,6 +97,7 @@ func TestGatewayHandleClientInviteStartsOutboundAgent(t *testing.T) {
 			Payloads:     []int{0, 101},
 			Direction:    "sendrecv",
 		},
+		Headers: map[string]string{"Session-Expires": "1800;refresher=uas"},
 	}}
 	g.RegisterAgent("dev-1", agent)
 	tx := &fakeServerTransaction{}
@@ -119,6 +120,9 @@ func TestGatewayHandleClientInviteStartsOutboundAgent(t *testing.T) {
 	}
 	if body := string(tx.responses[1].Body()); !strings.Contains(body, "m=audio 5004 RTP/AVP 0 101") {
 		t.Fatalf("200 OK SDP body=%q", body)
+	}
+	if got := tx.responses[1].GetHeader("Session-Expires"); got == nil || got.Value() != "1800;refresher=uas" {
+		t.Fatalf("Session-Expires response header=%v", got)
 	}
 	status := g.DeviceStatus("dev-1")
 	if status["active_dialogs"] != 1 {

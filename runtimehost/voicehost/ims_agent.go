@@ -14,28 +14,30 @@ import (
 var ErrIMSVoiceAgentNotReady = errors.New("ims voice agent not ready")
 
 type IMSOutboundAgent struct {
-	Transport       voiceclient.SIPRequestTransport
-	Profile         voiceclient.IMSProfile
-	Registration    voiceclient.RegistrationBinding
-	Domain          string
-	UserAgent       string
-	LocalTag        string
-	SessionExpires  int
-	RemoteTargetURI string
-	MediaRelay      *RTPRelayConfig
+	Transport        voiceclient.SIPRequestTransport
+	Profile          voiceclient.IMSProfile
+	Registration     voiceclient.RegistrationBinding
+	Domain           string
+	UserAgent        string
+	LocalTag         string
+	SessionExpires   int
+	SessionRefresher string
+	RemoteTargetURI  string
+	MediaRelay       *RTPRelayConfig
 
 	mu      sync.Mutex
 	dialogs map[string]imsDialogState
 }
 
 type IMSRegistrationUpdate struct {
-	Transport      voiceclient.SIPRequestTransport
-	Profile        voiceclient.IMSProfile
-	Registration   voiceclient.RegistrationBinding
-	Domain         string
-	UserAgent      string
-	SessionExpires int
-	MediaRelay     *RTPRelayConfig
+	Transport        voiceclient.SIPRequestTransport
+	Profile          voiceclient.IMSProfile
+	Registration     voiceclient.RegistrationBinding
+	Domain           string
+	UserAgent        string
+	SessionExpires   int
+	SessionRefresher string
+	MediaRelay       *RTPRelayConfig
 }
 
 type IMSRegistrationUpdater interface {
@@ -66,6 +68,9 @@ func (a *IMSOutboundAgent) UpdateIMSRegistration(update IMSRegistrationUpdate) {
 	if update.SessionExpires > 0 {
 		a.SessionExpires = update.SessionExpires
 	}
+	if refresher := normalizeSessionRefresher(update.SessionRefresher); refresher != "" {
+		a.SessionRefresher = refresher
+	}
 	if update.MediaRelay != nil {
 		a.MediaRelay = update.MediaRelay
 	}
@@ -93,17 +98,18 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		return OutboundCallResult{Accepted: false, Reason: "callee empty"}, errors.New("callee is empty")
 	}
 	cfg := voiceclient.DialogRequestConfig{
-		Profile:         a.Profile,
-		Registration:    a.Registration,
-		LocalURI:        firstVoiceNonEmpty(a.Registration.PublicIdentity, a.Profile.IMPU),
-		ContactURI:      a.Registration.ContactURI,
-		RemoteURI:       remoteURI,
-		RemoteTargetURI: firstVoiceNonEmpty(a.RemoteTargetURI, remoteURI),
-		CallID:          strings.TrimSpace(req.CallID),
-		LocalTag:        firstVoiceNonEmpty(a.LocalTag, "vowifi-go"),
-		CSeq:            1,
-		UserAgent:       firstVoiceNonEmpty(a.UserAgent, a.Profile.UserAgent, "vowifi-go"),
-		SessionExpires:  a.SessionExpires,
+		Profile:          a.Profile,
+		Registration:     a.Registration,
+		LocalURI:         firstVoiceNonEmpty(a.Registration.PublicIdentity, a.Profile.IMPU),
+		ContactURI:       a.Registration.ContactURI,
+		RemoteURI:        remoteURI,
+		RemoteTargetURI:  firstVoiceNonEmpty(a.RemoteTargetURI, remoteURI),
+		CallID:           strings.TrimSpace(req.CallID),
+		LocalTag:         firstVoiceNonEmpty(a.LocalTag, "vowifi-go"),
+		CSeq:             1,
+		UserAgent:        firstVoiceNonEmpty(a.UserAgent, a.Profile.UserAgent, "vowifi-go"),
+		SessionExpires:   a.SessionExpires,
+		SessionRefresher: normalizeSessionRefresher(a.SessionRefresher),
 	}
 	inviteBody := append([]byte(nil), req.RawSDP...)
 	var relay *RTPRelaySession
@@ -164,16 +170,16 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 			return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if resp.StatusCode == 422 && !retriedSessionInterval {
-			if minSE := minSEHeader(resp.Headers); minSE > cfg.SessionExpires {
+			if retryCfg, ok := retryDialogConfigForMinSE(cfg, invite.Headers, resp.Headers); ok {
 				if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
 					a.deleteDialog(strings.TrimSpace(req.CallID))
 					return OutboundCallResult{Accepted: false, Reason: "IMS INVITE session interval ACK failed"}, err
 				}
-				cfg.SessionExpires = minSE
-				cfg.MinSE = minSE
+				retryCfg.CSeq = nextCSeq
+				cfg = retryCfg
 				retriedSessionInterval = true
-				inviteCSeq = nextCSeq
-				nextCSeq++
+				inviteCSeq = retryCfg.CSeq
+				nextCSeq = outboundNextCSeq(inviteCSeq)
 				continue
 			}
 		}
@@ -202,6 +208,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
 	}
+	applyNegotiatedSessionInterval(&cfg, resp.Headers)
 	ack, err := voiceclient.BuildAckRequest(cfg)
 	if err != nil {
 		return OutboundCallResult{Accepted: false, Reason: "build IMS ACK failed"}, err
@@ -252,6 +259,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		Reason:     firstVoiceNonEmpty(resp.Reason, "OK"),
 		LocalSDP:   localSDP,
 		RawSDP:     answerBody,
+		Headers:    firstValueSIPHeaders(resp.Headers),
 	}, nil
 }
 
@@ -402,6 +410,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 			if latest, ok := a.dialogs[callID]; ok {
 				latest.cfg.CSeq = outboundNextCSeq(retryCfg.CSeq)
 				latest.cfg.SessionExpires = retryCfg.SessionExpires
+				latest.cfg.SessionRefresher = retryCfg.SessionRefresher
 				latest.cfg.MinSE = retryCfg.MinSE
 				a.dialogs[callID] = latest
 			}
@@ -424,10 +433,13 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 		}
 		resultBody = RewriteSDPMediaEndpoint(resultBody, state.relay.ClientEndpoint())
 	}
-	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); accepted && contact != "" {
+	if accepted {
 		a.mu.Lock()
 		if latest, ok := a.dialogs[callID]; ok {
-			latest.cfg.RemoteTargetURI = contact
+			if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+				latest.cfg.RemoteTargetURI = contact
+			}
+			applyNegotiatedSessionInterval(&latest.cfg, resp.Headers)
 			a.dialogs[callID] = latest
 		}
 		a.mu.Unlock()
@@ -534,6 +546,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			if latest, ok := a.dialogs[callID]; ok {
 				latest.cfg.CSeq = nextCSeq
 				latest.cfg.SessionExpires = retryCfg.SessionExpires
+				latest.cfg.SessionRefresher = retryCfg.SessionRefresher
 				latest.cfg.MinSE = retryCfg.MinSE
 				a.dialogs[callID] = latest
 			}
@@ -605,15 +618,16 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 		}
 		resultBody = RewriteSDPMediaEndpoint(resultBody, state.relay.ClientEndpoint())
 	}
-	if ackCfg.RemoteTargetURI != cfg.RemoteTargetURI || ackCfg.RemoteTag != cfg.RemoteTag {
-		a.mu.Lock()
-		if latest, ok := a.dialogs[callID]; ok {
+	a.mu.Lock()
+	if latest, ok := a.dialogs[callID]; ok {
+		if ackCfg.RemoteTargetURI != cfg.RemoteTargetURI || ackCfg.RemoteTag != cfg.RemoteTag {
 			latest.cfg.RemoteTargetURI = ackCfg.RemoteTargetURI
 			latest.cfg.RemoteTag = ackCfg.RemoteTag
-			a.dialogs[callID] = latest
 		}
-		a.mu.Unlock()
+		applyNegotiatedSessionInterval(&latest.cfg, resp.Headers)
+		a.dialogs[callID] = latest
 	}
+	a.mu.Unlock()
 	return DialogReinviteResult{
 		Accepted:    true,
 		StatusCode:  outboundStatusCode(resp.StatusCode, 200),
@@ -810,37 +824,92 @@ func retryDialogConfigForMinSE(cfg voiceclient.DialogRequestConfig, sentHeaders 
 	if minSE <= 0 {
 		return voiceclient.DialogRequestConfig{}, false
 	}
-	sessionExpires := sessionExpiresHeader(sentHeaders)
-	if sessionExpires <= 0 {
-		sessionExpires = cfg.SessionExpires
+	sentInterval := sessionExpiresRequestHeader(sentHeaders)
+	if sentInterval.Expires <= 0 {
+		sentInterval.Expires = cfg.SessionExpires
+		sentInterval.Refresher = normalizeSessionRefresher(cfg.SessionRefresher)
 	}
-	if sessionExpires < minSE {
-		sessionExpires = minSE
+	if sentInterval.Refresher == "" {
+		sentInterval.Refresher = normalizeSessionRefresher(cfg.SessionRefresher)
+	}
+	if sentInterval.Expires < minSE {
+		sentInterval.Expires = minSE
 	}
 	retry := cfg
 	retry.CSeq = outboundNextCSeq(cfg.CSeq)
-	retry.SessionExpires = sessionExpires
+	retry.SessionExpires = sentInterval.Expires
+	retry.SessionRefresher = sentInterval.Refresher
 	retry.MinSE = minSE
 	return retry, true
 }
 
-func sessionExpiresHeader(headers map[string]string) int {
+type sessionIntervalHeader struct {
+	Expires   int
+	Refresher string
+}
+
+func sessionExpiresRequestHeader(headers map[string]string) sessionIntervalHeader {
 	for key, value := range headers {
 		if !strings.EqualFold(key, "Session-Expires") {
 			continue
 		}
-		for _, part := range strings.Split(value, ",") {
-			part = strings.TrimSpace(part)
-			if semi := strings.IndexByte(part, ';'); semi >= 0 {
-				part = part[:semi]
-			}
-			n, err := strconv.Atoi(strings.TrimSpace(part))
-			if err == nil && n > 0 {
-				return n
+		if interval := parseSessionExpiresHeaderValue(value); interval.Expires > 0 {
+			return interval
+		}
+	}
+	return sessionIntervalHeader{}
+}
+
+func sessionExpiresResponseHeader(headers map[string][]string) sessionIntervalHeader {
+	for key, values := range headers {
+		if !strings.EqualFold(key, "Session-Expires") {
+			continue
+		}
+		for _, value := range values {
+			if interval := parseSessionExpiresHeaderValue(value); interval.Expires > 0 {
+				return interval
 			}
 		}
 	}
-	return 0
+	return sessionIntervalHeader{}
+}
+
+func parseSessionExpiresHeaderValue(value string) sessionIntervalHeader {
+	for _, entry := range splitVoiceHeaderValues(value) {
+		parts := strings.Split(entry, ";")
+		if len(parts) == 0 {
+			continue
+		}
+		expires, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil || expires <= 0 {
+			continue
+		}
+		interval := sessionIntervalHeader{Expires: expires}
+		for _, param := range parts[1:] {
+			key, raw, ok := strings.Cut(strings.TrimSpace(param), "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(key), "refresher") {
+				continue
+			}
+			interval.Refresher = normalizeSessionRefresher(strings.Trim(strings.TrimSpace(raw), `"`))
+		}
+		return interval
+	}
+	return sessionIntervalHeader{}
+}
+
+func applyNegotiatedSessionInterval(cfg *voiceclient.DialogRequestConfig, headers map[string][]string) bool {
+	if cfg == nil {
+		return false
+	}
+	interval := sessionExpiresResponseHeader(headers)
+	if interval.Expires <= 0 {
+		cfg.SessionExpires = 0
+		cfg.SessionRefresher = ""
+		return false
+	}
+	cfg.SessionExpires = interval.Expires
+	cfg.SessionRefresher = interval.Refresher
+	return true
 }
 
 func applySessionIntervalHeaders(headers map[string]string, cfg voiceclient.DialogRequestConfig) {
@@ -848,10 +917,23 @@ func applySessionIntervalHeaders(headers map[string]string, cfg voiceclient.Dial
 		return
 	}
 	if cfg.SessionExpires > 0 {
-		headers["Session-Expires"] = strconv.Itoa(cfg.SessionExpires)
+		value := strconv.Itoa(cfg.SessionExpires)
+		if refresher := normalizeSessionRefresher(cfg.SessionRefresher); refresher != "" {
+			value += ";refresher=" + refresher
+		}
+		headers["Session-Expires"] = value
 	}
 	if cfg.MinSE > 0 {
 		headers["Min-SE"] = strconv.Itoa(cfg.MinSE)
+	}
+}
+
+func normalizeSessionRefresher(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "uac", "uas":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
 	}
 }
 

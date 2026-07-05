@@ -194,6 +194,10 @@ protocol layers needed by VoHive:
   renegotiation, including SDP validation, RTP relay rewriting, final response
   ACK handling, remote Contact refresh, response header/body mapping, and CSeq
   advancement
+- IMS Session-Expires timer negotiation across initial INVITE, UPDATE, and
+  re-INVITE paths, including `refresher=uac/uas` preservation, 422 Min-SE
+  retry handling, dialog-state updates from 2xx responses, and softphone
+  response header propagation
 - in-dialog re-INVITE handling for IMS-originated media renegotiation, including
   local client forwarding, SDP answer rewriting, Contact refresh, and ACK CSeq
   tracking for the latest successful INVITE transaction

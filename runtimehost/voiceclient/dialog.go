@@ -24,20 +24,21 @@ type SIPIncomingRequest struct {
 }
 
 type DialogRequestConfig struct {
-	Profile         IMSProfile
-	Registration    RegistrationBinding
-	ContactURI      string
-	LocalURI        string
-	RemoteURI       string
-	RemoteTargetURI string
-	CallID          string
-	LocalTag        string
-	RemoteTag       string
-	CSeq            int
-	RouteSet        []string
-	UserAgent       string
-	SessionExpires  int
-	MinSE           int
+	Profile          IMSProfile
+	Registration     RegistrationBinding
+	ContactURI       string
+	LocalURI         string
+	RemoteURI        string
+	RemoteTargetURI  string
+	CallID           string
+	LocalTag         string
+	RemoteTag        string
+	CSeq             int
+	RouteSet         []string
+	UserAgent        string
+	SessionExpires   int
+	SessionRefresher string
+	MinSE            int
 }
 
 func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage, error) {
@@ -50,9 +51,7 @@ func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage,
 		msg.Headers["Accept"] = "application/sdp"
 	}
 	msg.Headers["Supported"] = "100rel, timer, replaces, outbound"
-	if cfg.SessionExpires > 0 {
-		msg.Headers["Session-Expires"] = strconv.Itoa(cfg.SessionExpires)
-	}
+	applySessionIntervalHeaders(msg.Headers, cfg)
 	if cfg.MinSE > 0 {
 		msg.Headers["Min-SE"] = strconv.Itoa(cfg.MinSE)
 	}
@@ -88,9 +87,7 @@ func BuildUpdateRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage,
 		return SIPRequestMessage{}, err
 	}
 	msg.Headers["Supported"] = "timer, replaces, outbound"
-	if cfg.SessionExpires > 0 {
-		msg.Headers["Session-Expires"] = strconv.Itoa(cfg.SessionExpires)
-	}
+	applySessionIntervalHeaders(msg.Headers, cfg)
 	if cfg.MinSE > 0 {
 		msg.Headers["Min-SE"] = strconv.Itoa(cfg.MinSE)
 	}
@@ -209,6 +206,26 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 		Headers: headers,
 		Body:    append([]byte(nil), body...),
 	}, nil
+}
+
+func applySessionIntervalHeaders(headers map[string]string, cfg DialogRequestConfig) {
+	if headers == nil || cfg.SessionExpires <= 0 {
+		return
+	}
+	value := strconv.Itoa(cfg.SessionExpires)
+	if refresher := normalizeSessionRefresher(cfg.SessionRefresher); refresher != "" {
+		value += ";refresher=" + refresher
+	}
+	headers["Session-Expires"] = value
+}
+
+func normalizeSessionRefresher(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "uac", "uas":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
 }
 
 func routeHeader(routes []string) string {
