@@ -136,8 +136,8 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
 			break
 		}
-		if err := s.Agent.EndInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); err != nil {
-			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, err.Error()))}, err
+		if callErr := s.Agent.EndInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); callErr != nil {
+			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, callErr.Error()))}, callErr
 			break
 		}
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}
@@ -146,8 +146,8 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
 			break
 		}
-		if err := s.Agent.CancelInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); err != nil {
-			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, err.Error()))}, err
+		if callErr := s.Agent.CancelInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); callErr != nil {
+			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, callErr.Error()))}, callErr
 			break
 		}
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}

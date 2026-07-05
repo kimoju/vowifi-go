@@ -2,6 +2,24 @@
 
 An independent, open implementation of the VoHive VoWiFi runtime boundary.
 
+## CI
+
+Local CI uses the same entry point as GitHub Actions:
+
+```sh
+make ci
+```
+
+Useful focused targets are `make fmt-check`, `make tidy-check`, `make vet`,
+`make test`, and `make race`. If Go is installed outside `PATH`, run for
+example `GO=/usr/local/go/bin/go make ci`.
+
+GitHub Actions runs `.github/workflows/ci.yml` on Ubuntu with the Go version
+from `go.mod`, calling `scripts/ci.sh` for formatting, module tidiness, vet,
+unit tests, and race tests. The current test suite uses loopback networking and
+mock command boundaries; it does not require a modem, root privileges, or a
+real TUN device in CI.
+
 This repository intentionally starts with the public API surface consumed by
 VoHive:
 

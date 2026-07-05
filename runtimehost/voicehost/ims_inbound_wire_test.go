@@ -513,6 +513,64 @@ func TestIMSInboundWireServerDispatchesInfoAndUSSDBye(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerReturnsAgentByeCancelErrors(t *testing.T) {
+	transport := newWireInboundTransport([]voiceclient.SIPResponse{
+		{StatusCode: 503, Reason: "client bye failed"},
+		{StatusCode: 503, Reason: "client cancel failed"},
+	})
+	agent := &IMSInboundAgent{ClientTransport: transport}
+	agent.storeInboundDialog("wire-error-call", imsInboundDialogState{
+		clientCfg: voiceclient.DialogRequestConfig{
+			Profile:         voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+			LocalURI:        "sip:user@ims.example",
+			ContactURI:      "sip:user@127.0.0.1:5060",
+			RemoteURI:       "sip:+18005551212@ims.example",
+			RemoteTargetURI: "sip:client@127.0.0.1:5070",
+			CallID:          "wire-error-call",
+			LocalTag:        "wire-local",
+			RemoteTag:       "client-remote",
+			CSeq:            1,
+		},
+	})
+	server := &IMSInboundWireServer{Agent: agent}
+
+	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+		Method: "BYE",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID": {"wire-error-call"},
+			"CSeq":    {"2 BYE"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "client BYE rejected") {
+		t.Fatalf("HandleRequest(BYE) err=%v, want client BYE rejection", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 500 || !strings.Contains(responses[0].Reason, "client BYE rejected") {
+		t.Fatalf("BYE responses=%+v", responses)
+	}
+	if req := transport.readRequest(t); req.Method != "BYE" {
+		t.Fatalf("client BYE request=%+v", req)
+	}
+
+	responses, err = server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+		Method: "CANCEL",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID": {"wire-error-call"},
+			"CSeq":    {"3 CANCEL"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "client CANCEL rejected") {
+		t.Fatalf("HandleRequest(CANCEL) err=%v, want client CANCEL rejection", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 500 || !strings.Contains(responses[0].Reason, "client CANCEL rejected") {
+		t.Fatalf("CANCEL responses=%+v", responses)
+	}
+	if req := transport.readRequest(t); req.Method != "CANCEL" {
+		t.Fatalf("client CANCEL request=%+v", req)
+	}
+}
+
 func TestIMSInboundWireServerFallsBackToAgentForUnhandledNonUSSDInfo(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{
 		StatusCode: 200,
