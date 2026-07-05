@@ -311,6 +311,65 @@ func TestIMSInboundWireServerDispatchesPrackUpdateAndOptions(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerDispatchesReinviteAndAck(t *testing.T) {
+	transport := newWireInboundTransport([]voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+			Body:       []byte(sampleSDP("127.0.0.1", 4002)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"Contact": {"<sip:client@127.0.0.1:5070>"}},
+			Body:       []byte(sampleSDP("127.0.0.1", 4006)),
+		},
+	})
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		ContactURI: "sip:vowifi@127.0.0.1:5060",
+	}
+	initial := parseWireIncoming(t, wireIMSInvite("wire-call-reinvite", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170))))
+	responses, err := server.HandleRequest(context.Background(), initial)
+	if err != nil {
+		t.Fatalf("HandleRequest(initial INVITE) error = %v", err)
+	}
+	if len(responses) != 2 || responses[1].StatusCode != 200 {
+		t.Fatalf("initial responses=%+v", responses)
+	}
+	_ = transport.readRequest(t)
+
+	reinvite := parseWireIncoming(t, wireIMSRequest("wire-call-reinvite", "INVITE", 4, []byte(sampleSDP("203.0.113.20", 49172))))
+	responses, err = server.HandleRequest(context.Background(), reinvite)
+	if err != nil {
+		t.Fatalf("HandleRequest(re-INVITE) error = %v", err)
+	}
+	if len(responses) != 2 || responses[1].StatusCode != 200 || !strings.Contains(string(responses[1].Body), "m=audio 4006 RTP/AVP") {
+		t.Fatalf("re-INVITE responses=%+v body=%q", responses, responses[1].Body)
+	}
+	clientReinvite := transport.readRequest(t)
+	if clientReinvite.Method != "INVITE" || clientReinvite.Headers["CSeq"] != "4 INVITE" || !strings.Contains(string(clientReinvite.Body), "m=audio 49172 RTP/AVP") {
+		t.Fatalf("client re-INVITE=%+v", clientReinvite)
+	}
+	ack := parseWireIncoming(t, wireIMSRequest("wire-call-reinvite", "ACK", 4, nil))
+	responses, err = server.HandleRequest(context.Background(), ack)
+	if err != nil {
+		t.Fatalf("HandleRequest(ACK) error = %v", err)
+	}
+	if len(responses) != 0 {
+		t.Fatalf("ACK responses=%+v", responses)
+	}
+	clientACK := transport.readWrite(t)
+	if clientACK.Method != "ACK" || clientACK.Headers["CSeq"] != "4 ACK" {
+		t.Fatalf("client ACK=%+v", clientACK)
+	}
+}
+
 func TestIMSInboundWireServerRejectsUnsupportedMethod(t *testing.T) {
 	server := &IMSInboundWireServer{}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{

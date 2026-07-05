@@ -73,6 +73,9 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 	if callID == "" {
 		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
 	}
+	if state, ok := a.inboundDialog(callID); ok {
+		return a.handleInboundReinvite(ctx, req, state)
+	}
 	callerURI := strings.TrimSpace(req.CallerURI)
 	if callerURI == "" {
 		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "caller URI empty"}, errors.New("caller URI is empty")
@@ -165,6 +168,59 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		LocalSDP:   localSDP,
 		RawSDP:     answerBody,
 	}, nil
+}
+
+func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req InboundCallRequest, state imsInboundDialogState) (InboundCallResult, error) {
+	cfg := state.clientCfg
+	cfg.CSeq = inboundCSeq(req.CSeq)
+	body := append([]byte(nil), req.RawSDP...)
+	if len(body) > 0 && state.relay != nil {
+		remoteSDP, offerBody, err := inboundOfferSDP(req)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid IMS re-INVITE SDP"}, err
+		}
+		if err := state.relay.SetIMSRemote(remoteSDP); err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS re-INVITE failed"}, err
+		}
+		body = RewriteSDPMediaEndpoint(offerBody, state.relay.ClientEndpoint())
+	}
+	invite, err := voiceclient.BuildInviteRequest(cfg, body)
+	if err != nil {
+		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client re-INVITE failed"}, err
+	}
+	resp, err := a.ClientTransport.RoundTripRequest(ctx, invite)
+	if err != nil {
+		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client re-INVITE failed"}, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 488), Reason: firstVoiceNonEmpty(resp.Reason, "re-INVITE rejected")}, nil
+	}
+	result := InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...)}
+	if len(resp.Body) > 0 {
+		localSDP, err := ParseSDP(resp.Body)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid client re-INVITE SDP answer"}, err
+		}
+		if state.relay != nil {
+			if err := state.relay.SetClientRemote(localSDP); err != nil {
+				return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client re-INVITE failed"}, err
+			}
+			result.RawSDP = RewriteSDPMediaEndpoint(resp.Body, state.relay.IMSEndpoint())
+			localSDP, err = ParseSDP(result.RawSDP)
+			if err != nil {
+				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay re-INVITE SDP answer"}, err
+			}
+		}
+		result.LocalSDP = localSDP
+	}
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
+	}
+	cfg.CSeq = state.clientCfg.CSeq
+	state.clientCfg = cfg
+	state.inviteCSeq = inboundCSeq(req.CSeq)
+	a.storeInboundDialog(strings.TrimSpace(req.CallID), state)
+	return result, nil
 }
 
 func (a *IMSInboundAgent) AckInboundCall(ctx context.Context, info DialogInfo) error {
