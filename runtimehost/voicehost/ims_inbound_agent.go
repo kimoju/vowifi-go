@@ -124,12 +124,18 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client INVITE failed"}, err
 	}
 	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, inviteCSeq: cfg.CSeq, relay: relay})
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, invite)
+	resp, err := a.roundTripClientInvite(ctx, invite)
 	if err != nil {
 		a.deleteInboundDialog(callID)
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client INVITE failed"}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode >= 300 {
+			if err := a.ackRejectedClientInvite(ctx, cfg, invite, resp); err != nil {
+				a.deleteInboundDialog(callID)
+				return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "client INVITE rejected ACK failed"}, err
+			}
+		}
 		a.deleteInboundDialog(callID)
 		return InboundCallResult{
 			Accepted:   false,
@@ -188,11 +194,16 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 	if err != nil {
 		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client re-INVITE failed"}, err
 	}
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, invite)
+	resp, err := a.roundTripClientInvite(ctx, invite)
 	if err != nil {
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client re-INVITE failed"}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode >= 300 {
+			if err := a.ackRejectedClientInvite(ctx, cfg, invite, resp); err != nil {
+				return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "client re-INVITE rejected ACK failed"}, err
+			}
+		}
 		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 488), Reason: firstVoiceNonEmpty(resp.Reason, "re-INVITE rejected")}, nil
 	}
 	result := InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...)}
@@ -242,6 +253,17 @@ func (a *IMSInboundAgent) AckInboundCall(ctx context.Context, info DialogInfo) e
 	if err != nil {
 		return err
 	}
+	return a.ClientTransport.WriteRequest(ctx, ack)
+}
+
+func (a *IMSInboundAgent) ackRejectedClientInvite(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
+	ackCfg := cfg
+	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
+	ack, err := voiceclient.BuildAckRequest(ackCfg)
+	if err != nil {
+		return err
+	}
+	copyDialogHeader(ack.Headers, invite.Headers, "Via")
 	return a.ClientTransport.WriteRequest(ctx, ack)
 }
 
@@ -481,4 +503,14 @@ func (a *IMSInboundAgent) deleteInboundDialog(callID string) {
 
 func (a *IMSInboundAgent) closeInboundDialog(callID string) {
 	a.deleteInboundDialog(callID)
+}
+
+func (a *IMSInboundAgent) roundTripClientInvite(ctx context.Context, invite voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	if a == nil || a.ClientTransport == nil {
+		return voiceclient.SIPResponse{}, ErrIMSInboundAgentNotReady
+	}
+	if inviteTransport, ok := a.ClientTransport.(voiceclient.SIPInviteTransport); ok {
+		return inviteTransport.RoundTripInvite(ctx, invite, nil)
+	}
+	return a.ClientTransport.RoundTripRequest(ctx, invite)
 }

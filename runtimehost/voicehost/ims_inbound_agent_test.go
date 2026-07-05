@@ -83,7 +83,11 @@ func TestIMSInboundAgentInviteAckAndBye(t *testing.T) {
 }
 
 func TestIMSInboundAgentRejectedInvite(t *testing.T) {
-	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 486, Reason: "Busy Here"}}}
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 486,
+		Reason:     "Busy Here",
+		Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=busy-tag"}},
+	}}}
 	agent := &IMSInboundAgent{
 		ClientTransport:  transport,
 		ClientContactURI: "sip:client@127.0.0.1:5070",
@@ -101,11 +105,24 @@ func TestIMSInboundAgentRejectedInvite(t *testing.T) {
 	if result.Accepted || result.StatusCode != 486 || result.Reason != "Busy Here" {
 		t.Fatalf("result=%+v", result)
 	}
+	if len(transport.requests) != 1 || transport.requests[0].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+	ack := transport.writes[0]
+	if ack.Headers["CSeq"] != "1 ACK" || !strings.Contains(ack.Headers["To"], "busy-tag") {
+		t.Fatalf("ACK=%+v", ack)
+	}
+	if ack.Headers["Via"] == "" || ack.Headers["Via"] != transport.requests[0].Headers["Via"] {
+		t.Fatalf("ACK Via=%q INVITE Via=%q", ack.Headers["Via"], transport.requests[0].Headers["Via"])
+	}
 	if err := agent.AckInboundCall(context.Background(), DialogInfo{CallID: "in-call-2"}); err != nil {
 		t.Fatalf("AckInboundCall(rejected) error = %v", err)
 	}
-	if len(transport.writes) != 0 {
-		t.Fatalf("writes=%+v, want none", transport.writes)
+	if len(transport.writes) != 1 {
+		t.Fatalf("writes=%+v, want only rejected INVITE ACK", transport.writes)
 	}
 }
 
@@ -232,6 +249,76 @@ func TestIMSInboundAgentHandlesReinviteAndTracksAckCSeq(t *testing.T) {
 	}
 	if len(transport.writes) != 2 || transport.writes[1].Headers["CSeq"] != "4 ACK" {
 		t.Fatalf("re-INVITE ACK writes=%+v", transport.writes)
+	}
+}
+
+func TestIMSInboundAgentRejectedReinviteAcksFinalResponse(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 488,
+			Reason:     "Not Acceptable Here",
+			Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-reinvite-reject",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		CSeq:      1,
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	if err := agent.AckInboundCall(context.Background(), DialogInfo{CallID: "in-call-reinvite-reject"}); err != nil {
+		t.Fatalf("AckInboundCall(initial) error = %v", err)
+	}
+
+	result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-reinvite-reject",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		CSeq:      4,
+		RawSDP:    []byte(sampleSDP("203.0.113.20", 49172)),
+	})
+	if err != nil {
+		t.Fatalf("HandleInboundInvite(re-INVITE) error = %v", err)
+	}
+	if result.Accepted || result.StatusCode != 488 || result.Reason != "Not Acceptable Here" {
+		t.Fatalf("re-INVITE result=%+v", result)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "INVITE" || transport.requests[1].Headers["CSeq"] != "4 INVITE" {
+		t.Fatalf("re-INVITE requests=%+v", transport.requests)
+	}
+	if len(transport.writes) != 2 || transport.writes[1].Method != "ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+	ack := transport.writes[1]
+	if ack.Headers["CSeq"] != "4 ACK" || !strings.Contains(ack.Headers["To"], "client-tag") {
+		t.Fatalf("ACK=%+v", ack)
+	}
+	if ack.Headers["Via"] == "" || ack.Headers["Via"] != transport.requests[1].Headers["Via"] {
+		t.Fatalf("ACK Via=%q INVITE Via=%q", ack.Headers["Via"], transport.requests[1].Headers["Via"])
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-reinvite-reject"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "2 BYE" {
+		t.Fatalf("BYE requests=%+v", transport.requests)
 	}
 }
 
