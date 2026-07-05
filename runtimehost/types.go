@@ -455,6 +455,14 @@ func (i *Instance) EndVoiceCall(ctx context.Context, info voicehost.DialogInfo) 
 	return agent.EndVoiceCall(ctx, info)
 }
 
+func (i *Instance) CancelVoiceCall(ctx context.Context, info voicehost.DialogInfo) error {
+	agent := i.dialogCanceller()
+	if agent == nil {
+		return voicehost.ErrIMSVoiceAgentNotReady
+	}
+	return agent.CancelVoiceCall(ctx, info)
+}
+
 func (i *Instance) outboundVoiceAgent() voicehost.OutboundCallAgent {
 	if i == nil {
 		return nil
@@ -475,6 +483,20 @@ func (i *Instance) dialogTerminator() voicehost.DialogTerminator {
 	}
 	i.mu.RLock()
 	agent, _ := i.voice.(voicehost.DialogTerminator)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogCanceller() voicehost.DialogCanceller {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogCanceller)
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {

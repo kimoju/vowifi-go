@@ -12,6 +12,7 @@ import (
 type fakeOutboundAgent struct {
 	requests   []OutboundCallRequest
 	terminated []DialogInfo
+	canceled   []DialogInfo
 	result     OutboundCallResult
 	err        error
 }
@@ -29,6 +30,11 @@ func (a *fakeOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundC
 
 func (a *fakeOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) error {
 	a.terminated = append(a.terminated, info)
+	return nil
+}
+
+func (a *fakeOutboundAgent) CancelVoiceCall(ctx context.Context, info DialogInfo) error {
+	a.canceled = append(a.canceled, info)
 	return nil
 }
 
@@ -117,6 +123,26 @@ func TestGatewayHandleClientByeTerminatesDialog(t *testing.T) {
 	}
 }
 
+func TestGatewayHandleClientCancelCancelsEarlyDialog(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{}
+	g.RegisterAgent("dev-1", agent)
+	g.recordDialog(DialogInfo{DeviceID: "dev-1", CallID: "call-cancel", Callee: "18005551212", State: DialogStateEarly})
+
+	tx := &fakeServerTransaction{}
+	g.HandleClientCancel("dev-1", newCancelRequest("call-cancel"), tx)
+
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 {
+		t.Fatalf("CANCEL responses=%v", responseCodes(tx.responses))
+	}
+	if len(agent.canceled) != 1 || agent.canceled[0].CallID != "call-cancel" || agent.canceled[0].State != DialogStateTerminated {
+		t.Fatalf("canceled=%+v", agent.canceled)
+	}
+	if status := g.DeviceStatus("dev-1"); status["active_dialogs"] != 0 {
+		t.Fatalf("DeviceStatus=%+v, want no active dialog", status)
+	}
+}
+
 func TestParseAndBuildSDP(t *testing.T) {
 	info, err := ParseSDP([]byte(sampleSDP("203.0.113.8", 49170) + "a=rtcp:49171 IN IP4 203.0.113.8\r\n"))
 	if err != nil {
@@ -144,6 +170,12 @@ func newInviteRequest(callID, callee, sdp string) *sip.Request {
 
 func newByeRequest(callID string) *sip.Request {
 	req := sip.NewRequest(sip.BYE, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
+	appendCommonHeaders(req, callID, "18005551212")
+	return req
+}
+
+func newCancelRequest(callID string) *sip.Request {
+	req := sip.NewRequest(sip.CANCEL, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
 	appendCommonHeaders(req, callID, "18005551212")
 	return req
 }

@@ -31,6 +31,7 @@ type IMSOutboundAgent struct {
 type imsDialogState struct {
 	cfg   voiceclient.DialogRequestConfig
 	relay *RTPRelaySession
+	early bool
 }
 
 func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCallRequest) (OutboundCallResult, error) {
@@ -80,6 +81,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if err != nil {
 		return OutboundCallResult{Accepted: false, Reason: "build IMS INVITE failed"}, err
 	}
+	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: cfg, relay: relay, early: true})
 	nextCSeq := cfg.CSeq + 1
 	var provisionalSDP SDPInfo
 	var provisionalAnswer []byte
@@ -105,9 +107,11 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		return nil
 	})
 	if err != nil {
+		a.deleteDialog(strings.TrimSpace(req.CallID))
 		return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed"}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		a.deleteDialog(strings.TrimSpace(req.CallID))
 		return OutboundCallResult{
 			Accepted: false,
 			Reason:   firstVoiceNonEmpty(resp.Reason, fmt.Sprintf("IMS rejected call: %d", resp.StatusCode)),
@@ -132,35 +136,34 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if len(resp.Body) > 0 {
 		parsed, err := ParseSDP(resp.Body)
 		if err != nil {
+			a.deleteDialog(strings.TrimSpace(req.CallID))
 			return OutboundCallResult{Accepted: false, Reason: "invalid IMS SDP answer"}, err
 		}
 		localSDP = parsed
 	}
 	if relay != nil && len(resp.Body) > 0 {
 		if err := relay.SetIMSRemote(localSDP); err != nil {
+			a.deleteDialog(strings.TrimSpace(req.CallID))
 			return OutboundCallResult{Accepted: false, Reason: "RTP relay remote setup failed"}, err
 		}
 		answerBody = RewriteSDPMediaEndpoint(resp.Body, relay.ClientEndpoint())
 		localSDP, err = ParseSDP(answerBody)
 		if err != nil {
+			a.deleteDialog(strings.TrimSpace(req.CallID))
 			return OutboundCallResult{Accepted: false, Reason: "invalid RTP relay SDP answer"}, err
 		}
 	}
 	if localSDP.MediaPort <= 0 || strings.TrimSpace(localSDP.ConnectionIP) == "" {
 		parsed, err := ParseSDP(answerBody)
 		if err != nil {
+			a.deleteDialog(strings.TrimSpace(req.CallID))
 			return OutboundCallResult{Accepted: false, Reason: "invalid IMS SDP answer"}, err
 		}
 		localSDP = parsed
 	}
-	a.mu.Lock()
-	if a.dialogs == nil {
-		a.dialogs = make(map[string]imsDialogState)
-	}
 	byeCfg := cfg
 	byeCfg.CSeq = nextCSeq
-	a.dialogs[strings.TrimSpace(req.CallID)] = imsDialogState{cfg: byeCfg, relay: relay}
-	a.mu.Unlock()
+	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: byeCfg, relay: relay})
 	closeRelayOnError = false
 	return OutboundCallResult{
 		Accepted: true,
@@ -207,6 +210,38 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	return nil
 }
 
+func (a *IMSOutboundAgent) CancelVoiceCall(ctx context.Context, info DialogInfo) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.Transport == nil {
+		return ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(info.CallID)
+	if callID == "" {
+		return nil
+	}
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	a.mu.Unlock()
+	if !ok || !state.early {
+		return nil
+	}
+	cancel, err := voiceclient.BuildCancelRequest(state.cfg)
+	if err != nil {
+		return err
+	}
+	resp, err := a.Transport.RoundTripRequest(ctx, cancel)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("IMS CANCEL rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
+	}
+	a.deleteDialog(callID)
+	return nil
+}
+
 func (a *IMSOutboundAgent) provisionalAnswer(resp voiceclient.SIPResponse, relay *RTPRelaySession) ([]byte, SDPInfo, bool, error) {
 	if len(resp.Body) == 0 {
 		return nil, SDPInfo{}, false, nil
@@ -228,6 +263,33 @@ func (a *IMSOutboundAgent) provisionalAnswer(resp voiceclient.SIPResponse, relay
 		}
 	}
 	return answerBody, localSDP, true, nil
+}
+
+func (a *IMSOutboundAgent) storeDialog(callID string, state imsDialogState) {
+	if a == nil || strings.TrimSpace(callID) == "" {
+		return
+	}
+	a.mu.Lock()
+	if a.dialogs == nil {
+		a.dialogs = make(map[string]imsDialogState)
+	}
+	a.dialogs[strings.TrimSpace(callID)] = state
+	a.mu.Unlock()
+}
+
+func (a *IMSOutboundAgent) deleteDialog(callID string) {
+	if a == nil || strings.TrimSpace(callID) == "" {
+		return
+	}
+	a.mu.Lock()
+	state, ok := a.dialogs[strings.TrimSpace(callID)]
+	if ok {
+		delete(a.dialogs, strings.TrimSpace(callID))
+	}
+	a.mu.Unlock()
+	if ok && state.relay != nil {
+		_ = state.relay.Close()
+	}
 }
 
 func (a *IMSOutboundAgent) roundTripInvite(ctx context.Context, invite voiceclient.SIPRequestMessage, onProvisional func(voiceclient.SIPResponse) error) (voiceclient.SIPResponse, error) {

@@ -236,6 +236,63 @@ func TestIMSOutboundAgentRejectedInviteDoesNotAck(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentCancelVoiceCallSendsCancelForEarlyDialog(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 200, Reason: "OK"}}}
+	agent := &IMSOutboundAgent{Transport: transport}
+	agent.storeDialog("call-cancel", imsDialogState{
+		early: true,
+		cfg: voiceclient.DialogRequestConfig{
+			Profile:         voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+			LocalURI:        "sip:user@ims.example",
+			ContactURI:      "sip:user@192.0.2.10:5060",
+			RemoteURI:       "sip:+18005551212@ims.example",
+			RemoteTargetURI: "sip:+18005551212@ims.example",
+			CallID:          "call-cancel",
+			LocalTag:        "local-tag",
+			CSeq:            1,
+		},
+	})
+
+	if err := agent.CancelVoiceCall(context.Background(), DialogInfo{CallID: "call-cancel"}); err != nil {
+		t.Fatalf("CancelVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 1 || transport.requests[0].Method != "CANCEL" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	cancel := transport.requests[0]
+	if cancel.Headers["CSeq"] != "1 CANCEL" || cancel.Headers["Call-ID"] != "call-cancel" || !strings.Contains(cancel.Headers["From"], "local-tag") {
+		t.Fatalf("CANCEL=%+v", cancel)
+	}
+	if _, ok := agent.dialogs["call-cancel"]; ok {
+		t.Fatal("early dialog still stored after successful CANCEL")
+	}
+}
+
+func TestIMSOutboundAgentCancelVoiceCallIgnoresEstablishedDialog(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 200, Reason: "OK"}}}
+	agent := &IMSOutboundAgent{Transport: transport}
+	agent.storeDialog("call-established", imsDialogState{
+		cfg: voiceclient.DialogRequestConfig{
+			LocalURI:        "sip:user@ims.example",
+			RemoteURI:       "sip:+18005551212@ims.example",
+			RemoteTargetURI: "sip:+18005551212@ims.example",
+			CallID:          "call-established",
+			LocalTag:        "local-tag",
+			CSeq:            2,
+		},
+	})
+
+	if err := agent.CancelVoiceCall(context.Background(), DialogInfo{CallID: "call-established"}); err != nil {
+		t.Fatalf("CancelVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 0 {
+		t.Fatalf("requests=%+v, want no CANCEL for established dialog", transport.requests)
+	}
+	if _, ok := agent.dialogs["call-established"]; !ok {
+		t.Fatal("established dialog should remain stored")
+	}
+}
+
 func TestIMSOutboundAgentKeepsDialogWhenByeFails(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

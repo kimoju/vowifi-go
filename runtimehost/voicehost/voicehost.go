@@ -33,6 +33,10 @@ type DialogTerminator interface {
 	EndVoiceCall(context.Context, DialogInfo) error
 }
 
+type DialogCanceller interface {
+	CancelVoiceCall(context.Context, DialogInfo) error
+}
+
 type OutboundCallRequest struct {
 	DeviceID  string
 	CallID    string
@@ -252,6 +256,20 @@ func (g *Gateway) HandleClientInvite(deviceID string, req *sip.Request, tx sip.S
 func (g *Gateway) HandleClientCancel(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
 	if tx != nil && req != nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
+	}
+	if req == nil {
+		return
+	}
+	callID := sipCallID(req)
+	if callID == "" {
+		return
+	}
+	dialog := g.dialog(callID)
+	dialog.DeviceID = firstVoiceNonEmpty(dialog.DeviceID, strings.TrimSpace(deviceID))
+	dialog.State = DialogStateTerminated
+	g.recordDialog(dialog)
+	if canceller, ok := g.GetAgent(deviceID).(DialogCanceller); ok {
+		_ = canceller.CancelVoiceCall(context.Background(), dialog)
 	}
 }
 
