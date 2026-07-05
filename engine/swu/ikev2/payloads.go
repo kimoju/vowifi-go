@@ -19,6 +19,7 @@ const (
 	NotifyUnexpectedNATDetected     uint16 = 41
 	NotifyNATDetectionSourceIP      uint16 = 16388
 	NotifyNATDetectionDestinationIP uint16 = 16389
+	NotifyRekeySA                   uint16 = 16393
 	NotifyMOBIKESupported           uint16 = 16396
 	NotifyAdditionalIPv4Address     uint16 = 16397
 	NotifyAdditionalIPv6Address     uint16 = 16398

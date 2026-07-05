@@ -61,6 +61,9 @@ protocol layers needed by VoHive:
 - MOBIKE UPDATE_SA_ADDRESSES control-plane helpers with optional NAT-D and
   address-set notifications, response rejection handling, and packet-session
   state refresh on successful updates
+- IKEv2 CREATE_CHILD_SA initiator flow for additional or rekeyed ESP Child
+  SAs, including SA/Nonce/TS request construction, REKEY_SA notify support,
+  encrypted response validation, and per-exchange Ni/Nr key derivation
 - encrypted IKE_AUTH EAP-Identity exchange scaffolding, including IDi, CP,
   CHILD_SA/TSi/TSr request payloads, responder EAP parsing, and
   EAP-Response/Identity transmission

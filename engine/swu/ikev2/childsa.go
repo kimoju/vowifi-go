@@ -114,6 +114,10 @@ func DeriveChildSAKeysWithNonces(prf crypto.Hash, skD, nonceI, nonceR []byte, se
 }
 
 func ParseChildSAResult(init InitResult, inner []Payload, localSPI []byte) (ChildSAResult, error) {
+	return ParseChildSAResultWithNonces(init, inner, localSPI, init.NonceI, init.NonceR)
+}
+
+func ParseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, nonceI, nonceR []byte) (ChildSAResult, error) {
 	var out ChildSAResult
 	for _, p := range inner {
 		switch p.Type {
@@ -161,7 +165,7 @@ func ParseChildSAResult(init InitResult, inner []Payload, localSPI []byte) (Chil
 	if len(out.TSr.Selectors) == 0 {
 		return ChildSAResult{}, fmt.Errorf("%w: missing TSr", ErrInvalidChildSA)
 	}
-	keys, err := DeriveChildSAKeys(init, out.SelectedSA)
+	keys, err := DeriveChildSAKeysWithNonces(init.Keys.Profile.PRF, init.Keys.SKD, nonceI, nonceR, out.SelectedSA)
 	if err != nil {
 		return ChildSAResult{}, err
 	}
