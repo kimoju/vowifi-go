@@ -84,6 +84,7 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 			Body: runtimeSDP("198.51.100.22", 49170),
 		},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"info-ok"}}},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"update-ok"}}, Body: runtimeSDP("198.51.100.23", 49172)},
 		{StatusCode: 200, Reason: "OK"},
 	}}
 	gw := voicehost.NewGateway()
@@ -167,10 +168,25 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if len(transport.requests) != 2 || transport.requests[1].Method != "INFO" || transport.requests[1].Headers["CSeq"] != "2 INFO" {
 		t.Fatalf("INFO requests=%+v", transport.requests)
 	}
+	updater, ok := gw.GetAgent("dev-voice").(voicehost.DialogUpdater)
+	if !ok {
+		t.Fatalf("gateway agent=%T, want dialog updater", gw.GetAgent("dev-voice"))
+	}
+	updateResult, err := updater.SendDialogUpdate(context.Background(), voicehost.DialogUpdateRequest{
+		CallID:      "call-runtime-voice",
+		ContentType: "application/sdp",
+		Body:        runtimeSDP("192.0.2.45", 4002),
+	})
+	if err != nil || !updateResult.Accepted || updateResult.Headers["X-IMS"] != "update-ok" {
+		t.Fatalf("SendDialogUpdate() result=%+v err=%v", updateResult, err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "UPDATE" || transport.requests[2].Headers["CSeq"] != "3 UPDATE" {
+		t.Fatalf("UPDATE requests=%+v", transport.requests)
+	}
 	if err := terminator.EndVoiceCall(context.Background(), voicehost.DialogInfo{CallID: "call-runtime-voice"}); err != nil {
 		t.Fatalf("EndVoiceCall() error = %v", err)
 	}
-	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
+	if len(transport.requests) != 4 || transport.requests[3].Method != "BYE" || transport.requests[3].Headers["CSeq"] != "4 BYE" {
 		t.Fatalf("requests after BYE=%+v", transport.requests)
 	}
 }

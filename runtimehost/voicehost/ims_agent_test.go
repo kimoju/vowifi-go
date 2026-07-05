@@ -136,6 +136,143 @@ func TestIMSOutboundAgentSendsInDialogInfoAndAdvancesCSeq(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentSendsInDialogUpdateAndAdvancesCSeq(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Content-Type": {"application/sdp"},
+				"Contact":      {"<sip:updated@198.51.100.2:5060>"},
+				"X-IMS":        {"update-ok"},
+			},
+			Body: []byte(sampleSDP("203.0.113.20", 49180)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-update",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogUpdate(context.Background(), DialogUpdateRequest{
+		CallID:      "call-update",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("192.0.2.60", 4010)),
+		Headers:     map[string]string{"Session-Expires": "1800"},
+	})
+	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "update-ok" || !strings.Contains(string(result.Body), "m=audio 49180") {
+		t.Fatalf("SendDialogUpdate() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "UPDATE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	update := transport.requests[1]
+	if update.URI != "sip:carrier@198.51.100.1:5060" || update.Headers["CSeq"] != "2 UPDATE" ||
+		update.Headers["Content-Type"] != "application/sdp" || update.Headers["Session-Expires"] != "1800" ||
+		!strings.Contains(string(update.Body), "m=audio 4010 RTP/AVP") {
+		t.Fatalf("UPDATE=%+v body=%q", update, update.Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-update"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
+		transport.requests[2].URI != "sip:updated@198.51.100.2:5060" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after UPDATE=%+v", transport.requests)
+	}
+}
+
+func TestIMSOutboundAgentRewritesInDialogUpdateThroughRelay(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@127.0.0.1:5060>"},
+			},
+			Body: []byte(sampleSDP("127.0.0.1", 49170)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"Content-Type": {"application/sdp"}},
+			Body:       []byte(sampleSDP("127.0.0.1", 49180)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@127.0.0.1:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+		MediaRelay: &RTPRelayConfig{
+			ClientListenIP:    "127.0.0.1",
+			ClientAdvertiseIP: "127.0.0.1",
+			IMSListenIP:       "127.0.0.1",
+			IMSAdvertiseIP:    "127.0.0.1",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID:    "call-update-relay",
+		Callee:    "+18005551212",
+		RemoteSDP: SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: 4002, Payloads: []int{0, 101}, Direction: "sendrecv"},
+		RawSDP:    []byte(sampleSDP("127.0.0.1", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogUpdate(context.Background(), DialogUpdateRequest{
+		CallID:      "call-update-relay",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("127.0.0.1", 4010)),
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("SendDialogUpdate() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "UPDATE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	imsOffer, err := ParseSDP(transport.requests[1].Body)
+	if err != nil {
+		t.Fatalf("ParseSDP(IMS UPDATE offer) error = %v", err)
+	}
+	if imsOffer.MediaPort == 4010 || imsOffer.MediaPort <= 0 {
+		t.Fatalf("IMS UPDATE offer was not rewritten: %+v", imsOffer)
+	}
+	clientAnswer, err := ParseSDP(result.Body)
+	if err != nil {
+		t.Fatalf("ParseSDP(client UPDATE answer) error = %v", err)
+	}
+	if clientAnswer.MediaPort == 49180 || clientAnswer.MediaPort <= 0 {
+		t.Fatalf("client UPDATE answer was not rewritten: %+v", clientAnswer)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-update-relay"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+}
+
 func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{
 		provisionals: []voiceclient.SIPResponse{

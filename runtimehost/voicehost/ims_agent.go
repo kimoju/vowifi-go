@@ -285,6 +285,83 @@ func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoReq
 	}, nil
 }
 
+func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdateRequest) (DialogUpdateResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.Transport == nil {
+		return DialogUpdateResult{Accepted: false, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return DialogUpdateResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	body := append([]byte(nil), req.Body...)
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		a.mu.Unlock()
+		return DialogUpdateResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.cfg
+	if len(body) > 0 && state.relay != nil {
+		clientSDP, err := ParseSDP(body)
+		if err != nil {
+			a.mu.Unlock()
+			return DialogUpdateResult{Accepted: false, StatusCode: 488, Reason: "invalid client UPDATE SDP"}, err
+		}
+		if err := state.relay.SetClientRemote(clientSDP); err != nil {
+			a.mu.Unlock()
+			return DialogUpdateResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client update failed"}, err
+		}
+		body = RewriteSDPMediaEndpoint(body, state.relay.IMSEndpoint())
+	}
+	update, err := voiceclient.BuildUpdateRequest(cfg, body)
+	if err != nil {
+		a.mu.Unlock()
+		return DialogUpdateResult{Accepted: false, StatusCode: 500, Reason: "build IMS UPDATE failed"}, err
+	}
+	if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
+		update.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
+	}
+	applyDialogUpdateHeaders(update.Headers, req.Headers)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+	resp, err := a.Transport.RoundTripRequest(ctx, update)
+	if err != nil {
+		return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE failed"}, err
+	}
+	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
+	resultBody := append([]byte(nil), resp.Body...)
+	if accepted && len(resultBody) > 0 && state.relay != nil {
+		imsSDP, err := ParseSDP(resultBody)
+		if err != nil {
+			return DialogUpdateResult{Accepted: false, StatusCode: 488, Reason: "invalid IMS UPDATE SDP answer"}, err
+		}
+		if err := state.relay.SetIMSRemote(imsSDP); err != nil {
+			return DialogUpdateResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS update failed"}, err
+		}
+		resultBody = RewriteSDPMediaEndpoint(resultBody, state.relay.ClientEndpoint())
+	}
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); accepted && contact != "" {
+		a.mu.Lock()
+		if latest, ok := a.dialogs[callID]; ok {
+			latest.cfg.RemoteTargetURI = contact
+			a.dialogs[callID] = latest
+		}
+		a.mu.Unlock()
+	}
+	return DialogUpdateResult{
+		Accepted:    accepted,
+		StatusCode:  outboundStatusCode(resp.StatusCode, 500),
+		Reason:      firstVoiceNonEmpty(resp.Reason, "OK"),
+		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:        resultBody,
+		Headers:     firstValueSIPHeaders(resp.Headers),
+	}, nil
+}
+
 func (a *IMSOutboundAgent) ackRejectedInvite(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
 	ackCfg := cfg
 	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
@@ -492,6 +569,20 @@ func applyDialogInfoHeaders(dst map[string]string, infoPackage string, headers m
 	}
 	if strings.TrimSpace(infoPackage) != "" {
 		dst["Info-Package"] = strings.TrimSpace(infoPackage)
+	}
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		dst[key] = value
+	}
+}
+
+func applyDialogUpdateHeaders(dst map[string]string, headers map[string]string) {
+	if dst == nil {
+		return
 	}
 	for key, value := range headers {
 		key = strings.TrimSpace(key)

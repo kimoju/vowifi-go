@@ -10,14 +10,17 @@ import (
 )
 
 type fakeOutboundAgent struct {
-	requests   []OutboundCallRequest
-	infos      []DialogInfoRequest
-	terminated []DialogInfo
-	canceled   []DialogInfo
-	result     OutboundCallResult
-	infoResult DialogInfoResult
-	err        error
-	infoErr    error
+	requests     []OutboundCallRequest
+	infos        []DialogInfoRequest
+	updates      []DialogUpdateRequest
+	terminated   []DialogInfo
+	canceled     []DialogInfo
+	result       OutboundCallResult
+	infoResult   DialogInfoResult
+	updateResult DialogUpdateResult
+	err          error
+	infoErr      error
+	updateErr    error
 }
 
 func (a *fakeOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCallRequest) (OutboundCallResult, error) {
@@ -47,6 +50,14 @@ func (a *fakeOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoRe
 		return DialogInfoResult{}, a.infoErr
 	}
 	return a.infoResult, nil
+}
+
+func (a *fakeOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdateRequest) (DialogUpdateResult, error) {
+	a.updates = append(a.updates, req)
+	if a.updateErr != nil {
+		return DialogUpdateResult{}, a.updateErr
+	}
+	return a.updateResult, nil
 }
 
 type fakeServerTransaction struct {
@@ -209,6 +220,39 @@ func TestGatewayHandleClientInfoSendsDialogInfo(t *testing.T) {
 	}
 }
 
+func TestGatewayHandleClientUpdateSendsDialogUpdate(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{updateResult: DialogUpdateResult{
+		Accepted:    true,
+		StatusCode:  200,
+		Reason:      "OK",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("203.0.113.44", 49180)),
+		Headers:     map[string]string{"X-IMS": "update-ok"},
+	}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newUpdateRequest("call-update", sampleSDP("198.51.100.20", 4010))
+	req.AppendHeader(sip.NewHeader("Session-Expires", "1800"))
+
+	g.HandleClientUpdate("dev-1", req, tx)
+
+	if len(agent.updates) != 1 {
+		t.Fatalf("updates=%d", len(agent.updates))
+	}
+	got := agent.updates[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-update" || got.ContentType != "application/sdp" ||
+		got.Headers["Session-Expires"] != "1800" || !strings.Contains(string(got.Body), "m=audio 4010") {
+		t.Fatalf("DialogUpdateRequest=%+v body=%q", got, got.Body)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "application/sdp" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "update-ok" ||
+		!strings.Contains(string(tx.responses[0].Body()), "m=audio 49180") {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
 func TestParseAndBuildSDP(t *testing.T) {
 	info, err := ParseSDP([]byte(sampleSDP("203.0.113.8", 49170) + "a=rtcp:49171 IN IP4 203.0.113.8\r\n"))
 	if err != nil {
@@ -252,6 +296,16 @@ func newInfoRequest(callID, contentType, body string) *sip.Request {
 	req.SetBody([]byte(body))
 	if strings.TrimSpace(contentType) != "" {
 		req.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	}
+	return req
+}
+
+func newUpdateRequest(callID, sdp string) *sip.Request {
+	req := sip.NewRequest(sip.UPDATE, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
+	appendCommonHeaders(req, callID, "18005551212")
+	if strings.TrimSpace(sdp) != "" {
+		req.SetBody([]byte(sdp))
+		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	}
 	return req
 }
