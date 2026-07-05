@@ -42,6 +42,8 @@ type imsInboundWireTransaction struct {
 	expires   time.Time
 }
 
+type imsInboundWireResponseEmitter func(IMSInboundWireResponse) error
+
 func (s *IMSInboundWireServer) ServePacket(ctx context.Context, pc net.PacketConn) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -97,6 +99,10 @@ func (s *IMSInboundWireServer) ServeListener(ctx context.Context, ln net.Listene
 }
 
 func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	return s.handleRequest(ctx, req, nil)
+}
+
+func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclient.SIPIncomingRequest, emit imsInboundWireResponseEmitter) ([]IMSInboundWireResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -111,7 +117,7 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 	var err error
 	switch method {
 	case "INVITE":
-		responses, err = s.handleInvite(ctx, req)
+		responses, err = s.handleInvite(ctx, req, key, emit)
 	case "ACK":
 		if s == nil || s.Agent == nil {
 			return nil, ErrIMSInboundAgentNotReady
@@ -156,7 +162,7 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 		resp.Headers["Allow"] = s.allowHeader()
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(resp)}
 	}
-	if key != "" && len(responses) > 0 {
+	if method != "INVITE" && key != "" && len(responses) > 0 {
 		s.storeTransaction(key, responses)
 	}
 	return responses, err
@@ -334,10 +340,29 @@ func (s *IMSInboundWireServer) handlePrack(ctx context.Context, req voiceclient.
 	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err
 }
 
-func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
-	responses := []IMSInboundWireResponse{wireResponse(100, "Trying")}
+func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient.SIPIncomingRequest, key string, emit imsInboundWireResponseEmitter) ([]IMSInboundWireResponse, error) {
+	trying := s.withResponseHeaders(wireResponse(100, "Trying"))
+	responses := []IMSInboundWireResponse{trying}
+	if key != "" {
+		s.storeTransaction(key, []IMSInboundWireResponse{trying})
+	}
+	if emit != nil {
+		if err := emit(trying); err != nil {
+			return nil, err
+		}
+		responses[0].NoResponse = true
+	}
+	final, err := s.handleInviteFinal(ctx, req)
+	responses = append(responses, final)
+	if key != "" {
+		s.storeTransaction(key, []IMSInboundWireResponse{trying, final})
+	}
+	return responses, err
+}
+
+func (s *IMSInboundWireServer) handleInviteFinal(ctx context.Context, req voiceclient.SIPIncomingRequest) (IMSInboundWireResponse, error) {
 	if s == nil || s.Agent == nil {
-		return append(responses, s.withResponseHeaders(wireResponse(503, "Service Unavailable"))), ErrIMSInboundAgentNotReady
+		return s.withResponseHeaders(wireResponse(503, "Service Unavailable")), ErrIMSInboundAgentNotReady
 	}
 	result, err := s.Agent.HandleInboundInvite(ctx, InboundCallRequest{
 		CallID:          wireCallID(req),
@@ -363,8 +388,7 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 		}
 	}
 	applyInboundWireResultHeaders(final.Headers, result.Headers)
-	responses = append(responses, s.withResponseHeaders(final))
-	return responses, err
+	return s.withResponseHeaders(final), err
 }
 
 func applyInboundWireResultHeaders(dst map[string]string, src map[string]string) {
@@ -387,7 +411,12 @@ func (s *IMSInboundWireServer) handlePacket(ctx context.Context, pc net.PacketCo
 		_ = writePacketSIPResponse(pc, addr, voiceclient.SIPIncomingRequest{}, wireResponse(400, "Bad Request"))
 		return
 	}
-	responses, _ := s.HandleRequest(ctx, req)
+	responses, _ := s.handleRequest(ctx, req, func(resp IMSInboundWireResponse) error {
+		if resp.NoResponse {
+			return nil
+		}
+		return writePacketSIPResponse(pc, addr, taggedWireRequest(req, s.localTag()), resp)
+	})
 	for _, resp := range responses {
 		if resp.NoResponse {
 			continue
@@ -412,7 +441,12 @@ func (s *IMSInboundWireServer) handleConn(ctx context.Context, conn net.Conn) {
 			_ = writeStreamSIPResponse(conn, voiceclient.SIPIncomingRequest{}, wireResponse(400, "Bad Request"))
 			return
 		}
-		responses, _ := s.HandleRequest(ctx, req)
+		responses, _ := s.handleRequest(ctx, req, func(resp IMSInboundWireResponse) error {
+			if resp.NoResponse {
+				return nil
+			}
+			return writeStreamSIPResponse(conn, taggedWireRequest(req, s.localTag()), resp)
+		})
 		for _, resp := range responses {
 			if resp.NoResponse {
 				continue

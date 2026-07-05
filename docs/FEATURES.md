@@ -167,7 +167,9 @@ protocol layers needed by VoHive:
 - wire-level inbound IMS SIP adapters for UDP/TCP listeners, SIP request
   parsing, provisional/final response construction, incoming INVITE/ACK/BYE/
   CANCEL dispatch, response To-tagging, transaction response caching for
-  retransmitted requests, and loopback-tested socket handling
+  retransmitted requests, immediate `100 Trying` emission for socket-served
+  INVITEs, in-progress INVITE transaction caching while local client final
+  responses are pending, and loopback-tested socket handling
 - IMS in-dialog interworking for UPDATE, PRACK, and OPTIONS, including SDP
   session refresh forwarding, RAck propagation, RTP relay endpoint rewriting
   for UPDATE offers/answers, and local OPTIONS capability responses

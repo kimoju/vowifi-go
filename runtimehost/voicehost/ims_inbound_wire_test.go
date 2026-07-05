@@ -102,6 +102,88 @@ func TestIMSInboundWireServerServesUDPInviteAckAndBye(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerSendsTryingBeforeClientFinal(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+	client, err := net.Dial("udp", pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	transport := newBlockingWireInboundTransport()
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		LocalTag:       "ue-tag",
+		ContactURI:     "sip:vowifi@127.0.0.1:5060",
+		ReadTimeout:    50 * time.Millisecond,
+		TransactionTTL: time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.ServePacket(ctx, pc)
+	}()
+
+	invite := wireIMSInvite("wire-call-early-trying", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170)))
+	if _, err := client.Write(invite); err != nil {
+		t.Fatalf("client INVITE Write() error = %v", err)
+	}
+	trying := readUDPWireResponse(t, client)
+	if trying.StatusCode != 100 {
+		t.Fatalf("first response=%+v, want immediate 100", trying)
+	}
+	req := transport.readRequest(t)
+	if req.Method != "INVITE" {
+		t.Fatalf("client request=%+v", req)
+	}
+
+	if _, err := client.Write(invite); err != nil {
+		t.Fatalf("retransmitted INVITE Write() error = %v", err)
+	}
+	replayed := readUDPWireResponse(t, client)
+	if replayed.StatusCode != 100 {
+		t.Fatalf("replayed response=%+v, want cached 100 while final pending", replayed)
+	}
+	select {
+	case msg := <-transport.requests:
+		t.Fatalf("unexpected duplicate client INVITE while pending=%+v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	transport.respond(voiceclient.SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers: map[string][]string{
+			"To":      {"<sip:user@ims.example>;tag=client-tag"},
+			"Contact": {"<sip:client@127.0.0.1:5070>"},
+		},
+		Body: []byte(sampleSDP("127.0.0.1", 4002)),
+	})
+	ok := readUDPWireResponse(t, client)
+	if ok.StatusCode != 200 || !strings.Contains(string(ok.Body), "m=audio 4002 RTP/AVP") {
+		t.Fatalf("final response=%+v body=%q", ok, ok.Body)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ServePacket() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("ServePacket() did not stop")
+	}
+}
+
 func TestIMSInboundWireServerServesTCPInvite(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -775,6 +857,50 @@ func (t *wireInboundTransport) readWrite(tb testing.TB) voiceclient.SIPRequestMe
 		tb.Fatalf("timed out waiting for client write")
 		return voiceclient.SIPRequestMessage{}
 	}
+}
+
+type blockingWireInboundTransport struct {
+	requests  chan voiceclient.SIPRequestMessage
+	writes    chan voiceclient.SIPRequestMessage
+	responses chan voiceclient.SIPResponse
+}
+
+func newBlockingWireInboundTransport() *blockingWireInboundTransport {
+	return &blockingWireInboundTransport{
+		requests:  make(chan voiceclient.SIPRequestMessage, 8),
+		writes:    make(chan voiceclient.SIPRequestMessage, 8),
+		responses: make(chan voiceclient.SIPResponse, 8),
+	}
+}
+
+func (t *blockingWireInboundTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	t.requests <- msg
+	select {
+	case resp := <-t.responses:
+		return resp, nil
+	case <-ctx.Done():
+		return voiceclient.SIPResponse{}, ctx.Err()
+	}
+}
+
+func (t *blockingWireInboundTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
+	t.writes <- msg
+	return nil
+}
+
+func (t *blockingWireInboundTransport) readRequest(tb testing.TB) voiceclient.SIPRequestMessage {
+	tb.Helper()
+	select {
+	case msg := <-t.requests:
+		return msg
+	case <-time.After(time.Second):
+		tb.Fatalf("timed out waiting for client request")
+		return voiceclient.SIPRequestMessage{}
+	}
+}
+
+func (t *blockingWireInboundTransport) respond(resp voiceclient.SIPResponse) {
+	t.responses <- resp
 }
 
 func wireIMSInvite(callID, method string, cseq int, body []byte) []byte {
