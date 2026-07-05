@@ -200,6 +200,9 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 	if route := routeHeader(firstNonEmptySlice(cfg.RouteSet, cfg.Registration.ServiceRoutes)); route != "" {
 		headers["Route"] = route
 	}
+	if securityVerify := routeHeader(cfg.Registration.SecurityVerify); securityVerify != "" {
+		headers["Security-Verify"] = securityVerify
+	}
 	return SIPRequestMessage{
 		Method:  method,
 		URI:     targetURI,

@@ -1014,6 +1014,7 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 			ContactURI:     "sip:user@192.0.2.10:5060",
 			PublicIdentity: "sip:user@example",
 			ServiceRoutes:  []string{"<sip:pcscf1.example;lr>", "<sip:pcscf2.example;lr>"},
+			SecurityVerify: []string{"ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063"},
 		},
 		RemoteURI:       "sip:+18005551212@ims.example",
 		RemoteTargetURI: "sip:+18005551212@pcscf.example",
@@ -1031,6 +1032,9 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if invite.URI != "sip:+18005551212@pcscf.example" || invite.Headers["Route"] != "<sip:pcscf1.example;lr>, <sip:pcscf2.example;lr>" {
 		t.Fatalf("invite=%+v", invite)
 	}
+	if !strings.Contains(invite.Headers["Security-Verify"], "spi-c=111") {
+		t.Fatalf("invite Security-Verify=%q", invite.Headers["Security-Verify"])
+	}
 	if invite.Headers["From"] != "<sip:user@example>;tag=ltag" || invite.Headers["To"] != "<sip:+18005551212@ims.example>;tag=rtag" {
 		t.Fatalf("dialog headers=%+v", invite.Headers)
 	}
@@ -1043,6 +1047,9 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	}
 	if bye.Method != "BYE" || bye.Headers["CSeq"] != "3 BYE" || bye.Headers["Contact"] != "" {
 		t.Fatalf("bye=%+v", bye)
+	}
+	if !strings.Contains(bye.Headers["Security-Verify"], "spi-c=111") {
+		t.Fatalf("bye Security-Verify=%q", bye.Headers["Security-Verify"])
 	}
 	byeBody, err := BuildByeRequestWithBody(cfg, "application/vnd.3gpp.ussd+xml", []byte("<ussd-data/>"))
 	if err != nil {
@@ -1082,12 +1089,18 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if message.Headers["Content-Type"] != "text/plain;charset=UTF-8" || message.Headers["P-Preferred-Service"] == "" || message.Headers["Accept-Contact"] == "" {
 		t.Fatalf("message headers=%+v", message.Headers)
 	}
+	if !strings.Contains(message.Headers["Security-Verify"], "spi-c=111") {
+		t.Fatalf("message Security-Verify=%q", message.Headers["Security-Verify"])
+	}
 	options, err := BuildOptionsRequest(cfg)
 	if err != nil {
 		t.Fatalf("BuildOptionsRequest() error = %v", err)
 	}
 	if options.Method != "OPTIONS" || options.Headers["Accept"] != "application/sdp" || options.Headers["Supported"] == "" {
 		t.Fatalf("options=%+v", options)
+	}
+	if !strings.Contains(options.Headers["Security-Verify"], "spi-c=111") {
+		t.Fatalf("options Security-Verify=%q", options.Headers["Security-Verify"])
 	}
 }
 
