@@ -195,6 +195,125 @@ func TestBuildAKAPrimeKDFNegotiationResponseRejectsUnsupportedOffer(t *testing.T
 	}
 }
 
+func TestBuildNotificationResponseBeforeAuthentication(t *testing.T) {
+	req := Packet{
+		Code:       CodeRequest,
+		Identifier: 21,
+		Type:       TypeAKA,
+		Subtype:    SubtypeNotification,
+		Attributes: []Attribute{NotificationAttribute(NotificationGeneralFailureBeforeAuthentication)},
+	}
+	resp, ok, err := BuildNotificationResponse(req)
+	if err != nil {
+		t.Fatalf("BuildNotificationResponse() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if resp.Code != CodeResponse || resp.Identifier != req.Identifier || resp.Type != TypeAKA || resp.Subtype != SubtypeNotification {
+		t.Fatalf("response=%+v", resp)
+	}
+	if len(resp.Attributes) != 0 {
+		t.Fatalf("attributes=%+v, want empty pre-auth notification ack", resp.Attributes)
+	}
+	raw, err := resp.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	if got, want := hex.EncodeToString(raw), "02150008170c0000"; got != want {
+		t.Fatalf("notification response=%s, want %s", got, want)
+	}
+}
+
+func TestBuildNotificationResponseAfterAuthenticationRequiresKeys(t *testing.T) {
+	_, _, err := BuildNotificationResponse(Packet{
+		Code:       CodeRequest,
+		Identifier: 21,
+		Type:       TypeAKA,
+		Subtype:    SubtypeNotification,
+		Attributes: []Attribute{NotificationAttribute(NotificationSuccess), MACAttribute(nil)},
+	})
+	if !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("BuildNotificationResponse() err=%v, want ErrInvalidKeyMaterial", err)
+	}
+}
+
+func TestBuildAuthenticatedNotificationResponse(t *testing.T) {
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	req := Packet{
+		Code:       CodeRequest,
+		Identifier: 22,
+		Type:       TypeAKA,
+		Subtype:    SubtypeNotification,
+		Attributes: []Attribute{NotificationAttribute(NotificationSuccess), MACAttribute(nil)},
+	}
+	raw, err := req.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(request) error = %v", err)
+	}
+	mac, err := CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateMAC(request) error = %v", err)
+	}
+	req.Attributes[len(req.Attributes)-1] = MACAttribute(mac)
+
+	resp, ok, err := BuildAuthenticatedNotificationResponse(req, keys.KAut)
+	if err != nil {
+		t.Fatalf("BuildAuthenticatedNotificationResponse() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if resp.Code != CodeResponse || resp.Identifier != req.Identifier || resp.Subtype != SubtypeNotification {
+		t.Fatalf("response=%+v", resp)
+	}
+	if len(resp.Attributes) != 1 || resp.Attributes[0].Type != AttributeMAC {
+		t.Fatalf("attributes=%+v, want AT_MAC", resp.Attributes)
+	}
+	raw, err = resp.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(response) error = %v", err)
+	}
+	if err := VerifyMAC(keys.KAut, raw, nil); err != nil {
+		t.Fatalf("VerifyMAC(response) error = %v", err)
+	}
+}
+
+func TestBuildClientErrorResponse(t *testing.T) {
+	resp, err := BuildClientErrorResponse(Packet{
+		Code:       CodeRequest,
+		Identifier: 23,
+		Type:       TypeAKAPrime,
+		Subtype:    SubtypeReauthentication,
+	}, ClientErrorUnableToProcessPacket)
+	if err != nil {
+		t.Fatalf("BuildClientErrorResponse() error = %v", err)
+	}
+	if resp.Code != CodeResponse || resp.Identifier != 23 || resp.Type != TypeAKAPrime || resp.Subtype != SubtypeClientError {
+		t.Fatalf("response=%+v", resp)
+	}
+	attr, ok := FindAttribute(resp.Attributes, AttributeClientErrorCode)
+	if !ok {
+		t.Fatal("missing AT_CLIENT_ERROR_CODE")
+	}
+	code, err := attr.ClientErrorCodeValue()
+	if err != nil {
+		t.Fatalf("ClientErrorCodeValue() error = %v", err)
+	}
+	if code != ClientErrorUnableToProcessPacket {
+		t.Fatalf("client error=%d", code)
+	}
+}
+
 func TestBuildChallengeResponseRejectsBadRequestMAC(t *testing.T) {
 	identity := "user@example.com"
 	aka := sim.AKAResult{RES: []byte{1}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}

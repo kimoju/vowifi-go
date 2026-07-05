@@ -177,6 +177,34 @@ func BuildAKAPrimeKDFNegotiationResponse(request Packet) (Packet, bool, error) {
 	return Packet{}, false, fmt.Errorf("%w: offered %v", ErrUnsupportedKDF, values)
 }
 
+func BuildNotificationResponse(request Packet) (Packet, bool, error) {
+	return buildNotificationResponse(request, nil, false)
+}
+
+func BuildAuthenticatedNotificationResponse(request Packet, kAut []byte) (Packet, bool, error) {
+	return buildNotificationResponse(request, kAut, true)
+}
+
+func BuildClientErrorResponse(request Packet, code uint16) (Packet, error) {
+	if request.Code != CodeRequest {
+		return Packet{}, fmt.Errorf("%w: not an EAP-AKA request", ErrInvalidAKAChallenge)
+	}
+	if !isAKAType(request.Type) {
+		return Packet{}, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+	}
+	eapType := request.Type
+	if eapType == 0 {
+		eapType = TypeAKA
+	}
+	return Packet{
+		Code:       CodeResponse,
+		Identifier: request.Identifier,
+		Type:       eapType,
+		Subtype:    SubtypeClientError,
+		Attributes: []Attribute{ClientErrorCodeAttribute(code)},
+	}, nil
+}
+
 func BuildSynchronizationFailureResponse(request Packet, auts []byte) (Packet, error) {
 	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
 		return Packet{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
@@ -218,6 +246,64 @@ func ChallengeRANDAndAUTN(request Packet) (rand16, autn16 []byte, err error) {
 		return nil, nil, err
 	}
 	return rands[0], autn, nil
+}
+
+func buildNotificationResponse(request Packet, kAut []byte, authenticated bool) (Packet, bool, error) {
+	if request.Subtype != SubtypeNotification {
+		return Packet{}, false, nil
+	}
+	if request.Code != CodeRequest {
+		return Packet{}, true, fmt.Errorf("%w: not an EAP-AKA notification request", ErrInvalidAKAChallenge)
+	}
+	if !isAKAType(request.Type) {
+		return Packet{}, true, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+	}
+	attr, ok := FindAttribute(request.Attributes, AttributeNotification)
+	if !ok {
+		return Packet{}, true, fmt.Errorf("%w: missing AT_NOTIFICATION", ErrInvalidAKAChallenge)
+	}
+	code, err := attr.NotificationValue()
+	if err != nil {
+		return Packet{}, true, err
+	}
+	var attrs []Attribute
+	if code&NotificationPBit == 0 {
+		if !authenticated {
+			return Packet{}, true, fmt.Errorf("%w: notification requires K_aut", ErrInvalidKeyMaterial)
+		}
+		raw, err := request.MarshalBinary()
+		if err != nil {
+			return Packet{}, true, err
+		}
+		if err := verifyChallengeMAC(request.Type, kAut, raw); err != nil {
+			return Packet{}, true, err
+		}
+		attrs = []Attribute{MACAttribute(nil)}
+	}
+	eapType := request.Type
+	if eapType == 0 {
+		eapType = TypeAKA
+	}
+	response := Packet{
+		Code:       CodeResponse,
+		Identifier: request.Identifier,
+		Type:       eapType,
+		Subtype:    SubtypeNotification,
+		Attributes: attrs,
+	}
+	if len(attrs) == 0 {
+		return response, true, nil
+	}
+	raw, err := response.MarshalBinary()
+	if err != nil {
+		return Packet{}, true, err
+	}
+	mac, err := calculateChallengeMAC(response.Type, kAut, raw)
+	if err != nil {
+		return Packet{}, true, err
+	}
+	response.Attributes[0] = MACAttribute(mac)
+	return response, true, nil
 }
 
 func MACAttribute(mac []byte) Attribute {
@@ -352,6 +438,10 @@ func deriveChallengeKeys(identity string, request Packet, aka sim.AKAResult) (Ke
 	default:
 		return Keys{}, 0, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
 	}
+}
+
+func isAKAType(eapType uint8) bool {
+	return eapType == 0 || eapType == TypeAKA || eapType == TypeAKAPrime
 }
 
 func firstKDFValue(attrs []Attribute) (uint16, error) {

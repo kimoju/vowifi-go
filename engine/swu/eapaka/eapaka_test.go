@@ -117,6 +117,68 @@ func TestAKAPrimeKDFAttributes(t *testing.T) {
 	}
 }
 
+func TestNotificationAndClientErrorAttributes(t *testing.T) {
+	raw, err := (Packet{
+		Code:       CodeRequest,
+		Identifier: 13,
+		Type:       TypeAKA,
+		Subtype:    SubtypeNotification,
+		Attributes: []Attribute{NotificationAttribute(NotificationGeneralFailureBeforeAuthentication)},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(notification) error = %v", err)
+	}
+	want := "010d000c170c00000c014000"
+	if hex.EncodeToString(raw) != want {
+		t.Fatalf("notification packet=%x, want %s", raw, want)
+	}
+	parsed, err := ParsePacket(raw)
+	if err != nil {
+		t.Fatalf("ParsePacket(notification) error = %v", err)
+	}
+	attr, ok := FindAttribute(parsed.Attributes, AttributeNotification)
+	if !ok {
+		t.Fatal("missing AT_NOTIFICATION")
+	}
+	code, err := attr.NotificationValue()
+	if err != nil {
+		t.Fatalf("NotificationValue() error = %v", err)
+	}
+	if code != NotificationGeneralFailureBeforeAuthentication {
+		t.Fatalf("notification code=%d", code)
+	}
+
+	raw, err = (Packet{
+		Code:       CodeResponse,
+		Identifier: 14,
+		Type:       TypeAKA,
+		Subtype:    SubtypeClientError,
+		Attributes: []Attribute{ClientErrorCodeAttribute(ClientErrorUnableToProcessPacket)},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(client-error) error = %v", err)
+	}
+	want = "020e000c170e000016010000"
+	if hex.EncodeToString(raw) != want {
+		t.Fatalf("client-error packet=%x, want %s", raw, want)
+	}
+	parsed, err = ParsePacket(raw)
+	if err != nil {
+		t.Fatalf("ParsePacket(client-error) error = %v", err)
+	}
+	attr, ok = FindAttribute(parsed.Attributes, AttributeClientErrorCode)
+	if !ok {
+		t.Fatal("missing AT_CLIENT_ERROR_CODE")
+	}
+	clientError, err := attr.ClientErrorCodeValue()
+	if err != nil {
+		t.Fatalf("ClientErrorCodeValue() error = %v", err)
+	}
+	if clientError != ClientErrorUnableToProcessPacket {
+		t.Fatalf("client error=%d", clientError)
+	}
+}
+
 func TestAKAChallengeAttributes(t *testing.T) {
 	raw, err := (Packet{
 		Code:       CodeRequest,

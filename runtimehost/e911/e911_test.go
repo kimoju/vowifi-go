@@ -281,6 +281,151 @@ func TestStartEmergencyAddressUpdateHandlesEAPRelayAKAPrimeKDFNegotiation(t *tes
 	}
 }
 
+func TestStartEmergencyAddressUpdateHandlesEAPRelayNotification(t *testing.T) {
+	notification := eapRelayNotificationRequest(t, eapaka.NotificationGeneralFailureBeforeAuthentication)
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":14,"eap-relay-packet":"` + notification + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity: Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280"},
+		Client:   client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=1" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("requests=%d, want notification response", len(client.requests))
+	}
+	answer := decodeEntitlementAnswer(t, client.requests[1].Body)
+	if _, ok := answer["aka-res"]; ok {
+		t.Fatalf("notification answer must not include AKA RES: %s", client.requests[1].Body)
+	}
+	packet := decodeRelayPacket(t, answer)
+	if packet.Code != eapaka.CodeResponse || packet.Subtype != eapaka.SubtypeNotification || len(packet.Attributes) != 0 {
+		t.Fatalf("notification relay response=%+v", packet)
+	}
+}
+
+func TestStartEmergencyAddressUpdateHandlesAuthenticatedEAPRelayNotification(t *testing.T) {
+	identity := "310280233641503@private.att.net"
+	akaResult := e911AKAResult()
+	challenge := signedEAPRelayChallenge(t, identity, akaResult)
+	notification := signedEAPRelayNotification(t, identity, akaResult, eapaka.NotificationSuccess)
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":15,"eap-relay-packet":"` + challenge + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":16,"eap-relay-packet":"` + notification + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+	aka := &fakeAKAProvider{}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity:    Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280", SIPUsername: identity},
+		AKAProvider: aka,
+		Client:      client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=1" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	if len(client.requests) != 3 {
+		t.Fatalf("requests=%d, want challenge response then notification response", len(client.requests))
+	}
+	notificationAnswer := decodeEntitlementAnswer(t, client.requests[2].Body)
+	if _, ok := notificationAnswer["aka-res"]; ok {
+		t.Fatalf("notification answer must not include AKA RES: %s", client.requests[2].Body)
+	}
+	packet := decodeRelayPacket(t, notificationAnswer)
+	if packet.Code != eapaka.CodeResponse || packet.Subtype != eapaka.SubtypeNotification {
+		t.Fatalf("authenticated notification response=%+v", packet)
+	}
+	if len(packet.Attributes) != 1 || packet.Attributes[0].Type != eapaka.AttributeMAC {
+		t.Fatalf("authenticated notification attributes=%+v", packet.Attributes)
+	}
+	keys, err := eapaka.DeriveKeys(identity, akaResult)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	if err := eapaka.VerifyMAC(keys.KAut, raw, nil); err != nil {
+		t.Fatalf("VerifyMAC(notification response) error = %v", err)
+	}
+	if aka.calls != 1 {
+		t.Fatalf("AKA calls=%d, want only challenge to use SIM", aka.calls)
+	}
+}
+
+func TestStartEmergencyAddressUpdateSendsClientErrorForUnsupportedEAPRelaySubtype(t *testing.T) {
+	unsupported := eapRelayUnsupportedRequest(t)
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":17,"eap-relay-packet":"` + unsupported + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity: Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280"},
+		Client:   client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=1" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("requests=%d, want client-error response", len(client.requests))
+	}
+	answer := decodeEntitlementAnswer(t, client.requests[1].Body)
+	if _, ok := answer["aka-res"]; ok {
+		t.Fatalf("client-error answer must not include AKA RES: %s", client.requests[1].Body)
+	}
+	packet := decodeRelayPacket(t, answer)
+	if packet.Code != eapaka.CodeResponse || packet.Subtype != eapaka.SubtypeClientError {
+		t.Fatalf("client-error relay response=%+v", packet)
+	}
+	attr, ok := eapaka.FindAttribute(packet.Attributes, eapaka.AttributeClientErrorCode)
+	if !ok {
+		t.Fatalf("client-error relay response missing AT_CLIENT_ERROR_CODE: %+v", packet)
+	}
+	code, err := attr.ClientErrorCodeValue()
+	if err != nil {
+		t.Fatalf("ClientErrorCodeValue() error = %v", err)
+	}
+	if code != eapaka.ClientErrorUnableToProcessPacket {
+		t.Fatalf("client error code=%d", code)
+	}
+}
+
 func TestStartEmergencyAddressUpdateReportsIncompleteChallenge(t *testing.T) {
 	client := &fakeHTTPClient{responses: []*HTTPResponse{{
 		StatusCode: 200,
@@ -347,6 +492,22 @@ func eapRelayIdentityRequest(t *testing.T) string {
 	return base64.StdEncoding.EncodeToString(raw)
 }
 
+func eapRelayNotificationRequest(t *testing.T, code uint16) string {
+	t.Helper()
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 10,
+		Type:       eapaka.TypeAKA,
+		Subtype:    eapaka.SubtypeNotification,
+		Attributes: []eapaka.Attribute{eapaka.NotificationAttribute(code)},
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
 func signedEAPRelayChallenge(t *testing.T, identity string, aka sim.AKAResult) string {
 	t.Helper()
 	keys, err := eapaka.DeriveKeys(identity, aka)
@@ -374,6 +535,53 @@ func signedEAPRelayChallenge(t *testing.T, identity string, aka sim.AKAResult) s
 	}
 	packet.Attributes[len(packet.Attributes)-1] = eapaka.MACAttribute(mac)
 	raw, err = packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func signedEAPRelayNotification(t *testing.T, identity string, aka sim.AKAResult, code uint16) string {
+	t.Helper()
+	keys, err := eapaka.DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 11,
+		Type:       eapaka.TypeAKA,
+		Subtype:    eapaka.SubtypeNotification,
+		Attributes: []eapaka.Attribute{
+			eapaka.NotificationAttribute(code),
+			eapaka.MACAttribute(nil),
+		},
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := eapaka.CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	packet.Attributes[len(packet.Attributes)-1] = eapaka.MACAttribute(mac)
+	raw, err = packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func eapRelayUnsupportedRequest(t *testing.T) string {
+	t.Helper()
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 12,
+		Type:       eapaka.TypeAKA,
+		Subtype:    eapaka.SubtypeReauthentication,
+	}
+	raw, err := packet.MarshalBinary()
 	if err != nil {
 		t.Fatalf("MarshalBinary() error = %v", err)
 	}

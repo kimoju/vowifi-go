@@ -50,6 +50,22 @@ const (
 	AttributeKDF             uint8 = 24
 )
 
+const (
+	NotificationSuccessBit uint16 = 0x8000
+	NotificationPBit       uint16 = 0x4000
+
+	NotificationGeneralFailureAfterAuthentication  uint16 = 0
+	NotificationGeneralFailureBeforeAuthentication uint16 = NotificationPBit
+	NotificationSuccess                            uint16 = NotificationSuccessBit
+)
+
+const (
+	ClientErrorUnableToProcessPacket  uint16 = 0
+	ClientErrorUnsupportedVersion     uint16 = 1
+	ClientErrorInsufficientChallenges uint16 = 2
+	ClientErrorRANDNotFresh           uint16 = 3
+)
+
 var (
 	ErrInvalidPacket    = errors.New("invalid eap-aka packet")
 	ErrInvalidAttribute = errors.New("invalid eap-aka attribute")
@@ -243,6 +259,18 @@ func KDFAttribute(kdf uint16) Attribute {
 	return Attribute{Type: AttributeKDF, Data: b[:]}
 }
 
+func NotificationAttribute(code uint16) Attribute {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], code)
+	return Attribute{Type: AttributeNotification, Data: b[:]}
+}
+
+func ClientErrorCodeAttribute(code uint16) Attribute {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], code)
+	return Attribute{Type: AttributeClientErrorCode, Data: b[:]}
+}
+
 func FindAttribute(attrs []Attribute, attributeType uint8) (Attribute, bool) {
 	for _, attr := range attrs {
 		if attr.Type == attributeType {
@@ -318,6 +346,21 @@ func (a Attribute) KDFValue() (uint16, error) {
 		return binary.BigEndian.Uint16(a.Data[2:4]), nil
 	}
 	return 0, ErrInvalidAttribute
+}
+
+func (a Attribute) NotificationValue() (uint16, error) {
+	return a.directUint16Value()
+}
+
+func (a Attribute) ClientErrorCodeValue() (uint16, error) {
+	return a.directUint16Value()
+}
+
+func (a Attribute) directUint16Value() (uint16, error) {
+	if len(a.Data) != 2 {
+		return 0, fmt.Errorf("%w: uint16 value length %d", ErrInvalidAttribute, len(a.Data))
+	}
+	return binary.BigEndian.Uint16(a.Data), nil
 }
 
 func fixed16Values(a Attribute) ([][]byte, error) {
