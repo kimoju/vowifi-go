@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"sync"
 	"testing"
 )
@@ -123,6 +124,103 @@ func TestTUNTunnelManagerRollsBackOnRoutingFailure(t *testing.T) {
 	}
 	if !baseSession.isClosed() || !device.isClosed() {
 		t.Fatalf("rollback closed session=%t device=%t", baseSession.isClosed(), device.isClosed())
+	}
+}
+
+func TestTUNTunnelManagerAddsDefaultRouteAndEPDGProtection(t *testing.T) {
+	baseSession := newTUNManagerPacketSession(TunnelResult{
+		Ready:            true,
+		EPDGAddress:      "epdg.example:4500",
+		LocalInnerIP:     "10.0.0.2",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+	})
+	device := newTUNManagerDevice("vohive0")
+	routing := &tunManagerRouting{}
+	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
+		Base:              &tunManagerBase{session: baseSession},
+		RoutingManager:    routing,
+		DefaultRoutes:     true,
+		ProtectEPDGRoutes: true,
+		EPDGRouteResolver: func(ctx context.Context, host string) ([]net.IP, error) {
+			if host != "epdg.example" {
+				t.Fatalf("resolve host=%q, want epdg.example", host)
+			}
+			return []net.IP{net.ParseIP("198.51.100.7")}, nil
+		},
+		DeviceFactory: func(ctx context.Context, cfg TunnelConfig, result TunnelResult) (InnerPacketDevice, string, error) {
+			return device, "vohive0", nil
+		},
+	})
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:       "dev-1",
+		Mode:           DataplaneModeUserspace,
+		EPDGAddress:    "epdg.example",
+		LocalInterface: "wwan0",
+		OuterLocalIP:   "192.0.2.10",
+		IMSI:           "310280233641503",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	if len(routing.applies) != 1 {
+		t.Fatalf("routing applies=%d, want 1", len(routing.applies))
+	}
+	applied := routing.applies[0]
+	if len(applied.Routes) != 1 || applied.Routes[0].Destination != "default" {
+		t.Fatalf("routes=%+v", applied.Routes)
+	}
+	if len(applied.EPDGRouteExclusions) != 1 {
+		t.Fatalf("ePDG exclusions=%+v", applied.EPDGRouteExclusions)
+	}
+	exclusion := applied.EPDGRouteExclusions[0]
+	if exclusion.Address != "198.51.100.7" || exclusion.InterfaceName != "wwan0" || exclusion.Source != "192.0.2.10" || len(exclusion.Tables) != 0 {
+		t.Fatalf("ePDG exclusion=%+v", exclusion)
+	}
+}
+
+func TestTUNTunnelManagerProtectsEPDGRoutesForPolicyTables(t *testing.T) {
+	baseSession := newTUNManagerPacketSession(TunnelResult{
+		Ready:            true,
+		EPDGAddress:      "198.51.100.8",
+		LocalInnerIP:     "10.0.0.2",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+	})
+	routing := &tunManagerRouting{}
+	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
+		Base:              &tunManagerBase{session: baseSession},
+		RoutingManager:    routing,
+		DefaultRoutes:     true,
+		ProtectEPDGRoutes: true,
+		Routes: []TUNRoute{
+			{Destination: "default", Table: "200"},
+			{Destination: "10.10.0.0/24", Table: "200"},
+			{Destination: "default", Table: "200"},
+			{Destination: "default", Table: "201"},
+		},
+		DeviceFactory: func(ctx context.Context, cfg TunnelConfig, result TunnelResult) (InnerPacketDevice, string, error) {
+			return newTUNManagerDevice("vohive0"), "vohive0", nil
+		},
+	})
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:       "dev-1",
+		Mode:           DataplaneModeUserspace,
+		EPDGAddress:    "198.51.100.8",
+		LocalInterface: "wwan0",
+		IMSI:           "310280233641503",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	exclusions := routing.applies[0].EPDGRouteExclusions
+	if len(exclusions) != 1 || exclusions[0].Address != "198.51.100.8" {
+		t.Fatalf("exclusions=%+v", exclusions)
+	}
+	if got, want := exclusions[0].Tables, []string{"200", "201"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("tables=%+v, want %+v", got, want)
 	}
 }
 
@@ -309,4 +407,16 @@ func (s *tunManagerPlainSession) MOBIKE(ctx context.Context, req MOBIKERequest) 
 func (s *tunManagerPlainSession) Close(ctx context.Context) error {
 	s.closed = true
 	return nil
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -101,6 +101,8 @@ protocol layers needed by VoHive:
 - runtime startup wiring that builds the default userspace SWu TUN/IKE manager
   for explicit userspace dataplane requests and forwards the negotiated tunnel
   inner address into IMS REGISTER Contact construction
+- default userspace dataplane routing that installs a TUN default route while
+  protecting ePDG outer UDP/ESP reachability with pre-tunnel host routes
 - Linux TUN dataplane routing helpers for MTU/link setup, inner address
   assignment, route installation, policy rule installation, cleanup, and
   best-effort rollback through the `ip` command boundary

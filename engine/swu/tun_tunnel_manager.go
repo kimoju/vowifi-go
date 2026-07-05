@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 )
@@ -19,6 +20,8 @@ type TUNRoutingManager interface {
 	Cleanup(context.Context, TUNRoutingState) error
 }
 
+type EPDGRouteResolver func(context.Context, string) ([]net.IP, error)
+
 type TUNTunnelManagerConfig struct {
 	Base                 TunnelManager
 	TUN                  TUNDeviceConfig
@@ -26,6 +29,9 @@ type TUNTunnelManagerConfig struct {
 	RoutingManager       TUNRoutingManager
 	RoutingConfigFactory TUNRoutingConfigFactory
 	DisableRouting       bool
+	DefaultRoutes        bool
+	ProtectEPDGRoutes    bool
+	EPDGRouteResolver    EPDGRouteResolver
 	MTU                  int
 	Addresses            []string
 	EPDGRouteExclusions  []EPDGRouteExclusion
@@ -94,7 +100,7 @@ func (m *TUNTunnelManager) EstablishTunnel(ctx context.Context, cfg TunnelConfig
 	var routingState TUNRoutingState
 	routingApplied := false
 	if !m.Config.DisableRouting {
-		routingCfg, err := m.routingConfig(cfg, result, iface)
+		routingCfg, err := m.routingConfig(ctx, cfg, result, iface)
 		if err != nil {
 			_ = closeInnerPacketDevice(ctx, device)
 			_ = packetSession.Close(ctx)
@@ -165,7 +171,7 @@ func (m *TUNTunnelManager) openDevice(ctx context.Context, cfg TunnelConfig, res
 	return device, name, nil
 }
 
-func (m *TUNTunnelManager) routingConfig(cfg TunnelConfig, result TunnelResult, iface string) (TUNRoutingConfig, error) {
+func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, result TunnelResult, iface string) (TUNRoutingConfig, error) {
 	if m.Config.RoutingConfigFactory != nil {
 		return m.Config.RoutingConfigFactory(cfg, result, iface)
 	}
@@ -173,14 +179,101 @@ func (m *TUNTunnelManager) routingConfig(cfg TunnelConfig, result TunnelResult, 
 	if len(addresses) == 0 && strings.TrimSpace(result.LocalInnerIP) != "" {
 		addresses = append(addresses, strings.TrimSpace(result.LocalInnerIP))
 	}
+	routes := cloneTUNRoutes(m.Config.Routes)
+	if m.Config.DefaultRoutes && len(routes) == 0 {
+		routes = append(routes, TUNRoute{Destination: "default"})
+	}
+	exclusions := cloneEPDGRouteExclusions(m.Config.EPDGRouteExclusions)
+	if m.Config.ProtectEPDGRoutes {
+		defaultExclusions, err := m.defaultEPDGRouteExclusions(ctx, cfg, result, routes)
+		if err != nil {
+			return TUNRoutingConfig{}, err
+		}
+		exclusions = append(exclusions, defaultExclusions...)
+	}
 	return TUNRoutingConfig{
 		InterfaceName:       iface,
 		MTU:                 m.Config.MTU,
 		Addresses:           addresses,
-		EPDGRouteExclusions: cloneEPDGRouteExclusions(m.Config.EPDGRouteExclusions),
-		Routes:              cloneTUNRoutes(m.Config.Routes),
+		EPDGRouteExclusions: exclusions,
+		Routes:              routes,
 		Rules:               cloneTUNRules(m.Config.Rules),
 	}, nil
+}
+
+func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg TunnelConfig, result TunnelResult, routes []TUNRoute) ([]EPDGRouteExclusion, error) {
+	if strings.TrimSpace(cfg.LocalInterface) == "" {
+		return nil, fmt.Errorf("%w: ePDG route protection requires outer interface", ErrInvalidTUNTunnelManager)
+	}
+	host := tunnelAddressHost(firstPacketNonEmpty(result.EPDGAddress, cfg.EPDGAddress))
+	if host == "" {
+		return nil, nil
+	}
+	ips, err := m.resolveEPDGRouteIPs(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, nil
+	}
+	tables := routingTablesForRoutes(routes)
+	out := make([]EPDGRouteExclusion, 0, len(ips))
+	for _, ip := range ips {
+		normalized := normalizedMOBIKEIP(ip)
+		if normalized == nil {
+			continue
+		}
+		out = append(out, EPDGRouteExclusion{
+			Address:       normalized.String(),
+			InterfaceName: strings.TrimSpace(cfg.LocalInterface),
+			Source:        strings.TrimSpace(cfg.OuterLocalIP),
+			Tables:        tables,
+		})
+	}
+	return out, nil
+}
+
+func (m *TUNTunnelManager) resolveEPDGRouteIPs(ctx context.Context, host string) ([]net.IP, error) {
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return []net.IP{append(net.IP(nil), ip...)}, nil
+	}
+	resolver := m.Config.EPDGRouteResolver
+	if resolver != nil {
+		return resolver(ctx, host)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve ePDG route host %q: %v", ErrInvalidTUNTunnelManager, host, err)
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		ips = append(ips, append(net.IP(nil), addr.IP...))
+	}
+	return ips, nil
+}
+
+func routingTablesForRoutes(routes []TUNRoute) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, route := range routes {
+		if normalizeRouteDestinationForRoutingTables(route.Destination) != "default" {
+			continue
+		}
+		table := strings.TrimSpace(route.Table)
+		if table == "" || seen[table] {
+			continue
+		}
+		seen[table] = true
+		out = append(out, table)
+	}
+	return out
+}
+
+func normalizeRouteDestinationForRoutingTables(destination string) string {
+	return strings.ToLower(strings.TrimSpace(destination))
 }
 
 func (s *TUNPacketTunnelSession) Result() TunnelResult {

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	swusim "github.com/iniwex5/vowifi-go/engine/sim"
 	"github.com/iniwex5/vowifi-go/engine/swu"
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
@@ -292,6 +293,35 @@ func TestStartDoesNotAutoBuildTunnelForImplicitDataplane(t *testing.T) {
 	}
 	if inst.State().TunnelReady {
 		t.Fatalf("state=%+v, want tunnel not ready", inst.State())
+	}
+}
+
+func TestDefaultTunnelManagerForStartEnablesTUNRoutingProtection(t *testing.T) {
+	manager, err := defaultTunnelManagerForStart(StartRequest{
+		DeviceID: "dev-1",
+		SIM:      &runtimeSIMAdapter{},
+		Dataplane: DataplanePolicy{
+			Mode:      swu.DataplaneModeUserspace,
+			TUNName:   "vohive0",
+			TUNMTU:    1420,
+			TUNRoutes: []swu.TUNRoute{{Destination: "default", Table: "200"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("defaultTunnelManagerForStart() error = %v", err)
+	}
+	tunManager, ok := manager.(*swu.TUNTunnelManager)
+	if !ok {
+		t.Fatalf("manager=%T, want *swu.TUNTunnelManager", manager)
+	}
+	if tunManager.Config.TUN.Name != "vohive0" || tunManager.Config.MTU != 1420 {
+		t.Fatalf("tun config=%+v mtu=%d", tunManager.Config.TUN, tunManager.Config.MTU)
+	}
+	if !tunManager.Config.DefaultRoutes || !tunManager.Config.ProtectEPDGRoutes {
+		t.Fatalf("default route/protect flags = %t/%t", tunManager.Config.DefaultRoutes, tunManager.Config.ProtectEPDGRoutes)
+	}
+	if len(tunManager.Config.Routes) != 1 || tunManager.Config.Routes[0].Table != "200" {
+		t.Fatalf("routes=%+v", tunManager.Config.Routes)
 	}
 }
 
@@ -670,6 +700,16 @@ func (s *runtimeTunnelSession) Close(ctx context.Context) error {
 	s.closed = true
 	return nil
 }
+
+type runtimeSIMAdapter struct{}
+
+func (s *runtimeSIMAdapter) GetIMSI() (string, error) { return "310280233641503", nil }
+
+func (s *runtimeSIMAdapter) CalculateAKA(rand16, autn16 []byte) (swusim.AKAResult, error) {
+	return swusim.AKAResult{}, nil
+}
+
+func (s *runtimeSIMAdapter) Close() error { return nil }
 
 type runtimeUSSDTransport struct {
 	executeRequests []messaging.USSDRequest
