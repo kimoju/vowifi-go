@@ -608,12 +608,58 @@ func sipURIAddr(uri string) (string, error) {
 
 func canonicalHeaderName(name string) string {
 	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "a":
+		return "Accept-Contact"
+	case "accept-contact":
+		return "Accept-Contact"
+	case "b":
+		return "Referred-By"
+	case "referred-by":
+		return "Referred-By"
+	case "d":
+		return "Request-Disposition"
+	case "request-disposition":
+		return "Request-Disposition"
+	case "e":
+		return "Content-Encoding"
+	case "content-encoding":
+		return "Content-Encoding"
 	case "i":
 		return "Call-ID"
 	case "call-id":
 		return "Call-ID"
+	case "j":
+		return "Reject-Contact"
+	case "reject-contact":
+		return "Reject-Contact"
+	case "k":
+		return "Supported"
+	case "supported":
+		return "Supported"
 	case "m":
 		return "Contact"
+	case "contact":
+		return "Contact"
+	case "o":
+		return "Event"
+	case "event":
+		return "Event"
+	case "r":
+		return "Refer-To"
+	case "refer-to":
+		return "Refer-To"
+	case "s":
+		return "Subject"
+	case "subject":
+		return "Subject"
+	case "u":
+		return "Allow-Events"
+	case "allow-events":
+		return "Allow-Events"
+	case "x":
+		return "Session-Expires"
+	case "session-expires":
+		return "Session-Expires"
 	case "l":
 		return "Content-Length"
 	case "content-length":

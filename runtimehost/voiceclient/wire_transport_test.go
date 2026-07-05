@@ -12,12 +12,32 @@ import (
 )
 
 func TestParseSIPResponseWithFoldedAndCompactHeaders(t *testing.T) {
-	resp, err := ParseSIPResponse([]byte("SIP/2.0 200 OK\r\nP-Associated-URI: <sip:user@example>,\r\n <tel:+18005551212>\r\nl: 5\r\n\r\nhello ignored"))
+	raw := strings.Join([]string{
+		"SIP/2.0 200 OK",
+		"P-Associated-URI: <sip:user@example>,",
+		" <tel:+18005551212>",
+		"k: path, sec-agree",
+		"a: *;+g.3gpp.smsip",
+		"e: gzip",
+		"l: 5",
+		"",
+		"hello ignored",
+	}, "\r\n")
+	resp, err := ParseSIPResponse([]byte(raw))
 	if err != nil {
 		t.Fatalf("ParseSIPResponse() error = %v", err)
 	}
 	if resp.StatusCode != 200 || resp.Reason != "OK" || string(resp.Body) != "hello" {
 		t.Fatalf("response=%+v body=%q", resp, resp.Body)
+	}
+	if got := resp.Headers["Supported"]; len(got) != 1 || got[0] != "path, sec-agree" {
+		t.Fatalf("Supported=%+v", got)
+	}
+	if got := resp.Headers["Accept-Contact"]; len(got) != 1 || got[0] != "*;+g.3gpp.smsip" {
+		t.Fatalf("Accept-Contact=%+v", got)
+	}
+	if got := resp.Headers["Content-Encoding"]; len(got) != 1 || got[0] != "gzip" {
+		t.Fatalf("Content-Encoding=%+v", got)
 	}
 	binding := BuildRegistrationBinding(IMSProfile{}, "sip:user@192.0.2.10:5060", resp, 3600)
 	if len(binding.AssociatedURIs) != 2 || binding.AssociatedURIs[0] != "sip:user@example" || binding.AssociatedURIs[1] != "tel:+18005551212" {
@@ -26,15 +46,50 @@ func TestParseSIPResponseWithFoldedAndCompactHeaders(t *testing.T) {
 }
 
 func TestParseSIPRequestAndBuildResponseWire(t *testing.T) {
-	req, err := ParseSIPRequest([]byte("INVITE sip:user@example SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-a\r\nTo: <sip:user@example>\r\nFrom: <sip:caller@example>;tag=remote\r\nCall-ID: call-1\r\nCSeq: 7 INVITE\r\nSubject: hello\r\n world\r\nl: 5\r\n\r\nabcde ignored"))
+	raw := strings.Join([]string{
+		"INVITE sip:user@example SIP/2.0",
+		"v: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-a",
+		"t: <sip:user@example>",
+		"f: <sip:caller@example>;tag=remote",
+		"i: call-1",
+		"CSeq: 7 INVITE",
+		"s: hello",
+		" world",
+		"u: presence",
+		"o: reg",
+		"r: <sip:refer@example>",
+		"b: <sip:referrer@example>",
+		"d: no-fork",
+		"j: *;audio",
+		"x: 1800;refresher=uac",
+		"l: 5",
+		"",
+		"abcde ignored",
+	}, "\r\n")
+	req, err := ParseSIPRequest([]byte(raw))
 	if err != nil {
 		t.Fatalf("ParseSIPRequest() error = %v", err)
 	}
 	if req.Method != "INVITE" || req.URI != "sip:user@example" || string(req.Body) != "abcde" {
 		t.Fatalf("request=%+v body=%q", req, req.Body)
 	}
-	if got := req.Headers["Subject"]; len(got) != 1 || got[0] != "hello world" {
-		t.Fatalf("Subject=%+v", got)
+	for name, want := range map[string]string{
+		"Via":                 "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-a",
+		"To":                  "<sip:user@example>",
+		"From":                "<sip:caller@example>;tag=remote",
+		"Call-ID":             "call-1",
+		"Subject":             "hello world",
+		"Allow-Events":        "presence",
+		"Event":               "reg",
+		"Refer-To":            "<sip:refer@example>",
+		"Referred-By":         "<sip:referrer@example>",
+		"Request-Disposition": "no-fork",
+		"Reject-Contact":      "*;audio",
+		"Session-Expires":     "1800;refresher=uac",
+	} {
+		if got := req.Headers[name]; len(got) != 1 || got[0] != want {
+			t.Fatalf("%s=%+v, want %q", name, got, want)
+		}
 	}
 	wire, err := BuildSIPResponseWire(req, 200, "OK", map[string]string{
 		"Contact":      "<sip:user@192.0.2.10:5060>",
