@@ -30,6 +30,7 @@ var (
 	ErrInvalidEncryptedData = errors.New("invalid eap-aka encrypted data")
 	ErrInvalidMAC           = errors.New("invalid eap-aka mac")
 	ErrInvalidKeyMaterial   = errors.New("invalid eap-aka key material")
+	ErrInvalidReauth        = errors.New("invalid eap-aka reauthentication")
 	ErrUnsupportedKDF       = errors.New("unsupported eap-aka prime kdf")
 )
 
@@ -330,6 +331,10 @@ func DecryptEncryptedAttributes(kEncr []byte, ivAttr, encrypted Attribute) ([]At
 }
 
 func DecryptChallengeEncryptedAttributes(request Packet, keys Keys) ([]Attribute, bool, error) {
+	return DecryptPacketEncryptedAttributes(request, keys)
+}
+
+func DecryptPacketEncryptedAttributes(request Packet, keys Keys) ([]Attribute, bool, error) {
 	ivAttr, hasIV := FindAttribute(request.Attributes, AttributeIV)
 	encryptedAttr, hasEncrypted := FindAttribute(request.Attributes, AttributeEncrData)
 	if !hasIV && !hasEncrypted {
@@ -343,6 +348,55 @@ func DecryptChallengeEncryptedAttributes(request Packet, keys Keys) ([]Attribute
 		return nil, true, err
 	}
 	return attrs, true, nil
+}
+
+func ParseReauthenticationRequest(request Packet, keys Keys) (ReauthenticationRequest, error) {
+	if request.Code != CodeRequest || request.Subtype != SubtypeReauthentication {
+		return ReauthenticationRequest{}, fmt.Errorf("%w: not an AKA reauthentication request", ErrInvalidReauth)
+	}
+	if !isAKAType(request.Type) {
+		return ReauthenticationRequest{}, fmt.Errorf("%w: EAP type %d", ErrInvalidReauth, request.Type)
+	}
+	raw, err := request.MarshalBinary()
+	if err != nil {
+		return ReauthenticationRequest{}, err
+	}
+	if err := verifyChallengeMAC(request.Type, keys.KAut, raw); err != nil {
+		return ReauthenticationRequest{}, err
+	}
+	attrs, ok, err := DecryptPacketEncryptedAttributes(request, keys)
+	if err != nil {
+		return ReauthenticationRequest{}, err
+	}
+	if !ok {
+		return ReauthenticationRequest{}, fmt.Errorf("%w: missing AT_IV/AT_ENCR_DATA", ErrInvalidReauth)
+	}
+	counterAttr, ok := FindAttribute(attrs, AttributeCounter)
+	if !ok {
+		return ReauthenticationRequest{}, fmt.Errorf("%w: missing AT_COUNTER", ErrInvalidReauth)
+	}
+	counter, err := counterAttr.CounterValue()
+	if err != nil {
+		return ReauthenticationRequest{}, err
+	}
+	nonceAttr, ok := FindAttribute(attrs, AttributeNonceS)
+	if !ok {
+		return ReauthenticationRequest{}, fmt.Errorf("%w: missing AT_NONCE_S", ErrInvalidReauth)
+	}
+	nonceS, err := nonceAttr.NonceSValue()
+	if err != nil {
+		return ReauthenticationRequest{}, err
+	}
+	state, err := IdentityStateFromAttributes(attrs)
+	if err != nil {
+		return ReauthenticationRequest{}, err
+	}
+	return ReauthenticationRequest{
+		Counter:             counter,
+		NonceS:              nonceS,
+		IdentityState:       state,
+		EncryptedAttributes: cloneAttributes(attrs),
+	}, nil
 }
 
 func ChallengeRANDAndAUTN(request Packet) (rand16, autn16 []byte, err error) {
@@ -611,6 +665,14 @@ func challengeKDFAttributes(attrs []Attribute) []Attribute {
 		if attr.Type == AttributeKDF {
 			out = append(out, Attribute{Type: attr.Type, Data: append([]byte(nil), attr.Data...)})
 		}
+	}
+	return out
+}
+
+func cloneAttributes(attrs []Attribute) []Attribute {
+	out := make([]Attribute, len(attrs))
+	for i, attr := range attrs {
+		out[i] = Attribute{Type: attr.Type, Data: append([]byte(nil), attr.Data...)}
 	}
 	return out
 }

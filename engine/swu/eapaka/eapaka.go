@@ -99,6 +99,13 @@ type EncryptedIdentityState struct {
 	NextReauthID  string
 }
 
+type ReauthenticationRequest struct {
+	Counter             uint16
+	NonceS              []byte
+	IdentityState       EncryptedIdentityState
+	EncryptedAttributes []Attribute
+}
+
 func (p Packet) MarshalBinary() ([]byte, error) {
 	if p.Code == CodeSuccess || p.Code == CodeFailure {
 		out := []byte{p.Code, p.Identifier, 0, 4}
@@ -285,6 +292,20 @@ func ClientErrorCodeAttribute(code uint16) Attribute {
 	return Attribute{Type: AttributeClientErrorCode, Data: b[:]}
 }
 
+func CounterAttribute(counter uint16) Attribute {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], counter)
+	return Attribute{Type: AttributeCounter, Data: b[:]}
+}
+
+func CounterTooSmallAttribute() Attribute {
+	return FixedAttribute(AttributeCounterTooSmall, nil)
+}
+
+func NonceSAttribute(nonce16 []byte) Attribute {
+	return FixedAttribute(AttributeNonceS, nonce16)
+}
+
 func IVAttribute(iv16 []byte) Attribute {
 	return FixedAttribute(AttributeIV, iv16)
 }
@@ -407,6 +428,21 @@ func (a Attribute) NotificationValue() (uint16, error) {
 
 func (a Attribute) ClientErrorCodeValue() (uint16, error) {
 	return a.directUint16Value()
+}
+
+func (a Attribute) CounterValue() (uint16, error) {
+	return a.directUint16Value()
+}
+
+func (a Attribute) CounterTooSmallValue() error {
+	if len(a.Data) != 2 {
+		return fmt.Errorf("%w: counter-too-small value length %d", ErrInvalidAttribute, len(a.Data))
+	}
+	return nil
+}
+
+func (a Attribute) NonceSValue() ([]byte, error) {
+	return a.FixedValue(16)
 }
 
 func (a Attribute) IVValue() ([]byte, error) {

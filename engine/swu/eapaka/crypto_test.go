@@ -195,6 +195,41 @@ func TestDecryptChallengeEncryptedAttributes(t *testing.T) {
 	}
 }
 
+func TestParseReauthenticationRequest(t *testing.T) {
+	identity := "reauth-identity@example"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	request := signedReauthenticationRequest(t, keys, 12, nonceS, []Attribute{
+		NextReauthIDAttribute("reauth-next"),
+	})
+	parsed, err := ParseReauthenticationRequest(request, keys)
+	if err != nil {
+		t.Fatalf("ParseReauthenticationRequest() error = %v", err)
+	}
+	if parsed.Counter != 12 || !bytes.Equal(parsed.NonceS, nonceS) || parsed.IdentityState.NextReauthID != "reauth-next" {
+		t.Fatalf("parsed=%+v nonce=%x", parsed, parsed.NonceS)
+	}
+	if len(parsed.EncryptedAttributes) != 3 {
+		t.Fatalf("encrypted attrs=%+v", parsed.EncryptedAttributes)
+	}
+	parsed.EncryptedAttributes[0].Data[1] = 99
+	again, err := ParseReauthenticationRequest(request, keys)
+	if err != nil {
+		t.Fatalf("ParseReauthenticationRequest(again) error = %v", err)
+	}
+	if again.Counter != 12 {
+		t.Fatalf("parsed result was not cloned: counter=%d", again.Counter)
+	}
+}
+
 func TestDecryptAttributesRejectsBadPadding(t *testing.T) {
 	kEncr := bytes.Repeat([]byte{0x11}, 16)
 	iv := bytes.Repeat([]byte{0x22}, 16)
@@ -670,6 +705,38 @@ func signedChallengeRequestWithEncryptedAttrs(t *testing.T, identity string, aka
 		Type:       TypeAKA,
 		Subtype:    SubtypeChallenge,
 		Attributes: challengeAttrs,
+	}
+	raw, err := req.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	req.Attributes[len(req.Attributes)-1] = MACAttribute(mac)
+	return req
+}
+
+func signedReauthenticationRequest(t *testing.T, keys Keys, counter uint16, nonceS []byte, extra []Attribute) Packet {
+	t.Helper()
+	iv := bytes.Repeat([]byte{0x55}, 16)
+	encryptedAttrs := []Attribute{CounterAttribute(counter), NonceSAttribute(nonceS)}
+	encryptedAttrs = append(encryptedAttrs, extra...)
+	encrypted, err := EncryptAttributes(keys.KEncr, iv, encryptedAttrs)
+	if err != nil {
+		t.Fatalf("EncryptAttributes() error = %v", err)
+	}
+	req := Packet{
+		Code:       CodeRequest,
+		Identifier: 15,
+		Type:       TypeAKA,
+		Subtype:    SubtypeReauthentication,
+		Attributes: []Attribute{
+			IVAttribute(iv),
+			encrypted,
+			MACAttribute(nil),
+		},
 	}
 	raw, err := req.MarshalBinary()
 	if err != nil {

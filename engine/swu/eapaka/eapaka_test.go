@@ -240,6 +240,42 @@ func TestIdentityStateFromAttributes(t *testing.T) {
 	}
 }
 
+func TestReauthenticationAttributes(t *testing.T) {
+	raw, err := MarshalAttributes([]Attribute{
+		CounterAttribute(7),
+		CounterTooSmallAttribute(),
+		NonceSAttribute([]byte("1234567890abcdef")),
+	})
+	if err != nil {
+		t.Fatalf("MarshalAttributes() error = %v", err)
+	}
+	want := "13010007140100001505000031323334353637383930616263646566"
+	if hex.EncodeToString(raw) != want {
+		t.Fatalf("reauth attrs=%x, want %s", raw, want)
+	}
+	attrs, err := ParseAttributes(raw)
+	if err != nil {
+		t.Fatalf("ParseAttributes() error = %v", err)
+	}
+	counter, err := attrs[0].CounterValue()
+	if err != nil {
+		t.Fatalf("CounterValue() error = %v", err)
+	}
+	if counter != 7 {
+		t.Fatalf("counter=%d", counter)
+	}
+	if err := attrs[1].CounterTooSmallValue(); err != nil {
+		t.Fatalf("CounterTooSmallValue() error = %v", err)
+	}
+	nonce, err := attrs[2].NonceSValue()
+	if err != nil {
+		t.Fatalf("NonceSValue() error = %v", err)
+	}
+	if string(nonce) != "1234567890abcdef" {
+		t.Fatalf("nonce_s=%q", string(nonce))
+	}
+}
+
 func TestAKAChallengeAttributes(t *testing.T) {
 	raw, err := (Packet{
 		Code:       CodeRequest,
