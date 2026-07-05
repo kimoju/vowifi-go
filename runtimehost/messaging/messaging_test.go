@@ -23,6 +23,24 @@ func TestSegmentSMSGSM7(t *testing.T) {
 	}
 }
 
+func TestSegmentSMSGSM7ExtendedCharacters(t *testing.T) {
+	single := SegmentSMS(strings.Repeat("^", 80), "")
+	if len(single) != 1 || single[0].Encoding != "gsm7" || single[0].UDH != nil || messageLen(single[0].Text, single[0].Encoding) != 160 {
+		t.Fatalf("single extended parts=%+v", single)
+	}
+
+	parts := SegmentSMS(strings.Repeat("^", 81), "")
+	if len(parts) != 2 {
+		t.Fatalf("parts=%d, want 2", len(parts))
+	}
+	if parts[0].Encoding != "gsm7" || messageLen(parts[0].Text, "gsm7") > 153 || len([]rune(parts[0].Text)) != 76 || len(parts[0].UDH) == 0 {
+		t.Fatalf("first extended part=%+v septets=%d", parts[0], messageLen(parts[0].Text, "gsm7"))
+	}
+	if parts[1].PartNo != 2 || parts[1].TotalParts != 2 || messageLen(parts[1].Text, "gsm7") != 10 {
+		t.Fatalf("second extended part=%+v septets=%d", parts[1], messageLen(parts[1].Text, "gsm7"))
+	}
+}
+
 func TestSegmentSMSUCS2(t *testing.T) {
 	parts := SegmentSMS(strings.Repeat("你", 71), "")
 	if len(parts) != 2 {

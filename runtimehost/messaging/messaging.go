@@ -455,7 +455,10 @@ func messageLen(text, encoding string) int {
 		return len([]byte(text))
 	}
 	if encoding == "gsm7" {
-		return len([]rune(text))
+		if septets, ok := gsm7SeptetLen(text); ok {
+			return septets
+		}
+		return utf8.RuneCountInString(text)
 	}
 	return utf8.RuneCountInString(text)
 }
@@ -478,6 +481,9 @@ func takeSMSChunk(text, encoding string, limit int) (string, string) {
 		}
 		return text[:i], text[i:]
 	}
+	if encoding == "gsm7" {
+		return takeGSM7Chunk(text, limit)
+	}
 	runes := []rune(text)
 	if len(runes) <= limit {
 		return text, ""
@@ -493,12 +499,8 @@ func concatUDH(total, partNo int) []byte {
 }
 
 func isGSM7Text(text string) bool {
-	for _, r := range text {
-		if gsm7Code(r) < 0 {
-			return false
-		}
-	}
-	return true
+	_, ok := gsm7SeptetLen(text)
+	return ok
 }
 
 const gsm7Alphabet = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"

@@ -19,6 +19,37 @@ func TestBuildSMSSubmitTPDUGSM7(t *testing.T) {
 	}
 }
 
+func TestBuildSMSSubmitTPDUGSM7ExtendedCharacters(t *testing.T) {
+	text := "^{}\\[~]|€\f"
+	septets, err := encodeGSM7(text)
+	if err != nil {
+		t.Fatalf("encodeGSM7() error = %v", err)
+	}
+	gotSeptets := strings.ToUpper(hex.EncodeToString(septets))
+	wantSeptets := "1B141B281B291B2F1B3C1B3D1B3E1B401B651B0A"
+	if gotSeptets != wantSeptets {
+		t.Fatalf("septets=%s want %s", gotSeptets, wantSeptets)
+	}
+	if decoded := decodeGSM7(septets); decoded != text {
+		t.Fatalf("decoded=%q want %q", decoded, text)
+	}
+
+	tpdu, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "cost {10}€", Encoding: "gsm7"}, 3)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU() error = %v", err)
+	}
+	if tpdu[11] != 0x00 || int(tpdu[12]) != 13 {
+		t.Fatalf("DCS=0x%02x UDL=%d want GSM7/13 septets TPDU=%x", tpdu[11], tpdu[12], tpdu)
+	}
+	textOut, _, err := decodeSMSUserData(tpdu[13:], int(tpdu[12]), tpdu[11], false)
+	if err != nil {
+		t.Fatalf("decodeSMSUserData() error = %v", err)
+	}
+	if textOut != "cost {10}€" {
+		t.Fatalf("decoded TPDU text=%q", textOut)
+	}
+}
+
 func TestBuildSMSSubmitTPDUUCS2(t *testing.T) {
 	tpdu, err := BuildSMSSubmitTPDU("10086", SMSPart{Text: "你", Encoding: "ucs2"}, 1)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 const IMS3GPPSMSContentType = "application/vnd.3gpp.sms"
@@ -341,12 +342,68 @@ func encodeGSM7(text string) ([]byte, error) {
 	out := make([]byte, 0, len(text))
 	for _, r := range text {
 		idx := gsm7Code(r)
-		if idx < 0 {
+		if idx >= 0 {
+			out = append(out, byte(idx))
+			continue
+		}
+		ext, ok := gsm7ExtensionCode(r)
+		if !ok {
 			return nil, fmt.Errorf("character %q is not in GSM 7-bit alphabet", r)
 		}
-		out = append(out, byte(idx))
+		out = append(out, 0x1b, ext)
 	}
 	return out, nil
+}
+
+func gsm7SeptetLen(text string) (int, bool) {
+	septets := 0
+	for _, r := range text {
+		if gsm7Code(r) >= 0 {
+			septets++
+			continue
+		}
+		if _, ok := gsm7ExtensionCode(r); ok {
+			septets += 2
+			continue
+		}
+		return 0, false
+	}
+	return septets, true
+}
+
+func takeGSM7Chunk(text string, limit int) (string, string) {
+	if text == "" || limit <= 0 {
+		return "", text
+	}
+	used := 0
+	end := 0
+	for pos, r := range text {
+		charSeptets := 0
+		switch {
+		case gsm7Code(r) >= 0:
+			charSeptets = 1
+		default:
+			if _, ok := gsm7ExtensionCode(r); ok {
+				charSeptets = 2
+			} else {
+				charSeptets = 1
+			}
+		}
+		if used > 0 && used+charSeptets > limit {
+			break
+		}
+		used += charSeptets
+		_, size := utf8.DecodeRuneInString(text[pos:])
+		end = pos + size
+		if used >= limit {
+			break
+		}
+	}
+	if end <= 0 {
+		_, size := utf8.DecodeRuneInString(text)
+		end = size
+	}
+	return text[:end], text[end:]
 }
 
 func gsm7Code(r rune) int {
@@ -356,6 +413,33 @@ func gsm7Code(r rune) int {
 		}
 	}
 	return -1
+}
+
+func gsm7ExtensionCode(r rune) (byte, bool) {
+	switch r {
+	case '\f':
+		return 0x0a, true
+	case '^':
+		return 0x14, true
+	case '{':
+		return 0x28, true
+	case '}':
+		return 0x29, true
+	case '\\':
+		return 0x2f, true
+	case '[':
+		return 0x3c, true
+	case '~':
+		return 0x3d, true
+	case ']':
+		return 0x3e, true
+	case '|':
+		return 0x40, true
+	case '€':
+		return 0x65, true
+	default:
+		return 0, false
+	}
 }
 
 var gsm7BasicAlphabet = []rune{
