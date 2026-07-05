@@ -19,8 +19,9 @@ func TestIMSUSSDTransportExecuteAndContinue(t *testing.T) {
 			StatusCode: 200,
 			Reason:     "OK",
 			Headers: map[string][]string{
-				"To":      {"<sip:*100%23@ims.example;user=dialstring>;tag=as-tag"},
-				"Contact": {"<sip:ussd-as@ims.example>"},
+				"To":           {"<sip:*100%23@ims.example;user=dialstring>;tag=as-tag"},
+				"Contact":      {"<sip:ussd-as@ims.example>"},
+				"Record-Route": {"<sip:dialog1.ims.example;lr>, <sip:dialog2.ims.example;lr>"},
 			},
 		},
 		{
@@ -63,6 +64,9 @@ func TestIMSUSSDTransportExecuteAndContinue(t *testing.T) {
 	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" || transport.writes[0].Headers["CSeq"] != "1 ACK" {
 		t.Fatalf("ACK writes=%+v", transport.writes)
 	}
+	if route := transport.writes[0].Headers["Route"]; route != "<sip:dialog2.ims.example;lr>, <sip:dialog1.ims.example;lr>" {
+		t.Fatalf("ACK Route=%q", route)
+	}
 
 	next, err := ussd.ContinueUSSD(context.Background(), USSDRequest{SessionID: "session-1", Input: "1"})
 	if err != nil {
@@ -78,6 +82,9 @@ func TestIMSUSSDTransportExecuteAndContinue(t *testing.T) {
 	if info.Method != "INFO" || info.Headers["CSeq"] != "2 INFO" || info.Headers["Info-Package"] != IMSUSSDInfoPackage || info.Headers["Content-Disposition"] != IMSUSSDContentDisposition {
 		t.Fatalf("info=%+v", info)
 	}
+	if info.URI != "sip:ussd-as@ims.example" || info.Headers["Route"] != "<sip:dialog2.ims.example;lr>, <sip:dialog1.ims.example;lr>" {
+		t.Fatalf("INFO route/target=%+v", info)
+	}
 	if _, err := ussd.ContinueUSSD(context.Background(), USSDRequest{SessionID: "session-1", Input: "1"}); err == nil {
 		t.Fatal("ContinueUSSD() err=nil after terminal notify, want inactive session")
 	}
@@ -89,8 +96,9 @@ func TestIMSUSSDTransportCancelSendsBye(t *testing.T) {
 			StatusCode: 200,
 			Reason:     "OK",
 			Headers: map[string][]string{
-				"To":      {"<sip:*100%23@ims.example;user=dialstring>;tag=as-tag"},
-				"Contact": {"<sip:ussd-as@ims.example>"},
+				"To":           {"<sip:*100%23@ims.example;user=dialstring>;tag=as-tag"},
+				"Contact":      {"<sip:ussd-as@ims.example>"},
+				"Record-Route": {"<sip:dialog-proxy.ims.example;lr>"},
 			},
 		},
 		{StatusCode: 200, Reason: "OK"},
@@ -115,6 +123,9 @@ func TestIMSUSSDTransportCancelSendsBye(t *testing.T) {
 	bye := transport.requests[1]
 	if bye.Method != "BYE" || bye.Headers["CSeq"] != "2 BYE" || bye.URI != "sip:ussd-as@ims.example" {
 		t.Fatalf("bye=%+v", bye)
+	}
+	if bye.Headers["Route"] != "<sip:dialog-proxy.ims.example;lr>" {
+		t.Fatalf("BYE Route=%q", bye.Headers["Route"])
 	}
 }
 

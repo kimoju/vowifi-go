@@ -72,6 +72,9 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 	if contact := sipHeaderURIValue(firstHeaderValue(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
 	}
+	if routeSet := ussdRecordRouteSet(resp.Headers); len(routeSet) > 0 {
+		cfg.RouteSet = routeSet
+	}
 	result, err := ussdResultFromSIPResponse(sessionID, resp, false)
 	if err != nil {
 		result.Done = true
@@ -349,6 +352,66 @@ func firstHeaderValue(headers map[string][]string, name string) string {
 		}
 	}
 	return ""
+}
+
+func ussdRecordRouteSet(headers map[string][]string) []string {
+	var routes []string
+	for key, values := range headers {
+		if !strings.EqualFold(key, "Record-Route") {
+			continue
+		}
+		for _, value := range values {
+			for _, route := range splitUSSDHeaderValues(value) {
+				if strings.TrimSpace(route) != "" {
+					routes = append(routes, strings.TrimSpace(route))
+				}
+			}
+		}
+	}
+	for i, j := 0, len(routes)-1; i < j; i, j = i+1, j-1 {
+		routes[i], routes[j] = routes[j], routes[i]
+	}
+	return routes
+}
+
+func splitUSSDHeaderValues(value string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	escaped := false
+	angleDepth := 0
+	for _, r := range value {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\' && inQuote:
+			cur.WriteRune(r)
+			escaped = true
+		case r == '"':
+			cur.WriteRune(r)
+			inQuote = !inQuote
+		case r == '<' && !inQuote:
+			angleDepth++
+			cur.WriteRune(r)
+		case r == '>' && !inQuote:
+			if angleDepth > 0 {
+				angleDepth--
+			}
+			cur.WriteRune(r)
+		case r == ',' && !inQuote && angleDepth == 0:
+			if part := strings.TrimSpace(cur.String()); part != "" {
+				out = append(out, part)
+			}
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if part := strings.TrimSpace(cur.String()); part != "" {
+		out = append(out, part)
+	}
+	return out
 }
 
 func sipHeaderTagValue(value string) string {
