@@ -20,6 +20,7 @@ type IMSSMSTransport struct {
 	RemoteTargetURI string
 	UserAgent       string
 	ContentType     string
+	SMSC            string
 }
 
 func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (SMSSendResult, error) {
@@ -44,6 +45,10 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 	if cseq <= 0 {
 		cseq = 1
 	}
+	contentType, body, err := t.messagePayload(req, byte(cseq))
+	if err != nil {
+		return SMSSendResult{CallID: callID, RPMR: cseq, State: "failed", ErrorText: err.Error()}, err
+	}
 	msg, err := voiceclient.BuildMessageRequest(voiceclient.DialogRequestConfig{
 		Profile:         t.Profile,
 		Registration:    t.Registration,
@@ -55,7 +60,7 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		LocalTag:        "sms",
 		CSeq:            cseq,
 		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
-	}, firstNonEmpty(t.ContentType, "text/plain;charset=UTF-8"), []byte(req.Part.Text))
+	}, contentType, body)
 	if err != nil {
 		return SMSSendResult{State: "failed", ErrorText: err.Error()}, err
 	}
@@ -76,6 +81,22 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		result.State = "accepted"
 	}
 	return result, nil
+}
+
+func (t IMSSMSTransport) messagePayload(req SMSSendRequest, rpMR byte) (string, []byte, error) {
+	contentType := firstNonEmpty(t.ContentType, IMS3GPPSMSContentType)
+	if strings.HasPrefix(strings.ToLower(contentType), "text/plain") {
+		return contentType, []byte(req.Part.Text), nil
+	}
+	tpdu, err := BuildSMSSubmitTPDU(req.Peer, req.Part, rpMR)
+	if err != nil {
+		return "", nil, err
+	}
+	rpData, err := BuildSMSRPData(rpMR, t.SMSC, tpdu)
+	if err != nil {
+		return "", nil, err
+	}
+	return contentType, rpData, nil
 }
 
 func (t IMSSMSTransport) remoteURI(peer string) string {

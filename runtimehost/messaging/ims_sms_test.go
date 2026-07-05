@@ -38,17 +38,43 @@ func TestIMSSMSTransportSendsSIPMessage(t *testing.T) {
 		t.Fatalf("requests=%d", len(transport.requests))
 	}
 	req := transport.requests[0]
-	if req.Method != "MESSAGE" || req.URI != "sip:+18005551212@ims.example" || string(req.Body) != "hello" {
+	if req.Method != "MESSAGE" || req.URI != "sip:+18005551212@ims.example" {
 		t.Fatalf("MESSAGE=%+v body=%q", req, req.Body)
 	}
-	if req.Headers["Route"] != "<sip:pcscf.ims.example;lr>" || req.Headers["Content-Type"] != "text/plain;charset=UTF-8" {
+	if req.Headers["Route"] != "<sip:pcscf.ims.example;lr>" || req.Headers["Content-Type"] != IMS3GPPSMSContentType {
 		t.Fatalf("headers=%+v", req.Headers)
+	}
+	rpMR, tpdu, err := ParseSMSRPData(req.Body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPData() error = %v body=%x", err, req.Body)
+	}
+	if rpMR != 2 || len(tpdu) == 0 || tpdu[0] != 0x01 || !strings.HasSuffix(strings.ToUpper(hexString(req.Body)), "E8329BFD06") {
+		t.Fatalf("RP-DATA rpMR=%d tpdu=%x body=%x", rpMR, tpdu, req.Body)
 	}
 	if req.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.sms" || req.Headers["Accept-Contact"] != "*;+g.3gpp.smsip" {
 		t.Fatalf("SMS service headers=%+v", req.Headers)
 	}
 	if !strings.Contains(req.Headers["From"], "sip:user@ims.example") || !strings.Contains(req.Headers["To"], "sip:+18005551212@ims.example") {
 		t.Fatalf("dialog headers=%+v", req.Headers)
+	}
+}
+
+func TestIMSSMSTransportAllowsTextPlainPayload(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 200, Reason: "OK"}}}
+	sms := IMSSMSTransport{
+		Transport:   transport,
+		ContentType: "text/plain;charset=UTF-8",
+		Profile:     voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := sms.SendSMSPart(context.Background(), SMSSendRequest{Peer: "+18005551212", Part: SMSPart{PartNo: 1, Text: "hello"}}); err != nil {
+		t.Fatalf("SendSMSPart() error = %v", err)
+	}
+	if len(transport.requests) != 1 || string(transport.requests[0].Body) != "hello" || transport.requests[0].Headers["Content-Type"] != "text/plain;charset=UTF-8" {
+		t.Fatalf("request=%+v", transport.requests)
 	}
 }
 
@@ -99,4 +125,14 @@ func (t *fakeSIPRequestTransport) RoundTripRequest(ctx context.Context, msg voic
 func (t *fakeSIPRequestTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
 	t.writes = append(t.writes, msg)
 	return nil
+}
+
+func hexString(b []byte) string {
+	const digits = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, v := range b {
+		out[i*2] = digits[v>>4]
+		out[i*2+1] = digits[v&0x0f]
+	}
+	return string(out)
 }

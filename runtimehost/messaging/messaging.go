@@ -490,7 +490,7 @@ func concatUDH(total, partNo int) []byte {
 
 func isGSM7Text(text string) bool {
 	for _, r := range text {
-		if !strings.ContainsRune(gsm7Alphabet, r) {
+		if gsm7Code(r) < 0 {
 			return false
 		}
 	}
