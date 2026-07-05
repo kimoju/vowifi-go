@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"github.com/pion/rtcp"
 )
 
 func TestSRTPMediaSessionProtectsRTPAndRTCP(t *testing.T) {
@@ -144,6 +146,41 @@ func TestSRTPMediaSessionSupportsGCMProfile(t *testing.T) {
 	}
 	if want := testRTPPacket(12, 0x11111111, []byte{0xaa, 0xbb}); !bytes.Equal(got, want) {
 		t.Fatalf("RTP=%x, want %x", got, want)
+	}
+}
+
+func TestSRTPMediaSessionReportsRTCPFeedbackInRelayTransform(t *testing.T) {
+	events := make(chan RTCPFeedbackEvent, 1)
+	cfg := testSRTPMediaConfig()
+	cfg.RTCPFeedbackHandler = func(event RTCPFeedbackEvent) {
+		events <- event
+	}
+	session, err := NewSRTPMediaSession(cfg)
+	if err != nil {
+		t.Fatalf("NewSRTPMediaSession() error = %v", err)
+	}
+	packet, err := (&rtcp.PictureLossIndication{SenderSSRC: 0x11111111, MediaSSRC: 0x22222222}).Marshal()
+	if err != nil {
+		t.Fatalf("PLI Marshal() error = %v", err)
+	}
+	protected, err := session.ProtectClientRTCP(packet)
+	if err != nil {
+		t.Fatalf("ProtectClientRTCP() error = %v", err)
+	}
+	transformed, err := session.RelayTransforms().ClientToIMSRTCP(protected)
+	if err != nil {
+		t.Fatalf("ClientToIMSRTCP() error = %v", err)
+	}
+	plain, err := session.UnprotectIMSRTCP(transformed)
+	if err != nil {
+		t.Fatalf("UnprotectIMSRTCP() error = %v", err)
+	}
+	if !bytes.Equal(plain, packet) {
+		t.Fatalf("RTCP plain=%x, want %x", plain, packet)
+	}
+	event := readRTCPFeedbackEvent(t, events)
+	if event.Direction != RTCPFeedbackClientToIMS || event.Kind != RTCPFeedbackPictureLossIndication || event.MediaSSRC != 0x22222222 {
+		t.Fatalf("event=%+v", event)
 	}
 }
 

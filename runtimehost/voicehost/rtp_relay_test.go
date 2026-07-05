@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/pion/rtcp"
 )
 
 func TestRTPRelaySessionForwardsBidirectionalPackets(t *testing.T) {
@@ -205,6 +207,78 @@ func TestRTPRelaySessionAppliesSRTPTransforms(t *testing.T) {
 	}
 }
 
+func TestRTPRelaySessionReportsRTCPFeedback(t *testing.T) {
+	clientPeer := listenTestUDP(t)
+	defer clientPeer.Close()
+	clientRTCPPeer := listenTestUDP(t)
+	defer clientRTCPPeer.Close()
+	imsPeer := listenTestUDP(t)
+	defer imsPeer.Close()
+	imsRTCPPeer := listenTestUDP(t)
+	defer imsRTCPPeer.Close()
+
+	events := make(chan RTCPFeedbackEvent, 4)
+	clientAddr := clientPeer.LocalAddr().(*net.UDPAddr)
+	clientRTCPAddr := clientRTCPPeer.LocalAddr().(*net.UDPAddr)
+	imsAddr := imsPeer.LocalAddr().(*net.UDPAddr)
+	imsRTCPAddr := imsRTCPPeer.LocalAddr().(*net.UDPAddr)
+	relay, err := NewRTPRelaySession(context.Background(), RTPRelayConfig{
+		ClientListenIP:    "127.0.0.1",
+		ClientAdvertiseIP: "127.0.0.1",
+		IMSListenIP:       "127.0.0.1",
+		IMSAdvertiseIP:    "127.0.0.1",
+		RTCPFeedbackHandler: func(event RTCPFeedbackEvent) {
+			events <- event
+		},
+	}, SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: clientAddr.Port, RTCPPort: clientRTCPAddr.Port})
+	if err != nil {
+		t.Fatalf("NewRTPRelaySession() error = %v", err)
+	}
+	defer relay.Close()
+	if err := relay.SetIMSRemote(SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: imsAddr.Port, RTCPPort: imsRTCPAddr.Port}); err != nil {
+		t.Fatalf("SetIMSRemote() error = %v", err)
+	}
+
+	packet, err := rtcp.Marshal([]rtcp.Packet{
+		&rtcp.PictureLossIndication{SenderSSRC: 0x11111111, MediaSSRC: 0x22222222},
+		&rtcp.TransportLayerNack{
+			SenderSSRC: 0x11111111,
+			MediaSSRC:  0x22222222,
+			Nacks:      rtcp.NackPairsFromSequenceNumbers([]uint16{7, 8, 12}),
+		},
+	})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal() error = %v", err)
+	}
+	clientRTCPEndpoint := udpRTCPAddrFromSDP(t, relay.ClientEndpoint())
+	if _, err := clientRTCPPeer.WriteToUDP(packet, clientRTCPEndpoint); err != nil {
+		t.Fatalf("client RTCP WriteToUDP() error = %v", err)
+	}
+	got, _ := readTestUDP(t, imsRTCPPeer)
+	if !bytes.Equal(got, packet) {
+		t.Fatalf("IMS RTCP got=%x, want %x", got, packet)
+	}
+
+	first := readRTCPFeedbackEvent(t, events)
+	second := readRTCPFeedbackEvent(t, events)
+	seen := map[RTCPFeedbackKind]RTCPFeedbackEvent{
+		first.Kind:  first,
+		second.Kind: second,
+	}
+	if event, ok := seen[RTCPFeedbackPictureLossIndication]; !ok || event.Direction != RTCPFeedbackClientToIMS || event.MediaSSRC != 0x22222222 {
+		t.Fatalf("PLI event=%+v seen=%v", event, ok)
+	}
+	if event, ok := seen[RTCPFeedbackTransportLayerNack]; !ok || event.NACKCount != 3 {
+		t.Fatalf("NACK event=%+v seen=%v", event, ok)
+	}
+	stats := waitRelayStats(t, relay, func(stats RTPRelayStats) bool {
+		return stats.RTCPFeedbackPackets == 2
+	})
+	if stats.RTCPPictureLossIndications != 1 || stats.RTCPTransportLayerNacks != 1 || stats.RTCPFeedbackParseErrors != 0 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
 func listenTestUDP(t *testing.T) *net.UDPConn {
 	t.Helper()
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
@@ -225,6 +299,32 @@ func readTestUDP(t *testing.T, conn *net.UDPConn) ([]byte, *net.UDPAddr) {
 		t.Fatalf("ReadFromUDP() error = %v", err)
 	}
 	return append([]byte(nil), buf[:n]...), addr
+}
+
+func readRTCPFeedbackEvent(t *testing.T, events <-chan RTCPFeedbackEvent) RTCPFeedbackEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for RTCP feedback event")
+		return RTCPFeedbackEvent{}
+	}
+}
+
+func waitRelayStats(t *testing.T, relay *RTPRelaySession, pred func(RTPRelayStats) bool) RTPRelayStats {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		stats := relay.Stats()
+		if pred(stats) {
+			return stats
+		}
+		if time.Now().After(deadline) {
+			return stats
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func udpAddrFromSDP(t *testing.T, info SDPInfo) *net.UDPAddr {

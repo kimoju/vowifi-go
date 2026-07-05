@@ -28,19 +28,21 @@ type SRTPKeys struct {
 }
 
 type SRTPMediaConfig struct {
-	Profile          SRTPProtectionProfile
-	ClientKeys       SRTPKeys
-	IMSKeys          SRTPKeys
-	ReplayWindowSize uint
+	Profile             SRTPProtectionProfile
+	ClientKeys          SRTPKeys
+	IMSKeys             SRTPKeys
+	ReplayWindowSize    uint
+	RTCPFeedbackHandler RTCPFeedbackHandler
 }
 
 type SRTPMediaSession struct {
 	mu sync.Mutex
 
-	clientProtect   *srtp.Context
-	clientUnprotect *srtp.Context
-	imsProtect      *srtp.Context
-	imsUnprotect    *srtp.Context
+	clientProtect       *srtp.Context
+	clientUnprotect     *srtp.Context
+	imsProtect          *srtp.Context
+	imsUnprotect        *srtp.Context
+	rtcpFeedbackHandler RTCPFeedbackHandler
 }
 
 func NewSRTPMediaSession(cfg SRTPMediaConfig) (*SRTPMediaSession, error) {
@@ -75,10 +77,11 @@ func NewSRTPMediaSession(cfg SRTPMediaConfig) (*SRTPMediaSession, error) {
 		return nil, fmt.Errorf("%w: ims unprotect: %v", ErrSRTPMediaConfig, err)
 	}
 	return &SRTPMediaSession{
-		clientProtect:   clientProtect,
-		clientUnprotect: clientUnprotect,
-		imsProtect:      imsProtect,
-		imsUnprotect:    imsUnprotect,
+		clientProtect:       clientProtect,
+		clientUnprotect:     clientUnprotect,
+		imsProtect:          imsProtect,
+		imsUnprotect:        imsUnprotect,
+		rtcpFeedbackHandler: cfg.RTCPFeedbackHandler,
 	}, nil
 }
 
@@ -158,11 +161,22 @@ func (s *SRTPMediaSession) RelayTransforms() RTPRelayTransforms {
 	if s == nil {
 		return RTPRelayTransforms{}
 	}
+	return s.RelayTransformsWithRTCPFeedback(s.rtcpFeedbackHandler)
+}
+
+func (s *SRTPMediaSession) RelayTransformsWithRTCPFeedback(handler RTCPFeedbackHandler) RTPRelayTransforms {
+	if s == nil {
+		return RTPRelayTransforms{}
+	}
 	return RTPRelayTransforms{
-		ClientToIMSRTP:  s.ClientToIMSRTP,
-		IMSToClientRTP:  s.IMSToClientRTP,
-		ClientToIMSRTCP: s.ClientToIMSRTCP,
-		IMSToClientRTCP: s.IMSToClientRTCP,
+		ClientToIMSRTP: s.ClientToIMSRTP,
+		IMSToClientRTP: s.IMSToClientRTP,
+		ClientToIMSRTCP: func(packet []byte) ([]byte, error) {
+			return s.clientToIMSRTCP(packet, handler)
+		},
+		IMSToClientRTCP: func(packet []byte) ([]byte, error) {
+			return s.imsToClientRTCP(packet, handler)
+		},
 	}
 }
 
@@ -183,18 +197,28 @@ func (s *SRTPMediaSession) IMSToClientRTP(packet []byte) ([]byte, error) {
 }
 
 func (s *SRTPMediaSession) ClientToIMSRTCP(packet []byte) ([]byte, error) {
+	return s.clientToIMSRTCP(packet, s.rtcpFeedbackHandler)
+}
+
+func (s *SRTPMediaSession) clientToIMSRTCP(packet []byte, handler RTCPFeedbackHandler) ([]byte, error) {
 	plain, err := s.UnprotectClientRTCP(packet)
 	if err != nil {
 		return nil, err
 	}
+	_, _ = InspectRTCPFeedback(RTCPFeedbackClientToIMS, plain, handler)
 	return s.ProtectIMSRTCP(plain)
 }
 
 func (s *SRTPMediaSession) IMSToClientRTCP(packet []byte) ([]byte, error) {
+	return s.imsToClientRTCP(packet, s.rtcpFeedbackHandler)
+}
+
+func (s *SRTPMediaSession) imsToClientRTCP(packet []byte, handler RTCPFeedbackHandler) ([]byte, error) {
 	plain, err := s.UnprotectIMSRTCP(packet)
 	if err != nil {
 		return nil, err
 	}
+	_, _ = InspectRTCPFeedback(RTCPFeedbackIMSToClient, plain, handler)
 	return s.ProtectClientRTCP(plain)
 }
 
