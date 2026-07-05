@@ -71,6 +71,10 @@ protocol layers needed by VoHive:
 - high-level encrypted IKE_AUTH EAP-AKA/AKA' orchestration that drives
   Identity, AKA' KDF negotiation, AKA challenge, EAP control follow-ups, and
   final CHILD_SA parsing as one flow
+- SWu userspace IKE packet tunnel manager that derives ePDG/AKA identities,
+  runs IKE_SA_INIT and full IKE_AUTH, requires a negotiated CHILD_SA, wires the
+  CHILD_SA into a PacketSession, and attaches graceful close/MOBIKE control
+  hooks when negotiated key material is available
 - EAP-AKA full-auth key derivation, EAP-AKA' CK'/IK' and PRF' key material,
   AT_KDF negotiation, AT_MAC verification/generation, AT_RAND/AT_AUTN challenge
   extraction, SIM AKA RES response, AUTS synchronization-failure response,
