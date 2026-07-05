@@ -11,8 +11,8 @@ make ci
 ```
 
 Useful focused targets are `make fmt-check`, `make tidy-check`, `make vet`,
-`make test`, and `make race`. If Go is installed outside `PATH`, run for
-example `GO=/usr/local/go/bin/go make ci`.
+`make test`, `make race`, and `make download`. If Go is installed outside
+`PATH`, run for example `GO=/usr/local/go/bin/go make ci`.
 
 GitHub Actions runs `.github/workflows/ci.yml` on Ubuntu with the Go version
 from `go.mod`, calling `scripts/ci.sh` for formatting, module tidiness, vet,

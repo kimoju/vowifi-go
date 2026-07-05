@@ -43,8 +43,10 @@ run() {
 fmt_check() {
 	mapfile -d '' files < <(find . -name '*.go' -not -path './.git/*' -print0)
 	if [[ ${#files[@]} -eq 0 ]]; then
+		printf '\n==> no Go files found for gofmt check\n'
 		return
 	fi
+	printf '\n==> %s -l <go files>\n' "$GOFMT_BIN"
 	unformatted="$("$GOFMT_BIN" -l "${files[@]}")"
 	if [[ -n "$unformatted" ]]; then
 		printf 'gofmt required for:\n%s\n' "$unformatted" >&2
