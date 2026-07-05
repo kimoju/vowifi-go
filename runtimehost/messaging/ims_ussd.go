@@ -75,16 +75,15 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 	if routeSet := ussdRecordRouteSet(resp.Headers); len(routeSet) > 0 {
 		cfg.RouteSet = routeSet
 	}
+	if resp.StatusCode >= 200 {
+		if err := t.writeUSSDACK(ctx, cfg); err != nil {
+			return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true}, err
+		}
+	}
 	result, err := ussdResultFromSIPResponse(sessionID, resp, false)
 	if err != nil {
 		result.Done = true
 		return result, err
-	}
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if err := t.writeUSSDACK(ctx, cfg); err != nil {
-			result.Done = true
-			return result, err
-		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		result.Done = true

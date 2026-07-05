@@ -129,6 +129,50 @@ func TestIMSUSSDTransportCancelSendsBye(t *testing.T) {
 	}
 }
 
+func TestIMSUSSDTransportACKsRejectedInvite(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 486,
+		Reason:     "Busy Here",
+		Headers: map[string][]string{
+			"To":           {"<sip:*100%23@ims.example;user=dialstring>;tag=busy-tag"},
+			"Contact":      {"<sip:ussd-as@ims.example>"},
+			"Record-Route": {"<sip:reject-proxy1.ims.example;lr>, <sip:reject-proxy2.ims.example;lr>"},
+		},
+	}}}
+	ussd := &IMSUSSDTransport{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+
+	result, err := ussd.ExecuteUSSD(context.Background(), USSDRequest{SessionID: "session-reject", Command: "*100#"})
+	if err == nil || !strings.Contains(err.Error(), "IMS USSD INVITE rejected: 486 Busy Here") {
+		t.Fatalf("ExecuteUSSD() result=%+v err=%v, want rejected error", result, err)
+	}
+	if result.Status != 486 || !result.Done {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+	ack := transport.writes[0]
+	if ack.Headers["CSeq"] != "1 ACK" || !strings.Contains(ack.Headers["To"], "busy-tag") {
+		t.Fatalf("ACK=%+v", ack)
+	}
+	if ack.URI != "sip:ussd-as@ims.example" {
+		t.Fatalf("ACK URI=%q", ack.URI)
+	}
+	if route := ack.Headers["Route"]; route != "<sip:reject-proxy2.ims.example;lr>, <sip:reject-proxy1.ims.example;lr>" {
+		t.Fatalf("ACK Route=%q", route)
+	}
+	if _, ok := ussd.session("session-reject"); ok {
+		t.Fatal("rejected USSD INVITE must not leave an active session")
+	}
+}
+
 func TestIMSUSSDTransportHandlesInboundInfoAndBye(t *testing.T) {
 	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{
 		StatusCode: 200,
