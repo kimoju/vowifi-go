@@ -188,6 +188,54 @@ func TestHandleIncomingSMSDispatchesEvent(t *testing.T) {
 	}
 }
 
+func TestHandleIMSMessageDispatchesRPDataAndReturnsAck(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+	tpdu := mustHex(t, "0005810180F600006270502143650005E8329BFD06")
+	body := append([]byte{0x01, 0x33, 0x00, 0x00, byte(len(tpdu))}, tpdu...)
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		CallID:      "sms-downlink-1",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        body,
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.StatusCode != 200 || result.ReplyContentType != IMS3GPPSMSContentType || string(result.ReplyBody) != string(BuildSMSRPAck(0x33)) {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	got, ok := dispatch.events[0].(eventhost.SMSReceived)
+	if !ok || got.Sender != "10086" || got.Content != "hello" {
+		t.Fatalf("event=%+v", dispatch.events[0])
+	}
+}
+
+func TestHandleIMSMessageMarksRPErrorDeliveryReport(t *testing.T) {
+	store := &fakeDeliveryStore{match: DeliveryPartMatch{MessageID: "msg-1", PartNo: 1, State: "failed"}}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		CallID:      "call-1",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        BuildSMSRPError(7, SMSRPCauseTemporaryFailure),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.StatusCode != 200 || result.DeliveryReport == nil {
+		t.Fatalf("result=%+v", result)
+	}
+	if store.reportCallID != "call-1" || store.reportRPMR != 7 || store.reportState != "failed" || store.reportRPCause != int(SMSRPCauseTemporaryFailure) {
+		t.Fatalf("store=%+v", store)
+	}
+}
+
 type fakeSMSTransport struct {
 	requests []SMSSendRequest
 	failPart int

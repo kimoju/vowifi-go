@@ -373,17 +373,86 @@ func TestIMSInboundWireServerDispatchesReinviteAndAck(t *testing.T) {
 func TestIMSInboundWireServerRejectsUnsupportedMethod(t *testing.T) {
 	server := &IMSInboundWireServer{}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
-		Method: "MESSAGE",
+		Method: "SUBSCRIBE",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
 			"Call-ID": {"call-options"},
-			"CSeq":    {"1 MESSAGE"},
+			"CSeq":    {"1 SUBSCRIBE"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("HandleRequest() error = %v", err)
 	}
 	if len(responses) != 1 || responses[0].StatusCode != 405 || !strings.Contains(responses[0].Headers["Allow"], "UPDATE") {
+		t.Fatalf("responses=%+v", responses)
+	}
+}
+
+func TestIMSInboundWireServerDispatchesMessage(t *testing.T) {
+	var handled IMSMessageRequest
+	server := &IMSInboundWireServer{
+		MessageHandler: IMSMessageHandlerFunc(func(ctx context.Context, req IMSMessageRequest) (IMSMessageResult, error) {
+			handled = req
+			return IMSMessageResult{
+				StatusCode:  200,
+				Reason:      "OK",
+				ContentType: "application/vnd.3gpp.sms",
+				Body:        []byte{0x02, 0x33},
+			}, nil
+		}),
+	}
+	req := voiceclient.SIPIncomingRequest{
+		Method: "MESSAGE",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID":      {"sms-call-1"},
+			"CSeq":         {"3 MESSAGE"},
+			"From":         {"<sip:smsc@ims.example>;tag=net"},
+			"To":           {"<sip:user@ims.example>"},
+			"Content-Type": {"application/vnd.3gpp.sms"},
+		},
+		Body: []byte{0x01, 0x33, 0x00, 0x00, 0x00},
+	}
+	responses, err := server.HandleRequest(context.Background(), req)
+	if err != nil {
+		t.Fatalf("HandleRequest(MESSAGE) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 || responses[0].Headers["Content-Type"] != "application/vnd.3gpp.sms" || string(responses[0].Body) != string([]byte{0x02, 0x33}) {
+		t.Fatalf("responses=%+v", responses)
+	}
+	if handled.CallID != "sms-call-1" || handled.CSeq != 3 || handled.FromURI != "sip:smsc@ims.example" || handled.ContentType != "application/vnd.3gpp.sms" {
+		t.Fatalf("handled=%+v", handled)
+	}
+	options, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+		Method: "OPTIONS",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID": {"options-call"},
+			"CSeq":    {"1 OPTIONS"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleRequest(OPTIONS) error = %v", err)
+	}
+	if len(options) != 1 || !strings.Contains(options[0].Headers["Allow"], "MESSAGE") || !strings.Contains(options[0].Headers["Accept"], "application/vnd.3gpp.sms") {
+		t.Fatalf("options=%+v", options)
+	}
+}
+
+func TestIMSInboundWireServerRejectsMessageWithoutHandler(t *testing.T) {
+	server := &IMSInboundWireServer{}
+	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+		Method: "MESSAGE",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID": {"sms-call-2"},
+			"CSeq":    {"1 MESSAGE"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleRequest(MESSAGE) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 405 || strings.Contains(responses[0].Headers["Allow"], "MESSAGE") {
 		t.Fatalf("responses=%+v", responses)
 	}
 }

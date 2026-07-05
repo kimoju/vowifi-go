@@ -554,6 +554,28 @@ func (i *Instance) HandleSMSDeliveryReport(ctx context.Context, report messaging
 	return svc.HandleSMSDeliveryReport(ctx, report)
 }
 
+func (i *Instance) HandleIMSMessage(ctx context.Context, req voicehost.IMSMessageRequest) (voicehost.IMSMessageResult, error) {
+	svc := i.Service()
+	if svc == nil {
+		return voicehost.IMSMessageResult{StatusCode: 503, Reason: "messaging service is nil"}, errors.New("messaging service is nil")
+	}
+	res, err := svc.HandleIMSMessage(ctx, messaging.IMSMessageRequest{
+		FromURI:     req.FromURI,
+		ToURI:       req.ToURI,
+		CallID:      req.CallID,
+		CSeq:        req.CSeq,
+		ContentType: req.ContentType,
+		Body:        append([]byte(nil), req.Body...),
+		Headers:     cloneRuntimeSIPHeaders(req.Headers),
+	})
+	return voicehost.IMSMessageResult{
+		StatusCode:  res.StatusCode,
+		Reason:      res.Reason,
+		ContentType: res.ReplyContentType,
+		Body:        append([]byte(nil), res.ReplyBody...),
+	}, err
+}
+
 func (i *Instance) State() State {
 	if i == nil {
 		return State{}
@@ -667,6 +689,14 @@ func sipDomainRuntime(uri string) string {
 		return strings.Trim(strings.TrimSpace(host), "<>")
 	}
 	return ""
+}
+
+func cloneRuntimeSIPHeaders(headers map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(headers))
+	for key, values := range headers {
+		out[key] = append([]string(nil), values...)
+	}
+	return out
 }
 
 func buildTunnelConfig(req StartRequest, modem Modem) swu.TunnelConfig {

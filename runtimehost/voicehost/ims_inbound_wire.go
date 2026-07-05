@@ -15,6 +15,7 @@ import (
 
 type IMSInboundWireServer struct {
 	Agent           *IMSInboundAgent
+	MessageHandler  IMSMessageHandler
 	ContactURI      string
 	LocalTag        string
 	UserAgent       string
@@ -118,6 +119,8 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 		responses, err = s.handleUpdate(ctx, req)
 	case "PRACK":
 		responses, err = s.handlePrack(ctx, req)
+	case "MESSAGE":
+		responses, err = s.handleMessage(ctx, req)
 	case "OPTIONS":
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(s.optionsResponse())}
 	case "BYE":
@@ -142,13 +145,48 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}
 	default:
 		resp := wireResponse(405, "Method Not Allowed")
-		resp.Headers["Allow"] = "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS"
+		resp.Headers["Allow"] = s.allowHeader()
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(resp)}
 	}
 	if key != "" && len(responses) > 0 {
 		s.storeTransaction(key, responses)
 	}
 	return responses, err
+}
+
+func (s *IMSInboundWireServer) handleMessage(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	if s == nil || s.MessageHandler == nil {
+		resp := wireResponse(405, "Method Not Allowed")
+		resp.Headers["Allow"] = s.allowHeader()
+		return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, nil
+	}
+	result, err := s.MessageHandler.HandleIMSMessage(ctx, IMSMessageRequest{
+		URI:         strings.TrimSpace(req.URI),
+		FromURI:     wireHeaderURI(req, "From"),
+		ToURI:       wireCalleeURI(req),
+		CallID:      wireCallID(req),
+		CSeq:        wireCSeq(req),
+		ContentType: firstVoiceHeader(req.Headers, "Content-Type"),
+		Body:        append([]byte(nil), req.Body...),
+		Headers:     cloneSIPHeaders(req.Headers),
+	})
+	statusCode := inboundStatusCode(result.StatusCode, 200)
+	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	if err != nil && result.StatusCode <= 0 {
+		statusCode = 500
+		reason = firstVoiceNonEmpty(result.Reason, err.Error(), "Server Internal Error")
+	}
+	resp := wireResponse(statusCode, reason)
+	for key, value := range result.Headers {
+		if strings.TrimSpace(key) != "" && strings.TrimSpace(value) != "" {
+			resp.Headers[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+	}
+	if len(result.Body) > 0 {
+		resp.Body = append([]byte(nil), result.Body...)
+		resp.Headers["Content-Type"] = firstVoiceNonEmpty(result.ContentType, "application/octet-stream")
+	}
+	return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, err
 }
 
 func (s *IMSInboundWireServer) handleUpdate(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
@@ -296,11 +334,22 @@ func wireResponse(statusCode int, reason string) IMSInboundWireResponse {
 
 func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 	resp := wireResponse(200, "OK")
-	resp.Headers["Allow"] = "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS"
+	resp.Headers["Allow"] = s.allowHeader()
 	resp.Headers["Supported"] = "100rel, timer, replaces, outbound"
 	resp.Headers["Accept"] = "application/sdp"
+	if s != nil && s.MessageHandler != nil {
+		resp.Headers["Accept"] = "application/sdp, application/vnd.3gpp.sms, text/plain"
+	}
 	resp.Headers["Contact"] = "<" + s.contactURI() + ">"
 	return resp
+}
+
+func (s *IMSInboundWireServer) allowHeader() string {
+	allow := "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS"
+	if s != nil && s.MessageHandler != nil {
+		allow += ", MESSAGE"
+	}
+	return allow
 }
 
 func (s *IMSInboundWireServer) withResponseHeaders(resp IMSInboundWireResponse) IMSInboundWireResponse {

@@ -2,6 +2,7 @@ package runtimehost
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"strconv"
 	"strings"
@@ -393,6 +394,31 @@ func TestInstanceHandlesIncomingSMSAndDeliveryReport(t *testing.T) {
 	}
 	if match.MessageID != "msg-1" || store.reportState != "delivered" || store.recomputed != "msg-1" {
 		t.Fatalf("match=%+v store=%+v", match, store)
+	}
+	tpdu, err := hex.DecodeString("0005810180F600006270502143650005E8329BFD06")
+	if err != nil {
+		t.Fatalf("DecodeString() error = %v", err)
+	}
+	body := append([]byte{0x01, 0x33, 0x00, 0x00, byte(len(tpdu))}, tpdu...)
+	imsResult, err := inst.HandleIMSMessage(context.Background(), voicehost.IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		CallID:      "sms-downlink-1",
+		ContentType: messaging.IMS3GPPSMSContentType,
+		Body:        body,
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if imsResult.StatusCode != 200 || imsResult.ContentType != messaging.IMS3GPPSMSContentType || string(imsResult.Body) != string(messaging.BuildSMSRPAck(0x33)) {
+		t.Fatalf("imsResult=%+v", imsResult)
+	}
+	if len(dispatch.events) != 2 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	got, ok := dispatch.events[1].(eventhost.SMSReceived)
+	if !ok || got.Sender != "10086" || got.Content != "hello" {
+		t.Fatalf("event=%+v", dispatch.events[1])
 	}
 }
 

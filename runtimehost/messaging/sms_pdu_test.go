@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildSMSSubmitTPDUGSM7(t *testing.T) {
@@ -68,4 +69,67 @@ func TestBuildSMSSubmitTPDUGSM7WithUDH(t *testing.T) {
 	if len(tpdu) != 13+140 {
 		t.Fatalf("TPDU length=%d want %d", len(tpdu), 153)
 	}
+}
+
+func TestParseSMSRPDUAckAndError(t *testing.T) {
+	ack, err := ParseSMSRPDU(BuildSMSRPAck(0x22))
+	if err != nil {
+		t.Fatalf("ParseSMSRPDU(ack) error = %v", err)
+	}
+	if ack.Kind != SMSRPDUKindAck || ack.MR != 0x22 {
+		t.Fatalf("ack=%+v", ack)
+	}
+	errRPDU, err := ParseSMSRPDU(BuildSMSRPError(0x23, SMSRPCauseTemporaryFailure))
+	if err != nil {
+		t.Fatalf("ParseSMSRPDU(error) error = %v", err)
+	}
+	if errRPDU.Kind != SMSRPDUKindError || errRPDU.MR != 0x23 || errRPDU.Cause != int(SMSRPCauseTemporaryFailure) {
+		t.Fatalf("error rpdu=%+v", errRPDU)
+	}
+}
+
+func TestParseSMSDeliverTPDUGSM7(t *testing.T) {
+	tpdu := mustHex(t, "0005810180F600006270502143650005E8329BFD06")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	if deliver.Sender != "10086" || deliver.Text != "hello" {
+		t.Fatalf("deliver=%+v", deliver)
+	}
+	want := time.Date(2026, 7, 5, 12, 34, 56, 0, time.FixedZone("", 0))
+	if !deliver.Timestamp.Equal(want) {
+		t.Fatalf("timestamp=%s want %s", deliver.Timestamp, want)
+	}
+}
+
+func TestParseSMSDeliverTPDUUCS2WithConcatUDH(t *testing.T) {
+	tpdu := mustHex(t, "4005810180F6000862705021436500080500037A02014F60")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	if deliver.Text != "你" || !deliver.Concat.IsConcat || deliver.Concat.Ref != 0x7a || deliver.Concat.Total != 2 || deliver.Concat.Seq != 1 {
+		t.Fatalf("deliver=%+v", deliver)
+	}
+}
+
+func TestParseSMSStatusReportTPDU(t *testing.T) {
+	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000000")
+	report, err := ParseSMSStatusReportTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSStatusReportTPDU() error = %v", err)
+	}
+	if report.Reference != 7 || report.Recipient != "+18005551212" || report.Status != 0 || report.State != "delivered" {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
+func mustHex(tb testing.TB, s string) []byte {
+	tb.Helper()
+	out, err := hex.DecodeString(s)
+	if err != nil {
+		tb.Fatalf("DecodeString(%q) error = %v", s, err)
+	}
+	return out
 }

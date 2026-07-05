@@ -4,10 +4,57 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf16"
 )
 
 const IMS3GPPSMSContentType = "application/vnd.3gpp.sms"
+const SMSRPCauseTemporaryFailure byte = 41
+
+type SMSRPDUKind string
+
+const (
+	SMSRPDUKindUnknown SMSRPDUKind = "UNKNOWN"
+	SMSRPDUKindData    SMSRPDUKind = "RP-DATA"
+	SMSRPDUKindAck     SMSRPDUKind = "RP-ACK"
+	SMSRPDUKindError   SMSRPDUKind = "RP-ERROR"
+)
+
+type SMSRPDU struct {
+	Kind        SMSRPDUKind
+	RawType     byte
+	MR          byte
+	Cause       int
+	Originator  string
+	Destination string
+	TPDU        []byte
+}
+
+type SMSConcatInfo struct {
+	IsConcat bool
+	Ref      int
+	RefBits  int
+	Total    int
+	Seq      int
+}
+
+type SMSDeliver struct {
+	Sender    string
+	Recipient string
+	Text      string
+	Timestamp time.Time
+	Concat    SMSConcatInfo
+	RawTPDU   []byte
+}
+
+type SMSStatusReport struct {
+	Reference byte
+	Recipient string
+	Timestamp time.Time
+	DoneAt    time.Time
+	Status    byte
+	State     string
+}
 
 func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 	number := normalizeSMSNumber(to)
@@ -53,42 +100,210 @@ func BuildSMSRPData(rpMR byte, smsc string, tpdu []byte) ([]byte, error) {
 }
 
 func ParseSMSRPData(body []byte) (rpMR byte, tpdu []byte, err error) {
-	if len(body) < 5 {
-		return 0, nil, errors.New("RP-DATA too short")
+	rpdu, err := ParseSMSRPDU(body)
+	if err != nil {
+		return 0, nil, err
 	}
-	if body[0] != 0x00 && body[0] != 0x01 {
-		return 0, nil, fmt.Errorf("not RP-DATA: 0x%02x", body[0])
+	if rpdu.Kind != SMSRPDUKindData {
+		return 0, nil, fmt.Errorf("not RP-DATA: 0x%02x", rpdu.RawType)
+	}
+	return rpdu.MR, append([]byte(nil), rpdu.TPDU...), nil
+}
+
+func ParseSMSRPDU(body []byte) (SMSRPDU, error) {
+	if len(body) < 2 {
+		return SMSRPDU{}, errors.New("RPDU too short")
+	}
+	rpdu := SMSRPDU{RawType: body[0], MR: body[1], Kind: SMSRPDUKindUnknown}
+	switch body[0] {
+	case 0x00, 0x01:
+		rpdu.Kind = SMSRPDUKindData
+		originator, destination, tpdu, err := parseSMSRPDataFields(body)
+		if err != nil {
+			return SMSRPDU{}, err
+		}
+		rpdu.Originator = originator
+		rpdu.Destination = destination
+		rpdu.TPDU = tpdu
+	case 0x02, 0x03:
+		rpdu.Kind = SMSRPDUKindAck
+	case 0x04, 0x05:
+		rpdu.Kind = SMSRPDUKindError
+		cause, err := ParseSMSRPErrorCause(body)
+		if err != nil {
+			return SMSRPDU{}, err
+		}
+		rpdu.Cause = int(cause)
+	default:
+		return SMSRPDU{}, fmt.Errorf("unsupported RPDU type: 0x%02x", body[0])
+	}
+	return rpdu, nil
+}
+
+func parseSMSRPDataFields(body []byte) (originator string, destination string, tpdu []byte, err error) {
+	if len(body) < 5 {
+		return "", "", nil, errors.New("RP-DATA too short")
 	}
 	i := 1
-	rpMR = body[i]
-	i++
+	i++ // RP-MR
 	if i >= len(body) {
-		return 0, nil, errors.New("RP originator address missing")
+		return "", "", nil, errors.New("RP originator address missing")
 	}
 	oaLen := int(body[i])
 	i++
 	if i+oaLen > len(body) {
-		return 0, nil, errors.New("RP originator address truncated")
+		return "", "", nil, errors.New("RP originator address truncated")
+	}
+	if oaLen > 0 {
+		originator, _ = decodeRPAddressValue(body[i : i+oaLen])
 	}
 	i += oaLen
 	if i >= len(body) {
-		return 0, nil, errors.New("RP destination address missing")
+		return "", "", nil, errors.New("RP destination address missing")
 	}
 	daLen := int(body[i])
 	i++
 	if i+daLen > len(body) {
-		return 0, nil, errors.New("RP destination address truncated")
+		return "", "", nil, errors.New("RP destination address truncated")
+	}
+	if daLen > 0 {
+		destination, _ = decodeRPAddressValue(body[i : i+daLen])
 	}
 	i += daLen
 	if i >= len(body) {
-		return 0, nil, errors.New("RP user data missing")
+		return "", "", nil, errors.New("RP user data missing")
 	}
 	udLen := int(body[i])
 	i++
 	if i+udLen > len(body) {
-		return 0, nil, errors.New("RP user data truncated")
+		return "", "", nil, errors.New("RP user data truncated")
 	}
-	return rpMR, append([]byte(nil), body[i:i+udLen]...), nil
+	return originator, destination, append([]byte(nil), body[i:i+udLen]...), nil
+}
+
+func ParseSMSRPErrorCause(body []byte) (byte, error) {
+	if len(body) < 4 {
+		return 0, errors.New("RP-ERROR too short")
+	}
+	if body[0] != 0x04 && body[0] != 0x05 {
+		return 0, fmt.Errorf("not RP-ERROR: 0x%02x", body[0])
+	}
+	causeLen := int(body[2])
+	if causeLen <= 0 {
+		return 0, errors.New("RP-ERROR cause IE empty")
+	}
+	if 3+causeLen > len(body) {
+		return 0, errors.New("RP-ERROR cause IE truncated")
+	}
+	return body[3] & 0x7f, nil
+}
+
+func BuildSMSRPAck(rpMR byte) []byte {
+	return []byte{0x02, rpMR}
+}
+
+func BuildSMSRPError(rpMR byte, cause byte) []byte {
+	return []byte{0x04, rpMR, 0x01, cause, 0x00}
+}
+
+func ParseSMSDeliverTPDU(tpdu []byte) (SMSDeliver, error) {
+	raw := append([]byte(nil), tpdu...)
+	if len(tpdu) < 12 {
+		return SMSDeliver{}, errors.New("SMS-DELIVER TPDU too short")
+	}
+	firstOctet := tpdu[0]
+	if firstOctet&0x03 != 0x00 {
+		return SMSDeliver{}, fmt.Errorf("not SMS-DELIVER TPDU: 0x%02x", firstOctet&0x03)
+	}
+	i := 1
+	oaDigits := int(tpdu[i])
+	i++
+	if i >= len(tpdu) {
+		return SMSDeliver{}, errors.New("SMS-DELIVER originator address type missing")
+	}
+	oaTOA := tpdu[i]
+	i++
+	oaOctets := (oaDigits + 1) / 2
+	if i+oaOctets > len(tpdu) {
+		return SMSDeliver{}, errors.New("SMS-DELIVER originator address truncated")
+	}
+	sender, err := decodeSMSAddress(oaDigits, oaTOA, tpdu[i:i+oaOctets])
+	if err != nil {
+		return SMSDeliver{}, err
+	}
+	i += oaOctets
+	if i+10 > len(tpdu) {
+		return SMSDeliver{}, errors.New("SMS-DELIVER fields truncated")
+	}
+	i++ // PID
+	dcs := tpdu[i]
+	i++
+	ts, err := decodeSMSTimestamp(tpdu[i : i+7])
+	if err != nil {
+		return SMSDeliver{}, err
+	}
+	i += 7
+	udl := int(tpdu[i])
+	i++
+	if i > len(tpdu) {
+		return SMSDeliver{}, errors.New("SMS-DELIVER user data missing")
+	}
+	text, concat, err := decodeSMSUserData(tpdu[i:], udl, dcs, firstOctet&0x40 != 0)
+	if err != nil {
+		return SMSDeliver{}, err
+	}
+	return SMSDeliver{
+		Sender:    sender,
+		Text:      text,
+		Timestamp: ts,
+		Concat:    concat,
+		RawTPDU:   raw,
+	}, nil
+}
+
+func ParseSMSStatusReportTPDU(tpdu []byte) (SMSStatusReport, error) {
+	if len(tpdu) < 17 {
+		return SMSStatusReport{}, errors.New("SMS-STATUS-REPORT TPDU too short")
+	}
+	if tpdu[0]&0x03 != 0x02 {
+		return SMSStatusReport{}, fmt.Errorf("not SMS-STATUS-REPORT TPDU: 0x%02x", tpdu[0]&0x03)
+	}
+	i := 1
+	report := SMSStatusReport{Reference: tpdu[i]}
+	i++
+	raDigits := int(tpdu[i])
+	i++
+	if i >= len(tpdu) {
+		return SMSStatusReport{}, errors.New("SMS-STATUS-REPORT recipient address type missing")
+	}
+	raTOA := tpdu[i]
+	i++
+	raOctets := (raDigits + 1) / 2
+	if i+raOctets > len(tpdu) {
+		return SMSStatusReport{}, errors.New("SMS-STATUS-REPORT recipient address truncated")
+	}
+	recipient, err := decodeSMSAddress(raDigits, raTOA, tpdu[i:i+raOctets])
+	if err != nil {
+		return SMSStatusReport{}, err
+	}
+	report.Recipient = recipient
+	i += raOctets
+	if i+15 > len(tpdu) {
+		return SMSStatusReport{}, errors.New("SMS-STATUS-REPORT timestamps truncated")
+	}
+	report.Timestamp, err = decodeSMSTimestamp(tpdu[i : i+7])
+	if err != nil {
+		return SMSStatusReport{}, err
+	}
+	i += 7
+	report.DoneAt, err = decodeSMSTimestamp(tpdu[i : i+7])
+	if err != nil {
+		return SMSStatusReport{}, err
+	}
+	i += 7
+	report.Status = tpdu[i]
+	report.State = smsStatusReportState(report.Status)
+	return report, nil
 }
 
 func encodeSMSUserData(text, encoding string, udh []byte) ([]byte, int, byte, error) {
@@ -180,6 +395,27 @@ func packSeptets(septets []byte, bitOffset int) []byte {
 	return out
 }
 
+func unpackSeptets(data []byte, septetCount int, bitOffset int) []byte {
+	if septetCount <= 0 {
+		return nil
+	}
+	out := make([]byte, 0, septetCount)
+	for i := 0; i < septetCount; i++ {
+		bitPos := bitOffset + i*7
+		bytePos := bitPos / 8
+		shift := bitPos % 8
+		if bytePos >= len(data) {
+			break
+		}
+		value := (data[bytePos] >> shift) & 0x7f
+		if shift > 1 && bytePos+1 < len(data) {
+			value |= (data[bytePos+1] << (8 - shift)) & 0x7f
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
 func encodeRPAddress(number string) ([]byte, error) {
 	number = normalizeSMSNumber(number)
 	if number == "" {
@@ -193,6 +429,13 @@ func encodeRPAddress(number string) ([]byte, error) {
 	out = append(out, byte(1+len(bcd)), toa)
 	out = append(out, bcd...)
 	return out, nil
+}
+
+func decodeRPAddressValue(value []byte) (string, error) {
+	if len(value) == 0 {
+		return "", nil
+	}
+	return decodeSMSAddress((len(value)-1)*2, value[0], value[1:])
 }
 
 func encodeSMSAddress(number string) (digits int, toa byte, bcd []byte, err error) {
@@ -229,6 +472,36 @@ func encodeSMSAddress(number string) (digits int, toa byte, bcd []byte, err erro
 	return digits, toa, bcd, nil
 }
 
+func decodeSMSAddress(digits int, toa byte, bcd []byte) (string, error) {
+	if digits < 0 {
+		return "", errors.New("sms address digit count is invalid")
+	}
+	var b strings.Builder
+	if toa&0x70 == 0x10 {
+		b.WriteByte('+')
+	}
+	written := 0
+	for _, item := range bcd {
+		for _, nibble := range []byte{item & 0x0f, (item >> 4) & 0x0f} {
+			if written >= digits {
+				break
+			}
+			if nibble == 0x0f {
+				return b.String(), nil
+			}
+			if nibble > 9 {
+				return "", fmt.Errorf("invalid BCD digit: 0x%x", nibble)
+			}
+			b.WriteByte('0' + nibble)
+			written++
+		}
+	}
+	if written < digits {
+		return "", errors.New("sms address truncated")
+	}
+	return b.String(), nil
+}
+
 func normalizeSMSNumber(value string) string {
 	value = strings.TrimSpace(value)
 	lower := strings.ToLower(value)
@@ -261,4 +534,202 @@ func normalizeSMSNumber(value string) string {
 		}
 	}
 	return b.String()
+}
+
+func decodeSMSUserData(data []byte, udl int, dcs byte, hasUDH bool) (string, SMSConcatInfo, error) {
+	if udl < 0 {
+		return "", SMSConcatInfo{}, errors.New("SMS user data length is invalid")
+	}
+	udh, payload, headerSeptets, concat, err := splitSMSUDH(data, hasUDH)
+	if err != nil {
+		return "", SMSConcatInfo{}, err
+	}
+	switch smsDCSAlphabet(dcs) {
+	case "ucs2":
+		payloadOctets := udl
+		if hasUDH {
+			payloadOctets -= len(udh)
+		}
+		if payloadOctets < 0 || payloadOctets > len(payload) {
+			payloadOctets = len(payload)
+		}
+		text, err := decodeUCS2(payload[:payloadOctets])
+		return text, concat, err
+	case "8bit":
+		payloadOctets := udl
+		if hasUDH {
+			payloadOctets -= len(udh)
+		}
+		if payloadOctets < 0 || payloadOctets > len(payload) {
+			payloadOctets = len(payload)
+		}
+		return strings.ToValidUTF8(string(payload[:payloadOctets]), ""), concat, nil
+	default:
+		septets := udl
+		if hasUDH {
+			septets -= headerSeptets
+		}
+		if septets < 0 {
+			septets = 0
+		}
+		fillBits := 0
+		if hasUDH {
+			fillBits = (7 - ((len(udh) * 8) % 7)) % 7
+		}
+		return decodeGSM7(unpackSeptets(payload, septets, fillBits)), concat, nil
+	}
+}
+
+func splitSMSUDH(data []byte, hasUDH bool) (udh []byte, payload []byte, headerSeptets int, concat SMSConcatInfo, err error) {
+	if !hasUDH {
+		return nil, data, 0, SMSConcatInfo{}, nil
+	}
+	if len(data) == 0 {
+		return nil, nil, 0, SMSConcatInfo{}, errors.New("SMS UDH length missing")
+	}
+	headerLen := int(data[0]) + 1
+	if headerLen > len(data) {
+		return nil, nil, 0, SMSConcatInfo{}, errors.New("SMS UDH truncated")
+	}
+	udh = append([]byte(nil), data[:headerLen]...)
+	concat = parseSMSConcatUDH(udh)
+	headerSeptets = (headerLen*8 + 6) / 7
+	return udh, data[headerLen:], headerSeptets, concat, nil
+}
+
+func parseSMSConcatUDH(udh []byte) SMSConcatInfo {
+	if len(udh) < 2 {
+		return SMSConcatInfo{}
+	}
+	for i := 1; i+1 < len(udh); {
+		iei := udh[i]
+		iedl := int(udh[i+1])
+		i += 2
+		if i+iedl > len(udh) {
+			return SMSConcatInfo{}
+		}
+		ie := udh[i : i+iedl]
+		switch {
+		case iei == 0x00 && len(ie) == 3 && ie[1] > 1:
+			return SMSConcatInfo{IsConcat: true, Ref: int(ie[0]), RefBits: 8, Total: int(ie[1]), Seq: int(ie[2])}
+		case iei == 0x08 && len(ie) == 4 && ie[2] > 1:
+			return SMSConcatInfo{IsConcat: true, Ref: int(ie[0])<<8 | int(ie[1]), RefBits: 16, Total: int(ie[2]), Seq: int(ie[3])}
+		}
+		i += iedl
+	}
+	return SMSConcatInfo{}
+}
+
+func smsDCSAlphabet(dcs byte) string {
+	switch dcs & 0x0c {
+	case 0x08:
+		return "ucs2"
+	case 0x04:
+		return "8bit"
+	default:
+		return "gsm7"
+	}
+}
+
+func decodeGSM7(septets []byte) string {
+	var b strings.Builder
+	for i := 0; i < len(septets); i++ {
+		code := int(septets[i] & 0x7f)
+		if code == 0x1b && i+1 < len(septets) {
+			if r, ok := gsm7ExtensionRune(septets[i+1] & 0x7f); ok {
+				b.WriteRune(r)
+				i++
+				continue
+			}
+		}
+		if code >= 0 && code < len(gsm7BasicAlphabet) {
+			b.WriteRune(gsm7BasicAlphabet[code])
+		}
+	}
+	return b.String()
+}
+
+func gsm7ExtensionRune(code byte) (rune, bool) {
+	switch code {
+	case 0x0a:
+		return '\f', true
+	case 0x14:
+		return '^', true
+	case 0x28:
+		return '{', true
+	case 0x29:
+		return '}', true
+	case 0x2f:
+		return '\\', true
+	case 0x3c:
+		return '[', true
+	case 0x3d:
+		return '~', true
+	case 0x3e:
+		return ']', true
+	case 0x40:
+		return '|', true
+	case 0x65:
+		return '€', true
+	default:
+		return 0, false
+	}
+}
+
+func decodeUCS2(data []byte) (string, error) {
+	if len(data)%2 != 0 {
+		return "", errors.New("UCS2 payload has odd length")
+	}
+	units := make([]uint16, 0, len(data)/2)
+	for i := 0; i+1 < len(data); i += 2 {
+		units = append(units, uint16(data[i])<<8|uint16(data[i+1]))
+	}
+	return string(utf16.Decode(units)), nil
+}
+
+func decodeSMSTimestamp(raw []byte) (time.Time, error) {
+	if len(raw) != 7 {
+		return time.Time{}, errors.New("SMS timestamp must be 7 octets")
+	}
+	year := decodeSemiOctetDecimal(raw[0])
+	month := decodeSemiOctetDecimal(raw[1])
+	day := decodeSemiOctetDecimal(raw[2])
+	hour := decodeSemiOctetDecimal(raw[3])
+	minute := decodeSemiOctetDecimal(raw[4])
+	second := decodeSemiOctetDecimal(raw[5])
+	tzOctet := raw[6]
+	negative := tzOctet&0x08 != 0
+	tzOctet &^= 0x08
+	tzQuarterHours := decodeSemiOctetDecimal(tzOctet)
+	if year < 0 || month <= 0 || month > 12 || day <= 0 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 || tzQuarterHours < 0 {
+		return time.Time{}, errors.New("SMS timestamp contains invalid BCD")
+	}
+	fullYear := 2000 + year
+	if year >= 90 {
+		fullYear = 1900 + year
+	}
+	offset := tzQuarterHours * 15 * 60
+	if negative {
+		offset = -offset
+	}
+	return time.Date(fullYear, time.Month(month), day, hour, minute, second, 0, time.FixedZone("", offset)), nil
+}
+
+func decodeSemiOctetDecimal(value byte) int {
+	lo := int(value & 0x0f)
+	hi := int((value >> 4) & 0x0f)
+	if lo > 9 || hi > 9 {
+		return -1
+	}
+	return lo*10 + hi
+}
+
+func smsStatusReportState(status byte) string {
+	if status <= 0x1f {
+		return "delivered"
+	}
+	if status >= 0x40 {
+		return "failed"
+	}
+	return "accepted"
 }
