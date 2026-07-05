@@ -116,3 +116,66 @@ func TestIMSUSSDTransportCancelSendsBye(t *testing.T) {
 		t.Fatalf("bye=%+v", bye)
 	}
 }
+
+func TestIMSUSSDTransportHandlesInboundInfoAndBye(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers: map[string][]string{
+			"To":      {"<sip:*100%23@ims.example;user=dialstring>;tag=as-tag"},
+			"Contact": {"<sip:ussd-as@ims.example>"},
+		},
+	}}}
+	ussd := &IMSUSSDTransport{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	svc.SetUSSDTransport(ussd)
+	first, err := svc.SendUSSD(context.Background(), "*100#")
+	if err != nil {
+		t.Fatalf("SendUSSD() error = %v", err)
+	}
+	if first.Done || !svc.hasUSSDSession(first.SessionID) {
+		t.Fatalf("first=%+v active=%v", first, svc.hasUSSDSession(first.SessionID))
+	}
+
+	menuXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "1. Balance\n2. Data", Operation: IMSUSSDOperationRequest})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML(menu) error = %v", err)
+	}
+	info, err := svc.HandleIMSUSSDInfo(context.Background(), IMSUSSDDialogRequest{
+		CallID:      "ussd-" + smsToken(first.SessionID) + "@vowifi-go",
+		CSeq:        2,
+		ContentType: IMSUSSDContentType,
+		InfoPackage: IMSUSSDInfoPackage,
+		Body:        menuXML,
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSUSSDInfo() error = %v", err)
+	}
+	if !info.Handled || info.StatusCode != 200 || info.USSD.Text != "1. Balance\n2. Data" || info.USSD.Done || !svc.hasUSSDSession(first.SessionID) {
+		t.Fatalf("info=%+v active=%v", info, svc.hasUSSDSession(first.SessionID))
+	}
+
+	byeXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "Bye", Operation: IMSUSSDOperationNotify})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML(bye) error = %v", err)
+	}
+	bye, err := svc.HandleIMSUSSDBye(context.Background(), IMSUSSDDialogRequest{
+		CallID:      "ussd-" + smsToken(first.SessionID) + "@vowifi-go",
+		CSeq:        3,
+		ContentType: IMSUSSDContentType,
+		Body:        byeXML,
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSUSSDBye() error = %v", err)
+	}
+	if !bye.Handled || bye.StatusCode != 200 || bye.USSD.Text != "Bye" || !bye.USSD.Done || svc.hasUSSDSession(first.SessionID) {
+		t.Fatalf("bye=%+v active=%v", bye, svc.hasUSSDSession(first.SessionID))
+	}
+}

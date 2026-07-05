@@ -431,6 +431,60 @@ func TestInstanceHandlesIncomingSMSAndDeliveryReport(t *testing.T) {
 	}
 }
 
+func TestInstanceHandlesIMSUSSDInfoAndBye(t *testing.T) {
+	transport := &runtimeUSSDTransport{
+		infoResult: messaging.IMSUSSDDialogResult{
+			Handled:    true,
+			StatusCode: 200,
+			USSD:       messaging.USSDResult{SessionID: "ussd-1", Text: "1. Balance", Done: false},
+		},
+		byeResult: messaging.IMSUSSDDialogResult{
+			Handled:    true,
+			StatusCode: 200,
+			USSD:       messaging.USSDResult{SessionID: "ussd-1", Text: "Bye", Done: true},
+		},
+	}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503"},
+		USSDTransport: transport,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	info, err := inst.HandleIMSInfo(context.Background(), voicehost.IMSInfoRequest{
+		CallID:      "ussd-call",
+		CSeq:        2,
+		ContentType: messaging.IMSUSSDContentType,
+		InfoPackage: messaging.IMSUSSDInfoPackage,
+		Body:        []byte(`<ussd-data><ussd-string>1. Balance</ussd-string><UnstructuredSS-Request/></ussd-data>`),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSInfo() error = %v", err)
+	}
+	if !info.Handled || info.StatusCode != 200 || len(transport.infoRequests) != 1 {
+		t.Fatalf("info=%+v transport=%+v", info, transport)
+	}
+	if _, err := inst.Service().ContinueUSSD(context.Background(), "ussd-1", "1"); err != nil {
+		t.Fatalf("ContinueUSSD() after INFO error = %v", err)
+	}
+	bye, err := inst.HandleIMSBye(context.Background(), voicehost.IMSByeRequest{
+		CallID:      "ussd-call",
+		CSeq:        3,
+		ContentType: messaging.IMSUSSDContentType,
+		Body:        []byte(`<ussd-data><ussd-string>Bye</ussd-string><UnstructuredSS-Notify/></ussd-data>`),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSBye() error = %v", err)
+	}
+	if !bye.Handled || bye.StatusCode != 200 || len(transport.byeRequests) != 1 {
+		t.Fatalf("bye=%+v transport=%+v", bye, transport)
+	}
+	if _, err := inst.Service().ContinueUSSD(context.Background(), "ussd-1", "1"); err == nil {
+		t.Fatal("ContinueUSSD() err=nil after BYE, want inactive session")
+	}
+}
+
 type runtimeSMSTransport struct {
 	requests []messaging.SMSSendRequest
 }
@@ -510,6 +564,10 @@ func (s *runtimeTunnelSession) Close(ctx context.Context) error {
 
 type runtimeUSSDTransport struct {
 	executeRequests []messaging.USSDRequest
+	infoRequests    []messaging.IMSUSSDDialogRequest
+	byeRequests     []messaging.IMSUSSDDialogRequest
+	infoResult      messaging.IMSUSSDDialogResult
+	byeResult       messaging.IMSUSSDDialogResult
 }
 
 type runtimeDispatcher struct {
@@ -558,11 +616,27 @@ func (t *runtimeUSSDTransport) ExecuteUSSD(ctx context.Context, req messaging.US
 }
 
 func (t *runtimeUSSDTransport) ContinueUSSD(ctx context.Context, req messaging.USSDRequest) (messaging.USSDResult, error) {
-	return messaging.USSDResult{Text: "continued", Done: true}, nil
+	return messaging.USSDResult{Text: "continued", Done: false}, nil
 }
 
 func (t *runtimeUSSDTransport) CancelUSSD(ctx context.Context, req messaging.USSDRequest) error {
 	return nil
+}
+
+func (t *runtimeUSSDTransport) HandleIMSInfo(ctx context.Context, req messaging.IMSUSSDDialogRequest) (messaging.IMSUSSDDialogResult, error) {
+	t.infoRequests = append(t.infoRequests, req)
+	if t.infoResult.StatusCode == 0 {
+		t.infoResult = messaging.IMSUSSDDialogResult{Handled: true, StatusCode: 200, USSD: messaging.USSDResult{SessionID: "ussd-1", Done: false}}
+	}
+	return t.infoResult, nil
+}
+
+func (t *runtimeUSSDTransport) HandleIMSBye(ctx context.Context, req messaging.IMSUSSDDialogRequest) (messaging.IMSUSSDDialogResult, error) {
+	t.byeRequests = append(t.byeRequests, req)
+	if t.byeResult.StatusCode == 0 {
+		t.byeResult = messaging.IMSUSSDDialogResult{Handled: true, StatusCode: 200, USSD: messaging.USSDResult{SessionID: "ussd-1", Done: true}}
+	}
+	return t.byeResult, nil
 }
 
 func (t *runtimeSMSTransport) SendSMSPart(ctx context.Context, req messaging.SMSSendRequest) (messaging.SMSSendResult, error) {

@@ -95,6 +95,9 @@ func TestBuildRegisterHeaders(t *testing.T) {
 	if !strings.Contains(headers["Security-Client"], "ipsec-3gpp") {
 		t.Fatalf("Security-Client=%q", headers["Security-Client"])
 	}
+	if !strings.Contains(headers["Allow"], "INFO") {
+		t.Fatalf("Allow=%q", headers["Allow"])
+	}
 }
 
 func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {

@@ -439,6 +439,80 @@ func TestIMSInboundWireServerDispatchesMessage(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerDispatchesInfoAndUSSDBye(t *testing.T) {
+	var handledInfo IMSInfoRequest
+	var handledBye IMSByeRequest
+	server := &IMSInboundWireServer{
+		InfoHandler: IMSInfoHandlerFunc(func(ctx context.Context, req IMSInfoRequest) (IMSInfoResult, error) {
+			handledInfo = req
+			return IMSInfoResult{Handled: true, StatusCode: 200, Reason: "OK"}, nil
+		}),
+		ByeHandler: IMSByeHandlerFunc(func(ctx context.Context, req IMSByeRequest) (IMSByeResult, error) {
+			handledBye = req
+			return IMSByeResult{Handled: true, StatusCode: 200, Reason: "OK"}, nil
+		}),
+	}
+	info := voiceclient.SIPIncomingRequest{
+		Method: "INFO",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID":      {"ussd-call-1"},
+			"CSeq":         {"2 INFO"},
+			"From":         {"<sip:ussd-as@ims.example>;tag=as"},
+			"To":           {"<sip:user@ims.example>;tag=ue"},
+			"Content-Type": {"application/vnd.3gpp.ussd+xml"},
+			"Info-Package": {"g.3gpp.ussd"},
+		},
+		Body: []byte(`<ussd-data><ussd-string>menu</ussd-string><UnstructuredSS-Request/></ussd-data>`),
+	}
+	responses, err := server.HandleRequest(context.Background(), info)
+	if err != nil {
+		t.Fatalf("HandleRequest(INFO) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 {
+		t.Fatalf("INFO responses=%+v", responses)
+	}
+	if handledInfo.CallID != "ussd-call-1" || handledInfo.CSeq != 2 || handledInfo.InfoPackage != "g.3gpp.ussd" || handledInfo.ContentType != "application/vnd.3gpp.ussd+xml" {
+		t.Fatalf("handledInfo=%+v", handledInfo)
+	}
+	bye := voiceclient.SIPIncomingRequest{
+		Method: "BYE",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID":      {"ussd-call-1"},
+			"CSeq":         {"3 BYE"},
+			"From":         {"<sip:ussd-as@ims.example>;tag=as"},
+			"To":           {"<sip:user@ims.example>;tag=ue"},
+			"Content-Type": {"application/vnd.3gpp.ussd+xml"},
+		},
+		Body: []byte(`<ussd-data><ussd-string>bye</ussd-string><UnstructuredSS-Notify/></ussd-data>`),
+	}
+	responses, err = server.HandleRequest(context.Background(), bye)
+	if err != nil {
+		t.Fatalf("HandleRequest(BYE) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 {
+		t.Fatalf("BYE responses=%+v", responses)
+	}
+	if handledBye.CallID != "ussd-call-1" || handledBye.CSeq != 3 || handledBye.ContentType != "application/vnd.3gpp.ussd+xml" {
+		t.Fatalf("handledBye=%+v", handledBye)
+	}
+	options, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+		Method: "OPTIONS",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID": {"options-info"},
+			"CSeq":    {"1 OPTIONS"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleRequest(OPTIONS) error = %v", err)
+	}
+	if len(options) != 1 || !strings.Contains(options[0].Headers["Allow"], "INFO") || !strings.Contains(options[0].Headers["Accept"], "application/vnd.3gpp.ussd+xml") {
+		t.Fatalf("options=%+v", options)
+	}
+}
+
 func TestIMSInboundWireServerRejectsMessageWithoutHandler(t *testing.T) {
 	server := &IMSInboundWireServer{}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{

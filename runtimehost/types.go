@@ -581,6 +581,57 @@ func (i *Instance) HandleIMSMessage(ctx context.Context, req voicehost.IMSMessag
 	}, err
 }
 
+func (i *Instance) HandleIMSInfo(ctx context.Context, req voicehost.IMSInfoRequest) (voicehost.IMSInfoResult, error) {
+	svc := i.Service()
+	if svc == nil {
+		return voicehost.IMSInfoResult{Handled: true, StatusCode: 503, Reason: "messaging service is nil"}, errors.New("messaging service is nil")
+	}
+	res, err := svc.HandleIMSUSSDInfo(ctx, messaging.IMSUSSDDialogRequest{
+		URI:         req.URI,
+		FromURI:     req.FromURI,
+		ToURI:       req.ToURI,
+		CallID:      req.CallID,
+		CSeq:        req.CSeq,
+		ContentType: req.ContentType,
+		InfoPackage: req.InfoPackage,
+		Body:        append([]byte(nil), req.Body...),
+		Headers:     cloneRuntimeSIPHeaders(req.Headers),
+	})
+	return voicehost.IMSInfoResult{
+		Handled:     res.Handled,
+		StatusCode:  res.StatusCode,
+		Reason:      res.Reason,
+		ContentType: res.ContentType,
+		Body:        append([]byte(nil), res.Body...),
+		Headers:     cloneRuntimeHeaderMap(res.Headers),
+	}, err
+}
+
+func (i *Instance) HandleIMSBye(ctx context.Context, req voicehost.IMSByeRequest) (voicehost.IMSByeResult, error) {
+	svc := i.Service()
+	if svc == nil {
+		return voicehost.IMSByeResult{Handled: true, StatusCode: 503, Reason: "messaging service is nil"}, errors.New("messaging service is nil")
+	}
+	res, err := svc.HandleIMSUSSDBye(ctx, messaging.IMSUSSDDialogRequest{
+		URI:         req.URI,
+		FromURI:     req.FromURI,
+		ToURI:       req.ToURI,
+		CallID:      req.CallID,
+		CSeq:        req.CSeq,
+		ContentType: req.ContentType,
+		Body:        append([]byte(nil), req.Body...),
+		Headers:     cloneRuntimeSIPHeaders(req.Headers),
+	})
+	return voicehost.IMSByeResult{
+		Handled:     res.Handled,
+		StatusCode:  res.StatusCode,
+		Reason:      res.Reason,
+		ContentType: res.ContentType,
+		Body:        append([]byte(nil), res.Body...),
+		Headers:     cloneRuntimeHeaderMap(res.Headers),
+	}, err
+}
+
 func (i *Instance) State() State {
 	if i == nil {
 		return State{}
@@ -700,6 +751,17 @@ func cloneRuntimeSIPHeaders(headers map[string][]string) map[string][]string {
 	out := make(map[string][]string, len(headers))
 	for key, values := range headers {
 		out[key] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func cloneRuntimeHeaderMap(headers map[string]string) map[string]string {
+	if headers == nil {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for key, value := range headers {
+		out[key] = value
 	}
 	return out
 }
