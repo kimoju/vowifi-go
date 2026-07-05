@@ -74,8 +74,11 @@ protocol layers needed by VoHive:
 - userspace dataplane packet pump and Linux TUN device integration, bridging
   inner IP packets from a TUN device into ESP and writing decrypted ESP payloads
   back to the TUN device
+- Linux TUN dataplane routing helpers for MTU/link setup, inner address
+  assignment, route installation, policy rule installation, cleanup, and
+  best-effort rollback through the `ip` command boundary
 
-Kernel ESP SA installation, route installation/policy routing, SRTP media,
+Kernel ESP SA installation, automatic ePDG route exclusion, SRTP media,
 advanced RTCP feedback handling, and complete inbound IMS call handling are
 still implemented incrementally behind these APIs.
 
