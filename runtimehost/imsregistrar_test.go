@@ -689,7 +689,7 @@ func TestWireIMSRegistrarRecoversRegistrationAfterRefresh503(t *testing.T) {
 	}
 }
 
-func TestWireIMSRegistrarRecoveryFailsOverToNextPCSCF(t *testing.T) {
+func TestWireIMSRegistrarRefreshFailsOverToNextPCSCF(t *testing.T) {
 	first, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("ListenPacket(first) error = %v", err)
@@ -734,7 +734,7 @@ func TestWireIMSRegistrarRecoveryFailsOverToNextPCSCF(t *testing.T) {
 	}()
 
 	secondSeen := make(chan []seenRequest, 1)
-	recovered := make(chan struct{}, 1)
+	refreshed := make(chan struct{}, 1)
 	go func() {
 		var requests []seenRequest
 		buf := make([]byte, 65535)
@@ -752,8 +752,9 @@ func TestWireIMSRegistrarRecoveryFailsOverToNextPCSCF(t *testing.T) {
 				"Contact: <sip:user@192.0.2.10:5060>;expires=60\r\n" +
 				"Content-Length: 0\r\n\r\n"
 			_, _ = second.WriteTo([]byte(resp), addr)
-			if strings.Contains(wire, "Call-ID: trace-pcscf-failover-recovery-1\r\n") {
-				recovered <- struct{}{}
+			if strings.Contains(wire, "Call-ID: trace-pcscf-failover\r\n") &&
+				strings.Contains(wire, "CSeq: 2 REGISTER\r\n") {
+				refreshed <- struct{}{}
 			}
 			if strings.Contains(wire, "Expires: 0\r\n") {
 				secondSeen <- requests
@@ -790,12 +791,12 @@ func TestWireIMSRegistrarRecoveryFailsOverToNextPCSCF(t *testing.T) {
 		t.Fatalf("RegisterIMS() error = %v", err)
 	}
 	select {
-	case <-recovered:
+	case <-refreshed:
 	case <-time.After(time.Second):
 		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		_ = res.Close(closeCtx)
-		t.Fatal("timed out waiting for recovery REGISTER on second P-CSCF")
+		t.Fatal("timed out waiting for refresh REGISTER on second P-CSCF")
 	}
 	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -811,11 +812,13 @@ func TestWireIMSRegistrarRecoveryFailsOverToNextPCSCF(t *testing.T) {
 		!strings.Contains(firstRequests[1].wire, "CSeq: 2 REGISTER\r\n") {
 		t.Fatalf("first P-CSCF requests=%+v", firstRequests)
 	}
-	if len(secondRequests) < 1 || !strings.Contains(secondRequests[0].wire, "Call-ID: trace-pcscf-failover-recovery-1\r\n") {
+	if len(secondRequests) < 1 ||
+		!strings.Contains(secondRequests[0].wire, "Call-ID: trace-pcscf-failover\r\n") ||
+		!strings.Contains(secondRequests[0].wire, "CSeq: 2 REGISTER\r\n") {
 		t.Fatalf("second P-CSCF requests=%+v", secondRequests)
 	}
 	if strings.Contains(secondRequests[0].wire, "Expires: 0\r\n") {
-		t.Fatalf("first second-P-CSCF request was deregister, want recovery REGISTER: %q", secondRequests[0].wire)
+		t.Fatalf("first second-P-CSCF request was deregister, want refresh REGISTER: %q", secondRequests[0].wire)
 	}
 }
 

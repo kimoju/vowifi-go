@@ -45,7 +45,7 @@ func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg Regist
 		timeout = 5 * time.Second
 	}
 	var lastErr error
-	for _, target := range targets {
+	for idx, target := range targets {
 		var resp RegisterResponse
 		var err error
 		switch network {
@@ -57,6 +57,9 @@ func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg Regist
 			return RegisterResponse{}, fmt.Errorf("unsupported SIP register network %q", network)
 		}
 		if err == nil {
+			if sipRegisterTargetFailoverStatus(resp.StatusCode) && idx+1 < len(targets) {
+				continue
+			}
 			return resp, nil
 		}
 		if ctx.Err() != nil {
@@ -357,6 +360,15 @@ func SIPResponseRetryAfter(resp RegisterResponse) time.Duration {
 		return resp.RetryAfter
 	}
 	return SIPRetryAfterDelay(resp.Headers)
+}
+
+func sipRegisterTargetFailoverStatus(code int) bool {
+	switch code {
+	case 408, 430, 480, 500, 502, 503, 504, 580:
+		return true
+	default:
+		return code >= 500 && code < 600
+	}
 }
 
 func SIPRetryAfterDelay(headers map[string][]string) time.Duration {

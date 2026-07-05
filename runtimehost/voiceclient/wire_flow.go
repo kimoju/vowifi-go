@@ -42,15 +42,15 @@ func (f *WireSIPFlow) RoundTripRegister(ctx context.Context, msg RegisterMessage
 		URI:     msg.URI,
 		Headers: cloneStringMap(msg.Headers),
 		Body:    append([]byte(nil), msg.Body...),
-	}, nil)
+	}, nil, sipRegisterTargetFailoverStatus)
 }
 
 func (f *WireSIPFlow) RoundTripRequest(ctx context.Context, msg SIPRequestMessage) (SIPResponse, error) {
-	return f.roundTrip(ctx, msg, nil)
+	return f.roundTrip(ctx, msg, nil, nil)
 }
 
 func (f *WireSIPFlow) RoundTripInvite(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
-	return f.roundTrip(ctx, msg, onProvisional)
+	return f.roundTrip(ctx, msg, onProvisional, nil)
 }
 
 func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) error {
@@ -201,7 +201,7 @@ func (f *WireSIPFlow) ResetToNextTarget() (bool, error) {
 	return switched, err
 }
 
-func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
+func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler, retryStatus func(int) bool) (SIPResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -219,6 +219,17 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 		if attempts >= f.targetCountLocked() {
 			return false
 		}
+		return f.advanceTargetLocked()
+	}
+	shouldRetryResponse := func(resp SIPResponse) bool {
+		if ctx.Err() != nil || retryStatus == nil || !retryStatus(resp.StatusCode) {
+			return false
+		}
+		attempts++
+		if attempts >= f.targetCountLocked() {
+			return false
+		}
+		f.closeConnLocked()
 		return f.advanceTargetLocked()
 	}
 	for {
@@ -278,6 +289,9 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 			if !shouldRetry(err) {
 				return SIPResponse{}, err
 			}
+			continue
+		}
+		if shouldRetryResponse(resp) {
 			continue
 		}
 		return resp, nil
