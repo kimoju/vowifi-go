@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
@@ -19,6 +20,10 @@ type IMSInboundWireServer struct {
 	UserAgent       string
 	ResponseHeaders map[string]string
 	ReadTimeout     time.Duration
+	TransactionTTL  time.Duration
+
+	mu           sync.Mutex
+	transactions map[string]imsInboundWireTransaction
 }
 
 type IMSInboundWireResponse struct {
@@ -27,6 +32,11 @@ type IMSInboundWireResponse struct {
 	Headers    map[string]string
 	Body       []byte
 	NoResponse bool
+}
+
+type imsInboundWireTransaction struct {
+	responses []IMSInboundWireResponse
+	expires   time.Time
 }
 
 func (s *IMSInboundWireServer) ServePacket(ctx context.Context, pc net.PacketConn) error {
@@ -88,9 +98,17 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 		ctx = context.Background()
 	}
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	key := wireTransactionKey(req)
+	if method != "ACK" && key != "" {
+		if responses, ok := s.cachedTransaction(key); ok {
+			return responses, nil
+		}
+	}
+	var responses []IMSInboundWireResponse
+	var err error
 	switch method {
 	case "INVITE":
-		return s.handleInvite(ctx, req)
+		responses, err = s.handleInvite(ctx, req)
 	case "ACK":
 		if s == nil || s.Agent == nil {
 			return nil, ErrIMSInboundAgentNotReady
@@ -98,25 +116,33 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 		return nil, s.Agent.AckInboundCall(ctx, DialogInfo{CallID: wireCallID(req)})
 	case "BYE":
 		if s == nil || s.Agent == nil {
-			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+			break
 		}
 		if err := s.Agent.EndInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); err != nil {
-			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, err.Error()))}, err
+			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, err.Error()))}, err
+			break
 		}
-		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}, nil
+		responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}
 	case "CANCEL":
 		if s == nil || s.Agent == nil {
-			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+			break
 		}
 		if err := s.Agent.CancelInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); err != nil {
-			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, err.Error()))}, err
+			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, err.Error()))}, err
+			break
 		}
-		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}, nil
+		responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}
 	default:
 		resp := wireResponse(405, "Method Not Allowed")
 		resp.Headers["Allow"] = "INVITE, ACK, CANCEL, BYE"
-		return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, nil
+		responses = []IMSInboundWireResponse{s.withResponseHeaders(resp)}
 	}
+	if key != "" && len(responses) > 0 {
+		s.storeTransaction(key, responses)
+	}
+	return responses, err
 }
 
 func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
@@ -266,6 +292,62 @@ func (s *IMSInboundWireServer) readTimeout() time.Duration {
 	return s.ReadTimeout
 }
 
+func (s *IMSInboundWireServer) transactionTTL() time.Duration {
+	if s == nil || s.TransactionTTL <= 0 {
+		return 32 * time.Second
+	}
+	return s.TransactionTTL
+}
+
+func (s *IMSInboundWireServer) cachedTransaction(key string) ([]IMSInboundWireResponse, bool) {
+	if s == nil || strings.TrimSpace(key) == "" {
+		return nil, false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for cachedKey, tx := range s.transactions {
+		if !tx.expires.IsZero() && now.After(tx.expires) {
+			delete(s.transactions, cachedKey)
+		}
+	}
+	tx, ok := s.transactions[key]
+	if !ok || (!tx.expires.IsZero() && now.After(tx.expires)) {
+		return nil, false
+	}
+	return cloneWireResponses(tx.responses), true
+}
+
+func (s *IMSInboundWireServer) storeTransaction(key string, responses []IMSInboundWireResponse) {
+	if s == nil || strings.TrimSpace(key) == "" || len(responses) == 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.transactions == nil {
+		s.transactions = make(map[string]imsInboundWireTransaction)
+	}
+	s.transactions[key] = imsInboundWireTransaction{
+		responses: cloneWireResponses(responses),
+		expires:   time.Now().Add(s.transactionTTL()),
+	}
+	s.mu.Unlock()
+}
+
+func cloneWireResponses(responses []IMSInboundWireResponse) []IMSInboundWireResponse {
+	out := make([]IMSInboundWireResponse, len(responses))
+	for i, resp := range responses {
+		out[i] = resp
+		out[i].Body = append([]byte(nil), resp.Body...)
+		if resp.Headers != nil {
+			out[i].Headers = make(map[string]string, len(resp.Headers))
+			for key, value := range resp.Headers {
+				out[i].Headers[key] = value
+			}
+		}
+	}
+	return out
+}
+
 func taggedWireRequest(req voiceclient.SIPIncomingRequest, tag string) voiceclient.SIPIncomingRequest {
 	out := req
 	out.Headers = cloneSIPHeaders(req.Headers)
@@ -279,6 +361,30 @@ func taggedWireRequest(req voiceclient.SIPIncomingRequest, tag string) voiceclie
 
 func wireCallID(req voiceclient.SIPIncomingRequest) string {
 	return firstVoiceHeader(req.Headers, "Call-ID")
+}
+
+func wireTransactionKey(req voiceclient.SIPIncomingRequest) string {
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	callID := strings.TrimSpace(wireCallID(req))
+	cseq := strings.TrimSpace(firstVoiceHeader(req.Headers, "CSeq"))
+	branch := wireViaBranch(firstVoiceHeader(req.Headers, "Via"))
+	if method == "" || callID == "" || cseq == "" {
+		return ""
+	}
+	if branch == "" {
+		branch = firstVoiceHeader(req.Headers, "Via")
+	}
+	return method + "|" + callID + "|" + cseq + "|" + branch
+}
+
+func wireViaBranch(via string) string {
+	for _, part := range strings.Split(via, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(key), "branch") {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func wireCSeq(req voiceclient.SIPIncomingRequest) int {

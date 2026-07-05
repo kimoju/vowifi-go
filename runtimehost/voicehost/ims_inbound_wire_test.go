@@ -171,6 +171,76 @@ func TestIMSInboundWireServerServesTCPInvite(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerReplaysCachedInviteTransaction(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+	client, err := net.Dial("udp", pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	transport := newWireInboundTransport([]voiceclient.SIPResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+		Body:       []byte(sampleSDP("127.0.0.1", 4002)),
+	}})
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		ReadTimeout:    50 * time.Millisecond,
+		TransactionTTL: time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.ServePacket(ctx, pc)
+	}()
+
+	invite := wireIMSInvite("wire-call-cache", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170)))
+	if _, err := client.Write(invite); err != nil {
+		t.Fatalf("first INVITE Write() error = %v", err)
+	}
+	firstTrying := readUDPWireResponse(t, client)
+	firstOK := readUDPWireResponse(t, client)
+	if firstTrying.StatusCode != 100 || firstOK.StatusCode != 200 {
+		t.Fatalf("first responses=%+v/%+v", firstTrying, firstOK)
+	}
+	_ = transport.readRequest(t)
+
+	if _, err := client.Write(invite); err != nil {
+		t.Fatalf("retransmitted INVITE Write() error = %v", err)
+	}
+	secondTrying := readUDPWireResponse(t, client)
+	secondOK := readUDPWireResponse(t, client)
+	if secondTrying.StatusCode != 100 || secondOK.StatusCode != 200 || string(secondOK.Body) != string(firstOK.Body) {
+		t.Fatalf("cached responses=%+v/%+v first=%+v", secondTrying, secondOK, firstOK)
+	}
+	select {
+	case msg := <-transport.requests:
+		t.Fatalf("unexpected second client INVITE=%+v", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ServePacket() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("ServePacket() did not stop")
+	}
+}
+
 func TestIMSInboundWireServerRejectsUnsupportedMethod(t *testing.T) {
 	server := &IMSInboundWireServer{}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{

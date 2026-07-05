@@ -96,10 +96,11 @@ protocol layers needed by VoHive:
   support RTP relay allocation with IMS-offer/client-answer SDP rewriting
 - wire-level inbound IMS SIP adapters for UDP/TCP listeners, SIP request
   parsing, provisional/final response construction, incoming INVITE/ACK/BYE/
-  CANCEL dispatch, response To-tagging, and loopback-tested socket handling
+  CANCEL dispatch, response To-tagging, transaction response caching for
+  retransmitted requests, and loopback-tested socket handling
 
-Full SIP transaction timer/retransmission handling and advanced IMS feature
-interworking are still implemented incrementally behind these APIs.
+Full SIP transaction timer state machines and advanced IMS feature interworking
+are still implemented incrementally behind these APIs.
 
 ## Development
 
