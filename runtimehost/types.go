@@ -222,6 +222,7 @@ type IMSRegistrationResult struct {
 	SMSTransport   messaging.SMSTransport
 	USSDTransport  messaging.USSDTransport
 	Close          func(context.Context) error
+	Recover        func(context.Context) (IMSRegistrationResult, error)
 }
 
 type IMSRegistrar interface {
@@ -261,17 +262,27 @@ type StartRequest struct {
 	ShouldRun                  func() bool
 }
 
+type runtimeVoiceAgentConfig struct {
+	transport      voiceclient.SIPRequestTransport
+	userAgent      string
+	sessionExpires int
+	mediaRelay     *voicehost.RTPRelayConfig
+}
+
 type Instance struct {
-	mu        sync.RWMutex
-	state     State
-	service   *messaging.Service
-	observers []Observer
-	notifier  func(string)
-	smsNotify func(deviceID, sender, content string, ts time.Time)
-	tunnel    swu.TunnelSession
-	voice     voicehost.Agent
-	imsClose  func(context.Context) error
-	stopped   bool
+	mu           sync.RWMutex
+	imsRecoverMu sync.Mutex
+	state        State
+	service      *messaging.Service
+	observers    []Observer
+	notifier     func(string)
+	smsNotify    func(deviceID, sender, content string, ts time.Time)
+	tunnel       swu.TunnelSession
+	voice        voicehost.Agent
+	voiceConfig  runtimeVoiceAgentConfig
+	imsClose     func(context.Context) error
+	imsRecover   func(context.Context) (IMSRegistrationResult, error)
+	stopped      bool
 }
 
 func Start(ctx context.Context, req StartRequest) (*Instance, error) {
@@ -388,7 +399,16 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		ussdTransport = imsResult.USSDTransport
 	}
 	svc.SetUSSDTransport(ussdTransport)
-	inst := &Instance{state: state, service: svc, tunnel: tunnel, voice: buildRuntimeVoiceAgent(req, imsResult), imsClose: imsResult.Close}
+	voiceConfig := runtimeVoiceAgentConfigFromStart(req)
+	inst := &Instance{
+		state:       state,
+		service:     svc,
+		tunnel:      tunnel,
+		voice:       buildRuntimeVoiceAgentWithConfig(voiceConfig, imsResult),
+		voiceConfig: voiceConfig,
+		imsClose:    imsResult.Close,
+		imsRecover:  imsResult.Recover,
+	}
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
@@ -397,7 +417,20 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 }
 
 func buildRuntimeVoiceAgent(req StartRequest, reg IMSRegistrationResult) voicehost.Agent {
-	transport := req.VoiceTransport
+	return buildRuntimeVoiceAgentWithConfig(runtimeVoiceAgentConfigFromStart(req), reg)
+}
+
+func runtimeVoiceAgentConfigFromStart(req StartRequest) runtimeVoiceAgentConfig {
+	return runtimeVoiceAgentConfig{
+		transport:      req.VoiceTransport,
+		userAgent:      req.VoiceUserAgent,
+		sessionExpires: req.VoiceSessionExpires,
+		mediaRelay:     req.VoiceMediaRelay,
+	}
+}
+
+func buildRuntimeVoiceAgentWithConfig(cfg runtimeVoiceAgentConfig, reg IMSRegistrationResult) voicehost.Agent {
+	transport := cfg.transport
 	if transport == nil {
 		transport = reg.VoiceTransport
 	}
@@ -420,10 +453,40 @@ func buildRuntimeVoiceAgent(req StartRequest, reg IMSRegistrationResult) voiceho
 		Profile:        profile,
 		Registration:   binding,
 		Domain:         profile.Domain,
-		UserAgent:      firstRuntimeNonEmpty(req.VoiceUserAgent, profile.UserAgent),
-		SessionExpires: req.VoiceSessionExpires,
-		MediaRelay:     req.VoiceMediaRelay,
+		UserAgent:      firstRuntimeNonEmpty(cfg.userAgent, profile.UserAgent),
+		SessionExpires: cfg.sessionExpires,
+		MediaRelay:     cfg.mediaRelay,
 	}
+}
+
+func buildRuntimeVoiceRegistrationUpdate(cfg runtimeVoiceAgentConfig, reg IMSRegistrationResult) (voicehost.IMSRegistrationUpdate, bool) {
+	if !reg.Registered {
+		return voicehost.IMSRegistrationUpdate{}, false
+	}
+	binding := reg.Binding
+	if strings.TrimSpace(binding.ContactURI) == "" {
+		return voicehost.IMSRegistrationUpdate{}, false
+	}
+	profile := reg.Profile
+	if strings.TrimSpace(profile.IMPU) == "" {
+		profile.IMPU = strings.TrimSpace(binding.PublicIdentity)
+	}
+	if strings.TrimSpace(profile.Domain) == "" {
+		profile.Domain = sipDomainRuntime(profile.IMPU)
+	}
+	transport := cfg.transport
+	if transport == nil {
+		transport = reg.VoiceTransport
+	}
+	return voicehost.IMSRegistrationUpdate{
+		Transport:      transport,
+		Profile:        profile,
+		Registration:   binding,
+		Domain:         profile.Domain,
+		UserAgent:      firstRuntimeNonEmpty(cfg.userAgent, profile.UserAgent),
+		SessionExpires: cfg.sessionExpires,
+		MediaRelay:     cfg.mediaRelay,
+	}, true
 }
 
 func (i *Instance) AddObserver(o Observer) {
@@ -481,6 +544,21 @@ func (i *Instance) StartOutboundCall(ctx context.Context, req voicehost.Outbound
 	if agent == nil {
 		return voicehost.OutboundCallResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
 	}
+	result, err := agent.StartOutboundCall(ctx, req)
+	if !result.RegistrationRecoveryNeeded {
+		return result, err
+	}
+	recovered, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true)
+	if recoveryErr != nil {
+		return result, runtimeOperationRecoveryError(err, recoveryErr)
+	}
+	if err == nil || !recovered {
+		return result, nil
+	}
+	agent = i.outboundVoiceAgent()
+	if agent == nil {
+		return result, errors.Join(err, voicehost.ErrIMSVoiceAgentNotReady)
+	}
 	return agent.StartOutboundCall(ctx, req)
 }
 
@@ -505,7 +583,13 @@ func (i *Instance) SendDialogInfo(ctx context.Context, req voicehost.DialogInfoR
 	if agent == nil {
 		return voicehost.DialogInfoResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
 	}
-	return agent.SendDialogInfo(ctx, req)
+	result, err := agent.SendDialogInfo(ctx, req)
+	if result.RegistrationRecoveryNeeded {
+		if _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
+			return result, runtimeOperationRecoveryError(err, recoveryErr)
+		}
+	}
+	return result, err
 }
 
 func (i *Instance) SendDialogUpdate(ctx context.Context, req voicehost.DialogUpdateRequest) (voicehost.DialogUpdateResult, error) {
@@ -513,7 +597,13 @@ func (i *Instance) SendDialogUpdate(ctx context.Context, req voicehost.DialogUpd
 	if agent == nil {
 		return voicehost.DialogUpdateResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
 	}
-	return agent.SendDialogUpdate(ctx, req)
+	result, err := agent.SendDialogUpdate(ctx, req)
+	if result.RegistrationRecoveryNeeded {
+		if _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
+			return result, runtimeOperationRecoveryError(err, recoveryErr)
+		}
+	}
+	return result, err
 }
 
 func (i *Instance) SendDialogReinvite(ctx context.Context, req voicehost.DialogReinviteRequest) (voicehost.DialogReinviteResult, error) {
@@ -521,7 +611,118 @@ func (i *Instance) SendDialogReinvite(ctx context.Context, req voicehost.DialogR
 	if agent == nil {
 		return voicehost.DialogReinviteResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
 	}
-	return agent.SendDialogReinvite(ctx, req)
+	result, err := agent.SendDialogReinvite(ctx, req)
+	if result.RegistrationRecoveryNeeded {
+		if _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
+			return result, runtimeOperationRecoveryError(err, recoveryErr)
+		}
+	}
+	return result, err
+}
+
+func runtimeOperationRecoveryError(operationErr, recoveryErr error) error {
+	if recoveryErr == nil {
+		return operationErr
+	}
+	if operationErr == nil {
+		return recoveryErr
+	}
+	return errors.Join(operationErr, recoveryErr)
+}
+
+func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, updateVoice bool) (bool, error) {
+	if i == nil {
+		return false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	i.imsRecoverMu.Lock()
+	defer i.imsRecoverMu.Unlock()
+
+	i.mu.RLock()
+	recover := i.imsRecover
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return false, voicehost.ErrIMSVoiceAgentNotReady
+	}
+	if recover == nil {
+		return false, nil
+	}
+	result, err := recover(ctx)
+	if err != nil {
+		i.recordIMSRecoveryFailure(ctx, err)
+		return false, err
+	}
+	if !result.Registered {
+		err := fmt.Errorf("IMS registration recovery did not register: %d %s", result.StatusCode, strings.TrimSpace(result.Reason))
+		i.recordIMSRecoveryFailure(ctx, err)
+		return false, err
+	}
+	i.applyIMSRegistrationResult(ctx, result, firstRuntimeNonEmpty(result.Reason, reason, "IMS registration recovered"), updateVoice)
+	return true, nil
+}
+
+func (i *Instance) recordIMSRecoveryFailure(ctx context.Context, err error) {
+	if i == nil || err == nil {
+		return
+	}
+	i.mu.Lock()
+	if i.stopped {
+		i.mu.Unlock()
+		return
+	}
+	i.state.IMSReady = false
+	i.state.LastReason = "IMS registration recovery failed: " + err.Error()
+	i.state.UpdatedAt = time.Now()
+	i.mu.Unlock()
+	i.notify(ctx)
+}
+
+func (i *Instance) applyIMSRegistrationResult(ctx context.Context, result IMSRegistrationResult, reason string, updateVoice bool) {
+	if i == nil {
+		return
+	}
+	smsTransport := result.SMSTransport
+	ussdTransport := result.USSDTransport
+	i.mu.Lock()
+	if i.stopped {
+		i.mu.Unlock()
+		return
+	}
+	if result.Close != nil {
+		i.imsClose = result.Close
+	}
+	if result.Recover != nil {
+		i.imsRecover = result.Recover
+	}
+	if updateVoice {
+		if update, ok := buildRuntimeVoiceRegistrationUpdate(i.voiceConfig, result); ok {
+			if updater, ok := i.voice.(voicehost.IMSRegistrationUpdater); ok {
+				updater.UpdateIMSRegistration(update)
+			} else {
+				i.voice = buildRuntimeVoiceAgentWithConfig(i.voiceConfig, result)
+			}
+		} else {
+			i.voice = nil
+		}
+	}
+	i.state.IMSReady = result.Registered
+	i.state.LastReason = firstRuntimeNonEmpty(reason, result.Server, "IMS registration recovered")
+	i.state.UpdatedAt = time.Now()
+	svc := i.service
+	i.mu.Unlock()
+
+	if svc != nil {
+		if smsTransport != nil {
+			svc.SetSMSTransport(smsTransport)
+		}
+		if ussdTransport != nil {
+			svc.SetUSSDTransport(ussdTransport)
+		}
+	}
+	i.notify(ctx)
 }
 
 func (i *Instance) outboundVoiceAgent() voicehost.OutboundCallAgent {

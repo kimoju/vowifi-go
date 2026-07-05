@@ -28,6 +28,49 @@ type IMSOutboundAgent struct {
 	dialogs map[string]imsDialogState
 }
 
+type IMSRegistrationUpdate struct {
+	Transport      voiceclient.SIPRequestTransport
+	Profile        voiceclient.IMSProfile
+	Registration   voiceclient.RegistrationBinding
+	Domain         string
+	UserAgent      string
+	SessionExpires int
+	MediaRelay     *RTPRelayConfig
+}
+
+type IMSRegistrationUpdater interface {
+	UpdateIMSRegistration(IMSRegistrationUpdate)
+}
+
+func (a *IMSOutboundAgent) UpdateIMSRegistration(update IMSRegistrationUpdate) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if update.Transport != nil {
+		a.Transport = update.Transport
+	}
+	if strings.TrimSpace(update.Profile.IMPU) != "" || strings.TrimSpace(update.Profile.IMPI) != "" {
+		a.Profile = update.Profile
+	}
+	if strings.TrimSpace(update.Registration.ContactURI) != "" {
+		a.Registration = update.Registration
+	}
+	if strings.TrimSpace(update.Domain) != "" {
+		a.Domain = strings.TrimSpace(update.Domain)
+	}
+	if strings.TrimSpace(update.UserAgent) != "" {
+		a.UserAgent = strings.TrimSpace(update.UserAgent)
+	}
+	if update.SessionExpires > 0 {
+		a.SessionExpires = update.SessionExpires
+	}
+	if update.MediaRelay != nil {
+		a.MediaRelay = update.MediaRelay
+	}
+}
+
 type imsDialogState struct {
 	cfg    voiceclient.DialogRequestConfig
 	invite voiceclient.SIPRequestMessage

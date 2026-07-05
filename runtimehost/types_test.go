@@ -211,6 +211,177 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	}
 }
 
+func TestRuntimeIMSRecoveryRetriesOutboundInviteAfterTransportFailure(t *testing.T) {
+	firstTransport := &runtimeVoiceTransport{errors: []error{errors.New("stale pcscf flow")}}
+	recoveredTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers: map[string][]string{
+			"To":      {"<sip:+18005551212@ims.example>;tag=recovered"},
+			"Contact": {"<sip:remote@pcscf2.ims.example>"},
+		},
+		Body: runtimeSDP("198.51.100.32", 49180),
+	}}}
+	profile := voiceclient.IMSProfile{
+		IMPI:   "user@ims.example",
+		IMPU:   "sip:user@ims.example",
+		Domain: "ims.example",
+	}
+	initialBinding := voiceclient.RegistrationBinding{
+		ContactURI:     "sip:user@192.0.2.10:5060",
+		PublicIdentity: "sip:user@ims.example",
+		ServiceRoutes:  []string{"<sip:pcscf1.ims.example;lr>"},
+	}
+	recoveredBinding := voiceclient.RegistrationBinding{
+		ContactURI:     "sip:user@192.0.2.20:5060",
+		PublicIdentity: "sip:user@ims.example",
+		ServiceRoutes:  []string{"<sip:pcscf2.ims.example;lr>"},
+	}
+	recoveries := 0
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
+		Registered:     true,
+		StatusCode:     200,
+		Reason:         "ims registered",
+		Profile:        profile,
+		Binding:        initialBinding,
+		VoiceTransport: firstTransport,
+		Recover: func(ctx context.Context) (IMSRegistrationResult, error) {
+			recoveries++
+			return IMSRegistrationResult{
+				Registered:     true,
+				StatusCode:     200,
+				Reason:         "ims recovered",
+				Profile:        profile,
+				Binding:        recoveredBinding,
+				VoiceTransport: recoveredTransport,
+			}, nil
+		},
+	}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:     "dev-recover",
+		TraceID:      "trace-recover",
+		IMSRegistrar: registrar,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := inst.StartOutboundCall(context.Background(), voicehost.OutboundCallRequest{
+		DeviceID: "dev-recover",
+		CallID:   "call-recover",
+		Callee:   "+18005551212",
+		RemoteSDP: voicehost.SDPInfo{
+			ConnectionIP: "192.0.2.44",
+			MediaPort:    4000,
+			Payloads:     []int{0, 8},
+			Direction:    "sendrecv",
+		},
+		RawSDP: runtimeSDP("192.0.2.44", 4000),
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("StartOutboundCall() result=%+v err=%v", result, err)
+	}
+	if recoveries != 1 {
+		t.Fatalf("recoveries=%d, want 1", recoveries)
+	}
+	if len(firstTransport.requests) != 1 || firstTransport.requests[0].Headers["Route"] != "<sip:pcscf1.ims.example;lr>" {
+		t.Fatalf("initial requests=%+v", firstTransport.requests)
+	}
+	if len(recoveredTransport.requests) != 1 || recoveredTransport.requests[0].Headers["Route"] != "<sip:pcscf2.ims.example;lr>" {
+		t.Fatalf("recovered requests=%+v", recoveredTransport.requests)
+	}
+	if len(recoveredTransport.writes) != 1 || recoveredTransport.writes[0].Method != "ACK" {
+		t.Fatalf("recovered writes=%+v", recoveredTransport.writes)
+	}
+	if st := inst.State(); !st.IMSReady || st.LastReason != "ims recovered" {
+		t.Fatalf("state=%+v", st)
+	}
+}
+
+func TestRuntimeIMSRecoveryAfterDialogInfoRecoverableResponse(t *testing.T) {
+	transport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote"},
+				"Contact": {"<sip:remote@pcscf.ims.example>"},
+			},
+			Body: runtimeSDP("198.51.100.22", 49170),
+		},
+		{StatusCode: 503, Reason: "Service Unavailable"},
+	}}
+	profile := voiceclient.IMSProfile{
+		IMPI:   "user@ims.example",
+		IMPU:   "sip:user@ims.example",
+		Domain: "ims.example",
+	}
+	binding := voiceclient.RegistrationBinding{
+		ContactURI:     "sip:user@192.0.2.10:5060",
+		PublicIdentity: "sip:user@ims.example",
+		ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+	}
+	recoveries := 0
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
+		Registered:     true,
+		StatusCode:     200,
+		Reason:         "ims registered",
+		Profile:        profile,
+		Binding:        binding,
+		VoiceTransport: transport,
+		Recover: func(ctx context.Context) (IMSRegistrationResult, error) {
+			recoveries++
+			return IMSRegistrationResult{
+				Registered:     true,
+				StatusCode:     200,
+				Reason:         "ims recovered",
+				Profile:        profile,
+				Binding:        binding,
+				VoiceTransport: transport,
+			}, nil
+		},
+	}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:     "dev-dialog-recover",
+		TraceID:      "trace-dialog-recover",
+		IMSRegistrar: registrar,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if _, err := inst.StartOutboundCall(context.Background(), voicehost.OutboundCallRequest{
+		DeviceID: "dev-dialog-recover",
+		CallID:   "call-dialog-recover",
+		Callee:   "+18005551212",
+		RemoteSDP: voicehost.SDPInfo{
+			ConnectionIP: "192.0.2.44",
+			MediaPort:    4000,
+			Payloads:     []int{0, 8},
+			Direction:    "sendrecv",
+		},
+		RawSDP: runtimeSDP("192.0.2.44", 4000),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := inst.SendDialogInfo(context.Background(), voicehost.DialogInfoRequest{
+		CallID:      "call-dialog-recover",
+		ContentType: "application/dtmf-relay",
+		InfoPackage: "dtmf",
+		Body:        []byte("Signal=5\r\nDuration=100\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("SendDialogInfo() error = %v", err)
+	}
+	if result.Accepted || result.StatusCode != 503 || !result.RegistrationRecoveryNeeded {
+		t.Fatalf("SendDialogInfo() result=%+v", result)
+	}
+	if recoveries != 1 {
+		t.Fatalf("recoveries=%d, want 1", recoveries)
+	}
+	if st := inst.State(); !st.IMSReady || st.LastReason != "ims recovered" {
+		t.Fatalf("state=%+v", st)
+	}
+}
+
 func TestStartRejectsIMSRegistrationFailure(t *testing.T) {
 	registrar := &testIMSRegistrar{err: errors.New("401 after AKA")}
 	_, err := Start(context.Background(), StartRequest{
@@ -708,10 +879,18 @@ type runtimeVoiceTransport struct {
 	requests  []voiceclient.SIPRequestMessage
 	writes    []voiceclient.SIPRequestMessage
 	responses []voiceclient.SIPResponse
+	errors    []error
 }
 
 func (t *runtimeVoiceTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
 	t.requests = append(t.requests, msg)
+	if len(t.errors) > 0 {
+		err := t.errors[0]
+		t.errors = t.errors[1:]
+		if err != nil {
+			return voiceclient.SIPResponse{}, err
+		}
+	}
 	if len(t.responses) == 0 {
 		return voiceclient.SIPResponse{StatusCode: 500, Reason: "empty"}, nil
 	}

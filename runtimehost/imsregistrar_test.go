@@ -298,6 +298,99 @@ func TestWireIMSRegistrarDefaultFlowReusesRegisterSocketForSMS(t *testing.T) {
 	}
 }
 
+func TestWireIMSRegistrarRecoverReturnsUpdatedBinding(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	type seenRequest struct {
+		addr string
+		wire string
+	}
+	seen := make(chan []seenRequest, 1)
+	go func() {
+		var requests []seenRequest
+		buf := make([]byte, 65535)
+		registers := 0
+		for i := 0; i < 3; i++ {
+			_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				seen <- append(requests, seenRequest{wire: "read error: " + err.Error()})
+				return
+			}
+			wire := string(append([]byte(nil), buf[:n]...))
+			requests = append(requests, seenRequest{addr: addr.String(), wire: wire})
+			registers++
+			serviceRoute := "<sip:pcscf1.ims.example;lr>"
+			if registers >= 2 {
+				serviceRoute = "<sip:pcscf2.ims.example;lr>"
+			}
+			resp := "SIP/2.0 200 OK\r\n" +
+				"P-Associated-URI: <sip:user@ims.example>\r\n" +
+				"Service-Route: " + serviceRoute + "\r\n" +
+				"Contact: <sip:user@192.0.2.10:5060>;expires=60\r\n" +
+				"Content-Length: 0\r\n\r\n"
+			_, _ = pc.WriteTo([]byte(resp), addr)
+			if strings.Contains(wire, "Expires: 0\r\n") {
+				seen <- requests
+				return
+			}
+		}
+		seen <- requests
+	}()
+
+	res, err := WireIMSRegistrar{
+		ServerAddr:       pc.LocalAddr().String(),
+		ContactHost:      "192.0.2.10",
+		ContactPort:      5060,
+		Expires:          60,
+		Timeout:          time.Second,
+		MaxRetransmits:   1,
+		DisableRefresh:   true,
+		DisableKeepalive: true,
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-1",
+		TraceID:  "trace-manual-recover",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if res.Recover == nil {
+		t.Fatal("Recover=nil, want default flow recovery hook")
+	}
+	recovered, err := res.Recover(context.Background())
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if !recovered.Registered || recovered.StatusCode != 200 || recovered.VoiceTransport == nil || recovered.SMSTransport == nil || recovered.USSDTransport == nil {
+		t.Fatalf("recovered result=%+v", recovered)
+	}
+	if len(recovered.Binding.ServiceRoutes) != 1 || recovered.Binding.ServiceRoutes[0] != "<sip:pcscf2.ims.example;lr>" {
+		t.Fatalf("recovered service routes=%+v", recovered.Binding.ServiceRoutes)
+	}
+	if recovered.Recover == nil || recovered.Close == nil {
+		t.Fatalf("recovered lifecycle hooks missing: close=%v recover=%v", recovered.Close != nil, recovered.Recover != nil)
+	}
+	if err := recovered.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	requests := <-seen
+	if len(requests) != 3 {
+		t.Fatalf("requests=%d %+v", len(requests), requests)
+	}
+	if !strings.Contains(requests[1].wire, "Call-ID: trace-manual-recover-recovery-1\r\n") ||
+		!strings.Contains(requests[1].wire, "CSeq: 1 REGISTER\r\n") {
+		t.Fatalf("recovery REGISTER wire=%q", requests[1].wire)
+	}
+	if !strings.Contains(requests[2].wire, "Expires: 0\r\n") {
+		t.Fatalf("deregister wire=%q", requests[2].wire)
+	}
+}
+
 func TestWireIMSRegistrarMaintainsDefaultFlowWithCRLFKeepalive(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

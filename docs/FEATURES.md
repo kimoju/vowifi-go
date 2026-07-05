@@ -61,6 +61,9 @@ protocol layers needed by VoHive:
   expiry-based renewal, retry scheduling, binding/auth/CSeq state updates,
   full re-registration after recoverable refresh/flow failures, and shutdown
   de-registration with the latest registration state
+- IMS registration recovery hooks exposed from the wire registrar to the
+  runtime, returning refreshed binding, voice, SMS, and USSD transports after
+  re-registration
 - automatic IMS SIP CRLF keepalive scheduling on the registered wire flow to
   preserve NAT/PCSCF pinholes between SIP transactions
 - IMS de-registration flow for shutdown cleanup, sending `REGISTER` with
@@ -164,9 +167,10 @@ protocol layers needed by VoHive:
 - IMS in-dialog SIP INFO forwarding for outbound and inbound voice dialogs,
   including DTMF-style payloads, Info-Package propagation, response body/header
   mapping, and dialog CSeq advancement
-- outbound IMS voice/dialog results flag recoverable registration or route
-  failures such as 481, 503, and other transient IMS 5xx responses so the host
-  can trigger IMS re-registration before retrying media or dialog operations
+- runtime voice operations consume recoverable registration or route failures
+  such as 481, 503, transport errors, and other transient IMS 5xx responses to
+  trigger IMS re-registration, refresh voice/SMS/USSD transports, and retry an
+  initial INVITE once after successful recovery
 - local softphone in-dialog SIP UPDATE forwarding to IMS dialogs, including
   session refresh/media renegotiation SDP validation, RTP relay endpoint
   rewriting, response body/header mapping, remote Contact refresh, and dialog

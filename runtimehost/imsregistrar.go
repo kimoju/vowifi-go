@@ -105,10 +105,12 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 	voiceTransport := r.voiceTransport(cfg, profile, result.Binding, defaultFlow)
 	smsTransport := r.smsTransport(cfg, profile, result.Binding, voiceTransport)
 	ussdTransport := r.ussdTransport(cfg, profile, result.Binding, voiceTransport)
-	maintenance := newIMSRegistrationMaintenance(defaultFlow, registerSession, result, r)
+	maintenance := newIMSRegistrationMaintenance(defaultFlow, registerSession, result, r, cfg, profile)
 	var closeRegistration func(context.Context) error
+	var recoverRegistration func(context.Context) (IMSRegistrationResult, error)
 	if maintenance != nil {
 		closeRegistration = maintenance.Close
+		recoverRegistration = maintenance.Recover
 	}
 	return IMSRegistrationResult{
 		Registered:     result.Registered,
@@ -121,6 +123,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		SMSTransport:   smsTransport,
 		USSDTransport:  ussdTransport,
 		Close:          closeRegistration,
+		Recover:        recoverRegistration,
 	}, nil
 }
 
@@ -173,13 +176,17 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 }
 
 type imsRegistrationMaintenance struct {
-	flow    *voiceclient.WireSIPFlow
-	session voiceclient.RegisterSession
-	config  WireIMSRegistrar
+	flow          *voiceclient.WireSIPFlow
+	session       voiceclient.RegisterSession
+	config        WireIMSRegistrar
+	runtimeConfig IMSRegistrationConfig
+	profile       voiceclient.IMSProfile
 
 	recoverMu      sync.Mutex
 	mu             sync.Mutex
 	registered     bool
+	statusCode     int
+	reason         string
 	binding        voiceclient.RegistrationBinding
 	nextCSeq       int
 	authHeader     string
@@ -192,7 +199,7 @@ type imsRegistrationMaintenance struct {
 	closed         bool
 }
 
-func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voiceclient.RegisterSession, result voiceclient.RegisterResult, config WireIMSRegistrar) *imsRegistrationMaintenance {
+func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voiceclient.RegisterSession, result voiceclient.RegisterResult, config WireIMSRegistrar, runtimeConfig IMSRegistrationConfig, profile voiceclient.IMSProfile) *imsRegistrationMaintenance {
 	if flow == nil {
 		return nil
 	}
@@ -201,10 +208,15 @@ func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voicec
 		nextCSeq = 1
 	}
 	m := &imsRegistrationMaintenance{
-		flow:           flow,
-		session:        session,
-		config:         config,
+		flow:          flow,
+		session:       session,
+		config:        config,
+		runtimeConfig: runtimeConfig,
+		profile:       profile,
+
 		registered:     result.Registered,
+		statusCode:     result.StatusCode,
+		reason:         result.Reason,
 		binding:        result.Binding,
 		nextCSeq:       nextCSeq,
 		authHeader:     result.AuthHeader,
@@ -235,6 +247,48 @@ func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voicec
 		}()
 	}
 	return m
+}
+
+func (m *imsRegistrationMaintenance) Recover(ctx context.Context) (IMSRegistrationResult, error) {
+	if m == nil {
+		return IMSRegistrationResult{}, errors.New("IMS registration maintenance unavailable")
+	}
+	if err := m.recoverRegistration(ctx, errors.New("requested IMS registration recovery")); err != nil {
+		return IMSRegistrationResult{}, err
+	}
+	return m.result("IMS registration recovered"), nil
+}
+
+func (m *imsRegistrationMaintenance) result(defaultReason string) IMSRegistrationResult {
+	if m == nil {
+		return IMSRegistrationResult{}
+	}
+	m.mu.Lock()
+	registered := m.registered
+	statusCode := m.statusCode
+	reason := m.reason
+	binding := m.binding
+	m.mu.Unlock()
+
+	if statusCode == 0 && registered {
+		statusCode = 200
+	}
+	voiceTransport := m.config.voiceTransport(m.runtimeConfig, m.profile, binding, m.flow)
+	smsTransport := m.config.smsTransport(m.runtimeConfig, m.profile, binding, voiceTransport)
+	ussdTransport := m.config.ussdTransport(m.runtimeConfig, m.profile, binding, voiceTransport)
+	return IMSRegistrationResult{
+		Registered:     registered,
+		StatusCode:     statusCode,
+		Reason:         firstRuntimeNonEmpty(reason, defaultReason),
+		Server:         firstRuntimeNonEmpty(binding.PublicIdentity, m.profile.Domain),
+		Profile:        m.profile,
+		Binding:        binding,
+		VoiceTransport: voiceTransport,
+		SMSTransport:   smsTransport,
+		USSDTransport:  ussdTransport,
+		Close:          m.Close,
+		Recover:        m.Recover,
+	}
 }
 
 func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
@@ -353,6 +407,8 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 	m.mu.Lock()
 	if result.Refreshed {
 		m.registered = true
+		m.statusCode = result.StatusCode
+		m.reason = result.Reason
 		m.binding = result.Binding
 		m.nextCSeq = result.NextCSeq
 		m.authHeader = result.AuthHeader
@@ -397,6 +453,11 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		return fmt.Errorf("IMS registration recovery failed after %v: %w", cause, err)
 	}
 	if !result.Registered {
+		m.mu.Lock()
+		m.registered = false
+		m.statusCode = result.StatusCode
+		m.reason = result.Reason
+		m.mu.Unlock()
 		return fmt.Errorf("IMS registration recovery did not register: %d %s", result.StatusCode, result.Reason)
 	}
 
@@ -407,6 +468,8 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	}
 	m.session = session
 	m.registered = true
+	m.statusCode = result.StatusCode
+	m.reason = result.Reason
 	m.binding = result.Binding
 	m.nextCSeq = result.NextCSeq
 	m.authHeader = result.AuthHeader
