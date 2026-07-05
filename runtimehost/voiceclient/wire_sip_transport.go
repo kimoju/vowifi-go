@@ -26,6 +26,7 @@ type WireSIPTransport struct {
 	Network               string
 	ServerAddr            string
 	LocalAddr             string
+	Resolver              SIPServerResolver
 	Timeout               time.Duration
 	RetransmitInterval    time.Duration
 	MaxRetransmitInterval time.Duration
@@ -145,7 +146,7 @@ func (t WireSIPTransport) dial(ctx context.Context, msg SIPRequestMessage) (net.
 	}
 	target := strings.TrimSpace(t.ServerAddr)
 	if target == "" {
-		addr, err := sipURIAddr(msg.URI)
+		addr, err := resolveSIPServerAddr(ctx, t.Resolver, network, msg.URI)
 		if err != nil {
 			return nil, "", 0, err
 		}

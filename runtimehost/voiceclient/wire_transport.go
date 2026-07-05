@@ -21,6 +21,7 @@ type WireRegisterTransport struct {
 	Network               string
 	ServerAddr            string
 	LocalAddr             string
+	Resolver              SIPServerResolver
 	Timeout               time.Duration
 	RetransmitInterval    time.Duration
 	MaxRetransmitInterval time.Duration
@@ -37,7 +38,7 @@ func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg Regist
 	}
 	target := strings.TrimSpace(t.ServerAddr)
 	if target == "" {
-		addr, err := sipURIAddr(msg.URI)
+		addr, err := resolveSIPServerAddr(ctx, t.Resolver, network, msg.URI)
 		if err != nil {
 			return RegisterResponse{}, err
 		}
@@ -598,50 +599,11 @@ func isSIPTimeout(err error) bool {
 }
 
 func sipURIAddr(uri string) (string, error) {
-	uri = strings.TrimSpace(uri)
-	if uri == "" {
-		return "", errors.New("SIP URI is empty")
+	endpoint, err := parseSIPURIEndpoint(uri)
+	if err != nil {
+		return "", err
 	}
-	lower := strings.ToLower(uri)
-	if strings.HasPrefix(lower, "sip:") {
-		uri = uri[4:]
-	} else if strings.HasPrefix(lower, "sips:") {
-		uri = uri[5:]
-	} else {
-		return "", fmt.Errorf("unsupported SIP URI %q", uri)
-	}
-	if user, host, ok := strings.Cut(uri, "@"); ok {
-		_ = user
-		uri = host
-	}
-	if semi := strings.IndexByte(uri, ';'); semi >= 0 {
-		uri = uri[:semi]
-	}
-	if q := strings.IndexByte(uri, '?'); q >= 0 {
-		uri = uri[:q]
-	}
-	host := strings.Trim(uri, "[] ")
-	port := "5060"
-	if strings.HasPrefix(strings.TrimSpace(uri), "[") {
-		end := strings.IndexByte(uri, ']')
-		if end < 0 {
-			return "", fmt.Errorf("invalid SIP URI host %q", uri)
-		}
-		host = strings.Trim(uri[1:end], " ")
-		if rest := strings.TrimSpace(uri[end+1:]); strings.HasPrefix(rest, ":") {
-			port = strings.TrimSpace(rest[1:])
-		}
-	} else if h, p, err := net.SplitHostPort(uri); err == nil {
-		host = strings.Trim(h, "[]")
-		port = p
-	} else if idx := strings.LastIndex(uri, ":"); idx > 0 && !strings.Contains(uri[idx+1:], ":") {
-		host = strings.Trim(uri[:idx], "[] ")
-		port = strings.TrimSpace(uri[idx+1:])
-	}
-	if host == "" {
-		return "", fmt.Errorf("SIP URI host is empty: %q", uri)
-	}
-	return net.JoinHostPort(host, port), nil
+	return endpoint.addr(), nil
 }
 
 func canonicalHeaderName(name string) string {

@@ -139,3 +139,56 @@ func TestWireSIPFlowSendsCRLFKeepaliveOnEstablishedUDPFlow(t *testing.T) {
 		t.Fatalf("keepalive=%q addrs=%q/%q", requests[2], requests[1], requests[3])
 	}
 }
+
+func TestWireSIPFlowUsesResolverForRegisterTarget(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	seen := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			seen <- "read error: " + err.Error()
+			return
+		}
+		seen <- string(append([]byte(nil), buf[:n]...))
+		_, _ = pc.WriteTo([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"), addr)
+	}()
+
+	var resolvedNetwork, resolvedURI string
+	flow := &WireSIPFlow{
+		Network: "udp",
+		Resolver: SIPServerResolverFunc(func(ctx context.Context, network, uri string) (string, error) {
+			resolvedNetwork = network
+			resolvedURI = uri
+			return pc.LocalAddr().String(), nil
+		}),
+		Timeout: time.Second,
+	}
+	defer flow.Close()
+	resp, err := flow.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-resolver",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("RoundTripRegister() response=%+v err=%v", resp, err)
+	}
+	if resolvedNetwork != "udp" || resolvedURI != "sip:ims.example" {
+		t.Fatalf("resolver saw network=%q uri=%q", resolvedNetwork, resolvedURI)
+	}
+	if wire := <-seen; !strings.Contains(wire, "REGISTER sip:ims.example SIP/2.0") {
+		t.Fatalf("wire=%q", wire)
+	}
+}

@@ -34,6 +34,7 @@ type WireIMSRegistrar struct {
 	Network               string
 	ServerAddr            string
 	LocalAddr             string
+	Resolver              voiceclient.SIPServerResolver
 	Timeout               time.Duration
 	Expires               int
 	UserAgent             string
@@ -124,6 +125,7 @@ func (r WireIMSRegistrar) voiceTransport(cfg IMSRegistrationConfig, profile voic
 		Network:               r.Network,
 		ServerAddr:            r.ServerAddr,
 		LocalAddr:             r.LocalAddr,
+		Resolver:              r.Resolver,
 		Timeout:               r.Timeout,
 		RetransmitInterval:    r.RetransmitInterval,
 		MaxRetransmitInterval: r.MaxRetransmitInterval,
@@ -136,6 +138,7 @@ func (r WireIMSRegistrar) defaultSIPFlow() *voiceclient.WireSIPFlow {
 		Network:               r.Network,
 		ServerAddr:            r.ServerAddr,
 		LocalAddr:             r.LocalAddr,
+		Resolver:              r.Resolver,
 		Timeout:               r.Timeout,
 		RetransmitInterval:    r.RetransmitInterval,
 		MaxRetransmitInterval: r.MaxRetransmitInterval,

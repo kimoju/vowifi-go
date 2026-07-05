@@ -36,6 +36,8 @@ protocol layers needed by VoHive:
 - reusable SIP flow transport for REGISTER, MESSAGE, USSD, and voice dialog
   requests, preserving the REGISTER socket/local port for IMS NAT pinholes and
   offering explicit CRLF keepalive support
+- SIP server resolution with injectable policy hooks and default `_sip._udp` /
+  `_sip._tcp` SRV lookup before direct host:port fallback
 - IMS REGISTER session flow with 401/407 authentication retry, associated URI,
   Service-Route, Path, Security-Server, and Contact expiry capture, plus a
   runtime `IMSRegistrar` adapter for the wire transport

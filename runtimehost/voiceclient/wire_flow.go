@@ -18,6 +18,7 @@ type WireSIPFlow struct {
 	Network               string
 	ServerAddr            string
 	LocalAddr             string
+	Resolver              SIPServerResolver
 	Timeout               time.Duration
 	RetransmitInterval    time.Duration
 	MaxRetransmitInterval time.Duration
@@ -237,7 +238,7 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 	}
 	target := strings.TrimSpace(f.ServerAddr)
 	if target == "" {
-		addr, err := sipURIAddr(msg.URI)
+		addr, err := resolveSIPServerAddr(ctx, f.Resolver, network, msg.URI)
 		if err != nil {
 			return nil, "", 0, err
 		}
