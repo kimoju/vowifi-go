@@ -36,38 +36,86 @@ func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg Regist
 	if network == "" {
 		network = "udp"
 	}
-	target := strings.TrimSpace(t.ServerAddr)
-	if target == "" {
-		addr, err := resolveSIPServerAddr(ctx, t.Resolver, network, msg.URI)
-		if err != nil {
-			return RegisterResponse{}, err
-		}
-		target = addr
+	targets, err := sipTargetsForRequest(ctx, t.Resolver, network, t.ServerAddr, msg.URI)
+	if err != nil {
+		return RegisterResponse{}, err
 	}
 	timeout := t.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	var lastErr error
+	for _, target := range targets {
+		var resp RegisterResponse
+		var err error
+		switch network {
+		case "udp", "udp4", "udp6":
+			resp, err = t.roundTripUDP(ctx, network, target, timeout, msg)
+		case "tcp", "tcp4", "tcp6":
+			resp, err = t.roundTripTCP(ctx, network, target, timeout, msg)
+		default:
+			return RegisterResponse{}, fmt.Errorf("unsupported SIP register network %q", network)
+		}
+		if err == nil {
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return RegisterResponse{}, ctx.Err()
+		}
+		lastErr = err
+		if !isSIPRetryableTransportError(err) {
+			break
+		}
+	}
+	if lastErr != nil {
+		return RegisterResponse{}, lastErr
+	}
+	return RegisterResponse{}, errSIPDNSResolverEmpty()
+}
+
+func sipTargetsForRequest(ctx context.Context, resolver SIPServerResolver, network, serverAddr, uri string) ([]string, error) {
+	target := strings.TrimSpace(serverAddr)
+	if target != "" {
+		return []string{target}, nil
+	}
+	targets, err := resolveSIPServerAddrs(ctx, resolver, network, uri)
+	if err != nil {
+		return nil, err
+	}
+	targets = appendSIPTargets(nil, targets...)
+	if len(targets) == 0 {
+		return nil, errSIPDNSResolverEmpty()
+	}
+	return targets, nil
+}
+
+func dialSIPConn(ctx context.Context, network, target, localAddr string, timeout time.Duration) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: timeout}
 	switch network {
 	case "udp", "udp4", "udp6":
-		return t.roundTripUDP(ctx, network, target, timeout, msg)
+		if strings.TrimSpace(localAddr) != "" {
+			addr, err := net.ResolveUDPAddr(network, localAddr)
+			if err != nil {
+				return nil, err
+			}
+			dialer.LocalAddr = addr
+		}
 	case "tcp", "tcp4", "tcp6":
-		return t.roundTripTCP(ctx, network, target, timeout, msg)
+		if strings.TrimSpace(localAddr) != "" {
+			addr, err := net.ResolveTCPAddr(network, localAddr)
+			if err != nil {
+				return nil, err
+			}
+			dialer.LocalAddr = addr
+		}
 	default:
-		return RegisterResponse{}, fmt.Errorf("unsupported SIP register network %q", network)
+		return nil, fmt.Errorf("unsupported SIP network %q", network)
 	}
+	return dialer.DialContext(ctx, network, target)
 }
 
 func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target string, timeout time.Duration, msg RegisterMessage) (RegisterResponse, error) {
-	dialer := net.Dialer{Timeout: timeout}
-	if strings.TrimSpace(t.LocalAddr) != "" {
-		addr, err := net.ResolveUDPAddr(network, t.LocalAddr)
-		if err != nil {
-			return RegisterResponse{}, err
-		}
-		dialer.LocalAddr = addr
-	}
-	conn, err := dialer.DialContext(ctx, network, target)
+	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout)
 	if err != nil {
 		return RegisterResponse{}, err
 	}
@@ -117,15 +165,7 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 }
 
 func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target string, timeout time.Duration, msg RegisterMessage) (RegisterResponse, error) {
-	dialer := net.Dialer{Timeout: timeout}
-	if strings.TrimSpace(t.LocalAddr) != "" {
-		addr, err := net.ResolveTCPAddr(network, t.LocalAddr)
-		if err != nil {
-			return RegisterResponse{}, err
-		}
-		dialer.LocalAddr = addr
-	}
-	conn, err := dialer.DialContext(ctx, network, target)
+	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout)
 	if err != nil {
 		return RegisterResponse{}, err
 	}
@@ -610,6 +650,20 @@ func shouldSIPRetransmit(done, max int) bool {
 func isSIPTimeout(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isSIPRetryableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if isSIPTimeout(err) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr)
 }
 
 func sipURIAddr(uri string) (string, error) {

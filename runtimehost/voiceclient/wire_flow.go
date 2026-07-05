@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -23,12 +22,14 @@ type WireSIPFlow struct {
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
 
-	mu      sync.Mutex
-	conn    net.Conn
-	reader  *bufio.Reader
-	network string
-	target  string
-	closed  bool
+	mu          sync.Mutex
+	conn        net.Conn
+	reader      *bufio.Reader
+	network     string
+	target      string
+	targets     []string
+	targetIndex int
+	closed      bool
 }
 
 var _ SIPRegisterTransport = (*WireSIPFlow)(nil)
@@ -61,24 +62,53 @@ func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) e
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	conn, network, timeout, err := f.ensureConnLocked(ctx, msg)
-	if err != nil {
-		return err
+	attempts := 0
+	shouldRetry := func(err error) bool {
+		if ctx.Err() != nil || !isSIPRetryableTransportError(err) {
+			return false
+		}
+		attempts++
+		if attempts >= f.targetCountLocked() {
+			return false
+		}
+		return f.advanceTargetLocked()
 	}
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		f.closeConnLocked()
-		return err
+	for {
+		conn, network, timeout, err := f.ensureConnLocked(ctx, msg)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !shouldRetry(err) {
+				return err
+			}
+			continue
+		}
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			f.closeConnLocked()
+			if !shouldRetry(err) {
+				return err
+			}
+			continue
+		}
+		attempt := cloneSIPRequestMessage(msg)
+		ensureSIPRequestVia(&attempt, transportName(network), conn.LocalAddr())
+		wire, err := buildSIPRequestWire(attempt, transportName(network), conn.LocalAddr())
+		if err != nil {
+			return err
+		}
+		if _, err := conn.Write(wire); err != nil {
+			f.closeConnLocked()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !shouldRetry(err) {
+				return err
+			}
+			continue
+		}
+		return nil
 	}
-	ensureSIPRequestVia(&msg, transportName(network), conn.LocalAddr())
-	wire, err := buildSIPRequestWire(msg, transportName(network), conn.LocalAddr())
-	if err != nil {
-		return err
-	}
-	if _, err := conn.Write(wire); err != nil {
-		f.closeConnLocked()
-		return err
-	}
-	return nil
 }
 
 func (f *WireSIPFlow) SendCRLFKeepalive(ctx context.Context) error {
@@ -100,6 +130,9 @@ func (f *WireSIPFlow) SendCRLFKeepalive(ctx context.Context) error {
 	}
 	if conn == nil {
 		target := strings.TrimSpace(f.ServerAddr)
+		if target == "" && len(f.targets) > 0 && f.targetIndex >= 0 && f.targetIndex < len(f.targets) {
+			target = f.targets[f.targetIndex]
+		}
 		if target == "" {
 			return errors.New("SIP flow has no connected remote for keepalive")
 		}
@@ -139,35 +172,78 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	conn, network, timeout, err := f.ensureConnLocked(ctx, msg)
-	if err != nil {
-		return SIPResponse{}, err
+	attempts := 0
+	shouldRetry := func(err error) bool {
+		if ctx.Err() != nil || !isSIPRetryableTransportError(err) {
+			return false
+		}
+		attempts++
+		if attempts >= f.targetCountLocked() {
+			return false
+		}
+		return f.advanceTargetLocked()
 	}
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		f.closeConnLocked()
-		return SIPResponse{}, err
-	}
-	ensureSIPRequestVia(&msg, transportName(network), conn.LocalAddr())
-	wire, err := buildSIPRequestWire(msg, transportName(network), conn.LocalAddr())
-	if err != nil {
-		return SIPResponse{}, err
-	}
-	if _, err := conn.Write(wire); err != nil {
-		f.closeConnLocked()
-		return SIPResponse{}, err
-	}
-	if strings.HasPrefix(network, "tcp") {
-		resp, err := readFinalSIPResponse(ctx, f.reader, msg, onProvisional)
+	for {
+		conn, network, timeout, err := f.ensureConnLocked(ctx, msg)
+		if err != nil {
+			if ctx.Err() != nil {
+				return SIPResponse{}, ctx.Err()
+			}
+			if !shouldRetry(err) {
+				return SIPResponse{}, err
+			}
+			continue
+		}
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			f.closeConnLocked()
+			if !shouldRetry(err) {
+				return SIPResponse{}, err
+			}
+			continue
+		}
+		attempt := cloneSIPRequestMessage(msg)
+		ensureSIPRequestVia(&attempt, transportName(network), conn.LocalAddr())
+		wire, err := buildSIPRequestWire(attempt, transportName(network), conn.LocalAddr())
+		if err != nil {
+			return SIPResponse{}, err
+		}
+		if _, err := conn.Write(wire); err != nil {
+			f.closeConnLocked()
+			if ctx.Err() != nil {
+				return SIPResponse{}, ctx.Err()
+			}
+			if !shouldRetry(err) {
+				return SIPResponse{}, err
+			}
+			continue
+		}
+		if strings.HasPrefix(network, "tcp") {
+			resp, err := readFinalSIPResponse(ctx, f.reader, attempt, onProvisional)
+			if err != nil {
+				f.closeConnLocked()
+				if ctx.Err() != nil {
+					return SIPResponse{}, ctx.Err()
+				}
+				if !shouldRetry(err) {
+					return SIPResponse{}, err
+				}
+				continue
+			}
+			return resp, nil
+		}
+		resp, err := f.readUDPResponseLocked(ctx, conn, timeout, wire, attempt, onProvisional)
 		if err != nil {
 			f.closeConnLocked()
+			if ctx.Err() != nil {
+				return SIPResponse{}, ctx.Err()
+			}
+			if !shouldRetry(err) {
+				return SIPResponse{}, err
+			}
+			continue
 		}
-		return resp, err
+		return resp, nil
 	}
-	resp, err := f.readUDPResponseLocked(ctx, conn, timeout, wire, msg, onProvisional)
-	if err != nil {
-		f.closeConnLocked()
-	}
-	return resp, err
 }
 
 func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, timeout time.Duration, wire []byte, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
@@ -235,44 +311,26 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 	if network == "" {
 		network = "udp"
 	}
-	target := strings.TrimSpace(f.ServerAddr)
-	if target == "" {
-		addr, err := resolveSIPServerAddr(ctx, f.Resolver, network, msg.URI)
-		if err != nil {
-			return nil, "", 0, err
-		}
-		target = addr
-	}
 	timeout := f.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	if f.conn != nil && f.network == network && (strings.TrimSpace(f.ServerAddr) == "" || f.target == strings.TrimSpace(f.ServerAddr)) {
+		return f.conn, network, timeout, nil
+	}
+	targets, err := f.ensureTargetsLocked(ctx, network, msg.URI)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if len(targets) == 0 {
+		return nil, "", 0, errSIPDNSResolverEmpty()
+	}
+	target := targets[f.targetIndex]
 	if f.conn != nil && f.network == network && f.target == target {
 		return f.conn, network, timeout, nil
 	}
 	_ = f.closeConnLocked()
-	dialer := net.Dialer{Timeout: timeout}
-	switch network {
-	case "udp", "udp4", "udp6":
-		if strings.TrimSpace(f.LocalAddr) != "" {
-			addr, err := net.ResolveUDPAddr(network, f.LocalAddr)
-			if err != nil {
-				return nil, "", 0, err
-			}
-			dialer.LocalAddr = addr
-		}
-	case "tcp", "tcp4", "tcp6":
-		if strings.TrimSpace(f.LocalAddr) != "" {
-			addr, err := net.ResolveTCPAddr(network, f.LocalAddr)
-			if err != nil {
-				return nil, "", 0, err
-			}
-			dialer.LocalAddr = addr
-		}
-	default:
-		return nil, "", 0, fmt.Errorf("unsupported SIP network %q", network)
-	}
-	conn, err := dialer.DialContext(ctx, network, target)
+	conn, err := dialSIPConn(ctx, network, target, f.LocalAddr, timeout)
 	if err != nil {
 		return nil, "", 0, err
 	}
@@ -285,6 +343,43 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 		f.reader = nil
 	}
 	return conn, network, timeout, nil
+}
+
+func (f *WireSIPFlow) ensureTargetsLocked(ctx context.Context, network, uri string) ([]string, error) {
+	if target := strings.TrimSpace(f.ServerAddr); target != "" {
+		if len(f.targets) != 1 || f.targets[0] != target {
+			f.targets = []string{target}
+			f.targetIndex = 0
+		}
+		return f.targets, nil
+	}
+	if len(f.targets) == 0 {
+		targets, err := resolveSIPServerAddrs(ctx, f.Resolver, network, uri)
+		if err != nil {
+			return nil, err
+		}
+		f.targets = appendSIPTargets(nil, targets...)
+		f.targetIndex = 0
+	}
+	if f.targetIndex < 0 || f.targetIndex >= len(f.targets) {
+		f.targetIndex = 0
+	}
+	return f.targets, nil
+}
+
+func (f *WireSIPFlow) advanceTargetLocked() bool {
+	if len(f.targets) <= 1 {
+		return false
+	}
+	f.targetIndex = (f.targetIndex + 1) % len(f.targets)
+	return true
+}
+
+func (f *WireSIPFlow) targetCountLocked() int {
+	if len(f.targets) == 0 {
+		return 1
+	}
+	return len(f.targets)
 }
 
 func (f *WireSIPFlow) closeConnLocked() error {
@@ -308,4 +403,10 @@ func cloneStringMap(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func cloneSIPRequestMessage(msg SIPRequestMessage) SIPRequestMessage {
+	msg.Headers = cloneStringMap(msg.Headers)
+	msg.Body = append([]byte(nil), msg.Body...)
+	return msg
 }

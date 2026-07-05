@@ -45,7 +45,40 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	conn, network, timeout, err := t.dial(ctx, msg)
+	network := strings.ToLower(strings.TrimSpace(t.Network))
+	if network == "" {
+		network = "udp"
+	}
+	targets, err := sipTargetsForRequest(ctx, t.Resolver, network, t.ServerAddr, msg.URI)
+	if err != nil {
+		return SIPResponse{}, err
+	}
+	timeout := t.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	var lastErr error
+	for _, target := range targets {
+		resp, err := t.roundTripTarget(ctx, network, target, timeout, msg, onProvisional)
+		if err == nil {
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return SIPResponse{}, ctx.Err()
+		}
+		lastErr = err
+		if !isSIPRetryableTransportError(err) {
+			break
+		}
+	}
+	if lastErr != nil {
+		return SIPResponse{}, lastErr
+	}
+	return SIPResponse{}, errSIPDNSResolverEmpty()
+}
+
+func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target string, timeout time.Duration, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
+	conn, err := t.dialTarget(ctx, network, target, timeout)
 	if err != nil {
 		return SIPResponse{}, err
 	}
@@ -53,8 +86,9 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return SIPResponse{}, err
 	}
-	ensureSIPRequestVia(&msg, transportName(network), conn.LocalAddr())
-	wire, err := buildSIPRequestWire(msg, transportName(network), conn.LocalAddr())
+	attempt := msg
+	ensureSIPRequestVia(&attempt, transportName(network), conn.LocalAddr())
+	wire, err := buildSIPRequestWire(attempt, transportName(network), conn.LocalAddr())
 	if err != nil {
 		return SIPResponse{}, err
 	}
@@ -63,7 +97,7 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 	}
 	if strings.HasPrefix(network, "tcp") {
 		reader := bufio.NewReader(conn)
-		return readFinalSIPResponse(ctx, reader, msg, onProvisional)
+		return readFinalSIPResponse(ctx, reader, attempt, onProvisional)
 	}
 	buf := make([]byte, 65535)
 	interval := sipRetransmitInterval(timeout, t.RetransmitInterval)
@@ -109,11 +143,11 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 		if err != nil {
 			return SIPResponse{}, err
 		}
-		if !isProvisionalResponse(resp.StatusCode, msg.Method) {
+		if !isProvisionalResponse(resp.StatusCode, attempt.Method) {
 			return resp, nil
 		}
 		if onProvisional != nil {
-			if err := onProvisional(ctx, msg, resp); err != nil {
+			if err := onProvisional(ctx, attempt, resp); err != nil {
 				return SIPResponse{}, err
 			}
 		}
@@ -125,7 +159,40 @@ func (t WireSIPTransport) WriteRequest(ctx context.Context, msg SIPRequestMessag
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	conn, network, timeout, err := t.dial(ctx, msg)
+	network := strings.ToLower(strings.TrimSpace(t.Network))
+	if network == "" {
+		network = "udp"
+	}
+	targets, err := sipTargetsForRequest(ctx, t.Resolver, network, t.ServerAddr, msg.URI)
+	if err != nil {
+		return err
+	}
+	timeout := t.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	var lastErr error
+	for _, target := range targets {
+		err := t.writeTarget(ctx, network, target, timeout, msg)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		lastErr = err
+		if !isSIPRetryableTransportError(err) {
+			break
+		}
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errSIPDNSResolverEmpty()
+}
+
+func (t WireSIPTransport) writeTarget(ctx context.Context, network, target string, timeout time.Duration, msg SIPRequestMessage) error {
+	conn, err := t.dialTarget(ctx, network, target, timeout)
 	if err != nil {
 		return err
 	}
@@ -133,8 +200,9 @@ func (t WireSIPTransport) WriteRequest(ctx context.Context, msg SIPRequestMessag
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
-	ensureSIPRequestVia(&msg, transportName(network), conn.LocalAddr())
-	wire, err := buildSIPRequestWire(msg, transportName(network), conn.LocalAddr())
+	attempt := msg
+	ensureSIPRequestVia(&attempt, transportName(network), conn.LocalAddr())
+	wire, err := buildSIPRequestWire(attempt, transportName(network), conn.LocalAddr())
 	if err != nil {
 		return err
 	}
@@ -142,49 +210,15 @@ func (t WireSIPTransport) WriteRequest(ctx context.Context, msg SIPRequestMessag
 	return err
 }
 
-func (t WireSIPTransport) dial(ctx context.Context, msg SIPRequestMessage) (net.Conn, string, time.Duration, error) {
-	network := strings.ToLower(strings.TrimSpace(t.Network))
-	if network == "" {
-		network = "udp"
-	}
-	target := strings.TrimSpace(t.ServerAddr)
-	if target == "" {
-		addr, err := resolveSIPServerAddr(ctx, t.Resolver, network, msg.URI)
-		if err != nil {
-			return nil, "", 0, err
-		}
-		target = addr
-	}
-	timeout := t.Timeout
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	dialer := net.Dialer{Timeout: timeout}
-	switch network {
-	case "udp", "udp4", "udp6":
-		if strings.TrimSpace(t.LocalAddr) != "" {
-			addr, err := net.ResolveUDPAddr(network, t.LocalAddr)
-			if err != nil {
-				return nil, "", 0, err
-			}
-			dialer.LocalAddr = addr
-		}
-	case "tcp", "tcp4", "tcp6":
-		if strings.TrimSpace(t.LocalAddr) != "" {
-			addr, err := net.ResolveTCPAddr(network, t.LocalAddr)
-			if err != nil {
-				return nil, "", 0, err
-			}
-			dialer.LocalAddr = addr
-		}
-	default:
-		return nil, "", 0, fmt.Errorf("unsupported SIP network %q", network)
-	}
-	conn, err := dialer.DialContext(ctx, network, target)
+func (t WireSIPTransport) dialTarget(ctx context.Context, network, target string, timeout time.Duration) (net.Conn, error) {
+	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout)
 	if err != nil {
-		return nil, "", 0, err
+		if strings.HasPrefix(strings.ToLower(network), "udp") || strings.HasPrefix(strings.ToLower(network), "tcp") {
+			return nil, err
+		}
+		return nil, fmt.Errorf("unsupported SIP network %q", network)
 	}
-	return conn, network, timeout, nil
+	return conn, nil
 }
 
 func readFinalSIPResponse(ctx context.Context, reader *bufio.Reader, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {

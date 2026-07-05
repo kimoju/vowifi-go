@@ -320,6 +320,80 @@ func TestWireRegisterTransportRetransmitsUDPRegister(t *testing.T) {
 	}
 }
 
+func TestWireRegisterTransportFailsOverResolvedUDPTargets(t *testing.T) {
+	dead, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(dead) error = %v", err)
+	}
+	defer dead.Close()
+	live, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(live) error = %v", err)
+	}
+	defer live.Close()
+
+	deadSeen := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = dead.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, err := dead.ReadFrom(buf)
+		if err != nil {
+			deadSeen <- "read error: " + err.Error()
+			return
+		}
+		deadSeen <- string(append([]byte(nil), buf[:n]...))
+	}()
+	liveSeen := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = live.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := live.ReadFrom(buf)
+		if err != nil {
+			liveSeen <- "read error: " + err.Error()
+			return
+		}
+		liveSeen <- string(append([]byte(nil), buf[:n]...))
+		_, _ = live.WriteTo([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"), addr)
+	}()
+
+	resolver := SIPServerCandidateResolverFunc(func(ctx context.Context, network, uri string) ([]string, error) {
+		if network != "udp" || uri != "sip:ims.example" {
+			t.Fatalf("resolver network=%q uri=%q", network, uri)
+		}
+		return []string{dead.LocalAddr().String(), live.LocalAddr().String()}, nil
+	})
+	resp, err := WireRegisterTransport{
+		Network:               "udp",
+		Resolver:              resolver,
+		Timeout:               80 * time.Millisecond,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+		MaxRetransmits:        1,
+	}.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "failover-register",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRegister() error = %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("response=%+v", resp)
+	}
+	if wire := <-deadSeen; !strings.Contains(wire, "REGISTER sip:ims.example") {
+		t.Fatalf("dead target wire=%q", wire)
+	}
+	if wire := <-liveSeen; !strings.Contains(wire, "REGISTER sip:ims.example") {
+		t.Fatalf("live target wire=%q", wire)
+	}
+}
+
 func TestWireRegisterTransportRoundTripOverTCP(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

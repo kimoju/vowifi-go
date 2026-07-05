@@ -47,9 +47,11 @@ protocol layers needed by VoHive:
   response handling
 - reusable SIP flow transport for REGISTER, MESSAGE, USSD, and voice dialog
   requests, preserving the REGISTER socket/local port for IMS NAT pinholes and
-  offering explicit CRLF keepalive support
+  offering explicit CRLF keepalive support, including sticky reuse of the
+  selected P-CSCF after failover
 - SIP server resolution with injectable policy hooks and default `_sip._udp` /
-  `_sip._tcp` SRV lookup before direct host:port fallback
+  `_sip._tcp` SRV lookup, A/AAAA expansion, ordered candidate lists, and
+  REGISTER/dialog transport failover before direct host:port fallback
 - SWu IKE configuration payload DNS extraction, exposing negotiated internal
   DNS servers to the runtime and using them for default IMS SRV/A/AAAA lookups
 - IMS REGISTER session flow with 401/407 authentication retry, associated URI,

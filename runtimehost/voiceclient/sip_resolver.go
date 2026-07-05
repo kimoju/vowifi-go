@@ -21,6 +21,27 @@ func (f SIPServerResolverFunc) ResolveSIPServer(ctx context.Context, network, ur
 	return f(ctx, network, uri)
 }
 
+type SIPServerCandidateResolver interface {
+	ResolveSIPServers(context.Context, string, string) ([]string, error)
+}
+
+type SIPServerCandidateResolverFunc func(context.Context, string, string) ([]string, error)
+
+func (f SIPServerCandidateResolverFunc) ResolveSIPServers(ctx context.Context, network, uri string) ([]string, error) {
+	return f(ctx, network, uri)
+}
+
+func (f SIPServerCandidateResolverFunc) ResolveSIPServer(ctx context.Context, network, uri string) (string, error) {
+	addrs, err := f.ResolveSIPServers(ctx, network, uri)
+	if err != nil {
+		return "", err
+	}
+	if len(addrs) == 0 {
+		return "", errSIPDNSResolverEmpty()
+	}
+	return strings.TrimSpace(addrs[0]), nil
+}
+
 type NetSIPResolver struct {
 	Resolver   *net.Resolver
 	DNSServers []string
@@ -28,12 +49,23 @@ type NetSIPResolver struct {
 }
 
 func (r NetSIPResolver) ResolveSIPServer(ctx context.Context, network, uri string) (string, error) {
-	endpoint, err := parseSIPURIEndpoint(uri)
+	addrs, err := r.ResolveSIPServers(ctx, network, uri)
 	if err != nil {
 		return "", err
 	}
+	if len(addrs) == 0 {
+		return "", errSIPDNSResolverEmpty()
+	}
+	return addrs[0], nil
+}
+
+func (r NetSIPResolver) ResolveSIPServers(ctx context.Context, network, uri string) ([]string, error) {
+	endpoint, err := parseSIPURIEndpoint(uri)
+	if err != nil {
+		return nil, err
+	}
 	if endpoint.ExplicitPort || net.ParseIP(strings.Trim(endpoint.Host, "[]")) != nil {
-		return endpoint.addr(), nil
+		return []string{endpoint.addr()}, nil
 	}
 	resolver := r.Resolver
 	if resolver == nil {
@@ -43,21 +75,37 @@ func (r NetSIPResolver) ResolveSIPServer(ctx context.Context, network, uri strin
 	if endpoint.Secure {
 		service = "sips"
 	}
+	var out []string
 	_, records, err := resolver.LookupSRV(ctx, service, sipResolverProto(network, endpoint.Secure), endpoint.Host)
 	if err == nil && len(records) > 0 {
-		target := strings.TrimSuffix(strings.TrimSpace(records[0].Target), ".")
-		if target != "" {
-			return net.JoinHostPort(target, strconv.Itoa(int(records[0].Port))), nil
+		for _, record := range records {
+			target := strings.TrimSuffix(strings.TrimSpace(record.Target), ".")
+			if target == "" {
+				continue
+			}
+			port := strconv.Itoa(int(record.Port))
+			if addrs := resolveSIPHostAddrs(ctx, resolver, network, target, port); len(addrs) > 0 {
+				out = appendSIPTargets(out, addrs...)
+				continue
+			}
+			out = appendSIPTargets(out, net.JoinHostPort(strings.Trim(target, "[]"), port))
 		}
 	}
-	if addr := resolveSIPHostAddr(ctx, resolver, network, endpoint.Host, endpoint.Port); addr != "" {
-		return addr, nil
+	if addrs := resolveSIPHostAddrs(ctx, resolver, network, endpoint.Host, endpoint.Port); len(addrs) > 0 {
+		out = appendSIPTargets(out, addrs...)
 	}
-	return endpoint.addr(), nil
+	if len(out) == 0 {
+		out = appendSIPTargets(out, endpoint.addr())
+	}
+	return out, nil
 }
 
 func ResolveSIPServer(ctx context.Context, network, uri string) (string, error) {
 	return NetSIPResolver{}.ResolveSIPServer(ctx, network, uri)
+}
+
+func ResolveSIPServers(ctx context.Context, network, uri string) ([]string, error) {
+	return NetSIPResolver{}.ResolveSIPServers(ctx, network, uri)
 }
 
 func DNSResolverForServers(servers []string, timeout time.Duration) *net.Resolver {
@@ -92,6 +140,25 @@ func DNSResolverForServers(servers []string, timeout time.Duration) *net.Resolve
 			return nil, errSIPDNSResolverEmpty()
 		},
 	}
+}
+
+func appendSIPTargets(out []string, targets ...string) []string {
+	for _, target := range targets {
+		target = strings.TrimSpace(target)
+		if target != "" {
+			duplicate := false
+			for _, existing := range out {
+				if existing == target {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				out = append(out, target)
+			}
+		}
+	}
+	return out
 }
 
 func normalizeDNSServerAddrs(servers []string) []string {
@@ -153,10 +220,32 @@ func normalizeDNSServerAddr(server string) string {
 }
 
 func resolveSIPServerAddr(ctx context.Context, resolver SIPServerResolver, network, uri string) (string, error) {
-	if resolver == nil {
-		resolver = NetSIPResolver{}
+	addrs, err := resolveSIPServerAddrs(ctx, resolver, network, uri)
+	if err != nil {
+		return "", err
 	}
-	return resolver.ResolveSIPServer(ctx, network, uri)
+	if len(addrs) == 0 {
+		return "", errSIPDNSResolverEmpty()
+	}
+	return addrs[0], nil
+}
+
+func resolveSIPServerAddrs(ctx context.Context, resolver SIPServerResolver, network, uri string) ([]string, error) {
+	if resolver == nil {
+		return NetSIPResolver{}.ResolveSIPServers(ctx, network, uri)
+	}
+	if candidateResolver, ok := resolver.(SIPServerCandidateResolver); ok {
+		addrs, err := candidateResolver.ResolveSIPServers(ctx, network, uri)
+		if err != nil {
+			return nil, err
+		}
+		return appendSIPTargets(nil, addrs...), nil
+	}
+	addr, err := resolver.ResolveSIPServer(ctx, network, uri)
+	if err != nil {
+		return nil, err
+	}
+	return appendSIPTargets(nil, addr), nil
 }
 
 type sipURIEndpoint struct {
@@ -244,35 +333,42 @@ func sipResolverProto(network string, secure bool) string {
 }
 
 func resolveSIPHostAddr(ctx context.Context, resolver *net.Resolver, network, host, port string) string {
-	if resolver == nil {
+	addrs := resolveSIPHostAddrs(ctx, resolver, network, host, port)
+	if len(addrs) == 0 {
 		return ""
+	}
+	return addrs[0]
+}
+
+func resolveSIPHostAddrs(ctx context.Context, resolver *net.Resolver, network, host, port string) []string {
+	if resolver == nil {
+		return nil
 	}
 	addrs, err := resolver.LookupIPAddr(ctx, strings.Trim(host, "[]"))
 	if err != nil {
-		return ""
+		return nil
 	}
 	prefer6 := strings.HasSuffix(strings.ToLower(strings.TrimSpace(network)), "6")
 	prefer4 := strings.HasSuffix(strings.ToLower(strings.TrimSpace(network)), "4")
-	var fallback net.IP
+	var preferred []string
+	var fallback []string
 	for _, addr := range addrs {
 		ip := addr.IP
 		if ip == nil {
 			continue
 		}
-		if fallback == nil {
-			fallback = ip
-		}
+		target := net.JoinHostPort(ip.String(), port)
 		if prefer4 && ip.To4() != nil {
-			return net.JoinHostPort(ip.String(), port)
+			preferred = appendSIPTargets(preferred, target)
+			continue
 		}
 		if prefer6 && ip.To4() == nil {
-			return net.JoinHostPort(ip.String(), port)
+			preferred = appendSIPTargets(preferred, target)
+			continue
 		}
+		fallback = appendSIPTargets(fallback, target)
 	}
-	if fallback == nil {
-		return ""
-	}
-	return net.JoinHostPort(fallback.String(), port)
+	return appendSIPTargets(preferred, fallback...)
 }
 
 func errSIPURIEmpty() error {
