@@ -115,6 +115,21 @@ func TestParseSIPRequestAndBuildResponseWire(t *testing.T) {
 	}
 }
 
+func TestReadSIPStreamMessageSkipsCRLFKeepalive(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("\r\n\r\n\r\nSIP/2.0 200 OK\r\nContent-Length: 5\r\n\r\nreadytrailing"))
+	raw, err := readSIPStreamMessage(reader)
+	if err != nil {
+		t.Fatalf("readSIPStreamMessage() error = %v", err)
+	}
+	resp, err := ParseSIPResponse(raw)
+	if err != nil {
+		t.Fatalf("ParseSIPResponse() error = %v raw=%q", err, raw)
+	}
+	if resp.StatusCode != 200 || string(resp.Body) != "ready" {
+		t.Fatalf("response=%+v body=%q raw=%q", resp, resp.Body, raw)
+	}
+}
+
 func TestSIPURIAddrParsesHostPortAndIPv6(t *testing.T) {
 	cases := map[string]string{
 		"sip:ims.example":                  "ims.example:5060",
@@ -130,6 +145,53 @@ func TestSIPURIAddrParsesHostPortAndIPv6(t *testing.T) {
 		if got != want {
 			t.Fatalf("sipURIAddr(%q)=%q, want %q", uri, got, want)
 		}
+	}
+}
+
+func TestWireRegisterTransportIgnoresUDPKeepaliveBeforeResponse(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	requestCh := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			requestCh <- "read error: " + err.Error()
+			return
+		}
+		requestCh <- string(append([]byte(nil), buf[:n]...))
+		_, _ = pc.WriteTo([]byte("\r\n\r\n"), addr)
+		_, _ = pc.WriteTo([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"), addr)
+	}()
+
+	resp, err := WireRegisterTransport{
+		Network:    "udp",
+		ServerAddr: pc.LocalAddr().String(),
+		Timeout:    time.Second,
+	}.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "keepalive-register",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRegister() error = %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("response=%+v", resp)
+	}
+	if req := <-requestCh; !strings.Contains(req, "REGISTER sip:ims.example SIP/2.0") {
+		t.Fatalf("REGISTER wire=%q", req)
 	}
 }
 
@@ -307,6 +369,48 @@ func TestWireRegisterTransportRoundTripOverTCP(t *testing.T) {
 	req := <-requestCh
 	if !strings.Contains(req, "Via: SIP/2.0/TCP") || !strings.Contains(req, "Content-Length: 0") {
 		t.Fatalf("TCP request=%q", req)
+	}
+}
+
+func TestWireSIPTransportIgnoresUDPKeepaliveBeforeResponse(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		_, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		_, _ = pc.WriteTo([]byte("\r\n\r\n"), addr)
+		_, _ = pc.WriteTo([]byte("SIP/2.0 202 Accepted\r\nContent-Length: 0\r\n\r\n"), addr)
+	}()
+
+	resp, err := WireSIPTransport{
+		Network:    "udp",
+		ServerAddr: pc.LocalAddr().String(),
+		Timeout:    time.Second,
+	}.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"To":           "<sip:callee@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Call-ID":      "keepalive-message",
+			"CSeq":         "1 MESSAGE",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRequest() error = %v", err)
+	}
+	if resp.StatusCode != 202 {
+		t.Fatalf("response=%+v", resp)
 	}
 }
 

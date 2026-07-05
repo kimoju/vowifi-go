@@ -102,6 +102,9 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 			}
 			return SIPResponse{}, err
 		}
+		if !isSIPResponseWire(buf[:n]) {
+			continue
+		}
 		resp, err := ParseSIPResponse(buf[:n])
 		if err != nil {
 			return SIPResponse{}, err

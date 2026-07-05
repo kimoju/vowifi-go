@@ -93,6 +93,9 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 		}
 		n, err := conn.Read(buf)
 		if err == nil {
+			if !isSIPResponseWire(buf[:n]) {
+				continue
+			}
 			return ParseSIPResponse(buf[:n])
 		}
 		if ctx.Err() != nil {
@@ -508,6 +511,9 @@ func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		if len(raw) == 0 && isSIPBlankLine(line) {
+			continue
+		}
 		raw = append(raw, line...)
 		if bytes.HasSuffix(raw, []byte("\r\n\r\n")) || bytes.HasSuffix(raw, []byte("\n\n")) {
 			break
@@ -530,6 +536,14 @@ func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 		raw = append(raw, body...)
 	}
 	return raw, nil
+}
+
+func isSIPBlankLine(line []byte) bool {
+	return len(bytes.TrimSpace(line)) == 0
+}
+
+func isSIPResponseWire(raw []byte) bool {
+	return bytes.HasPrefix(bytes.TrimLeft(raw, "\r\n\t "), []byte("SIP/2.0"))
 }
 
 func contentLength(headers map[string][]string) (int, bool) {

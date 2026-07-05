@@ -2,7 +2,6 @@ package voiceclient
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -209,7 +208,7 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 			}
 			return SIPResponse{}, err
 		}
-		if !bytes.HasPrefix(buf[:n], []byte("SIP/2.0")) {
+		if !isSIPResponseWire(buf[:n]) {
 			continue
 		}
 		resp, err := ParseSIPResponse(buf[:n])
