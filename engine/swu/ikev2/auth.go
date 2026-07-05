@@ -75,6 +75,8 @@ type AKAChallengeResult struct {
 	EAPNext                *eapaka.Packet
 	EAPKeys                eapaka.Keys
 	EAPEncryptedAttributes []eapaka.Attribute
+	EAPNextPseudonym       string
+	EAPNextReauthID        string
 	EAPNotifications       []eapaka.Packet
 	EAPClientError         bool
 	ChildSA                *ChildSAResult
@@ -115,6 +117,8 @@ type FullAuthResult struct {
 	EAPLast            *eapaka.Packet
 	EAPNotifications   []eapaka.Packet
 	EAPClientError     bool
+	EAPNextPseudonym   string
+	EAPNextReauthID    string
 	SyncFailure        bool
 	AuthFailure        bool
 	KDFNegotiations    int
@@ -354,6 +358,12 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		out.FinalResponseInner = clonePayloads(challenge.FinalResponseInner)
 		out.EAPNotifications = append(out.EAPNotifications, challenge.EAPNotifications...)
 		out.EAPClientError = out.EAPClientError || challenge.EAPClientError
+		if challenge.EAPNextPseudonym != "" {
+			out.EAPNextPseudonym = challenge.EAPNextPseudonym
+		}
+		if challenge.EAPNextReauthID != "" {
+			out.EAPNextReauthID = challenge.EAPNextReauthID
+		}
 		out.SyncFailure = out.SyncFailure || challenge.SyncFailure
 		out.AuthFailure = out.AuthFailure || challenge.AuthFailure
 		if challenge.KDFNegotiated {
@@ -397,6 +407,7 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	var clientError bool
 	var notifications []eapaka.Packet
 	var encryptedAttributes []eapaka.Attribute
+	var identityState eapaka.EncryptedIdentityState
 	if response, handled, err := buildAKAControlResponse(cfg.Request, cfg.EAPKeys); err != nil {
 		return AKAChallengeResult{}, err
 	} else if handled {
@@ -444,6 +455,10 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 				return AKAChallengeResult{}, err
 			} else if len(attrs) > 0 {
 				encryptedAttributes = attrs
+				identityState, err = eapaka.IdentityStateFromAttributes(attrs)
+				if err != nil {
+					return AKAChallengeResult{}, err
+				}
 			}
 		}
 	}
@@ -496,6 +511,8 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 		EAPResponse:            eapResp,
 		EAPKeys:                resultEAPKeys,
 		EAPEncryptedAttributes: cloneEAPAttributes(encryptedAttributes),
+		EAPNextPseudonym:       identityState.NextPseudonym,
+		EAPNextReauthID:        identityState.NextReauthID,
 		EAPNotifications:       cloneEAPPackets(notifications),
 		EAPClientError:         clientError,
 		SyncFailure:            syncFailure,

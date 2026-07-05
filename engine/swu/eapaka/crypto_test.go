@@ -122,7 +122,7 @@ func TestEncryptDecryptAttributes(t *testing.T) {
 	kEncr := bytes.Repeat([]byte{0x11}, 16)
 	iv := bytes.Repeat([]byte{0x22}, 16)
 	attrs := []Attribute{
-		VariableAttribute(AttributeNextPseudonym, []byte("pseudo-123")),
+		NextPseudonymAttribute("pseudo-123"),
 		ResultIndAttribute(),
 	}
 	encrypted, err := EncryptAttributes(kEncr, iv, attrs)
@@ -173,7 +173,7 @@ func TestDecryptChallengeEncryptedAttributes(t *testing.T) {
 	}
 	iv := bytes.Repeat([]byte{0x33}, 16)
 	encrypted, err := EncryptAttributes(keys.KEncr, iv, []Attribute{
-		VariableAttribute(AttributeNextReauthID, []byte("reauth-1")),
+		NextReauthIDAttribute("reauth-1"),
 	})
 	if err != nil {
 		t.Fatalf("EncryptAttributes() error = %v", err)
@@ -200,7 +200,7 @@ func TestDecryptAttributesRejectsBadPadding(t *testing.T) {
 	iv := bytes.Repeat([]byte{0x22}, 16)
 	plaintext, err := MarshalAttributes([]Attribute{
 		ResultIndAttribute(),
-		VariableAttribute(AttributeNextPseudonym, []byte("abc")),
+		NextPseudonymAttribute("abc"),
 		{Type: AttributePadding, Data: []byte{0, 1}},
 	})
 	if err != nil {

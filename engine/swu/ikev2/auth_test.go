@@ -416,7 +416,8 @@ func TestRunIKEAuthAKAChallenge(t *testing.T) {
 	}
 	encryptedIV := bytes.Repeat([]byte{0x33}, 16)
 	encrypted, err := eapaka.EncryptAttributes(eapKeys.KEncr, encryptedIV, []eapaka.Attribute{
-		eapaka.VariableAttribute(eapaka.AttributeNextReauthID, []byte("reauth-2")),
+		eapaka.NextPseudonymAttribute("pseudo-2"),
+		eapaka.NextReauthIDAttribute("reauth-2"),
 	})
 	if err != nil {
 		t.Fatalf("EncryptAttributes() error = %v", err)
@@ -498,15 +499,11 @@ func TestRunIKEAuthAKAChallenge(t *testing.T) {
 	if len(res.EAPKeys.KAut) != eapaka.KeyLengthKAut || len(res.EAPKeys.MSK) != eapaka.KeyLengthMSK {
 		t.Fatalf("EAP keys=%+v", res.EAPKeys)
 	}
-	if len(res.EAPEncryptedAttributes) != 1 || res.EAPEncryptedAttributes[0].Type != eapaka.AttributeNextReauthID {
+	if len(res.EAPEncryptedAttributes) != 2 || res.EAPEncryptedAttributes[0].Type != eapaka.AttributeNextPseudonym || res.EAPEncryptedAttributes[1].Type != eapaka.AttributeNextReauthID {
 		t.Fatalf("encrypted attributes=%+v", res.EAPEncryptedAttributes)
 	}
-	nextReauth, err := res.EAPEncryptedAttributes[0].VariableValue()
-	if err != nil {
-		t.Fatalf("VariableValue() error = %v", err)
-	}
-	if string(nextReauth) != "reauth-2" {
-		t.Fatalf("next reauth=%q", string(nextReauth))
+	if res.EAPNextPseudonym != "pseudo-2" || res.EAPNextReauthID != "reauth-2" {
+		t.Fatalf("EAP identity state pseudonym=%q reauth=%q", res.EAPNextPseudonym, res.EAPNextReauthID)
 	}
 	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.LocalSPI, localSPI) || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xbe, 0xef}) {
 		t.Fatalf("child SA=%+v", res.ChildSA)

@@ -226,6 +226,20 @@ func TestResultIndAttribute(t *testing.T) {
 	}
 }
 
+func TestIdentityStateFromAttributes(t *testing.T) {
+	state, err := IdentityStateFromAttributes([]Attribute{
+		NextPseudonymAttribute("pseudo-1"),
+		NextReauthIDAttribute("reauth-1"),
+		ResultIndAttribute(),
+	})
+	if err != nil {
+		t.Fatalf("IdentityStateFromAttributes() error = %v", err)
+	}
+	if state.NextPseudonym != "pseudo-1" || state.NextReauthID != "reauth-1" {
+		t.Fatalf("state=%+v", state)
+	}
+}
+
 func TestAKAChallengeAttributes(t *testing.T) {
 	raw, err := (Packet{
 		Code:       CodeRequest,

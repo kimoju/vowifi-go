@@ -108,10 +108,12 @@ type Request struct {
 }
 
 type WebsheetRequest struct {
-	URL         string
-	UserData    string
-	ContentType string
-	Title       string
+	URL              string
+	UserData         string
+	ContentType      string
+	Title            string
+	EAPNextPseudonym string
+	EAPNextReauthID  string
 }
 
 func StartEmergencyAddressUpdate(ctx context.Context, req Request) (WebsheetRequest, error) {
@@ -182,11 +184,12 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 	}
 	var eapKeys *eapaka.Keys
 	var identityTranscript [][]byte
+	var eapIdentityState eapaka.EncryptedIdentityState
 	for challengeResponses := 0; result.HasChallenge(); challengeResponses++ {
 		if challengeResponses >= maxEntitlementChallengeResponses {
 			return WebsheetRequest{}, ErrChallengeNotImplemented
 		}
-		answerBody, nextEAPKeys, nextIdentityTranscript, err := buildEntitlementChallengeAnswer(req, result, eapKeys, identityTranscript)
+		answerBody, nextEAPKeys, nextIdentityTranscript, nextEAPIdentityState, err := buildEntitlementChallengeAnswer(req, result, eapKeys, identityTranscript)
 		if err != nil {
 			return WebsheetRequest{}, err
 		}
@@ -194,6 +197,7 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 			eapKeys = nextEAPKeys
 		}
 		identityTranscript = nextIdentityTranscript
+		eapIdentityState = mergeEAPIdentityState(eapIdentityState, nextEAPIdentityState)
 		answer, err := json.Marshal([]map[string]any{answerBody})
 		if err != nil {
 			return WebsheetRequest{}, err
@@ -216,6 +220,7 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 			return WebsheetRequest{}, err
 		}
 		if ws := websheetFromEntitlement(req.Carrier.E911.Websheet, result); ws.URL != "" {
+			ws = websheetWithEAPIdentityState(ws, eapIdentityState)
 			return ws, nil
 		}
 	}
@@ -225,7 +230,7 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 	return WebsheetRequest{}, fmt.Errorf("e911 entitlement response did not include websheet data")
 }
 
-func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapKeys *eapaka.Keys, identityTranscript [][]byte) (map[string]any, *eapaka.Keys, [][]byte, error) {
+func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapKeys *eapaka.Keys, identityTranscript [][]byte) (map[string]any, *eapaka.Keys, [][]byte, eapaka.EncryptedIdentityState, error) {
 	answerBody := map[string]any{
 		"message-id":    2,
 		"operation":     "emergency-address-update",
@@ -235,7 +240,7 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 	}
 	nextIdentityTranscript := cloneByteSlices(identityTranscript)
 	if relay, raw, ok, err := buildEAPRelayIdentityAnswer(result, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI)); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 	} else if ok {
 		answerBody["eap-relay-packet"] = relay
 		if len(result.EAPPacketRaw) > 0 {
@@ -243,72 +248,74 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 		} else if result.EAPPacket != nil {
 			requestRaw, err := result.EAPPacket.MarshalBinary()
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 			}
 			nextIdentityTranscript = append(nextIdentityTranscript, requestRaw)
 		}
 		nextIdentityTranscript = append(nextIdentityTranscript, append([]byte(nil), raw...))
-		return answerBody, nil, nextIdentityTranscript, nil
+		return answerBody, nil, nextIdentityTranscript, eapaka.EncryptedIdentityState{}, nil
 	}
 	if relay, negotiated, err := buildEAPRelayKDFNegotiationAnswer(result); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 	} else if negotiated {
 		answerBody["eap-relay-packet"] = relay
-		return answerBody, nil, nextIdentityTranscript, nil
+		return answerBody, nil, nextIdentityTranscript, eapaka.EncryptedIdentityState{}, nil
 	}
 	if relay, ok, err := buildEAPRelayNotificationAnswer(result, eapKeys); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 	} else if ok {
 		answerBody["eap-relay-packet"] = relay
-		return answerBody, nil, nextIdentityTranscript, nil
+		return answerBody, nil, nextIdentityTranscript, eapaka.EncryptedIdentityState{}, nil
 	}
 	if result.EAPPacket != nil && result.EAPPacket.Subtype != eapaka.SubtypeChallenge {
 		relay, err := buildEAPRelayClientErrorAnswer(result, eapaka.ClientErrorUnableToProcessPacket)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 		}
 		answerBody["eap-relay-packet"] = relay
-		return answerBody, nil, nextIdentityTranscript, nil
+		return answerBody, nil, nextIdentityTranscript, eapaka.EncryptedIdentityState{}, nil
 	}
 	if req.AKAProvider == nil {
-		return nil, nil, nil, ErrChallengeNotImplemented
+		return nil, nil, nil, eapaka.EncryptedIdentityState{}, ErrChallengeNotImplemented
 	}
 	aka, err := req.AKAProvider.CalculateAKA(result.RAND, result.AUTN)
 	syncFailure := errors.Is(err, sim.ErrSyncFailure)
 	authFailure := errors.Is(err, sim.ErrAuthFailure)
 	if err != nil && !syncFailure && !authFailure {
-		return nil, nil, nil, err
+		return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 	}
 	if syncFailure && len(aka.AUTS) == 0 {
-		return nil, nil, nil, err
+		return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 	}
 	if authFailure {
 		if result.EAPPacket == nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 		}
 		relay, err := buildEAPRelayAuthenticationRejectAnswer(result)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 		}
 		answerBody["eap-relay-packet"] = relay
-		return answerBody, nil, nextIdentityTranscript, nil
+		return answerBody, nil, nextIdentityTranscript, eapaka.EncryptedIdentityState{}, nil
 	}
 	answerBody["aka-res"] = strings.ToUpper(hex.EncodeToString(aka.RES))
 	answerBody["aka-ck"] = strings.ToUpper(hex.EncodeToString(aka.CK))
 	answerBody["aka-ik"] = strings.ToUpper(hex.EncodeToString(aka.IK))
 	answerBody["aka-auts"] = strings.ToUpper(hex.EncodeToString(aka.AUTS))
 	var nextEAPKeys *eapaka.Keys
+	var nextEAPIdentityState eapaka.EncryptedIdentityState
 	if result.EAPPacket != nil {
-		relay, keys, err := buildEAPRelayAnswer(result, aka, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI), syncFailure, nextIdentityTranscript)
+		relay, keys, identityState, err := buildEAPRelayAnswer(result, aka, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI), syncFailure, nextIdentityTranscript)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, eapaka.EncryptedIdentityState{}, err
 		}
 		if relay != "" {
 			answerBody["eap-relay-packet"] = relay
 			nextEAPKeys = keys
+			nextEAPIdentityState = identityState
 		}
 	}
-	return answerBody, nextEAPKeys, nextIdentityTranscript, nil
+	return answerBody, nextEAPKeys, nextIdentityTranscript, nextEAPIdentityState, nil
 }
 
 func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req *HTTPRequest) (*HTTPResponse, error) {
@@ -470,12 +477,13 @@ func buildEAPRelayIdentityAnswer(result entitlementResult, identity string) (str
 	return base64.StdEncoding.EncodeToString(raw), raw, true, nil
 }
 
-func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity string, syncFailure bool, identityTranscript [][]byte) (string, *eapaka.Keys, error) {
+func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity string, syncFailure bool, identityTranscript [][]byte) (string, *eapaka.Keys, eapaka.EncryptedIdentityState, error) {
 	if result.EAPPacket == nil {
-		return "", nil, nil
+		return "", nil, eapaka.EncryptedIdentityState{}, nil
 	}
 	var packet eapaka.Packet
 	var keys *eapaka.Keys
+	var identityState eapaka.EncryptedIdentityState
 	var err error
 	if syncFailure {
 		packet, err = eapaka.BuildSynchronizationFailureResponse(*result.EAPPacket, aka.AUTS)
@@ -484,16 +492,21 @@ func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity s
 		packet, err = response, responseErr
 		if responseErr == nil {
 			keys = &responseKeys
+			if attrs, _, decryptErr := eapaka.DecryptChallengeEncryptedAttributes(*result.EAPPacket, responseKeys); decryptErr != nil {
+				err = decryptErr
+			} else if len(attrs) > 0 {
+				identityState, err = eapaka.IdentityStateFromAttributes(attrs)
+			}
 		}
 	}
 	if err != nil {
-		return "", nil, err
+		return "", nil, eapaka.EncryptedIdentityState{}, err
 	}
 	raw, err := packet.MarshalBinary()
 	if err != nil {
-		return "", nil, err
+		return "", nil, eapaka.EncryptedIdentityState{}, err
 	}
-	return base64.StdEncoding.EncodeToString(raw), keys, nil
+	return base64.StdEncoding.EncodeToString(raw), keys, identityState, nil
 }
 
 func cloneByteSlices(in [][]byte) [][]byte {
@@ -505,6 +518,22 @@ func cloneByteSlices(in [][]byte) [][]byte {
 		out[i] = append([]byte(nil), item...)
 	}
 	return out
+}
+
+func mergeEAPIdentityState(current, next eapaka.EncryptedIdentityState) eapaka.EncryptedIdentityState {
+	if next.NextPseudonym != "" {
+		current.NextPseudonym = next.NextPseudonym
+	}
+	if next.NextReauthID != "" {
+		current.NextReauthID = next.NextReauthID
+	}
+	return current
+}
+
+func websheetWithEAPIdentityState(ws WebsheetRequest, state eapaka.EncryptedIdentityState) WebsheetRequest {
+	ws.EAPNextPseudonym = state.NextPseudonym
+	ws.EAPNextReauthID = state.NextReauthID
+	return ws
 }
 
 func buildEAPRelayAuthenticationRejectAnswer(result entitlementResult) (string, error) {

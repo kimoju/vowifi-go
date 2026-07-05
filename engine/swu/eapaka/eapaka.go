@@ -94,6 +94,11 @@ type Attribute struct {
 	Data []byte
 }
 
+type EncryptedIdentityState struct {
+	NextPseudonym string
+	NextReauthID  string
+}
+
 func (p Packet) MarshalBinary() ([]byte, error) {
 	if p.Code == CodeSuccess || p.Code == CodeFailure {
 		out := []byte{p.Code, p.Identifier, 0, 4}
@@ -288,6 +293,14 @@ func EncrDataAttribute(ciphertext []byte) Attribute {
 	return FixedAttribute(AttributeEncrData, ciphertext)
 }
 
+func NextPseudonymAttribute(identity string) Attribute {
+	return VariableAttribute(AttributeNextPseudonym, []byte(identity))
+}
+
+func NextReauthIDAttribute(identity string) Attribute {
+	return VariableAttribute(AttributeNextReauthID, []byte(identity))
+}
+
 func CheckcodeAttribute(checkcode []byte) Attribute {
 	return FixedAttribute(AttributeCheckcode, checkcode)
 }
@@ -405,6 +418,43 @@ func (a Attribute) EncrDataValue() ([]byte, error) {
 		return nil, ErrInvalidAttribute
 	}
 	return append([]byte(nil), a.Data[2:]...), nil
+}
+
+func (a Attribute) NextPseudonymValue() (string, error) {
+	value, err := a.VariableValue()
+	if err != nil {
+		return "", err
+	}
+	return string(value), nil
+}
+
+func (a Attribute) NextReauthIDValue() (string, error) {
+	value, err := a.VariableValue()
+	if err != nil {
+		return "", err
+	}
+	return string(value), nil
+}
+
+func IdentityStateFromAttributes(attrs []Attribute) (EncryptedIdentityState, error) {
+	var out EncryptedIdentityState
+	for _, attr := range attrs {
+		switch attr.Type {
+		case AttributeNextPseudonym:
+			value, err := attr.NextPseudonymValue()
+			if err != nil {
+				return EncryptedIdentityState{}, err
+			}
+			out.NextPseudonym = value
+		case AttributeNextReauthID:
+			value, err := attr.NextReauthIDValue()
+			if err != nil {
+				return EncryptedIdentityState{}, err
+			}
+			out.NextReauthID = value
+		}
+	}
+	return out, nil
 }
 
 func (a Attribute) CheckcodeValue() ([]byte, error) {

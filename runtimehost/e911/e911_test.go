@@ -169,6 +169,51 @@ func TestStartEmergencyAddressUpdateHandlesEAPRelayChallenge(t *testing.T) {
 	}
 }
 
+func TestStartEmergencyAddressUpdateCapturesEAPRelayEncryptedIdentityState(t *testing.T) {
+	identity := "310280233641503@private.att.net"
+	akaResult := e911AKAResult()
+	keys, err := eapaka.DeriveKeys(identity, akaResult)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	iv := bytesFrom(0x70, 16)
+	encrypted, err := eapaka.EncryptAttributes(keys.KEncr, iv, []eapaka.Attribute{
+		eapaka.NextPseudonymAttribute("pseudo-e911"),
+		eapaka.NextReauthIDAttribute("reauth-e911"),
+	})
+	if err != nil {
+		t.Fatalf("EncryptAttributes() error = %v", err)
+	}
+	relayPacket := signedEAPRelayChallengeWithEncryptedAttrs(t, identity, akaResult, eapaka.IVAttribute(iv), encrypted)
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":19,"eap-relay-packet":"` + relayPacket + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+	aka := &fakeAKAProvider{}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity:    Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280", SIPUsername: identity},
+		AKAProvider: aka,
+		Client:      client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.EAPNextPseudonym != "pseudo-e911" || ws.EAPNextReauthID != "reauth-e911" {
+		t.Fatalf("websheet EAP state pseudonym=%q reauth=%q", ws.EAPNextPseudonym, ws.EAPNextReauthID)
+	}
+	if aka.calls != 1 {
+		t.Fatalf("AKA calls=%d, want one AKA calculation", aka.calls)
+	}
+}
+
 func TestStartEmergencyAddressUpdateHandlesEAPRelayAuthenticationReject(t *testing.T) {
 	identity := "310280233641503@private.att.net"
 	relayPacket := signedEAPRelayChallenge(t, identity, e911AKAResult())
@@ -597,6 +642,41 @@ func signedEAPRelayChallenge(t *testing.T, identity string, aka sim.AKAResult) s
 			eapaka.AUTNAttribute(bytesFrom(0x40, 16)),
 			eapaka.MACAttribute(nil),
 		},
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := eapaka.CalculateMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	packet.Attributes[len(packet.Attributes)-1] = eapaka.MACAttribute(mac)
+	raw, err = packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func signedEAPRelayChallengeWithEncryptedAttrs(t *testing.T, identity string, aka sim.AKAResult, attrs ...eapaka.Attribute) string {
+	t.Helper()
+	keys, err := eapaka.DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	challengeAttrs := []eapaka.Attribute{
+		eapaka.RANDAttribute(bytesFrom(0x10, 16)),
+		eapaka.AUTNAttribute(bytesFrom(0x40, 16)),
+	}
+	challengeAttrs = append(challengeAttrs, attrs...)
+	challengeAttrs = append(challengeAttrs, eapaka.MACAttribute(nil))
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 7,
+		Type:       eapaka.TypeAKA,
+		Subtype:    eapaka.SubtypeChallenge,
+		Attributes: challengeAttrs,
 	}
 	raw, err := packet.MarshalBinary()
 	if err != nil {
