@@ -3,32 +3,42 @@ package eapaka
 import (
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
 )
 
 const (
-	KeyLengthKEncr = 16
-	KeyLengthKAut  = 16
-	KeyLengthMSK   = 64
-	KeyLengthEMSK  = 64
+	KeyLengthKEncr        = 16
+	KeyLengthKAut         = 16
+	KeyLengthAKAPrimeKAut = 32
+	KeyLengthKRe          = 32
+	KeyLengthMSK          = 64
+	KeyLengthEMSK         = 64
 )
+
+const AKAPrimeKDFDefault uint16 = 1
 
 var (
 	ErrInvalidAKAChallenge = errors.New("invalid eap-aka challenge")
 	ErrInvalidMAC          = errors.New("invalid eap-aka mac")
 	ErrInvalidKeyMaterial  = errors.New("invalid eap-aka key material")
+	ErrUnsupportedKDF      = errors.New("unsupported eap-aka prime kdf")
 )
 
 type Keys struct {
-	MK    []byte
-	KEncr []byte
-	KAut  []byte
-	MSK   []byte
-	EMSK  []byte
+	MK      []byte
+	KEncr   []byte
+	KAut    []byte
+	KRe     []byte
+	MSK     []byte
+	EMSK    []byte
+	CKPrime []byte
+	IKPrime []byte
 }
 
 func DeriveKeys(identity string, aka sim.AKAResult) (Keys, error) {
@@ -50,6 +60,50 @@ func DeriveKeys(identity string, aka sim.AKAResult) (Keys, error) {
 	}, nil
 }
 
+func DeriveAKAPrimeKeys(identity, networkName string, autn16 []byte, aka sim.AKAResult) (Keys, error) {
+	if identity == "" {
+		return Keys{}, fmt.Errorf("%w: identity is empty", ErrInvalidKeyMaterial)
+	}
+	if networkName == "" {
+		return Keys{}, fmt.Errorf("%w: network name is empty", ErrInvalidKeyMaterial)
+	}
+	if len(autn16) < 6 {
+		return Keys{}, fmt.Errorf("%w: AUTN length %d", ErrInvalidKeyMaterial, len(autn16))
+	}
+	if len(aka.IK) == 0 || len(aka.CK) == 0 {
+		return Keys{}, fmt.Errorf("%w: IK/CK is empty", ErrInvalidKeyMaterial)
+	}
+	if len(networkName) > 0xffff {
+		return Keys{}, fmt.Errorf("%w: network name too long", ErrInvalidKeyMaterial)
+	}
+	ckPrimeIKPrime := deriveAKAPrimeCKIK([]byte(networkName), autn16[:6], aka)
+	ckPrime := append([]byte(nil), ckPrimeIKPrime[:16]...)
+	ikPrime := append([]byte(nil), ckPrimeIKPrime[16:]...)
+	key := make([]byte, 0, len(ikPrime)+len(ckPrime))
+	key = append(key, ikPrime...)
+	key = append(key, ckPrime...)
+	seed := make([]byte, 0, len("EAP-AKA'")+len(identity))
+	seed = append(seed, []byte("EAP-AKA'")...)
+	seed = append(seed, []byte(identity)...)
+	stream := prfPrimeSHA256(key, seed, KeyLengthKEncr+KeyLengthAKAPrimeKAut+KeyLengthKRe+KeyLengthMSK+KeyLengthEMSK)
+	offset := 0
+	out := Keys{
+		MK:      append([]byte(nil), stream...),
+		KEncr:   append([]byte(nil), stream[offset:offset+KeyLengthKEncr]...),
+		CKPrime: ckPrime,
+		IKPrime: ikPrime,
+	}
+	offset += KeyLengthKEncr
+	out.KAut = append([]byte(nil), stream[offset:offset+KeyLengthAKAPrimeKAut]...)
+	offset += KeyLengthAKAPrimeKAut
+	out.KRe = append([]byte(nil), stream[offset:offset+KeyLengthKRe]...)
+	offset += KeyLengthKRe
+	out.MSK = append([]byte(nil), stream[offset:offset+KeyLengthMSK]...)
+	offset += KeyLengthMSK
+	out.EMSK = append([]byte(nil), stream[offset:offset+KeyLengthEMSK]...)
+	return out, nil
+}
+
 func BuildChallengeResponse(identity string, request Packet, aka sim.AKAResult) (Packet, Keys, error) {
 	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
 		return Packet{}, Keys{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
@@ -57,7 +111,7 @@ func BuildChallengeResponse(identity string, request Packet, aka sim.AKAResult) 
 	if len(aka.RES) == 0 {
 		return Packet{}, Keys{}, fmt.Errorf("%w: RES is empty", ErrInvalidKeyMaterial)
 	}
-	keys, err := DeriveKeys(identity, aka)
+	keys, selectedKDF, err := deriveChallengeKeys(identity, request, aka)
 	if err != nil {
 		return Packet{}, Keys{}, err
 	}
@@ -65,24 +119,26 @@ func BuildChallengeResponse(identity string, request Packet, aka sim.AKAResult) 
 	if err != nil {
 		return Packet{}, Keys{}, err
 	}
-	if err := VerifyMAC(keys.KAut, requestRaw, nil); err != nil {
+	if err := verifyChallengeMAC(request.Type, keys.KAut, requestRaw); err != nil {
 		return Packet{}, Keys{}, err
 	}
+	responseAttrs := []Attribute{RESAttribute(aka.RES)}
+	if request.Type == TypeAKAPrime {
+		responseAttrs = append(responseAttrs, KDFAttribute(selectedKDF))
+	}
+	responseAttrs = append(responseAttrs, MACAttribute(nil))
 	response := Packet{
 		Code:       CodeResponse,
 		Identifier: request.Identifier,
 		Type:       request.Type,
 		Subtype:    SubtypeChallenge,
-		Attributes: []Attribute{
-			RESAttribute(aka.RES),
-			MACAttribute(nil),
-		},
+		Attributes: responseAttrs,
 	}
 	raw, err := response.MarshalBinary()
 	if err != nil {
 		return Packet{}, Keys{}, err
 	}
-	mac, err := CalculateMAC(keys.KAut, raw, nil)
+	mac, err := calculateChallengeMAC(response.Type, keys.KAut, raw)
 	if err != nil {
 		return Packet{}, Keys{}, err
 	}
@@ -97,12 +153,16 @@ func BuildSynchronizationFailureResponse(request Packet, auts []byte) (Packet, e
 	if len(auts) == 0 {
 		return Packet{}, fmt.Errorf("%w: AUTS is empty", ErrInvalidAKAChallenge)
 	}
+	attrs := []Attribute{AUTSAttribute(auts)}
+	if request.Type == TypeAKAPrime {
+		attrs = append(attrs, challengeKDFAttributes(request.Attributes)...)
+	}
 	return Packet{
 		Code:       CodeResponse,
 		Identifier: request.Identifier,
 		Type:       request.Type,
 		Subtype:    SubtypeSynchronizationFailure,
-		Attributes: []Attribute{AUTSAttribute(auts)},
+		Attributes: attrs,
 	}, nil
 }
 
@@ -136,6 +196,14 @@ func MACAttribute(mac []byte) Attribute {
 }
 
 func CalculateMAC(kAut, packet, extra []byte) ([]byte, error) {
+	return calculateMAC(kAut, packet, extra, sha1.New)
+}
+
+func CalculateAKAPrimeMAC(kAut, packet, extra []byte) ([]byte, error) {
+	return calculateMAC(kAut, packet, extra, sha256.New)
+}
+
+func calculateMAC(kAut, packet, extra []byte, h func() hash.Hash) ([]byte, error) {
 	if len(kAut) == 0 {
 		return nil, fmt.Errorf("%w: K_aut is empty", ErrInvalidKeyMaterial)
 	}
@@ -143,7 +211,7 @@ func CalculateMAC(kAut, packet, extra []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	mac := hmac.New(sha1.New, kAut)
+	mac := hmac.New(h, kAut)
 	_, _ = mac.Write(zeroed)
 	_, _ = mac.Write(extra)
 	sum := mac.Sum(nil)
@@ -156,6 +224,21 @@ func VerifyMAC(kAut, packet, extra []byte) error {
 		return err
 	}
 	expected, err := CalculateMAC(kAut, packet, extra)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(actual, expected) {
+		return fmt.Errorf("%w: AT_MAC mismatch", ErrInvalidMAC)
+	}
+	return nil
+}
+
+func VerifyAKAPrimeMAC(kAut, packet, extra []byte) error {
+	actual, err := packetMAC(packet)
+	if err != nil {
+		return err
+	}
+	expected, err := CalculateAKAPrimeMAC(kAut, packet, extra)
 	if err != nil {
 		return err
 	}
@@ -210,6 +293,122 @@ func findMACAttribute(packet []byte) (offset int, length int, err error) {
 		offset += length
 	}
 	return 0, 0, fmt.Errorf("%w: missing AT_MAC", ErrInvalidMAC)
+}
+
+func deriveChallengeKeys(identity string, request Packet, aka sim.AKAResult) (Keys, uint16, error) {
+	switch request.Type {
+	case 0, TypeAKA:
+		keys, err := DeriveKeys(identity, aka)
+		return keys, 0, err
+	case TypeAKAPrime:
+		kdf, err := firstKDFValue(request.Attributes)
+		if err != nil {
+			return Keys{}, 0, err
+		}
+		if kdf != AKAPrimeKDFDefault {
+			return Keys{}, 0, fmt.Errorf("%w: %d", ErrUnsupportedKDF, kdf)
+		}
+		networkName, err := challengeKDFInput(request.Attributes)
+		if err != nil {
+			return Keys{}, 0, err
+		}
+		_, autn16, err := ChallengeRANDAndAUTN(request)
+		if err != nil {
+			return Keys{}, 0, err
+		}
+		keys, err := DeriveAKAPrimeKeys(identity, networkName, autn16, aka)
+		return keys, kdf, err
+	default:
+		return Keys{}, 0, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+	}
+}
+
+func firstKDFValue(attrs []Attribute) (uint16, error) {
+	for _, attr := range attrs {
+		if attr.Type != AttributeKDF {
+			continue
+		}
+		return attr.KDFValue()
+	}
+	return 0, fmt.Errorf("%w: missing AT_KDF", ErrInvalidAKAChallenge)
+}
+
+func challengeKDFInput(attrs []Attribute) (string, error) {
+	attr, ok := FindAttribute(attrs, AttributeKDFInput)
+	if !ok {
+		return "", fmt.Errorf("%w: missing AT_KDF_INPUT", ErrInvalidAKAChallenge)
+	}
+	value, err := attr.KDFInputValue()
+	if err != nil {
+		return "", err
+	}
+	if value == "" {
+		return "", fmt.Errorf("%w: empty AT_KDF_INPUT", ErrInvalidAKAChallenge)
+	}
+	return value, nil
+}
+
+func challengeKDFAttributes(attrs []Attribute) []Attribute {
+	var out []Attribute
+	for _, attr := range attrs {
+		if attr.Type == AttributeKDF {
+			out = append(out, Attribute{Type: attr.Type, Data: append([]byte(nil), attr.Data...)})
+		}
+	}
+	return out
+}
+
+func verifyChallengeMAC(eapType uint8, kAut, raw []byte) error {
+	if eapType == TypeAKAPrime {
+		return VerifyAKAPrimeMAC(kAut, raw, nil)
+	}
+	return VerifyMAC(kAut, raw, nil)
+}
+
+func calculateChallengeMAC(eapType uint8, kAut, raw []byte) ([]byte, error) {
+	if eapType == TypeAKAPrime {
+		return CalculateAKAPrimeMAC(kAut, raw, nil)
+	}
+	return CalculateMAC(kAut, raw, nil)
+}
+
+func deriveAKAPrimeCKIK(networkName, sqnXorAK []byte, aka sim.AKAResult) []byte {
+	key := make([]byte, 0, len(aka.CK)+len(aka.IK))
+	key = append(key, aka.CK...)
+	key = append(key, aka.IK...)
+	input := kdfInput(0x20, networkName, sqnXorAK)
+	sum := hmac.New(sha256.New, key)
+	_, _ = sum.Write(input)
+	return sum.Sum(nil)
+}
+
+func kdfInput(fc byte, params ...[]byte) []byte {
+	out := []byte{fc}
+	var length [2]byte
+	for _, param := range params {
+		out = append(out, param...)
+		binary.BigEndian.PutUint16(length[:], uint16(len(param)))
+		out = append(out, length[:]...)
+	}
+	return out
+}
+
+func prfPrimeSHA256(key, seed []byte, length int) []byte {
+	var out []byte
+	var prev []byte
+	counter := byte(1)
+	for len(out) < length {
+		mac := hmac.New(sha256.New, key)
+		if len(prev) > 0 {
+			_, _ = mac.Write(prev)
+		}
+		_, _ = mac.Write(seed)
+		_, _ = mac.Write([]byte{counter})
+		prev = mac.Sum(nil)
+		out = append(out, prev...)
+		counter++
+	}
+	return out[:length]
 }
 
 func fips1862PRF(seed []byte, length int) []byte {

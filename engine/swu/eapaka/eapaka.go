@@ -302,6 +302,22 @@ func (a Attribute) AUTSValue() ([]byte, error) {
 	return a.FixedValue(14)
 }
 
+func (a Attribute) KDFInputValue() (string, error) {
+	value, err := a.VariableValue()
+	if err != nil {
+		return "", err
+	}
+	return string(value), nil
+}
+
+func (a Attribute) KDFValue() (uint16, error) {
+	value, err := a.FixedValue(2)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(value), nil
+}
+
 func fixed16Values(a Attribute) ([][]byte, error) {
 	if len(a.Data) < 2 || (len(a.Data)-2)%16 != 0 {
 		return nil, ErrInvalidAttribute

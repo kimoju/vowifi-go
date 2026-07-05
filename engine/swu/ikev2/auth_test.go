@@ -235,6 +235,79 @@ func TestRunIKEAuthAKAChallenge(t *testing.T) {
 	}
 }
 
+func TestRunIKEAuthAKAPrimeChallenge(t *testing.T) {
+	init := fakeInitResult(t)
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	networkName := "WLAN"
+	aka := simAKAResult()
+	challenge := signedAKAPrimeChallenge(t, identity, networkName, aka)
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(request, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+			t.Fatalf("request header=%+v inner=%+v", msg.Header, inner)
+		}
+		pkt, err := eapaka.ParsePacket(inner[0].Body)
+		if err != nil {
+			return nil, err
+		}
+		if pkt.Code != eapaka.CodeResponse || pkt.Type != eapaka.TypeAKAPrime || pkt.Subtype != eapaka.SubtypeChallenge {
+			t.Fatalf("packet=%+v", pkt)
+		}
+		keys, err := eapaka.DeriveAKAPrimeKeys(identity, networkName, bytes.Repeat([]byte{0xb2}, 16), aka)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := pkt.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		if err := eapaka.VerifyAKAPrimeMAC(keys.KAut, raw, nil); err != nil {
+			return nil, err
+		}
+		if _, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeRES); !ok {
+			t.Fatal("missing AT_RES")
+		}
+		kdfAttr, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeKDF)
+		if !ok {
+			t.Fatal("missing AT_KDF")
+		}
+		kdf, err := kdfAttr.KDFValue()
+		if err != nil {
+			return nil, err
+		}
+		if kdf != eapaka.AKAPrimeKDFDefault {
+			t.Fatalf("AT_KDF=%d", kdf)
+		}
+		success, err := (eapaka.Packet{Code: eapaka.CodeSuccess, Identifier: pkt.Identifier}).MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0x62}, init.Keys.Profile.EncryptionBlockSize))
+		return rawResp, err
+	})
+	res, err := RunIKE_AUTH_AKAChallenge(context.Background(), AKAChallengeConfig{
+		Transport: transport,
+		Init:      init,
+		SIM:       akaProviderStub{result: aka},
+		Identity:  identity,
+		Request:   challenge,
+		MessageID: 3,
+		IV:        bytes.Repeat([]byte{0x61}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_AKAChallenge(AKA') error = %v", err)
+	}
+	if res.SyncFailure || res.EAPNext == nil || res.EAPNext.Code != eapaka.CodeSuccess {
+		t.Fatalf("result=%+v", res)
+	}
+	if res.EAPResponse.Type != eapaka.TypeAKAPrime || len(res.EAPKeys.KAut) != eapaka.KeyLengthAKAPrimeKAut || len(res.EAPKeys.KRe) != eapaka.KeyLengthKRe {
+		t.Fatalf("AKA' response=%+v keys=%+v", res.EAPResponse, res.EAPKeys)
+	}
+}
+
 func TestRunIKEAuthAKAChallengeSyncFailure(t *testing.T) {
 	init := fakeInitResult(t)
 	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
@@ -362,6 +435,38 @@ func signedAKAChallenge(t *testing.T, identity string, aka sim.AKAResult) eapaka
 	mac, err := eapaka.CalculateMAC(keys.KAut, raw, nil)
 	if err != nil {
 		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	challenge.Attributes[len(challenge.Attributes)-1] = eapaka.MACAttribute(mac)
+	return challenge
+}
+
+func signedAKAPrimeChallenge(t *testing.T, identity, networkName string, aka sim.AKAResult) eapaka.Packet {
+	t.Helper()
+	autn := bytes.Repeat([]byte{0xb2}, 16)
+	keys, err := eapaka.DeriveAKAPrimeKeys(identity, networkName, autn, aka)
+	if err != nil {
+		t.Fatalf("DeriveAKAPrimeKeys() error = %v", err)
+	}
+	challenge := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 11,
+		Type:       eapaka.TypeAKAPrime,
+		Subtype:    eapaka.SubtypeChallenge,
+		Attributes: []eapaka.Attribute{
+			eapaka.RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
+			eapaka.AUTNAttribute(autn),
+			eapaka.KDFInputAttribute(networkName),
+			eapaka.KDFAttribute(eapaka.AKAPrimeKDFDefault),
+			eapaka.MACAttribute(nil),
+		},
+	}
+	raw, err := challenge.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := eapaka.CalculateAKAPrimeMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateAKAPrimeMAC() error = %v", err)
 	}
 	challenge.Attributes[len(challenge.Attributes)-1] = eapaka.MACAttribute(mac)
 	return challenge

@@ -2,6 +2,7 @@ package eapaka
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"testing"
 
@@ -46,6 +47,91 @@ func TestDeriveKeysAndBuildChallengeResponse(t *testing.T) {
 	}
 }
 
+func TestDeriveAKAPrimeKeysRFC9048Vector(t *testing.T) {
+	identity := "0555444333222111"
+	networkName := "WLAN"
+	autn := mustHex(t, "bb52e91c747ac3ab2a5c23d15ee351d5")
+	aka := sim.AKAResult{
+		RES: mustHex(t, "28d7b0f2a2ec3de5"),
+		IK:  mustHex(t, "9744871ad32bf9bbd1dd5ce54e3e2e5a"),
+		CK:  mustHex(t, "5349fbe098649f948f5d2e973a81c00f"),
+	}
+	keys, err := DeriveAKAPrimeKeys(identity, networkName, autn, aka)
+	if err != nil {
+		t.Fatalf("DeriveAKAPrimeKeys() error = %v", err)
+	}
+	assertHex(t, "CK'", keys.CKPrime, "0093962d0dd84aa5684b045c9edffa04")
+	assertHex(t, "IK'", keys.IKPrime, "ccfc230ca74fcc96c0a5d61164f5a76c")
+	assertHex(t, "K_encr", keys.KEncr, "766fa0a6c317174b812d52fbcd11a179")
+	assertHex(t, "K_aut", keys.KAut, "0842ea722ff6835bfa2032499fc3ec23c2f0e388b4f07543ffc677f1696d71ea")
+	assertHex(t, "K_re", keys.KRe, "cf83aa8bc7e0aced892acc98e76a9b2095b558c7795c7094715cb3393aa7d17a")
+	assertHex(t, "MSK", keys.MSK, "67c42d9aa56c1b79e295e3459fc3d187d42be0bf818d3070e362c5e967a4d544e8ecfe19358ab3039aff03b7c930588c055babee58a02650b067ec4e9347c75a")
+	assertHex(t, "EMSK", keys.EMSK, "f861703cd775590e16c7679ea3874ada866311de290764d760cf76df647ea01c313f69924bdd7650ca9bac141ea075c4ef9e8029c0e290cdbad5638b63bc23fb")
+}
+
+func TestBuildAKAPrimeChallengeResponse(t *testing.T) {
+	identity := "0555444333222111"
+	networkName := "WLAN"
+	aka := sim.AKAResult{
+		RES: mustHex(t, "28d7b0f2a2ec3de5"),
+		IK:  mustHex(t, "9744871ad32bf9bbd1dd5ce54e3e2e5a"),
+		CK:  mustHex(t, "5349fbe098649f948f5d2e973a81c00f"),
+	}
+	req := signedAKAPrimeChallengeRequest(t, identity, networkName, aka)
+	resp, keys, err := BuildChallengeResponse(identity, req, aka)
+	if err != nil {
+		t.Fatalf("BuildChallengeResponse(AKA') error = %v", err)
+	}
+	if resp.Type != TypeAKAPrime || resp.Code != CodeResponse || resp.Subtype != SubtypeChallenge {
+		t.Fatalf("response=%+v", resp)
+	}
+	if len(keys.KAut) != KeyLengthAKAPrimeKAut || len(keys.KRe) != KeyLengthKRe {
+		t.Fatalf("AKA' key lengths KAut=%d KRe=%d", len(keys.KAut), len(keys.KRe))
+	}
+	if _, ok := FindAttribute(resp.Attributes, AttributeRES); !ok {
+		t.Fatal("missing AT_RES")
+	}
+	kdfAttr, ok := FindAttribute(resp.Attributes, AttributeKDF)
+	if !ok {
+		t.Fatal("missing AT_KDF")
+	}
+	kdf, err := kdfAttr.KDFValue()
+	if err != nil {
+		t.Fatalf("KDFValue() error = %v", err)
+	}
+	if kdf != AKAPrimeKDFDefault {
+		t.Fatalf("AT_KDF=%d", kdf)
+	}
+	raw, err := resp.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	if err := VerifyAKAPrimeMAC(keys.KAut, raw, nil); err != nil {
+		t.Fatalf("VerifyAKAPrimeMAC(response) error = %v", err)
+	}
+}
+
+func TestBuildAKAPrimeChallengeResponseRequiresKDFInput(t *testing.T) {
+	identity := "0555444333222111"
+	aka := sim.AKAResult{
+		RES: mustHex(t, "28d7b0f2a2ec3de5"),
+		IK:  mustHex(t, "9744871ad32bf9bbd1dd5ce54e3e2e5a"),
+		CK:  mustHex(t, "5349fbe098649f948f5d2e973a81c00f"),
+	}
+	req := signedAKAPrimeChallengeRequest(t, identity, "WLAN", aka)
+	var attrs []Attribute
+	for _, attr := range req.Attributes {
+		if attr.Type != AttributeKDFInput {
+			attrs = append(attrs, attr)
+		}
+	}
+	req.Attributes = attrs
+	_, _, err := BuildChallengeResponse(identity, req, aka)
+	if !errors.Is(err, ErrInvalidAKAChallenge) {
+		t.Fatalf("BuildChallengeResponse() err=%v, want ErrInvalidAKAChallenge", err)
+	}
+}
+
 func TestBuildChallengeResponseRejectsBadRequestMAC(t *testing.T) {
 	identity := "user@example.com"
 	aka := sim.AKAResult{RES: []byte{1}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}
@@ -80,6 +166,39 @@ func TestBuildSynchronizationFailureResponse(t *testing.T) {
 	}
 }
 
+func TestBuildSynchronizationFailureResponseCopiesAKAPrimeKDF(t *testing.T) {
+	req := Packet{
+		Code:    CodeRequest,
+		Type:    TypeAKAPrime,
+		Subtype: SubtypeChallenge,
+		Attributes: []Attribute{
+			KDFInputAttribute("WLAN"),
+			KDFAttribute(AKAPrimeKDFDefault),
+		},
+	}
+	resp, err := BuildSynchronizationFailureResponse(req, bytes.Repeat([]byte{0xaa}, 14))
+	if err != nil {
+		t.Fatalf("BuildSynchronizationFailureResponse() error = %v", err)
+	}
+	if _, ok := FindAttribute(resp.Attributes, AttributeAUTS); !ok {
+		t.Fatal("missing AT_AUTS")
+	}
+	kdfAttr, ok := FindAttribute(resp.Attributes, AttributeKDF)
+	if !ok {
+		t.Fatal("missing copied AT_KDF")
+	}
+	kdf, err := kdfAttr.KDFValue()
+	if err != nil {
+		t.Fatalf("KDFValue() error = %v", err)
+	}
+	if kdf != AKAPrimeKDFDefault {
+		t.Fatalf("copied AT_KDF=%d", kdf)
+	}
+	if _, ok := FindAttribute(resp.Attributes, AttributeKDFInput); ok {
+		t.Fatal("AKA' sync failure must copy AT_KDF, not AT_KDF_INPUT")
+	}
+}
+
 func signedChallengeRequest(t *testing.T, identity string, aka sim.AKAResult) Packet {
 	t.Helper()
 	keys, err := DeriveKeys(identity, aka)
@@ -107,4 +226,52 @@ func signedChallengeRequest(t *testing.T, identity string, aka sim.AKAResult) Pa
 	}
 	req.Attributes[len(req.Attributes)-1] = MACAttribute(mac)
 	return req
+}
+
+func signedAKAPrimeChallengeRequest(t *testing.T, identity, networkName string, aka sim.AKAResult) Packet {
+	t.Helper()
+	autn := mustHex(t, "bb52e91c747ac3ab2a5c23d15ee351d5")
+	keys, err := DeriveAKAPrimeKeys(identity, networkName, autn, aka)
+	if err != nil {
+		t.Fatalf("DeriveAKAPrimeKeys() error = %v", err)
+	}
+	req := Packet{
+		Code:       CodeRequest,
+		Identifier: 9,
+		Type:       TypeAKAPrime,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{
+			RANDAttribute(mustHex(t, "81e92b6c0ee0e12ebceba8d92a99dfa5")),
+			AUTNAttribute(autn),
+			KDFInputAttribute(networkName),
+			KDFAttribute(AKAPrimeKDFDefault),
+			MACAttribute(nil),
+		},
+	}
+	raw, err := req.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	mac, err := CalculateAKAPrimeMAC(keys.KAut, raw, nil)
+	if err != nil {
+		t.Fatalf("CalculateAKAPrimeMAC() error = %v", err)
+	}
+	req.Attributes[len(req.Attributes)-1] = MACAttribute(mac)
+	return req
+}
+
+func mustHex(t *testing.T, value string) []byte {
+	t.Helper()
+	out, err := hex.DecodeString(value)
+	if err != nil {
+		t.Fatalf("hex.DecodeString(%q) error = %v", value, err)
+	}
+	return out
+}
+
+func assertHex(t *testing.T, name string, got []byte, want string) {
+	t.Helper()
+	if !bytes.Equal(got, mustHex(t, want)) {
+		t.Fatalf("%s=%x, want %s", name, got, want)
+	}
 }
