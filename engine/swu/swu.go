@@ -85,6 +85,7 @@ type TunnelResult struct {
 	EPDGAddress       string
 	LocalInnerIP      string
 	RemoteInnerIP     string
+	DNSServers        []string
 	IKEEstablished    bool
 	IPsecEstablished  bool
 	MOBIKESupported   bool
@@ -95,6 +96,26 @@ type TunnelResult struct {
 
 func (r TunnelResult) IsReady() bool {
 	return r.Ready && r.IKEEstablished && r.IPsecEstablished
+}
+
+func cloneTunnelResult(r TunnelResult) TunnelResult {
+	r.DNSServers = append([]string(nil), r.DNSServers...)
+	return r
+}
+
+func isZeroTunnelResult(r TunnelResult) bool {
+	return !r.Ready &&
+		strings.TrimSpace(r.Mode) == "" &&
+		strings.TrimSpace(r.EPDGAddress) == "" &&
+		strings.TrimSpace(r.LocalInnerIP) == "" &&
+		strings.TrimSpace(r.RemoteInnerIP) == "" &&
+		len(r.DNSServers) == 0 &&
+		!r.IKEEstablished &&
+		!r.IPsecEstablished &&
+		!r.MOBIKESupported &&
+		strings.TrimSpace(r.ChildSAIdentifier) == "" &&
+		strings.TrimSpace(r.Reason) == "" &&
+		r.EstablishedAt.IsZero()
 }
 
 type MOBIKERequest struct {
@@ -110,6 +131,7 @@ type MOBIKEResult struct {
 	OuterLocalIP     string
 	LocalInnerIP     string
 	RemoteInnerIP    string
+	DNSServers       []string
 	IKEEstablished   bool
 	IPsecEstablished bool
 	Reason           string

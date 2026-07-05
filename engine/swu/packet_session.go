@@ -120,7 +120,7 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 		return nil, err
 	}
 	result := cfg.Result
-	if result == (TunnelResult{}) {
+	if isZeroTunnelResult(result) {
 		result.Ready = true
 		result.IKEEstablished = true
 		result.IPsecEstablished = true
@@ -165,7 +165,7 @@ func (s *PacketSession) Result() TunnelResult {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.result
+	return cloneTunnelResult(s.result)
 }
 
 func (s *PacketSession) MOBIKE(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
@@ -200,6 +200,7 @@ func (s *PacketSession) MOBIKE(ctx context.Context, req MOBIKERequest) (MOBIKERe
 		OuterLocalIP:     firstPacketNonEmpty(req.NewIP, req.OldIP, result.EPDGAddress),
 		LocalInnerIP:     result.LocalInnerIP,
 		RemoteInnerIP:    result.RemoteInnerIP,
+		DNSServers:       append([]string(nil), result.DNSServers...),
 		IKEEstablished:   result.IKEEstablished,
 		IPsecEstablished: result.IPsecEstablished,
 		Reason:           "mobike unsupported",
@@ -216,6 +217,11 @@ func completeMOBIKEResult(res MOBIKEResult, req MOBIKERequest, current TunnelRes
 	}
 	if res.RemoteInnerIP == "" {
 		res.RemoteInnerIP = current.RemoteInnerIP
+	}
+	if len(res.DNSServers) == 0 {
+		res.DNSServers = append([]string(nil), current.DNSServers...)
+	} else {
+		res.DNSServers = append([]string(nil), res.DNSServers...)
 	}
 	if !res.IKEEstablished {
 		res.IKEEstablished = current.IKEEstablished
@@ -240,6 +246,7 @@ func (s *PacketSession) applyMOBIKEResult(res MOBIKEResult) {
 	}
 	s.result.LocalInnerIP = res.LocalInnerIP
 	s.result.RemoteInnerIP = res.RemoteInnerIP
+	s.result.DNSServers = append([]string(nil), res.DNSServers...)
 	s.result.IKEEstablished = res.IKEEstablished
 	s.result.IPsecEstablished = res.IPsecEstablished
 	s.result.Ready = res.IKEEstablished && res.IPsecEstablished

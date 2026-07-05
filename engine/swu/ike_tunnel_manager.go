@@ -425,6 +425,7 @@ func tunnelResultFromIKE(cfg TunnelConfig, epdg string, init ikev2.InitResult, c
 		EPDGAddress:       epdg,
 		LocalInnerIP:      firstPacketNonEmpty(cfg.InnerLocalIP, childConfigurationAddress(child, ikev2.ConfigInternalIPv4Address), childConfigurationAddress(child, ikev2.ConfigInternalIPv6Address)),
 		RemoteInnerIP:     strings.TrimSpace(cfg.RemoteInnerIP),
+		DNSServers:        childConfigurationDNS(child),
 		IKEEstablished:    true,
 		IPsecEstablished:  true,
 		MOBIKESupported:   init.MOBIKESupported,
@@ -435,25 +436,45 @@ func tunnelResultFromIKE(cfg TunnelConfig, epdg string, init ikev2.InitResult, c
 }
 
 func childConfigurationAddress(child ikev2.ChildSAResult, attrType uint16) string {
-	if child.Configuration == nil {
+	values := childConfigurationIPStrings(child, attrType)
+	if len(values) == 0 {
 		return ""
 	}
+	return values[0]
+}
+
+func childConfigurationDNS(child ikev2.ChildSAResult) []string {
+	return append(childConfigurationIPStrings(child, ikev2.ConfigInternalIPv4DNS), childConfigurationIPStrings(child, ikev2.ConfigInternalIPv6DNS)...)
+}
+
+func childConfigurationIPStrings(child ikev2.ChildSAResult, attrType uint16) []string {
+	if child.Configuration == nil {
+		return nil
+	}
+	width := 0
+	switch attrType {
+	case ikev2.ConfigInternalIPv4Address, ikev2.ConfigInternalIPv4DNS:
+		width = net.IPv4len
+	case ikev2.ConfigInternalIPv6Address, ikev2.ConfigInternalIPv6DNS:
+		width = net.IPv6len
+	default:
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
 	for _, attr := range child.Configuration.Attributes {
 		if attr.Type != attrType {
 			continue
 		}
-		switch attrType {
-		case ikev2.ConfigInternalIPv4Address:
-			if len(attr.Value) >= net.IPv4len {
-				return net.IP(attr.Value[:net.IPv4len]).String()
-			}
-		case ikev2.ConfigInternalIPv6Address:
-			if len(attr.Value) >= net.IPv6len {
-				return net.IP(attr.Value[:net.IPv6len]).String()
+		for value := attr.Value; len(value) >= width; value = value[width:] {
+			ip := net.IP(value[:width]).String()
+			if ip != "" && !seen[ip] {
+				out = append(out, ip)
+				seen[ip] = true
 			}
 		}
 	}
-	return ""
+	return out
 }
 
 func childSAIdentifier(child ikev2.ChildSAResult) string {

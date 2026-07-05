@@ -64,7 +64,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		transport = r.TransportFactory(cfg, profile, registrarURI, contactURI)
 	}
 	if transport == nil {
-		defaultFlow = r.defaultSIPFlow()
+		defaultFlow = r.defaultSIPFlow(cfg)
 		transport = defaultFlow
 	}
 	expires := r.Expires
@@ -125,7 +125,7 @@ func (r WireIMSRegistrar) voiceTransport(cfg IMSRegistrationConfig, profile voic
 		Network:               r.Network,
 		ServerAddr:            r.ServerAddr,
 		LocalAddr:             r.LocalAddr,
-		Resolver:              r.Resolver,
+		Resolver:              r.resolverForConfig(cfg),
 		Timeout:               r.Timeout,
 		RetransmitInterval:    r.RetransmitInterval,
 		MaxRetransmitInterval: r.MaxRetransmitInterval,
@@ -133,16 +133,29 @@ func (r WireIMSRegistrar) voiceTransport(cfg IMSRegistrationConfig, profile voic
 	}
 }
 
-func (r WireIMSRegistrar) defaultSIPFlow() *voiceclient.WireSIPFlow {
+func (r WireIMSRegistrar) defaultSIPFlow(cfg IMSRegistrationConfig) *voiceclient.WireSIPFlow {
 	return &voiceclient.WireSIPFlow{
 		Network:               r.Network,
 		ServerAddr:            r.ServerAddr,
 		LocalAddr:             r.LocalAddr,
-		Resolver:              r.Resolver,
+		Resolver:              r.resolverForConfig(cfg),
 		Timeout:               r.Timeout,
 		RetransmitInterval:    r.RetransmitInterval,
 		MaxRetransmitInterval: r.MaxRetransmitInterval,
 		MaxRetransmits:        r.MaxRetransmits,
+	}
+}
+
+func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclient.SIPServerResolver {
+	if r.Resolver != nil {
+		return r.Resolver
+	}
+	if len(cfg.Tunnel.DNSServers) == 0 {
+		return nil
+	}
+	return voiceclient.NetSIPResolver{
+		DNSServers: append([]string(nil), cfg.Tunnel.DNSServers...),
+		Timeout:    r.Timeout,
 	}
 }
 

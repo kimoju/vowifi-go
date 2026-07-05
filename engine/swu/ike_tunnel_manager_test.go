@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"testing"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
@@ -38,8 +39,12 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 			child := packetChildSA(true)
 			child.LocalSPI = append([]byte(nil), cfg.ChildSPI...)
 			child.Configuration = &ikev2.Configuration{
-				Type:       ikev2.CFGReply,
-				Attributes: []ikev2.ConfigurationAttribute{{Type: ikev2.ConfigInternalIPv4Address, Value: []byte{10, 0, 0, 2}}},
+				Type: ikev2.CFGReply,
+				Attributes: []ikev2.ConfigurationAttribute{
+					{Type: ikev2.ConfigInternalIPv4Address, Value: []byte{10, 0, 0, 2}},
+					{Type: ikev2.ConfigInternalIPv4DNS, Value: []byte{10, 0, 0, 1}},
+					{Type: ikev2.ConfigInternalIPv6DNS, Value: net.ParseIP("2001:db8::53").To16()},
+				},
 			}
 			return ikev2.FullAuthResult{ChildSA: &child, NextMessageID: 3}, nil
 		},
@@ -61,6 +66,13 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	result := session.Result()
 	if !result.IsReady() || result.EPDGAddress != "epdg.example" || result.LocalInnerIP != "10.0.0.2" {
 		t.Fatalf("result=%+v", result)
+	}
+	if len(result.DNSServers) != 2 || result.DNSServers[0] != "10.0.0.1" || result.DNSServers[1] != "2001:db8::53" {
+		t.Fatalf("result DNS=%+v", result.DNSServers)
+	}
+	result.DNSServers[0] = "198.51.100.53"
+	if got := session.Result().DNSServers[0]; got != "10.0.0.1" {
+		t.Fatalf("Result() leaked DNS slice, got %q", got)
 	}
 	if !result.MOBIKESupported || result.ChildSAIdentifier != "cafebabe/22222222" {
 		t.Fatalf("result MOBIKE/child id = %+v", result)

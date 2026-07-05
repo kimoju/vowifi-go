@@ -77,6 +77,27 @@ func TestPacketSessionDefaultResultIsReady(t *testing.T) {
 	}
 }
 
+func TestPacketSessionResultClonesDNSServers(t *testing.T) {
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: &captureESPPacketTransport{},
+		Result: TunnelResult{
+			Ready:            true,
+			IKEEstablished:   true,
+			IPsecEstablished: true,
+			DNSServers:       []string{"10.0.0.1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	result := session.Result()
+	result.DNSServers[0] = "198.51.100.53"
+	if got := session.Result().DNSServers[0]; got != "10.0.0.1" {
+		t.Fatalf("Result() DNS=%q, want original", got)
+	}
+}
+
 func TestPacketSessionReadInnerPacketUsesReadableTransport(t *testing.T) {
 	wire := &captureESPPacketTransport{}
 	a, err := NewPacketSession(PacketSessionConfig{ChildSA: packetChildSA(true), Transport: wire})

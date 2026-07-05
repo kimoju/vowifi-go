@@ -38,6 +38,8 @@ protocol layers needed by VoHive:
   offering explicit CRLF keepalive support
 - SIP server resolution with injectable policy hooks and default `_sip._udp` /
   `_sip._tcp` SRV lookup before direct host:port fallback
+- SWu IKE configuration payload DNS extraction, exposing negotiated internal
+  DNS servers to the runtime and using them for default IMS SRV/A/AAAA lookups
 - IMS REGISTER session flow with 401/407 authentication retry, associated URI,
   Service-Route, Path, Security-Server, and Contact expiry capture, plus a
   runtime `IMSRegistrar` adapter for the wire transport

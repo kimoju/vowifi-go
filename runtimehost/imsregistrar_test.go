@@ -192,6 +192,33 @@ func TestWireIMSRegistrarUsesTunnelInnerIPForContact(t *testing.T) {
 	}
 }
 
+func TestWireIMSRegistrarDefaultResolverUsesTunnelDNS(t *testing.T) {
+	dnsServers := []string{"10.0.0.53", "2001:db8::53"}
+	flow := WireIMSRegistrar{Timeout: 2 * time.Second}.defaultSIPFlow(IMSRegistrationConfig{
+		Tunnel: swu.TunnelResult{DNSServers: dnsServers},
+	})
+	dnsServers[0] = "198.51.100.53"
+	resolver, ok := flow.Resolver.(voiceclient.NetSIPResolver)
+	if !ok {
+		t.Fatalf("resolver=%T, want NetSIPResolver", flow.Resolver)
+	}
+	if len(resolver.DNSServers) != 2 || resolver.DNSServers[0] != "10.0.0.53" || resolver.DNSServers[1] != "2001:db8::53" || resolver.Timeout != 2*time.Second {
+		t.Fatalf("resolver=%+v", resolver)
+	}
+	custom := voiceclient.SIPServerResolverFunc(func(context.Context, string, string) (string, error) {
+		return "127.0.0.1:5060", nil
+	})
+	customFlow := WireIMSRegistrar{Resolver: custom}.defaultSIPFlow(IMSRegistrationConfig{
+		Tunnel: swu.TunnelResult{DNSServers: []string{"10.0.0.53"}},
+	})
+	if customFlow.Resolver == nil {
+		t.Fatal("custom resolver not retained")
+	}
+	if _, ok := customFlow.Resolver.(voiceclient.NetSIPResolver); ok {
+		t.Fatalf("custom resolver was overwritten: %T", customFlow.Resolver)
+	}
+}
+
 func TestWireIMSRegistrarDefaultFlowReusesRegisterSocketForSMS(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

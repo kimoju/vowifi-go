@@ -282,7 +282,7 @@ func (s *TUNPacketTunnelSession) Result() TunnelResult {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.result
+	return cloneTunnelResult(s.result)
 }
 
 func (s *TUNPacketTunnelSession) MOBIKE(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
@@ -300,6 +300,9 @@ func (s *TUNPacketTunnelSession) MOBIKE(ctx context.Context, req MOBIKERequest) 
 	}
 	if res.RemoteInnerIP != "" {
 		s.result.RemoteInnerIP = res.RemoteInnerIP
+	}
+	if len(res.DNSServers) > 0 {
+		s.result.DNSServers = append([]string(nil), res.DNSServers...)
 	}
 	if res.IKEEstablished || res.IPsecEstablished {
 		s.result.IKEEstablished = res.IKEEstablished
