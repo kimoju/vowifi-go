@@ -71,10 +71,13 @@ protocol layers needed by VoHive:
 - UDP/NAT-T ESP packet transport for the userspace dataplane, including
   reusable UDP socket management, raw ESP send/receive, NAT keepalive and
   non-ESP marker filtering, deadline handling, and close semantics
+- userspace dataplane packet pump and Linux TUN device integration, bridging
+  inner IP packets from a TUN device into ESP and writing decrypted ESP payloads
+  back to the TUN device
 
-Kernel ESP SA installation, real TUN/routing integration, SRTP media, advanced
-RTCP feedback handling, and complete inbound IMS call handling are still
-implemented incrementally behind these APIs.
+Kernel ESP SA installation, route installation/policy routing, SRTP media,
+advanced RTCP feedback handling, and complete inbound IMS call handling are
+still implemented incrementally behind these APIs.
 
 ## Development
 
