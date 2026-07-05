@@ -35,6 +35,25 @@ func TestRewriteSDPMediaEndpointUsesIPv6ConnectionLine(t *testing.T) {
 	}
 }
 
+func TestRewriteSDPMediaEndpointPreservesDisabledAudioPort(t *testing.T) {
+	raw := []byte("v=0\r\n" +
+		"o=user 0 0 IN IP4 192.0.2.10\r\n" +
+		"s=-\r\n" +
+		"c=IN IP4 0.0.0.0\r\n" +
+		"t=0 0\r\n" +
+		"m=audio 0 RTP/AVP 0\r\n" +
+		"a=inactive\r\n")
+	got := string(RewriteSDPMediaEndpoint(raw, SDPInfo{ConnectionIP: "198.51.100.20", MediaPort: 49170, RTCPPort: 49171}))
+	for _, want := range []string{"c=IN IP4 0.0.0.0", "m=audio 0 RTP/AVP 0", "a=inactive"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rewritten disabled SDP missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "49170") || strings.Contains(got, "49171") || strings.Contains(got, "198.51.100.20") {
+		t.Fatalf("rewritten disabled SDP leaked relay endpoint:\n%s", got)
+	}
+}
+
 func TestParseSDPKeepsSeparateRTCPAddress(t *testing.T) {
 	info, err := ParseSDP([]byte("v=0\r\nc=IN IP4 192.0.2.10\r\nm=audio 4002 RTP/AVP 0\r\na=rtcp:5005 IN IP4 198.51.100.20\r\n"))
 	if err != nil {

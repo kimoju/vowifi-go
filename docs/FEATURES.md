@@ -196,7 +196,8 @@ protocol layers needed by VoHive:
   advancement
 - RTP relay media-direction enforcement for SDP hold/resume semantics, applying
   `sendonly`, `recvonly`, `inactive`, and legacy `c=0.0.0.0` hold handling to
-  RTP forwarding while keeping RTCP feedback/report paths available
+  RTP forwarding while keeping RTCP feedback/report paths available, including
+  disabled `m=audio 0` streams without leaking relay endpoints
 - IMS Session-Expires timer negotiation across initial INVITE, UPDATE, and
   re-INVITE paths, including `refresher=uac/uas` preservation, 422 Min-SE
   retry handling, dialog-state updates from 2xx responses, and softphone

@@ -156,6 +156,13 @@ func TestRTPRelaySessionAppliesSDPMediaDirection(t *testing.T) {
 		t.Fatalf("client zero-target WriteToUDP() error = %v", err)
 	}
 	expectNoTestUDP(t, imsPeer)
+	if err := relay.SetIMSRemote(SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: 0, Direction: "inactive"}); err != nil {
+		t.Fatalf("SetIMSRemote(port 0) error = %v", err)
+	}
+	if _, err := clientPeer.WriteToUDP([]byte{0x13}, clientEndpoint); err != nil {
+		t.Fatalf("client disabled-port WriteToUDP() error = %v", err)
+	}
+	expectNoTestUDP(t, imsPeer)
 
 	stats := waitRelayStats(t, relay, func(stats RTPRelayStats) bool {
 		return stats.ClientToIMSRTPPackets == 1 && stats.ClientToIMSRTPDrops >= 1 && stats.IMSToClientRTPPackets == 1

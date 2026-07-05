@@ -12,6 +12,7 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 	}
 	text := strings.ReplaceAll(string(body), "\r\n", "\n")
 	lines := strings.Split(text, "\n")
+	audioDisabled := sdpAudioPortDisabled(lines)
 	ipVersion := "IP4"
 	if ip := net.ParseIP(endpoint.ConnectionIP); ip != nil && ip.To4() == nil {
 		ipVersion = "IP6"
@@ -34,18 +35,28 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 		}
 		switch {
 		case strings.HasPrefix(line, "c=IN IP"):
-			out = append(out, "c=IN "+ipVersion+" "+endpoint.ConnectionIP)
+			if audioDisabled {
+				out = append(out, line)
+			} else {
+				out = append(out, "c=IN "+ipVersion+" "+endpoint.ConnectionIP)
+			}
 			rewroteConnection = true
 		case strings.HasPrefix(line, "m=audio "):
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
-				fields[1] = strconv.Itoa(endpoint.MediaPort)
+				if fields[1] != "0" {
+					fields[1] = strconv.Itoa(endpoint.MediaPort)
+				}
 				line = strings.Join(fields, " ")
 				rewroteAudio = true
 			}
 			out = append(out, line)
 		case strings.HasPrefix(line, "a=rtcp:") && endpoint.RTCPPort > 0:
-			out = append(out, "a=rtcp:"+strconv.Itoa(endpoint.RTCPPort)+" IN "+rtcpIPVersion+" "+rtcpIP)
+			if audioDisabled {
+				out = append(out, line)
+			} else {
+				out = append(out, "a=rtcp:"+strconv.Itoa(endpoint.RTCPPort)+" IN "+rtcpIPVersion+" "+rtcpIP)
+			}
 			rewroteRTCP = true
 		default:
 			out = append(out, line)
@@ -54,7 +65,7 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 	if !rewroteAudio {
 		return BuildSDPAnswer(endpoint)
 	}
-	if !rewroteConnection {
+	if !rewroteConnection && !audioDisabled {
 		insertAt := len(out)
 		for i, line := range out {
 			if strings.HasPrefix(line, "m=audio ") {
@@ -66,7 +77,7 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 		copy(out[insertAt+1:], out[insertAt:])
 		out[insertAt] = "c=IN " + ipVersion + " " + endpoint.ConnectionIP
 	}
-	if endpoint.RTCPPort > 0 && !rewroteRTCP {
+	if endpoint.RTCPPort > 0 && !rewroteRTCP && !audioDisabled {
 		insertAt := len(out)
 		for i, line := range out {
 			if strings.HasPrefix(line, "m=audio ") {
@@ -79,4 +90,15 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 		out[insertAt] = "a=rtcp:" + strconv.Itoa(endpoint.RTCPPort) + " IN " + rtcpIPVersion + " " + rtcpIP
 	}
 	return []byte(strings.Join(out, "\r\n") + "\r\n")
+}
+
+func sdpAudioPortDisabled(lines []string) bool {
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "m=audio ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		return len(fields) >= 2 && strings.TrimSpace(fields[1]) == "0"
+	}
+	return false
 }

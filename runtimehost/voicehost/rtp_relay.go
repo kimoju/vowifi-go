@@ -557,7 +557,10 @@ func udpLocalPort(conn *net.UDPConn) int {
 }
 
 func resolveSDPEndpoint(info SDPInfo, label string) (*net.UDPAddr, *net.UDPAddr, error) {
-	if strings.TrimSpace(info.ConnectionIP) == "" || info.MediaPort <= 0 {
+	if info.MediaPort == 0 {
+		return nil, nil, nil
+	}
+	if strings.TrimSpace(info.ConnectionIP) == "" || info.MediaPort < 0 {
 		return nil, nil, fmt.Errorf("%w: %s media target is incomplete", ErrRTPRelayConfig, label)
 	}
 	if ip := net.ParseIP(strings.TrimSpace(info.ConnectionIP)); ip != nil && ip.IsUnspecified() {

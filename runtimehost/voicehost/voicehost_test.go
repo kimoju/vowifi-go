@@ -338,6 +338,20 @@ func TestParseSDPUnspecifiedConnectionMeansInactive(t *testing.T) {
 	}
 }
 
+func TestParseAndBuildSDPDisabledAudioPort(t *testing.T) {
+	info, err := ParseSDP([]byte("v=0\r\nc=IN IP4 192.0.2.10\r\nm=audio 0 RTP/AVP 0 101\r\n"))
+	if err != nil {
+		t.Fatalf("ParseSDP() error = %v", err)
+	}
+	if info.ConnectionIP != "192.0.2.10" || info.MediaPort != 0 || info.Direction != "inactive" {
+		t.Fatalf("info=%+v", info)
+	}
+	answer := string(BuildSDPAnswer(SDPInfo{ConnectionIP: "192.0.2.10", MediaPort: 0, Payloads: []int{0}, Direction: "inactive"}))
+	if !strings.Contains(answer, "m=audio 0 RTP/AVP 0") || !strings.Contains(answer, "a=inactive") {
+		t.Fatalf("answer=%q", answer)
+	}
+}
+
 func newInviteRequest(callID, callee, sdp string) *sip.Request {
 	req := sip.NewRequest(sip.INVITE, sip.Uri{Scheme: "sip", User: callee, Host: "ims.example"})
 	appendCommonHeaders(req, callID, callee)

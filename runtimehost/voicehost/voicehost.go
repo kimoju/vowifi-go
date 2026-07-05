@@ -557,7 +557,9 @@ func ParseSDP(body []byte) (SDPInfo, error) {
 	if ip == nil {
 		return SDPInfo{}, errors.New("invalid SDP connection IP")
 	}
+	hasAudio := false
 	if m := sdpMediaRE.FindStringSubmatch(text); len(m) == 3 {
+		hasAudio = true
 		port, _ := strconv.Atoi(m[1])
 		out.MediaPort = port
 		for _, part := range strings.Fields(m[2]) {
@@ -567,7 +569,7 @@ func ParseSDP(body []byte) (SDPInfo, error) {
 			}
 		}
 	}
-	if out.MediaPort <= 0 {
+	if !hasAudio {
 		return SDPInfo{}, errors.New("missing SDP audio port")
 	}
 	if m := sdpRTCPRE.FindStringSubmatch(text); len(m) >= 2 {
@@ -581,7 +583,7 @@ func ParseSDP(body []byte) (SDPInfo, error) {
 		out.Direction = strings.TrimSpace(m[1])
 	}
 	if out.Direction == "" {
-		if ip.IsUnspecified() {
+		if ip.IsUnspecified() || out.MediaPort == 0 {
 			out.Direction = "inactive"
 		} else {
 			out.Direction = "sendrecv"
@@ -601,7 +603,9 @@ func BuildSDPAnswer(info SDPInfo) []byte {
 	}
 	port := info.MediaPort
 	if port <= 0 {
-		port = 4000
+		if normalizeSDPDirection(info.Direction) != "inactive" {
+			port = 4000
+		}
 	}
 	payloads := info.Payloads
 	if len(payloads) == 0 {
