@@ -1060,6 +1060,7 @@ func buildRegistrationBinding(profile IMSProfile, contactURI string, resp Regist
 	if !isZeroSecurityAgreement(securityClient) {
 		securityClientHeader = BuildSecurityClientHeader(securityClient)
 	}
+	registrarContact := registrationContactHeader(resp.Headers, contactURI)
 	binding := RegistrationBinding{
 		ContactURI:       strings.TrimSpace(contactURI),
 		PublicIdentity:   defaultPublicIdentity(profile, associated),
@@ -1070,7 +1071,7 @@ func buildRegistrationBinding(profile IMSProfile, contactURI string, resp Regist
 		SecurityServer:   securityServer,
 		SecurityVerify:   securityVerify,
 		Expires:          registrationExpires(resp.Headers, contactURI, requestedExpires),
-		RegistrarContact: firstTrimmed(headerListValues(resp.Headers, "Contact")...),
+		RegistrarContact: registrarContact,
 	}
 	if selected, ok := SelectSecurityAgreement(binding.SecurityServer, securityClient); ok {
 		binding.SecurityAgreement = selected
@@ -1324,16 +1325,13 @@ func defaultPublicIdentity(profile IMSProfile, associated []string) string {
 }
 
 func registrationExpires(headers map[string][]string, contactURI string, fallback int) int {
-	for _, value := range rawHeaderValues(headers, "Expires") {
-		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+	if contact, ok := matchingRegistrationContactHeader(headers, contactURI); ok {
+		if n, ok := headerParamInt(contact, "expires"); ok {
 			return n
 		}
 	}
-	for _, contact := range headerListValues(headers, "Contact") {
-		if contactURI != "" && !strings.Contains(contact, contactURI) {
-			continue
-		}
-		if n, ok := headerParamInt(contact, "expires"); ok {
+	for _, value := range rawHeaderValues(headers, "Expires") {
+		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
 			return n
 		}
 	}
@@ -1341,6 +1339,45 @@ func registrationExpires(headers map[string][]string, contactURI string, fallbac
 		return fallback
 	}
 	return 0
+}
+
+func registrationContactHeader(headers map[string][]string, contactURI string) string {
+	contacts := trimHeaderValues(headerListValues(headers, "Contact"))
+	if len(contacts) == 0 {
+		return ""
+	}
+	if contact, ok := matchingRegistrationContactHeader(headers, contactURI); ok {
+		return contact
+	}
+	return contacts[0]
+}
+
+func matchingRegistrationContactHeader(headers map[string][]string, contactURI string) (string, bool) {
+	contacts := trimHeaderValues(headerListValues(headers, "Contact"))
+	if len(contacts) == 0 {
+		return "", false
+	}
+	target := normalizeSIPURIForContactMatch(contactURI)
+	if target == "" {
+		return contacts[0], true
+	}
+	for _, contact := range contacts {
+		if normalizeSIPURIForContactMatch(extractAddressURI(contact)) == target {
+			return contact, true
+		}
+	}
+	return "", false
+}
+
+func normalizeSIPURIForContactMatch(uri string) string {
+	uri = strings.TrimSpace(strings.Trim(uri, "<>"))
+	if uri == "" || uri == "*" {
+		return ""
+	}
+	if semi := strings.IndexByte(uri, ';'); semi >= 0 {
+		uri = uri[:semi]
+	}
+	return strings.ToLower(strings.TrimSpace(uri))
 }
 
 func minExpiresHeader(headers map[string][]string) int {

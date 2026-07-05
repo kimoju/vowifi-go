@@ -966,7 +966,8 @@ func TestBuildRegistrationBindingParsesIMSHeaders(t *testing.T) {
 			"Service-Route":    {`<sip:pcscf1.example;lr>, <sip:pcscf2.example;lr>`},
 			"Path":             {`<sip:path.example;lr>`},
 			"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=1;spi-s=2`},
-			"Contact":          {`<sip:user@192.0.2.10:5060>;expires=777`},
+			"Expires":          {`3600`},
+			"Contact":          {`<sip:other@192.0.2.20:5060>;expires=111, <sip:user@192.0.2.10:5060;transport=udp>;expires=777`},
 		},
 	}, 3600)
 	if binding.PublicIdentity != "sip:user@example" || len(binding.AssociatedURIs) != 2 {
@@ -975,7 +976,33 @@ func TestBuildRegistrationBindingParsesIMSHeaders(t *testing.T) {
 	if len(binding.ServiceRoutes) != 2 || binding.ServiceRoutes[1] != "<sip:pcscf2.example;lr>" {
 		t.Fatalf("routes=%+v", binding.ServiceRoutes)
 	}
-	if binding.Expires != 777 || len(binding.SecurityVerify) != 1 {
+	if binding.Expires != 777 || len(binding.SecurityVerify) != 1 || !strings.Contains(binding.RegistrarContact, "transport=udp") {
+		t.Fatalf("binding=%+v", binding)
+	}
+}
+
+func TestBuildRegistrationBindingFallsBackToExpiresHeader(t *testing.T) {
+	binding := BuildRegistrationBinding(IMSProfile{IMPU: "sip:fallback@example"}, "sip:user@192.0.2.10:5060", RegisterResponse{
+		Headers: map[string][]string{
+			"Expires": {"900"},
+			"Contact": {`<sip:other@192.0.2.20:5060>;expires=111, ` +
+				`<sip:user@192.0.2.10:5060;transport=udp>`},
+		},
+	}, 3600)
+	if binding.Expires != 900 || !strings.Contains(binding.RegistrarContact, "transport=udp") {
+		t.Fatalf("binding=%+v", binding)
+	}
+}
+
+func TestBuildRegistrationBindingDoesNotUseOtherContactExpires(t *testing.T) {
+	binding := BuildRegistrationBinding(IMSProfile{IMPU: "sip:fallback@example"}, "sip:user@192.0.2.10:5060", RegisterResponse{
+		Headers: map[string][]string{
+			"Expires": {"1200"},
+			"Contact": {`<sip:other@192.0.2.20:5060>;expires=111, ` +
+				`<sip:another@192.0.2.30:5060>;expires=222`},
+		},
+	}, 3600)
+	if binding.Expires != 1200 || !strings.Contains(binding.RegistrarContact, "sip:other@192.0.2.20") {
 		t.Fatalf("binding=%+v", binding)
 	}
 }
