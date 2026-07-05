@@ -178,6 +178,29 @@ func (f *WireSIPFlow) Reset() error {
 	return err
 }
 
+func (f *WireSIPFlow) ResetToNextTarget() (bool, error) {
+	if f == nil {
+		return false, nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return false, ErrSIPFlowClosed
+	}
+	err := f.closeConnLocked()
+	if strings.TrimSpace(f.ServerAddr) != "" {
+		return false, err
+	}
+	if len(f.targets) <= 1 {
+		f.targets = nil
+		f.targetIndex = 0
+		return false, err
+	}
+	old := f.targetIndex
+	switched := f.advanceTargetLocked() && f.targetIndex != old
+	return switched, err
+}
+
 func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()

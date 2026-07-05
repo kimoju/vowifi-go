@@ -435,11 +435,17 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		return nil
 	}
 	m.mu.Unlock()
-	if retryAfter > 0 && !m.wait(ctx, retryAfter) {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	switchedTarget, err := m.resetFlowForRecovery(ctx)
+	if err != nil {
+		return err
+	}
+	if retryAfter > 0 && !switchedTarget {
+		if !m.wait(ctx, retryAfter) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return context.Canceled
 		}
-		return context.Canceled
 	}
 	m.mu.Lock()
 	if m.closed || !m.registered {
@@ -451,12 +457,6 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	session.CallID = imsRecoveryCallID(session.CallID, m.recoveryCount)
 	m.mu.Unlock()
 
-	if err := m.flow.Reset(); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("IMS registration recovery reset failed: %w", err)
-	}
 	result, err := session.Register(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -489,6 +489,17 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	m.authState = result.AuthState
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *imsRegistrationMaintenance) resetFlowForRecovery(ctx context.Context) (bool, error) {
+	switched, err := m.flow.ResetToNextTarget()
+	if err == nil {
+		return switched, nil
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return false, fmt.Errorf("IMS registration recovery reset failed: %w", err)
 }
 
 func (m *imsRegistrationMaintenance) shouldRecoverRegistration(result voiceclient.RefreshResult, err error) bool {

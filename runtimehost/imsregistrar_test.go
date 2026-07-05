@@ -689,6 +689,136 @@ func TestWireIMSRegistrarRecoversRegistrationAfterRefresh503(t *testing.T) {
 	}
 }
 
+func TestWireIMSRegistrarRecoveryFailsOverToNextPCSCF(t *testing.T) {
+	first, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(first) error = %v", err)
+	}
+	defer first.Close()
+	second, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(second) error = %v", err)
+	}
+	defer second.Close()
+
+	type seenRequest struct {
+		addr string
+		wire string
+	}
+	firstSeen := make(chan []seenRequest, 1)
+	go func() {
+		var requests []seenRequest
+		buf := make([]byte, 65535)
+		for i := 0; i < 2; i++ {
+			_ = first.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, addr, err := first.ReadFrom(buf)
+			if err != nil {
+				firstSeen <- append(requests, seenRequest{wire: "read error: " + err.Error()})
+				return
+			}
+			wire := string(append([]byte(nil), buf[:n]...))
+			requests = append(requests, seenRequest{addr: addr.String(), wire: wire})
+			if i == 0 {
+				resp := "SIP/2.0 200 OK\r\n" +
+					"P-Associated-URI: <sip:user@ims.example>\r\n" +
+					"Contact: <sip:user@192.0.2.10:5060>;expires=60\r\n" +
+					"Content-Length: 0\r\n\r\n"
+				_, _ = first.WriteTo([]byte(resp), addr)
+				continue
+			}
+			_, _ = first.WriteTo([]byte("SIP/2.0 503 Service Unavailable\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n"), addr)
+			firstSeen <- requests
+			return
+		}
+		firstSeen <- requests
+	}()
+
+	secondSeen := make(chan []seenRequest, 1)
+	recovered := make(chan struct{}, 1)
+	go func() {
+		var requests []seenRequest
+		buf := make([]byte, 65535)
+		for i := 0; i < 4; i++ {
+			_ = second.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, addr, err := second.ReadFrom(buf)
+			if err != nil {
+				secondSeen <- append(requests, seenRequest{wire: "read error: " + err.Error()})
+				return
+			}
+			wire := string(append([]byte(nil), buf[:n]...))
+			requests = append(requests, seenRequest{addr: addr.String(), wire: wire})
+			resp := "SIP/2.0 200 OK\r\n" +
+				"P-Associated-URI: <sip:user@ims.example>\r\n" +
+				"Contact: <sip:user@192.0.2.10:5060>;expires=60\r\n" +
+				"Content-Length: 0\r\n\r\n"
+			_, _ = second.WriteTo([]byte(resp), addr)
+			if strings.Contains(wire, "Call-ID: trace-pcscf-failover-recovery-1\r\n") {
+				recovered <- struct{}{}
+			}
+			if strings.Contains(wire, "Expires: 0\r\n") {
+				secondSeen <- requests
+				return
+			}
+		}
+		secondSeen <- requests
+	}()
+
+	resolver := voiceclient.SIPServerCandidateResolverFunc(func(ctx context.Context, network, uri string) ([]string, error) {
+		if network != "udp" || uri != "sip:ims.mnc280.mcc310.3gppnetwork.org" {
+			t.Fatalf("resolver network=%q uri=%q", network, uri)
+		}
+		return []string{first.LocalAddr().String(), second.LocalAddr().String()}, nil
+	})
+	res, err := WireIMSRegistrar{
+		Resolver:              resolver,
+		ContactHost:           "192.0.2.10",
+		ContactPort:           5060,
+		Expires:               60,
+		RefreshInterval:       60 * time.Millisecond,
+		RefreshRetryInterval:  60 * time.Millisecond,
+		Timeout:               time.Second,
+		MaxRetransmits:        1,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+		DisableKeepalive:      true,
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-pcscf-failover",
+		TraceID:  "trace-pcscf-failover",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	select {
+	case <-recovered:
+	case <-time.After(time.Second):
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = res.Close(closeCtx)
+		t.Fatal("timed out waiting for recovery REGISTER on second P-CSCF")
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := res.Close(closeCtx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	firstRequests := <-firstSeen
+	secondRequests := <-secondSeen
+	if len(firstRequests) != 2 {
+		t.Fatalf("first requests=%d %+v", len(firstRequests), firstRequests)
+	}
+	if !strings.Contains(firstRequests[0].wire, "Call-ID: trace-pcscf-failover\r\n") ||
+		!strings.Contains(firstRequests[1].wire, "CSeq: 2 REGISTER\r\n") {
+		t.Fatalf("first P-CSCF requests=%+v", firstRequests)
+	}
+	if len(secondRequests) < 1 || !strings.Contains(secondRequests[0].wire, "Call-ID: trace-pcscf-failover-recovery-1\r\n") {
+		t.Fatalf("second P-CSCF requests=%+v", secondRequests)
+	}
+	if strings.Contains(secondRequests[0].wire, "Expires: 0\r\n") {
+		t.Fatalf("first second-P-CSCF request was deregister, want recovery REGISTER: %q", secondRequests[0].wire)
+	}
+}
+
 func TestWireIMSRegistrarRefreshAndCloseAdvanceDigestNonceCount(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

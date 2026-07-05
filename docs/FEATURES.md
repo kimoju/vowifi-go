@@ -61,6 +61,9 @@ protocol layers needed by VoHive:
   expiry-based renewal, retry scheduling, binding/auth/CSeq state updates,
   full re-registration after recoverable refresh/flow failures, and shutdown
   de-registration with the latest registration state
+- IMS recovery re-registration on reusable SIP flows can advance to the next
+  resolved P-CSCF candidate after recoverable failures, preserving the candidate
+  list instead of repeatedly selecting the same failed proxy
 - IMS registration recovery hooks exposed from the wire registrar to the
   runtime, returning refreshed binding, voice, SMS, and USSD transports after
   re-registration
