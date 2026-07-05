@@ -209,6 +209,7 @@ type IMSRegistrationResult struct {
 	Profile        voiceclient.IMSProfile
 	Binding        voiceclient.RegistrationBinding
 	VoiceTransport voiceclient.SIPRequestTransport
+	SMSTransport   messaging.SMSTransport
 }
 
 type IMSRegistrar interface {
@@ -354,7 +355,11 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		state.NetworkMode = modem.GetNetworkMode()
 	}
 	svc := messaging.NewService(req.DeviceID, req.Profile.IMSI, req.DeliveryStore, req.Dispatch)
-	svc.SetSMSTransport(req.SMSTransport)
+	smsTransport := req.SMSTransport
+	if smsTransport == nil {
+		smsTransport = imsResult.SMSTransport
+	}
+	svc.SetSMSTransport(smsTransport)
 	svc.SetUSSDTransport(req.USSDTransport)
 	inst := &Instance{state: state, service: svc, tunnel: tunnel, voice: buildRuntimeVoiceAgent(req, imsResult)}
 	if req.VoiceGateway != nil {

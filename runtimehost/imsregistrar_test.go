@@ -9,6 +9,7 @@ import (
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
+	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
 
@@ -21,12 +22,14 @@ func TestWireIMSRegistrarUsesPreparedIdentity(t *testing.T) {
 			"Service-Route":    {"<sip:pcscf.ims.example;lr>"},
 		},
 	}}}
+	voiceTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
 	res, err := WireIMSRegistrar{
-		Transport:   transport,
-		ContactHost: "192.0.2.10",
-		ContactPort: 5062,
-		UserAgent:   "VoHive",
-		Expires:     600,
+		Transport:      transport,
+		VoiceTransport: voiceTransport,
+		ContactHost:    "192.0.2.10",
+		ContactPort:    5062,
+		UserAgent:      "VoHive",
+		Expires:        600,
 	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
 		DeviceID: "dev-1",
 		TraceID:  "trace-1",
@@ -53,6 +56,20 @@ func TestWireIMSRegistrarUsesPreparedIdentity(t *testing.T) {
 	}
 	if res.VoiceTransport == nil {
 		t.Fatal("VoiceTransport=nil, want SIP request transport for IMS voice")
+	}
+	if res.SMSTransport == nil {
+		t.Fatal("SMSTransport=nil, want IMS SIP MESSAGE transport")
+	}
+	smsResult, err := res.SMSTransport.SendSMSPart(context.Background(), messaging.SMSSendRequest{
+		Peer:      "+18005551212",
+		MessageID: "msg-1",
+		Part:      messaging.SMSPart{PartNo: 1, TotalParts: 1, Text: "hello"},
+	})
+	if err != nil || smsResult.State != "accepted" {
+		t.Fatalf("SendSMSPart() result=%+v err=%v", smsResult, err)
+	}
+	if len(voiceTransport.requests) != 1 || voiceTransport.requests[0].Method != "MESSAGE" || voiceTransport.requests[0].Headers["Route"] != "<sip:pcscf.ims.example;lr>" {
+		t.Fatalf("SMS request=%+v", voiceTransport.requests)
 	}
 	if len(transport.requests) != 1 {
 		t.Fatalf("requests=%d", len(transport.requests))

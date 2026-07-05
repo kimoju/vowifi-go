@@ -35,8 +35,8 @@ protocol layers needed by VoHive:
 - IMS REGISTER session flow with 401/407 authentication retry, associated URI,
   Service-Route, Path, Security-Server, and Contact expiry capture, plus a
   runtime `IMSRegistrar` adapter for the wire transport
-- SMS segmentation, SIP transport hooks, inbound SMS, delivery report matching,
-  and USSD session transport hooks
+- SMS segmentation, IMS SIP `MESSAGE` transport hooks, inbound SMS, delivery
+  report matching, and USSD session transport hooks
 - outbound voice dialog bridging helpers, SDP parsing/building, IMS INVITE/ACK/
   BYE/CANCEL request construction, route-set application, UDP/TCP SIP request
   transport, outbound IMS voice agent, ACK/BYE dialog handling, RTP/RTCP media

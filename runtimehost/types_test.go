@@ -325,6 +325,31 @@ func TestStartWiresSMSTransport(t *testing.T) {
 	}
 }
 
+func TestStartUsesIMSRegistrarSMSTransport(t *testing.T) {
+	transport := &runtimeSMSTransport{}
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
+		Registered:   true,
+		StatusCode:   200,
+		Reason:       "OK",
+		SMSTransport: transport,
+	}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:     "dev-ims-sms",
+		Profile:      identity.Profile{IMSI: "310280233641503"},
+		IMSRegistrar: registrar,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	out, err := inst.SendSMSWithOptions(context.Background(), "+18005551212", "hello", messaging.SendOptions{})
+	if err != nil {
+		t.Fatalf("SendSMSWithOptions() error = %v", err)
+	}
+	if out.PartsTotal != 1 || len(transport.requests) != 1 || transport.requests[0].Peer != "+18005551212" {
+		t.Fatalf("outcome=%+v requests=%+v", out, transport.requests)
+	}
+}
+
 func TestStartWiresUSSDTransport(t *testing.T) {
 	transport := &runtimeUSSDTransport{}
 	inst, err := Start(context.Background(), StartRequest{

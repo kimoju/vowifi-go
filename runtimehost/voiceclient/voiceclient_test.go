@@ -256,6 +256,16 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if prack.Method != "PRACK" || prack.Headers["RAck"] != "1 1 INVITE" || prack.Headers["CSeq"] != "3 PRACK" {
 		t.Fatalf("prack=%+v", prack)
 	}
+	message, err := BuildMessageRequest(cfg, "text/plain;charset=UTF-8", []byte("hello"))
+	if err != nil {
+		t.Fatalf("BuildMessageRequest() error = %v", err)
+	}
+	if message.Method != "MESSAGE" || message.Headers["CSeq"] != "3 MESSAGE" || message.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" {
+		t.Fatalf("message=%+v", message)
+	}
+	if message.Headers["Content-Type"] != "text/plain;charset=UTF-8" || message.Headers["P-Preferred-Service"] == "" || message.Headers["Accept-Contact"] == "" {
+		t.Fatalf("message headers=%+v", message.Headers)
+	}
 	options, err := BuildOptionsRequest(cfg)
 	if err != nil {
 		t.Fatalf("BuildOptionsRequest() error = %v", err)

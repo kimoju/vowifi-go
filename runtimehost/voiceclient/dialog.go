@@ -94,6 +94,23 @@ func BuildPrackRequest(cfg DialogRequestConfig, rack string) (SIPRequestMessage,
 	return msg, nil
 }
 
+func BuildMessageRequest(cfg DialogRequestConfig, contentType string, body []byte) (SIPRequestMessage, error) {
+	msg, err := buildDialogRequest("MESSAGE", cfg, body)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	if len(body) > 0 {
+		msg.Headers["Content-Type"] = firstNonEmpty(contentType, "text/plain;charset=UTF-8")
+	}
+	msg.Headers["Accept"] = "text/plain, application/vnd.3gpp.sms"
+	msg.Headers["P-Preferred-Service"] = "urn:urn-7:3gpp-service.ims.icsi.sms"
+	msg.Headers["Accept-Contact"] = "*;+g.3gpp.smsip"
+	if contactURI := firstNonEmpty(cfg.ContactURI, cfg.Registration.ContactURI); contactURI != "" {
+		msg.Headers["Contact"] = "<" + contactURI + ">"
+	}
+	return msg, nil
+}
+
 func BuildOptionsRequest(cfg DialogRequestConfig) (SIPRequestMessage, error) {
 	msg, err := buildDialogRequest("OPTIONS", cfg, nil)
 	if err != nil {

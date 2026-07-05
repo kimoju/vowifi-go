@@ -9,17 +9,21 @@ import (
 	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
+	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
 
 type IMSRegisterTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, string, string) voiceclient.SIPRegisterTransport
 type IMSVoiceTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, voiceclient.RegistrationBinding) voiceclient.SIPRequestTransport
+type IMSSMSTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, voiceclient.RegistrationBinding, voiceclient.SIPRequestTransport) messaging.SMSTransport
 
 type WireIMSRegistrar struct {
 	Transport             voiceclient.SIPRegisterTransport
 	TransportFactory      IMSRegisterTransportFactory
 	VoiceTransport        voiceclient.SIPRequestTransport
 	VoiceFactory          IMSVoiceTransportFactory
+	SMSTransport          messaging.SMSTransport
+	SMSFactory            IMSSMSTransportFactory
 	RegistrarURI          string
 	ContactURI            string
 	ContactHost           string
@@ -90,6 +94,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		}, err
 	}
 	voiceTransport := r.voiceTransport(cfg, profile, result.Binding)
+	smsTransport := r.smsTransport(cfg, profile, result.Binding, voiceTransport)
 	return IMSRegistrationResult{
 		Registered:     result.Registered,
 		StatusCode:     result.StatusCode,
@@ -98,6 +103,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		Profile:        profile,
 		Binding:        result.Binding,
 		VoiceTransport: voiceTransport,
+		SMSTransport:   smsTransport,
 	}, nil
 }
 
@@ -116,6 +122,25 @@ func (r WireIMSRegistrar) voiceTransport(cfg IMSRegistrationConfig, profile voic
 		RetransmitInterval:    r.RetransmitInterval,
 		MaxRetransmitInterval: r.MaxRetransmitInterval,
 		MaxRetransmits:        r.MaxRetransmits,
+	}
+}
+
+func (r WireIMSRegistrar) smsTransport(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, binding voiceclient.RegistrationBinding, voiceTransport voiceclient.SIPRequestTransport) messaging.SMSTransport {
+	if r.SMSTransport != nil {
+		return r.SMSTransport
+	}
+	if r.SMSFactory != nil {
+		return r.SMSFactory(cfg, profile, binding, voiceTransport)
+	}
+	if voiceTransport == nil {
+		return nil
+	}
+	return messaging.IMSSMSTransport{
+		Transport:    voiceTransport,
+		Profile:      profile,
+		Registration: binding,
+		Domain:       profile.Domain,
+		UserAgent:    firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
 	}
 }
 
