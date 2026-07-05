@@ -498,6 +498,8 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	currentAuthInput = authzInput
 	if syncFailure {
 		if isSIPSuccess(resp2.StatusCode) {
+			authState := newDigestAuthState(authzHeader, ch, currentAuthInput, authz)
+			authState = updateDigestAuthStateFromInfo(authState, resp2.Headers, authzHeader)
 			return RegisterResult{
 				Registered:     true,
 				StatusCode:     resp2.StatusCode,
@@ -507,7 +509,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 				Binding:        buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders),
 				AuthHeader:     authz,
 				AuthHeaderName: authzHeader,
-				AuthState:      newDigestAuthState(authzHeader, ch, currentAuthInput, authz),
+				AuthState:      authState,
 				NextCSeq:       cseq + 1,
 			}, nil
 		}
@@ -566,6 +568,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if !result.Registered {
 		return result, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 	}
+	result.AuthState = updateDigestAuthStateFromInfo(result.AuthState, resp2.Headers, authzHeader)
 	return result, nil
 }
 
@@ -714,6 +717,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	}
 	if isSIPSuccess(resp.StatusCode) {
 		binding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp, expires, securityClientFromBinding(req.Binding), nil))
+		authState = updateDigestAuthStateFromInfo(authState, resp.Headers, authHeaderName)
 		return RefreshResult{
 			Refreshed:      true,
 			StatusCode:     resp.StatusCode,
@@ -772,6 +776,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if !result.Refreshed {
 		return result, fmt.Errorf("%w: refresh %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 	}
+	result.AuthState = updateDigestAuthStateFromInfo(result.AuthState, resp2.Headers, authHeaderName)
 	return result, nil
 }
 
@@ -792,6 +797,46 @@ func nextDigestAuthorization(state DigestAuthState, method, uri, fallbackName, f
 		return firstNonEmpty(next.headerName, headerName), authz, next, nil
 	}
 	return firstNonEmpty(fallbackName, headerName), strings.TrimSpace(fallbackHeader), state.clone(), nil
+}
+
+func updateDigestAuthStateFromInfo(state DigestAuthState, headers map[string][]string, authHeaderName string) DigestAuthState {
+	if !state.Usable() {
+		return state
+	}
+	nextNonce := digestInfoNextNonce(headers, authHeaderName)
+	if nextNonce == "" || nextNonce == state.challenge.Nonce {
+		return state
+	}
+	next := state.clone()
+	next.challenge.Nonce = nextNonce
+	next.input.NC = 1
+	next.nextNC = 1
+	next.lastHeader = ""
+	return next
+}
+
+func digestInfoNextNonce(headers map[string][]string, authHeaderName string) string {
+	for _, name := range digestInfoHeaderNames(authHeaderName) {
+		for _, header := range rawHeaderValues(headers, name) {
+			for _, part := range splitAuthParams(header) {
+				key, value, ok := strings.Cut(part, "=")
+				if !ok || !strings.EqualFold(strings.TrimSpace(key), "nextnonce") {
+					continue
+				}
+				if nonce := unquote(strings.TrimSpace(value)); nonce != "" {
+					return nonce
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func digestInfoHeaderNames(authHeaderName string) []string {
+	if strings.EqualFold(strings.TrimSpace(authHeaderName), "Proxy-Authorization") {
+		return []string{"Proxy-Authentication-Info", "Authentication-Info"}
+	}
+	return []string{"Authentication-Info", "Proxy-Authentication-Info"}
 }
 
 func securityClientFromBinding(binding RegistrationBinding) SecurityAgreement {

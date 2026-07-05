@@ -694,6 +694,88 @@ func TestRegisterSessionRefreshAndDeregisterAdvanceDigestNonceCount(t *testing.T
 	}
 }
 
+func TestRegisterSessionUsesAuthenticationInfoNextNonce(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-one", algorithm=MD5, qop="auth"`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Authentication-Info": {`nextnonce="nonce-two", qop=auth, rspauth="ignored"`},
+				"Contact":             {`<sip:user@192.0.2.10:5060>;expires=1200`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Authentication-Info": {`nextnonce=nonce-three`},
+				"Contact":             {`<sip:user@192.0.2.10:5060>;expires=900`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	session := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-nextnonce",
+		CNonce:       "cnonce",
+	}
+	registered, err := session.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !registered.Registered || registered.AuthState.challenge.Nonce != "nonce-two" || registered.AuthState.nextNC != 1 {
+		t.Fatalf("registered=%+v authState=%+v", registered, registered.AuthState)
+	}
+	refreshed, err := session.Refresh(context.Background(), RefreshRequest{
+		Binding:        registered.Binding,
+		CSeq:           registered.NextCSeq,
+		AuthHeader:     registered.AuthHeader,
+		AuthHeaderName: registered.AuthHeaderName,
+		AuthState:      registered.AuthState,
+	})
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if !refreshed.Refreshed || refreshed.AuthState.challenge.Nonce != "nonce-three" || refreshed.AuthState.nextNC != 1 {
+		t.Fatalf("refreshed=%+v authState=%+v", refreshed, refreshed.AuthState)
+	}
+	deregistered, err := session.Deregister(context.Background(), DeregisterRequest{
+		Binding:        refreshed.Binding,
+		CSeq:           refreshed.NextCSeq,
+		AuthHeader:     refreshed.AuthHeader,
+		AuthHeaderName: refreshed.AuthHeaderName,
+		AuthState:      refreshed.AuthState,
+	})
+	if err != nil {
+		t.Fatalf("Deregister() error = %v", err)
+	}
+	if !deregistered.Deregistered {
+		t.Fatalf("deregistered=%+v", deregistered)
+	}
+	if len(transport.requests) != 4 {
+		t.Fatalf("requests=%d, want 4", len(transport.requests))
+	}
+	if auth := transport.requests[1].Headers["Authorization"]; !strings.Contains(auth, `nonce="nonce-one"`) || !strings.Contains(auth, "nc=00000001") {
+		t.Fatalf("register Authorization=%s", auth)
+	}
+	if auth := transport.requests[2].Headers["Authorization"]; !strings.Contains(auth, `nonce="nonce-two"`) || !strings.Contains(auth, "nc=00000001") {
+		t.Fatalf("refresh Authorization=%s", auth)
+	}
+	if auth := transport.requests[3].Headers["Authorization"]; !strings.Contains(auth, `nonce="nonce-three"`) || !strings.Contains(auth, "nc=00000001") {
+		t.Fatalf("deregister Authorization=%s", auth)
+	}
+}
+
 func TestRegisterSessionRefreshRetriesDigestChallenge(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{
@@ -796,6 +878,16 @@ func TestSelectDigestChallengeSkipsUnsupportedQOP(t *testing.T) {
 	}
 	if ch.Algorithm != "AKAv1-MD5" || ch.QOP != "auth" {
 		t.Fatalf("challenge=%+v, want AKAv1-MD5 auth", ch)
+	}
+}
+
+func TestDigestInfoNextNoncePrefersProxyAuthenticationInfo(t *testing.T) {
+	got := digestInfoNextNonce(map[string][]string{
+		"Authentication-Info":       {`nextnonce="origin-next"`},
+		"Proxy-Authentication-Info": {`qop=auth, nextnonce="proxy-next"`},
+	}, "Proxy-Authorization")
+	if got != "proxy-next" {
+		t.Fatalf("nextnonce=%q, want proxy-next", got)
 	}
 }
 
