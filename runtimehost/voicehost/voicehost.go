@@ -37,6 +37,10 @@ type DialogCanceller interface {
 	CancelVoiceCall(context.Context, DialogInfo) error
 }
 
+type DialogInfoSender interface {
+	SendDialogInfo(context.Context, DialogInfoRequest) (DialogInfoResult, error)
+}
+
 type OutboundCallRequest struct {
 	DeviceID  string
 	CallID    string
@@ -67,6 +71,24 @@ const (
 	DialogStateEstablished DialogState = "established"
 	DialogStateTerminated  DialogState = "terminated"
 )
+
+type DialogInfoRequest struct {
+	DeviceID    string
+	CallID      string
+	ContentType string
+	InfoPackage string
+	Body        []byte
+	Headers     map[string]string
+}
+
+type DialogInfoResult struct {
+	Accepted    bool
+	StatusCode  int
+	Reason      string
+	ContentType string
+	Body        []byte
+	Headers     map[string]string
+}
 
 type Gateway struct {
 	mu       sync.RWMutex
@@ -280,6 +302,50 @@ func (g *Gateway) HandleClientPrack(deviceID string, req *sip.Request, tx sip.Se
 	}
 }
 
+func (g *Gateway) HandleClientInfo(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
+	if tx == nil || req == nil {
+		return
+	}
+	sender, _ := g.GetAgent(deviceID).(DialogInfoSender)
+	if sender == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
+		return
+	}
+	callID := sipCallID(req)
+	if callID == "" {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
+		return
+	}
+	result, err := sender.SendDialogInfo(context.Background(), DialogInfoRequest{
+		DeviceID:    strings.TrimSpace(deviceID),
+		CallID:      callID,
+		ContentType: sipHeaderValue(req, "Content-Type"),
+		InfoPackage: sipHeaderValue(req, "Info-Package"),
+		Body:        append([]byte(nil), req.Body()...),
+		Headers:     sipRequestHeaderMap(req),
+	})
+	if err != nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi INFO failed", nil))
+		return
+	}
+	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)
+	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	body := append([]byte(nil), result.Body...)
+	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
+	if strings.TrimSpace(result.ContentType) != "" && len(body) > 0 {
+		res.AppendHeader(sip.NewHeader("Content-Type", strings.TrimSpace(result.ContentType)))
+	}
+	for key, value := range result.Headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
+	_ = tx.Respond(res)
+}
+
 func (g *Gateway) HandleClientAck(deviceID string, req *sip.Request, tx sip.ServerTransaction) {}
 
 func (g *Gateway) HandleClientBye(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
@@ -445,6 +511,50 @@ func localFinalStatusCode(code, fallback int) int {
 		return code
 	}
 	return fallback
+}
+
+func localDialogInfoStatusCode(code int, accepted bool) int {
+	if code >= 200 && code <= 699 {
+		return code
+	}
+	if accepted {
+		return 200
+	}
+	return 500
+}
+
+func sipHeaderValue(req *sip.Request, name string) string {
+	if req == nil {
+		return ""
+	}
+	header := req.GetHeader(name)
+	if header == nil {
+		return ""
+	}
+	return strings.TrimSpace(header.Value())
+}
+
+func sipRequestHeaderMap(req *sip.Request) map[string]string {
+	if req == nil {
+		return nil
+	}
+	headers := req.Headers()
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for _, header := range headers {
+		if header == nil {
+			continue
+		}
+		name := strings.TrimSpace(header.Name())
+		value := strings.TrimSpace(header.Value())
+		if name == "" || value == "" || isProtectedDialogHeader(name) {
+			continue
+		}
+		out[name] = value
+	}
+	return out
 }
 
 func sipCallID(req *sip.Request) string {

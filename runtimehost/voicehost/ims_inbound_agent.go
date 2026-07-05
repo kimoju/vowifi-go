@@ -364,6 +364,48 @@ func (a *IMSInboundAgent) HandleInboundPrack(ctx context.Context, req InboundDia
 	return InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...)}, nil
 }
 
+func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequest) (IMSInfoResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.ClientTransport == nil {
+		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return IMSInfoResult{Handled: true, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	state, ok := a.inboundDialog(callID)
+	if !ok {
+		return IMSInfoResult{Handled: true, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.clientCfg
+	cfg.CSeq = inboundCSeq(req.CSeq)
+	info, err := voiceclient.BuildInfoRequest(cfg, req.ContentType, req.Body)
+	if err != nil {
+		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client INFO failed"}, err
+	}
+	applyIncomingInfoHeaders(info.Headers, req.InfoPackage, req.Headers)
+	resp, err := a.ClientTransport.RoundTripRequest(ctx, info)
+	if err != nil {
+		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client INFO failed"}, err
+	}
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
+		cfg.CSeq = state.clientCfg.CSeq
+		state.clientCfg = cfg
+		a.storeInboundDialog(callID, state)
+	}
+	return IMSInfoResult{
+		Handled:     true,
+		StatusCode:  inboundStatusCode(resp.StatusCode, 500),
+		Reason:      firstVoiceNonEmpty(resp.Reason, "OK"),
+		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:        append([]byte(nil), resp.Body...),
+		Headers:     firstValueSIPHeaders(resp.Headers),
+	}, nil
+}
+
 func (a *IMSInboundAgent) CancelInboundCall(ctx context.Context, info DialogInfo) error {
 	if ctx == nil {
 		ctx = context.Background()

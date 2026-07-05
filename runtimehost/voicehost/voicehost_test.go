@@ -11,10 +11,13 @@ import (
 
 type fakeOutboundAgent struct {
 	requests   []OutboundCallRequest
+	infos      []DialogInfoRequest
 	terminated []DialogInfo
 	canceled   []DialogInfo
 	result     OutboundCallResult
+	infoResult DialogInfoResult
 	err        error
+	infoErr    error
 }
 
 func (a *fakeOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCallRequest) (OutboundCallResult, error) {
@@ -36,6 +39,14 @@ func (a *fakeOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) e
 func (a *fakeOutboundAgent) CancelVoiceCall(ctx context.Context, info DialogInfo) error {
 	a.canceled = append(a.canceled, info)
 	return nil
+}
+
+func (a *fakeOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoRequest) (DialogInfoResult, error) {
+	a.infos = append(a.infos, req)
+	if a.infoErr != nil {
+		return DialogInfoResult{}, a.infoErr
+	}
+	return a.infoResult, nil
 }
 
 type fakeServerTransaction struct {
@@ -166,6 +177,38 @@ func TestGatewayHandleClientCancelCancelsEarlyDialog(t *testing.T) {
 	}
 }
 
+func TestGatewayHandleClientInfoSendsDialogInfo(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{infoResult: DialogInfoResult{
+		Accepted:    true,
+		StatusCode:  202,
+		Reason:      "Accepted",
+		ContentType: "application/dtmf-relay",
+		Body:        []byte("ok"),
+		Headers:     map[string]string{"X-IMS": "info-ok"},
+	}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newInfoRequest("call-info", "application/dtmf-relay", "Signal=2\r\nDuration=100\r\n")
+	req.AppendHeader(sip.NewHeader("Info-Package", "dtmf"))
+	req.AppendHeader(sip.NewHeader("X-Client", "info"))
+
+	g.HandleClientInfo("dev-1", req, tx)
+
+	if len(agent.infos) != 1 {
+		t.Fatalf("infos=%d", len(agent.infos))
+	}
+	got := agent.infos[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-info" || got.ContentType != "application/dtmf-relay" ||
+		got.InfoPackage != "dtmf" || got.Headers["X-Client"] != "info" || !strings.Contains(string(got.Body), "Signal=2") {
+		t.Fatalf("DialogInfoRequest=%+v body=%q", got, got.Body)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 202 || tx.responses[0].Reason != "Accepted" ||
+		string(tx.responses[0].Body()) != "ok" || tx.responses[0].GetHeader("X-IMS").Value() != "info-ok" {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
 func TestParseAndBuildSDP(t *testing.T) {
 	info, err := ParseSDP([]byte(sampleSDP("203.0.113.8", 49170) + "a=rtcp:49171 IN IP4 203.0.113.8\r\n"))
 	if err != nil {
@@ -200,6 +243,16 @@ func newByeRequest(callID string) *sip.Request {
 func newCancelRequest(callID string) *sip.Request {
 	req := sip.NewRequest(sip.CANCEL, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
 	appendCommonHeaders(req, callID, "18005551212")
+	return req
+}
+
+func newInfoRequest(callID, contentType, body string) *sip.Request {
+	req := sip.NewRequest(sip.INFO, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
+	appendCommonHeaders(req, callID, "18005551212")
+	req.SetBody([]byte(body))
+	if strings.TrimSpace(contentType) != "" {
+		req.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	}
 	return req
 }
 

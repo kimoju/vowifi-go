@@ -513,6 +513,62 @@ func TestIMSInboundWireServerDispatchesInfoAndUSSDBye(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerFallsBackToAgentForUnhandledNonUSSDInfo(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"X-Client": {"dtmf-ok"}},
+	}}}
+	agent := &IMSInboundAgent{
+		ClientTransport: transport,
+	}
+	agent.storeInboundDialog("dtmf-call", imsInboundDialogState{
+		clientCfg: voiceclient.DialogRequestConfig{
+			Profile:         voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+			LocalURI:        "sip:+18005551212@ims.example",
+			ContactURI:      "sip:vowifi@127.0.0.1:5060",
+			RemoteURI:       "sip:user@ims.example",
+			RemoteTargetURI: "sip:client@127.0.0.1:5070",
+			CallID:          "dtmf-call",
+			LocalTag:        "ims-tag",
+			RemoteTag:       "client-tag",
+			CSeq:            2,
+		},
+	})
+	server := &IMSInboundWireServer{
+		Agent: agent,
+		InfoHandler: IMSInfoHandlerFunc(func(ctx context.Context, req IMSInfoRequest) (IMSInfoResult, error) {
+			return IMSInfoResult{Handled: false}, nil
+		}),
+	}
+	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+		Method: "INFO",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID":      {"dtmf-call"},
+			"CSeq":         {"9 INFO"},
+			"From":         {"<sip:+18005551212@ims.example>;tag=ims-tag"},
+			"To":           {"<sip:user@ims.example>;tag=ue"},
+			"Content-Type": {"application/dtmf-relay"},
+		},
+		Body: []byte("Signal=7\r\nDuration=90\r\n"),
+	})
+	if err != nil {
+		t.Fatalf("HandleRequest(INFO) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 || responses[0].Headers["X-Client"] != "dtmf-ok" {
+		t.Fatalf("responses=%+v", responses)
+	}
+	if len(transport.requests) != 1 || transport.requests[0].Method != "INFO" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	info := transport.requests[0]
+	if info.URI != "sip:client@127.0.0.1:5070" || info.Headers["CSeq"] != "9 INFO" ||
+		info.Headers["Content-Type"] != "application/dtmf-relay" || !strings.Contains(string(info.Body), "Signal=7") {
+		t.Fatalf("forwarded INFO=%+v body=%q", info, info.Body)
+	}
+}
+
 func TestIMSInboundWireServerRejectsMessageWithoutHandler(t *testing.T) {
 	server := &IMSInboundWireServer{}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{

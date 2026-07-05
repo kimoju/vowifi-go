@@ -146,6 +146,9 @@ protocol layers needed by VoHive:
 - IMS in-dialog interworking for UPDATE, PRACK, and OPTIONS, including SDP
   session refresh forwarding, RAck propagation, RTP relay endpoint rewriting
   for UPDATE offers/answers, and local OPTIONS capability responses
+- IMS in-dialog SIP INFO forwarding for outbound and inbound voice dialogs,
+  including DTMF-style payloads, Info-Package propagation, response body/header
+  mapping, and dialog CSeq advancement
 - in-dialog re-INVITE handling for IMS-originated media renegotiation, including
   local client forwarding, SDP answer rewriting, Contact refresh, and ACK CSeq
   tracking for the latest successful INVITE transaction

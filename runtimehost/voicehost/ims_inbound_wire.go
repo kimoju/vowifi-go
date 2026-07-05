@@ -163,12 +163,7 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 }
 
 func (s *IMSInboundWireServer) handleInfo(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
-	if s == nil || s.InfoHandler == nil {
-		resp := wireResponse(405, "Method Not Allowed")
-		resp.Headers["Allow"] = s.allowHeader()
-		return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, nil
-	}
-	result, err := s.InfoHandler.HandleIMSInfo(ctx, IMSInfoRequest{
+	infoReq := IMSInfoRequest{
 		URI:         strings.TrimSpace(req.URI),
 		FromURI:     wireHeaderURI(req, "From"),
 		ToURI:       wireCalleeURI(req),
@@ -178,11 +173,30 @@ func (s *IMSInboundWireServer) handleInfo(ctx context.Context, req voiceclient.S
 		InfoPackage: firstVoiceHeader(req.Headers, "Info-Package"),
 		Body:        append([]byte(nil), req.Body...),
 		Headers:     cloneSIPHeaders(req.Headers),
-	})
-	if !result.Handled && err == nil {
-		resp := wireResponse(415, "Unsupported Media Type")
-		return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, nil
 	}
+	if s != nil && s.InfoHandler != nil {
+		result, err := s.InfoHandler.HandleIMSInfo(ctx, infoReq)
+		if result.Handled || err != nil {
+			return s.infoResultResponse(result, err), err
+		}
+		if isUSSDInfoRequest(infoReq) {
+			resp := wireResponse(415, "Unsupported Media Type")
+			return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, nil
+		}
+	}
+	if s != nil && s.Agent != nil {
+		result, err := s.Agent.HandleInboundInfo(ctx, infoReq)
+		return s.infoResultResponse(result, err), err
+	}
+	resp := wireResponse(415, "Unsupported Media Type")
+	if s == nil || s.InfoHandler == nil {
+		resp = wireResponse(405, "Method Not Allowed")
+		resp.Headers["Allow"] = s.allowHeader()
+	}
+	return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, nil
+}
+
+func (s *IMSInboundWireServer) infoResultResponse(result IMSInfoResult, err error) []IMSInboundWireResponse {
 	resp := wireResponse(inboundStatusCode(result.StatusCode, 200), firstVoiceNonEmpty(result.Reason, "OK"))
 	if err != nil && result.StatusCode <= 0 {
 		resp = wireResponse(500, firstVoiceNonEmpty(result.Reason, err.Error(), "Server Internal Error"))
@@ -196,7 +210,12 @@ func (s *IMSInboundWireServer) handleInfo(ctx context.Context, req voiceclient.S
 		resp.Body = append([]byte(nil), result.Body...)
 		resp.Headers["Content-Type"] = firstVoiceNonEmpty(result.ContentType, "application/octet-stream")
 	}
-	return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, err
+	return []IMSInboundWireResponse{s.withResponseHeaders(resp)}
+}
+
+func isUSSDInfoRequest(req IMSInfoRequest) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(req.ContentType)), "vnd.3gpp.ussd") ||
+		strings.EqualFold(strings.TrimSpace(req.InfoPackage), "g.3gpp.ussd")
 }
 
 func (s *IMSInboundWireServer) tryHandleBye(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error, bool) {

@@ -244,6 +244,47 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	return nil
 }
 
+func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoRequest) (DialogInfoResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.Transport == nil {
+		return DialogInfoResult{Accepted: false, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return DialogInfoResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		a.mu.Unlock()
+		return DialogInfoResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.cfg
+	info, err := voiceclient.BuildInfoRequest(cfg, req.ContentType, req.Body)
+	if err != nil {
+		a.mu.Unlock()
+		return DialogInfoResult{Accepted: false, StatusCode: 500, Reason: "build IMS INFO failed"}, err
+	}
+	applyDialogInfoHeaders(info.Headers, req.InfoPackage, req.Headers)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+	resp, err := a.Transport.RoundTripRequest(ctx, info)
+	if err != nil {
+		return DialogInfoResult{Accepted: false, Reason: "IMS INFO failed"}, err
+	}
+	return DialogInfoResult{
+		Accepted:    resp.StatusCode >= 200 && resp.StatusCode < 300,
+		StatusCode:  outboundStatusCode(resp.StatusCode, 500),
+		Reason:      firstVoiceNonEmpty(resp.Reason, "OK"),
+		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:        append([]byte(nil), resp.Body...),
+		Headers:     firstValueSIPHeaders(resp.Headers),
+	}, nil
+}
+
 func (a *IMSOutboundAgent) ackRejectedInvite(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
 	ackCfg := cfg
 	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
@@ -378,6 +419,13 @@ func outboundInviteCSeq(cseq int) int {
 	return cseq
 }
 
+func outboundNextCSeq(cseq int) int {
+	if cseq <= 0 {
+		return 2
+	}
+	return cseq + 1
+}
+
 func outboundStatusCode(code, fallback int) int {
 	if code >= 100 && code <= 699 {
 		return code
@@ -436,6 +484,69 @@ func copyDialogHeader(dst, src map[string]string, name string) {
 			return
 		}
 	}
+}
+
+func applyDialogInfoHeaders(dst map[string]string, infoPackage string, headers map[string]string) {
+	if dst == nil {
+		return
+	}
+	if strings.TrimSpace(infoPackage) != "" {
+		dst["Info-Package"] = strings.TrimSpace(infoPackage)
+	}
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		dst[key] = value
+	}
+}
+
+func applyIncomingInfoHeaders(dst map[string]string, infoPackage string, headers map[string][]string) {
+	if dst == nil {
+		return
+	}
+	if strings.TrimSpace(infoPackage) != "" {
+		dst["Info-Package"] = strings.TrimSpace(infoPackage)
+	}
+	for key, values := range headers {
+		key = strings.TrimSpace(key)
+		if key == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		for _, value := range values {
+			if strings.TrimSpace(value) != "" {
+				dst[key] = strings.TrimSpace(value)
+				break
+			}
+		}
+	}
+}
+
+func isProtectedDialogHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "to", "from", "call-id", "cseq", "max-forwards", "route", "record-route", "via", "contact", "content-length", "content-type":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstValueSIPHeaders(headers map[string][]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for key, values := range headers {
+		for _, value := range values {
+			if strings.TrimSpace(key) != "" && strings.TrimSpace(value) != "" {
+				out[strings.TrimSpace(key)] = strings.TrimSpace(value)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (a *IMSOutboundAgent) remoteURI(callee string) string {

@@ -190,6 +190,62 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentForwardsInDialogInfoToClient(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"Contact": {"<sip:client@192.0.2.60:5060>"}, "X-Client": {"info-ok"}}},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-info",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RemoteTag: "ims-tag",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	result, err := agent.HandleInboundInfo(context.Background(), IMSInfoRequest{
+		CallID:      "in-call-info",
+		CSeq:        7,
+		ContentType: "application/dtmf-relay",
+		InfoPackage: "dtmf",
+		Body:        []byte("Signal=5\r\nDuration=120\r\n"),
+		Headers:     map[string][]string{"X-IMS": {"info"}},
+	})
+	if err != nil || !result.Handled || result.StatusCode != 200 || result.Headers["X-Client"] != "info-ok" {
+		t.Fatalf("HandleInboundInfo() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "INFO" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	info := transport.requests[1]
+	if info.URI != "sip:client@192.0.2.50:5060" || info.Headers["CSeq"] != "7 INFO" ||
+		info.Headers["Content-Type"] != "application/dtmf-relay" || info.Headers["Info-Package"] != "dtmf" ||
+		info.Headers["X-IMS"] != "info" || !strings.Contains(string(info.Body), "Signal=5") {
+		t.Fatalf("INFO=%+v body=%q", info, info.Body)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-info"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].URI != "sip:client@192.0.2.60:5060" {
+		t.Fatalf("BYE after INFO=%+v", transport.requests)
+	}
+}
+
 func TestIMSInboundAgentHandlesReinviteAndTracksAckCSeq(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

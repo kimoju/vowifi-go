@@ -83,6 +83,7 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 			},
 			Body: runtimeSDP("198.51.100.22", 49170),
 		},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"info-ok"}}},
 		{StatusCode: 200, Reason: "OK"},
 	}}
 	gw := voicehost.NewGateway()
@@ -150,10 +151,26 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if err := canceller.CancelVoiceCall(context.Background(), voicehost.DialogInfo{CallID: "unknown-call"}); err != nil {
 		t.Fatalf("CancelVoiceCall(unknown) error = %v", err)
 	}
+	sender, ok := gw.GetAgent("dev-voice").(voicehost.DialogInfoSender)
+	if !ok {
+		t.Fatalf("gateway agent=%T, want dialog info sender", gw.GetAgent("dev-voice"))
+	}
+	infoResult, err := sender.SendDialogInfo(context.Background(), voicehost.DialogInfoRequest{
+		CallID:      "call-runtime-voice",
+		ContentType: "application/dtmf-relay",
+		InfoPackage: "dtmf",
+		Body:        []byte("Signal=3\r\nDuration=100\r\n"),
+	})
+	if err != nil || !infoResult.Accepted || infoResult.Headers["X-IMS"] != "info-ok" {
+		t.Fatalf("SendDialogInfo() result=%+v err=%v", infoResult, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "INFO" || transport.requests[1].Headers["CSeq"] != "2 INFO" {
+		t.Fatalf("INFO requests=%+v", transport.requests)
+	}
 	if err := terminator.EndVoiceCall(context.Background(), voicehost.DialogInfo{CallID: "call-runtime-voice"}); err != nil {
 		t.Fatalf("EndVoiceCall() error = %v", err)
 	}
-	if len(transport.requests) != 2 || transport.requests[1].Method != "BYE" {
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
 		t.Fatalf("requests after BYE=%+v", transport.requests)
 	}
 }

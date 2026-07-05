@@ -79,6 +79,63 @@ func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentSendsInDialogInfoAndAdvancesCSeq(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"info-ok"}}},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-info",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogInfo(context.Background(), DialogInfoRequest{
+		CallID:      "call-info",
+		ContentType: "application/dtmf-relay",
+		InfoPackage: "dtmf",
+		Body:        []byte("Signal=1\r\nDuration=160\r\n"),
+		Headers:     map[string]string{"X-Test": "info"},
+	})
+	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "info-ok" {
+		t.Fatalf("SendDialogInfo() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "INFO" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	info := transport.requests[1]
+	if info.URI != "sip:carrier@198.51.100.1:5060" || info.Headers["CSeq"] != "2 INFO" ||
+		info.Headers["Content-Type"] != "application/dtmf-relay" || info.Headers["Info-Package"] != "dtmf" ||
+		info.Headers["X-Test"] != "info" || !strings.Contains(string(info.Body), "Signal=1") {
+		t.Fatalf("INFO=%+v body=%q", info, info.Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-info"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after INFO=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{
 		provisionals: []voiceclient.SIPResponse{

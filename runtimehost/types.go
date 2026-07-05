@@ -498,6 +498,14 @@ func (i *Instance) CancelVoiceCall(ctx context.Context, info voicehost.DialogInf
 	return agent.CancelVoiceCall(ctx, info)
 }
 
+func (i *Instance) SendDialogInfo(ctx context.Context, req voicehost.DialogInfoRequest) (voicehost.DialogInfoResult, error) {
+	agent := i.dialogInfoSender()
+	if agent == nil {
+		return voicehost.DialogInfoResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
+	}
+	return agent.SendDialogInfo(ctx, req)
+}
+
 func (i *Instance) outboundVoiceAgent() voicehost.OutboundCallAgent {
 	if i == nil {
 		return nil
@@ -532,6 +540,20 @@ func (i *Instance) dialogCanceller() voicehost.DialogCanceller {
 	}
 	i.mu.RLock()
 	agent, _ := i.voice.(voicehost.DialogCanceller)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogInfoSender() voicehost.DialogInfoSender {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogInfoSender)
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {
