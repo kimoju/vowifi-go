@@ -43,6 +43,7 @@ type DigestAuthInput struct {
 	Password string
 	CNonce   string
 	NC       int
+	Body     []byte
 	AUTS     []byte
 }
 
@@ -221,12 +222,19 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 		password = ""
 	}
 	ha1 := md5Hex(username + ":" + ch.Realm + ":" + password)
-	ha2 := md5Hex(method + ":" + uri)
-	response := ""
 	qop := firstQOP(ch.QOP)
-	if qop != "" && qop != "auth" {
+	ha2 := ""
+	switch qop {
+	case "":
+		ha2 = md5Hex(method + ":" + uri)
+	case "auth":
+		ha2 = md5Hex(method + ":" + uri)
+	case "auth-int":
+		ha2 = md5Hex(method + ":" + uri + ":" + md5HexBytes(in.Body))
+	default:
 		return "", fmt.Errorf("unsupported digest qop %q", qop)
 	}
+	response := ""
 	nc := in.NC
 	if nc <= 0 {
 		nc = 1
@@ -301,7 +309,7 @@ func (s DigestAuthState) Build(method, uri string) (string, DigestAuthState, err
 }
 
 func (s DigestAuthState) clone() DigestAuthState {
-	s.input.AUTS = append([]byte(nil), s.input.AUTS...)
+	s.input = cloneDigestAuthInput(s.input)
 	return s
 }
 
@@ -320,6 +328,7 @@ func newDigestAuthState(headerName string, ch DigestChallenge, input DigestAuthI
 }
 
 func cloneDigestAuthInput(input DigestAuthInput) DigestAuthInput {
+	input.Body = append([]byte(nil), input.Body...)
 	input.AUTS = append([]byte(nil), input.AUTS...)
 	return input
 }
@@ -908,7 +917,12 @@ func digestQOPSupported(qop string) bool {
 	if qop == "" {
 		return true
 	}
-	return firstQOP(qop) == "auth"
+	switch firstQOP(qop) {
+	case "auth", "auth-int":
+		return true
+	default:
+		return false
+	}
 }
 
 func unsupportedDigestChallengeError(ch DigestChallenge) error {
@@ -989,6 +1003,12 @@ func firstQOP(qop string) string {
 	for _, part := range strings.Split(qop, ",") {
 		p := strings.ToLower(strings.TrimSpace(part))
 		if p == "auth" {
+			return p
+		}
+	}
+	for _, part := range strings.Split(qop, ",") {
+		p := strings.ToLower(strings.TrimSpace(part))
+		if p == "auth-int" {
 			return p
 		}
 	}
@@ -1242,6 +1262,11 @@ func securityVerifyFromChallenge(headers map[string][]string) string {
 
 func md5Hex(s string) string {
 	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func md5HexBytes(b []byte) string {
+	sum := md5.Sum(b)
 	return hex.EncodeToString(sum[:])
 }
 

@@ -63,6 +63,34 @@ func TestBuildDigestAuthorizationRFC2617Vector(t *testing.T) {
 	}
 }
 
+func TestBuildDigestAuthorizationAuthInt(t *testing.T) {
+	ch := DigestChallenge{
+		Realm:     "ims.example",
+		Nonce:     "nonce-auth-int",
+		Algorithm: "MD5",
+		QOP:       "auth-int",
+	}
+	body := []byte("hello")
+	got, err := BuildDigestAuthorization(ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       9,
+		Body:     body,
+	})
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization(auth-int) error = %v", err)
+	}
+	ha1 := md5Hex("impi@example:ims.example:secret")
+	ha2 := md5Hex("REGISTER:sip:ims.example:" + md5HexBytes(body))
+	wantResponse := md5Hex(ha1 + ":nonce-auth-int:00000009:cnonce:auth-int:" + ha2)
+	if !strings.Contains(got, `qop=auth-int`) || !strings.Contains(got, `nc=00000009`) || !strings.Contains(got, `response="`+wantResponse+`"`) {
+		t.Fatalf("Authorization=%s", got)
+	}
+}
+
 func TestBuildAKADigestPasswordAKAv2(t *testing.T) {
 	aka := sim.AKAResult{
 		RES: []byte{0x01, 0x02, 0x03, 0x04},
@@ -410,7 +438,7 @@ func TestRegisterSessionFallsBackToSupportedDigestChallenge(t *testing.T) {
 			Reason:     "Unauthorized",
 			Headers: map[string][]string{
 				"WWW-Authenticate": {
-					`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth-int"`,
+					`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth-conf"`,
 					`Digest realm="ims.example", nonce="md5nonce", algorithm=MD5, qop="auth"`,
 				},
 			},
@@ -440,6 +468,47 @@ func TestRegisterSessionFallsBackToSupportedDigestChallenge(t *testing.T) {
 	}
 	auth := transport.requests[1].Headers["Authorization"]
 	if !strings.Contains(auth, `algorithm=MD5`) || !strings.Contains(auth, `nonce="md5nonce"`) || !strings.Contains(auth, `qop=auth`) {
+		t.Fatalf("Authorization=%s", auth)
+	}
+}
+
+func TestRegisterSessionHandlesAuthIntDigestChallenge(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-auth-int", algorithm=MD5, qop="auth-int"`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"Contact": {`<sip:user@192.0.2.10:5060>;expires=1800`}},
+		},
+	}}
+	result, err := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-auth-int",
+		CNonce:       "cnonce",
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || result.Challenge.QOP != "auth-int" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("requests=%d, want 2", len(transport.requests))
+	}
+	auth := transport.requests[1].Headers["Authorization"]
+	ha1 := md5Hex("impi@example:ims.example:")
+	ha2 := md5Hex("REGISTER:sip:ims.example:" + md5HexBytes(nil))
+	wantResponse := md5Hex(ha1 + ":nonce-auth-int:00000001:cnonce:auth-int:" + ha2)
+	if !strings.Contains(auth, `qop=auth-int`) || !strings.Contains(auth, `response="`+wantResponse+`"`) {
 		t.Fatalf("Authorization=%s", auth)
 	}
 }
@@ -697,11 +766,27 @@ func TestSelectDigestChallengePrefersAKAv2(t *testing.T) {
 	}
 }
 
-func TestSelectDigestChallengeSkipsUnsupportedQOP(t *testing.T) {
+func TestSelectDigestChallengeSupportsAuthInt(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	ch, err := SelectDigestChallenge(map[string][]string{
 		"WWW-Authenticate": {
 			`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth-int"`,
+			`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`,
+		},
+	}, "WWW-Authenticate")
+	if err != nil {
+		t.Fatalf("SelectDigestChallenge() error = %v", err)
+	}
+	if ch.Algorithm != "AKAv2-MD5" || ch.QOP != "auth-int" {
+		t.Fatalf("challenge=%+v, want AKAv2-MD5 auth-int", ch)
+	}
+}
+
+func TestSelectDigestChallengeSkipsUnsupportedQOP(t *testing.T) {
+	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	ch, err := SelectDigestChallenge(map[string][]string{
+		"WWW-Authenticate": {
+			`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth-conf"`,
 			`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`,
 			`Digest realm="ims.example", nonce="md5nonce", algorithm=MD5, qop="auth"`,
 		},
