@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 
@@ -695,6 +696,13 @@ func TestRegisterSessionRefreshAndDeregisterAdvanceDigestNonceCount(t *testing.T
 }
 
 func TestRegisterSessionUsesAuthenticationInfoNextNonce(t *testing.T) {
+	firstRspauth := mustTestDigestRspauth(t, DigestChallenge{Realm: "ims.example", Nonce: "nonce-one", Algorithm: "MD5", QOP: "auth"}, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, nil)
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{
 			StatusCode: 401,
@@ -707,7 +715,7 @@ func TestRegisterSessionUsesAuthenticationInfoNextNonce(t *testing.T) {
 			StatusCode: 200,
 			Reason:     "OK",
 			Headers: map[string][]string{
-				"Authentication-Info": {`nextnonce="nonce-two", qop=auth, rspauth="ignored"`},
+				"Authentication-Info": {`nextnonce="nonce-two", qop=auth, rspauth="` + firstRspauth + `"`},
 				"Contact":             {`<sip:user@192.0.2.10:5060>;expires=1200`},
 			},
 		},
@@ -773,6 +781,40 @@ func TestRegisterSessionUsesAuthenticationInfoNextNonce(t *testing.T) {
 	}
 	if auth := transport.requests[3].Headers["Authorization"]; !strings.Contains(auth, `nonce="nonce-three"`) || !strings.Contains(auth, "nc=00000001") {
 		t.Fatalf("deregister Authorization=%s", auth)
+	}
+}
+
+func TestRegisterSessionRejectsInvalidRspauth(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-one", algorithm=MD5, qop="auth"`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Authentication-Info": {`rspauth="bad"`},
+				"Contact":             {`<sip:user@192.0.2.10:5060>;expires=1200`},
+			},
+		},
+	}}
+	result, err := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-bad-rspauth",
+		CNonce:       "cnonce",
+	}.Register(context.Background())
+	if !errors.Is(err, ErrInvalidAuthenticationInfo) {
+		t.Fatalf("Register() err=%v, want ErrInvalidAuthenticationInfo", err)
+	}
+	if result.Registered || result.StatusCode != 200 {
+		t.Fatalf("result=%+v", result)
 	}
 }
 
@@ -1080,4 +1122,13 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+func mustTestDigestRspauth(t *testing.T, ch DigestChallenge, input DigestAuthInput, body []byte) string {
+	t.Helper()
+	got, err := digestRspauth(newDigestAuthState("Authorization", ch, input, ""), firstNonEmpty(ch.QOP, "auth"), body)
+	if err != nil {
+		t.Fatalf("digestRspauth() error = %v", err)
+	}
+	return got
 }

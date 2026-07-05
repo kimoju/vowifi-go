@@ -16,6 +16,7 @@ import (
 )
 
 var ErrInvalidChallenge = errors.New("invalid SIP digest challenge")
+var ErrInvalidAuthenticationInfo = errors.New("invalid SIP digest authentication-info")
 var ErrRegistrationRejected = errors.New("IMS registration rejected")
 
 type IMSProfile struct {
@@ -499,8 +500,8 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if syncFailure {
 		if isSIPSuccess(resp2.StatusCode) {
 			authState := newDigestAuthState(authzHeader, ch, currentAuthInput, authz)
-			authState = updateDigestAuthStateFromInfo(authState, resp2.Headers, authzHeader)
-			return RegisterResult{
+			authState, err = updateDigestAuthStateFromInfo(authState, resp2.Headers, authzHeader, resp2.Body)
+			result := RegisterResult{
 				Registered:     true,
 				StatusCode:     resp2.StatusCode,
 				Reason:         resp2.Reason,
@@ -511,7 +512,12 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 				AuthHeaderName: authzHeader,
 				AuthState:      authState,
 				NextCSeq:       cseq + 1,
-			}, nil
+			}
+			if err != nil {
+				result.Registered = false
+				return result, err
+			}
+			return result, nil
 		}
 		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
 			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: ch, AuthHeader: authz}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
@@ -568,7 +574,11 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if !result.Registered {
 		return result, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 	}
-	result.AuthState = updateDigestAuthStateFromInfo(result.AuthState, resp2.Headers, authzHeader)
+	result.AuthState, err = updateDigestAuthStateFromInfo(result.AuthState, resp2.Headers, authzHeader, resp2.Body)
+	if err != nil {
+		result.Registered = false
+		return result, err
+	}
 	return result, nil
 }
 
@@ -717,8 +727,8 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	}
 	if isSIPSuccess(resp.StatusCode) {
 		binding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp, expires, securityClientFromBinding(req.Binding), nil))
-		authState = updateDigestAuthStateFromInfo(authState, resp.Headers, authHeaderName)
-		return RefreshResult{
+		authState, err = updateDigestAuthStateFromInfo(authState, resp.Headers, authHeaderName, resp.Body)
+		result := RefreshResult{
 			Refreshed:      true,
 			StatusCode:     resp.StatusCode,
 			Reason:         resp.Reason,
@@ -728,7 +738,12 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 			AuthHeaderName: authHeaderName,
 			AuthState:      authState,
 			NextCSeq:       cseq + 1,
-		}, nil
+		}
+		if err != nil {
+			result.Refreshed = false
+			return result, err
+		}
+		return result, nil
 	}
 	if resp.StatusCode != 401 && resp.StatusCode != 407 {
 		result := RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}
@@ -776,7 +791,11 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if !result.Refreshed {
 		return result, fmt.Errorf("%w: refresh %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 	}
-	result.AuthState = updateDigestAuthStateFromInfo(result.AuthState, resp2.Headers, authHeaderName)
+	result.AuthState, err = updateDigestAuthStateFromInfo(result.AuthState, resp2.Headers, authHeaderName, resp2.Body)
+	if err != nil {
+		result.Refreshed = false
+		return result, err
+	}
 	return result, nil
 }
 
@@ -799,37 +818,57 @@ func nextDigestAuthorization(state DigestAuthState, method, uri, fallbackName, f
 	return firstNonEmpty(fallbackName, headerName), strings.TrimSpace(fallbackHeader), state.clone(), nil
 }
 
-func updateDigestAuthStateFromInfo(state DigestAuthState, headers map[string][]string, authHeaderName string) DigestAuthState {
+func updateDigestAuthStateFromInfo(state DigestAuthState, headers map[string][]string, authHeaderName string, body []byte) (DigestAuthState, error) {
 	if !state.Usable() {
-		return state
+		return state, nil
 	}
-	nextNonce := digestInfoNextNonce(headers, authHeaderName)
+	params := digestInfoParams(headers, authHeaderName)
+	if rspauth := strings.TrimSpace(params["rspauth"]); rspauth != "" {
+		expected, err := digestRspauth(state, firstNonEmpty(params["qop"], state.challenge.QOP), body)
+		if err != nil {
+			return state, err
+		}
+		if !strings.EqualFold(rspauth, expected) {
+			return state, fmt.Errorf("%w: rspauth mismatch", ErrInvalidAuthenticationInfo)
+		}
+	}
+	nextNonce := strings.TrimSpace(params["nextnonce"])
 	if nextNonce == "" || nextNonce == state.challenge.Nonce {
-		return state
+		return state, nil
 	}
 	next := state.clone()
 	next.challenge.Nonce = nextNonce
 	next.input.NC = 1
 	next.nextNC = 1
 	next.lastHeader = ""
-	return next
+	return next, nil
 }
 
 func digestInfoNextNonce(headers map[string][]string, authHeaderName string) string {
+	return digestInfoParams(headers, authHeaderName)["nextnonce"]
+}
+
+func digestInfoParams(headers map[string][]string, authHeaderName string) map[string]string {
+	params := make(map[string]string)
 	for _, name := range digestInfoHeaderNames(authHeaderName) {
 		for _, header := range rawHeaderValues(headers, name) {
 			for _, part := range splitAuthParams(header) {
 				key, value, ok := strings.Cut(part, "=")
-				if !ok || !strings.EqualFold(strings.TrimSpace(key), "nextnonce") {
+				if !ok {
 					continue
 				}
-				if nonce := unquote(strings.TrimSpace(value)); nonce != "" {
-					return nonce
+				key = strings.ToLower(strings.TrimSpace(key))
+				value = unquote(strings.TrimSpace(value))
+				if key != "" && value != "" {
+					params[key] = value
 				}
 			}
 		}
+		if len(params) > 0 {
+			return params
+		}
 	}
-	return ""
+	return params
 }
 
 func digestInfoHeaderNames(authHeaderName string) []string {
@@ -837,6 +876,35 @@ func digestInfoHeaderNames(authHeaderName string) []string {
 		return []string{"Proxy-Authentication-Info", "Authentication-Info"}
 	}
 	return []string{"Authentication-Info", "Proxy-Authentication-Info"}
+}
+
+func digestRspauth(state DigestAuthState, qop string, body []byte) (string, error) {
+	input := state.input
+	qop = firstQOP(qop)
+	ha1 := md5Hex(input.Username + ":" + state.challenge.Realm + ":" + input.Password)
+	ha2 := ""
+	switch qop {
+	case "":
+		ha2 = md5Hex(":" + input.URI)
+	case "auth":
+		ha2 = md5Hex(":" + input.URI)
+	case "auth-int":
+		ha2 = md5Hex(":" + input.URI + ":" + md5HexBytes(body))
+	default:
+		return "", fmt.Errorf("%w: unsupported rspauth qop %q", ErrInvalidAuthenticationInfo, qop)
+	}
+	nc := input.NC
+	if nc <= 0 {
+		nc = 1
+	}
+	if qop == "" {
+		return md5Hex(ha1 + ":" + state.challenge.Nonce + ":" + ha2), nil
+	}
+	cnonce := strings.TrimSpace(input.CNonce)
+	if cnonce == "" {
+		return "", fmt.Errorf("%w: cnonce required", ErrInvalidAuthenticationInfo)
+	}
+	return md5Hex(ha1 + ":" + state.challenge.Nonce + ":" + fmt.Sprintf("%08x", nc) + ":" + cnonce + ":" + qop + ":" + ha2), nil
 }
 
 func securityClientFromBinding(binding RegistrationBinding) SecurityAgreement {
