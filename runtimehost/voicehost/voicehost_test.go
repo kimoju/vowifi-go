@@ -118,18 +118,18 @@ func TestGatewayHandleClientByeTerminatesDialog(t *testing.T) {
 }
 
 func TestParseAndBuildSDP(t *testing.T) {
-	info, err := ParseSDP([]byte(sampleSDP("203.0.113.8", 49170)))
+	info, err := ParseSDP([]byte(sampleSDP("203.0.113.8", 49170) + "a=rtcp:49171 IN IP4 203.0.113.8\r\n"))
 	if err != nil {
 		t.Fatalf("ParseSDP() error = %v", err)
 	}
-	if info.ConnectionIP != "203.0.113.8" || info.MediaPort != 49170 || info.Direction != "sendrecv" {
+	if info.ConnectionIP != "203.0.113.8" || info.MediaPort != 49170 || info.RTCPIP != "203.0.113.8" || info.RTCPPort != 49171 || info.Direction != "sendrecv" {
 		t.Fatalf("info=%+v", info)
 	}
 	if len(info.Payloads) != 3 || info.Payloads[0] != 0 || info.Payloads[2] != 101 {
 		t.Fatalf("payloads=%+v", info.Payloads)
 	}
-	answer := string(BuildSDPAnswer(SDPInfo{ConnectionIP: "192.0.2.2", MediaPort: 6000, Payloads: []int{8}, Direction: "recvonly"}))
-	if !strings.Contains(answer, "m=audio 6000 RTP/AVP 8") || !strings.Contains(answer, "a=recvonly") {
+	answer := string(BuildSDPAnswer(SDPInfo{ConnectionIP: "192.0.2.2", MediaPort: 6000, RTCPPort: 6001, Payloads: []int{8}, Direction: "recvonly"}))
+	if !strings.Contains(answer, "m=audio 6000 RTP/AVP 8") || !strings.Contains(answer, "a=rtcp:6001 IN IP4 192.0.2.2") || !strings.Contains(answer, "a=recvonly") {
 		t.Fatalf("answer=%q", answer)
 	}
 }

@@ -285,6 +285,8 @@ func (g *Gateway) HandleClientBye(deviceID string, req *sip.Request, tx sip.Serv
 type SDPInfo struct {
 	ConnectionIP string
 	MediaPort    int
+	RTCPIP       string
+	RTCPPort     int
 	Payloads     []int
 	Direction    string
 }
@@ -292,6 +294,7 @@ type SDPInfo struct {
 var (
 	sdpConnRE      = regexp.MustCompile(`(?m)^c=IN IP[46] ([^\r\n]+)`)
 	sdpMediaRE     = regexp.MustCompile(`(?m)^m=audio ([0-9]+) [A-Z0-9/]+(.*)$`)
+	sdpRTCPRE      = regexp.MustCompile(`(?m)^a=rtcp:([0-9]+)(?:\s+IN\s+IP[46]\s+([^\r\n]+))?`)
 	sdpDirectionRE = regexp.MustCompile(`(?m)^a=(sendrecv|sendonly|recvonly|inactive)\s*$`)
 )
 
@@ -320,6 +323,13 @@ func ParseSDP(body []byte) (SDPInfo, error) {
 	if out.MediaPort <= 0 {
 		return SDPInfo{}, errors.New("missing SDP audio port")
 	}
+	if m := sdpRTCPRE.FindStringSubmatch(text); len(m) >= 2 {
+		port, _ := strconv.Atoi(m[1])
+		out.RTCPPort = port
+		if len(m) >= 3 && strings.TrimSpace(m[2]) != "" {
+			out.RTCPIP = strings.TrimSpace(m[2])
+		}
+	}
 	if m := sdpDirectionRE.FindStringSubmatch(text); len(m) == 2 {
 		out.Direction = strings.TrimSpace(m[1])
 	}
@@ -333,6 +343,10 @@ func BuildSDPAnswer(info SDPInfo) []byte {
 	ip := strings.TrimSpace(info.ConnectionIP)
 	if ip == "" {
 		ip = "127.0.0.1"
+	}
+	ipVersion := "IP4"
+	if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+		ipVersion = "IP6"
 	}
 	port := info.MediaPort
 	if port <= 0 {
@@ -348,15 +362,26 @@ func BuildSDPAnswer(info SDPInfo) []byte {
 	}
 	var b strings.Builder
 	b.WriteString("v=0\r\n")
-	b.WriteString("o=vowifi-go 0 0 IN IP4 " + ip + "\r\n")
+	b.WriteString("o=vowifi-go 0 0 IN " + ipVersion + " " + ip + "\r\n")
 	b.WriteString("s=VoWiFi\r\n")
-	b.WriteString("c=IN IP4 " + ip + "\r\n")
+	b.WriteString("c=IN " + ipVersion + " " + ip + "\r\n")
 	b.WriteString("t=0 0\r\n")
 	b.WriteString("m=audio " + strconv.Itoa(port) + " RTP/AVP")
 	for _, payload := range payloads {
 		b.WriteString(" " + strconv.Itoa(payload))
 	}
 	b.WriteString("\r\n")
+	if info.RTCPPort > 0 {
+		rtcpIP := strings.TrimSpace(info.RTCPIP)
+		if rtcpIP == "" {
+			rtcpIP = ip
+		}
+		rtcpIPVersion := "IP4"
+		if parsed := net.ParseIP(rtcpIP); parsed != nil && parsed.To4() == nil {
+			rtcpIPVersion = "IP6"
+		}
+		b.WriteString("a=rtcp:" + strconv.Itoa(info.RTCPPort) + " IN " + rtcpIPVersion + " " + rtcpIP + "\r\n")
+	}
 	b.WriteString("a=" + direction + "\r\n")
 	for _, payload := range payloads {
 		switch payload {

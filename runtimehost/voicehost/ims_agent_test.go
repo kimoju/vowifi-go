@@ -182,13 +182,13 @@ func TestIMSOutboundAgentUsesRTPRelayWhenConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSDP(IMS offer) error = %v", err)
 	}
-	if imsOffer.ConnectionIP != "127.0.0.1" || imsOffer.MediaPort == 4002 || imsOffer.MediaPort <= 0 {
+	if imsOffer.ConnectionIP != "127.0.0.1" || imsOffer.MediaPort == 4002 || imsOffer.MediaPort <= 0 || imsOffer.RTCPPort <= 0 {
 		t.Fatalf("IMS offer=%+v", imsOffer)
 	}
-	if result.LocalSDP.ConnectionIP != "127.0.0.1" || result.LocalSDP.MediaPort == 49170 || result.LocalSDP.MediaPort <= 0 {
+	if result.LocalSDP.ConnectionIP != "127.0.0.1" || result.LocalSDP.MediaPort == 49170 || result.LocalSDP.MediaPort <= 0 || result.LocalSDP.RTCPPort <= 0 {
 		t.Fatalf("client answer=%+v", result.LocalSDP)
 	}
-	if answer := string(result.RawSDP); !strings.Contains(answer, "c=IN IP4 127.0.0.1") || strings.Contains(answer, "m=audio 49170") {
+	if answer := string(result.RawSDP); !strings.Contains(answer, "c=IN IP4 127.0.0.1") || !strings.Contains(answer, "a=rtcp:") || strings.Contains(answer, "m=audio 49170") {
 		t.Fatalf("client answer body=%q", answer)
 	}
 	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-relay"}); err != nil {

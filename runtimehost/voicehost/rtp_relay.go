@@ -17,28 +17,42 @@ type RTPRelayConfig struct {
 	ClientListenIP    string
 	ClientAdvertiseIP string
 	ClientPort        int
+	ClientRTCPPort    int
 	IMSListenIP       string
 	IMSAdvertiseIP    string
 	IMSPort           int
+	IMSRTCPPort       int
 	BufferSize        int
 }
 
 type RTPRelayStats struct {
-	ClientToIMSPackets uint64
-	IMSToClientPackets uint64
-	ClientToIMSBytes   uint64
-	IMSToClientBytes   uint64
+	ClientToIMSPackets     uint64
+	IMSToClientPackets     uint64
+	ClientToIMSBytes       uint64
+	IMSToClientBytes       uint64
+	ClientToIMSRTPPackets  uint64
+	IMSToClientRTPPackets  uint64
+	ClientToIMSRTCPPackets uint64
+	IMSToClientRTCPPackets uint64
+	ClientToIMSRTPBytes    uint64
+	IMSToClientRTPBytes    uint64
+	ClientToIMSRTCPBytes   uint64
+	IMSToClientRTCPBytes   uint64
 }
 
 type RTPRelaySession struct {
-	clientConn *net.UDPConn
-	imsConn    *net.UDPConn
+	clientConn     *net.UDPConn
+	imsConn        *net.UDPConn
+	clientRTCPConn *net.UDPConn
+	imsRTCPConn    *net.UDPConn
 
-	clientTarget *net.UDPAddr
+	clientTarget     *net.UDPAddr
+	clientRTCPTarget *net.UDPAddr
 
-	mu        sync.RWMutex
-	imsTarget *net.UDPAddr
-	closed    bool
+	mu            sync.RWMutex
+	imsTarget     *net.UDPAddr
+	imsRTCPTarget *net.UDPAddr
+	closed        bool
 
 	clientAdvertiseIP string
 	imsAdvertiseIP    string
@@ -47,10 +61,14 @@ type RTPRelaySession struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	clientToIMSPackets atomic.Uint64
-	imsToClientPackets atomic.Uint64
-	clientToIMSBytes   atomic.Uint64
-	imsToClientBytes   atomic.Uint64
+	clientToIMSRTPPackets  atomic.Uint64
+	imsToClientRTPPackets  atomic.Uint64
+	clientToIMSRTCPPackets atomic.Uint64
+	imsToClientRTCPPackets atomic.Uint64
+	clientToIMSRTPBytes    atomic.Uint64
+	imsToClientRTPBytes    atomic.Uint64
+	clientToIMSRTCPBytes   atomic.Uint64
+	imsToClientRTCPBytes   atomic.Uint64
 }
 
 func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SDPInfo) (*RTPRelaySession, error) {
@@ -61,6 +79,10 @@ func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SD
 		return nil, fmt.Errorf("%w: client media target is incomplete", ErrRTPRelayConfig)
 	}
 	clientAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(clientTarget.ConnectionIP, strconv.Itoa(clientTarget.MediaPort)))
+	if err != nil {
+		return nil, err
+	}
+	clientRTCPAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(defaultRTCPIP(clientTarget), strconv.Itoa(defaultRTCPPort(clientTarget))))
 	if err != nil {
 		return nil, err
 	}
@@ -75,11 +97,27 @@ func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SD
 		_ = clientConn.Close()
 		return nil, err
 	}
+	clientRTCPConn, err := listenUDP(clientListenIP, cfg.ClientRTCPPort)
+	if err != nil {
+		_ = clientConn.Close()
+		_ = imsConn.Close()
+		return nil, err
+	}
+	imsRTCPConn, err := listenUDP(imsListenIP, cfg.IMSRTCPPort)
+	if err != nil {
+		_ = clientConn.Close()
+		_ = imsConn.Close()
+		_ = clientRTCPConn.Close()
+		return nil, err
+	}
 	childCtx, cancel := context.WithCancel(ctx)
 	s := &RTPRelaySession{
 		clientConn:        clientConn,
 		imsConn:           imsConn,
+		clientRTCPConn:    clientRTCPConn,
+		imsRTCPConn:       imsRTCPConn,
 		clientTarget:      clientAddr,
+		clientRTCPTarget:  clientRTCPAddr,
 		clientAdvertiseIP: advertiseIP(cfg.ClientAdvertiseIP, clientListenIP),
 		imsAdvertiseIP:    advertiseIP(cfg.IMSAdvertiseIP, imsListenIP),
 		bufferSize:        cfg.BufferSize,
@@ -88,9 +126,11 @@ func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SD
 	if s.bufferSize <= 0 {
 		s.bufferSize = 2048
 	}
-	s.wg.Add(2)
-	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, true)
-	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, false)
+	s.wg.Add(4)
+	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, &s.clientToIMSRTPPackets, &s.clientToIMSRTPBytes)
+	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes)
+	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes)
+	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes)
 	return s, nil
 }
 
@@ -98,6 +138,7 @@ func (s *RTPRelaySession) IMSOfferSDP(clientOffer SDPInfo) []byte {
 	info := clientOffer
 	info.ConnectionIP = s.imsAdvertiseIP
 	info.MediaPort = s.imsPort()
+	info.RTCPPort = s.imsRTCPPort()
 	return BuildSDPAnswer(info)
 }
 
@@ -105,6 +146,7 @@ func (s *RTPRelaySession) ClientAnswerSDP(imsAnswer SDPInfo) []byte {
 	info := imsAnswer
 	info.ConnectionIP = s.clientAdvertiseIP
 	info.MediaPort = s.clientPort()
+	info.RTCPPort = s.clientRTCPPort()
 	return BuildSDPAnswer(info)
 }
 
@@ -119,8 +161,13 @@ func (s *RTPRelaySession) SetIMSRemote(info SDPInfo) error {
 	if err != nil {
 		return err
 	}
+	rtcpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(defaultRTCPIP(info), strconv.Itoa(defaultRTCPPort(info))))
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.imsTarget = addr
+	s.imsRTCPTarget = rtcpAddr
 	s.mu.Unlock()
 	return nil
 }
@@ -129,25 +176,37 @@ func (s *RTPRelaySession) ClientEndpoint() SDPInfo {
 	if s == nil {
 		return SDPInfo{}
 	}
-	return SDPInfo{ConnectionIP: s.clientAdvertiseIP, MediaPort: s.clientPort()}
+	return SDPInfo{ConnectionIP: s.clientAdvertiseIP, MediaPort: s.clientPort(), RTCPIP: s.clientAdvertiseIP, RTCPPort: s.clientRTCPPort()}
 }
 
 func (s *RTPRelaySession) IMSEndpoint() SDPInfo {
 	if s == nil {
 		return SDPInfo{}
 	}
-	return SDPInfo{ConnectionIP: s.imsAdvertiseIP, MediaPort: s.imsPort()}
+	return SDPInfo{ConnectionIP: s.imsAdvertiseIP, MediaPort: s.imsPort(), RTCPIP: s.imsAdvertiseIP, RTCPPort: s.imsRTCPPort()}
 }
 
 func (s *RTPRelaySession) Stats() RTPRelayStats {
 	if s == nil {
 		return RTPRelayStats{}
 	}
+	rtpOutPackets := s.clientToIMSRTPPackets.Load()
+	rtpInPackets := s.imsToClientRTPPackets.Load()
+	rtpOutBytes := s.clientToIMSRTPBytes.Load()
+	rtpInBytes := s.imsToClientRTPBytes.Load()
 	return RTPRelayStats{
-		ClientToIMSPackets: s.clientToIMSPackets.Load(),
-		IMSToClientPackets: s.imsToClientPackets.Load(),
-		ClientToIMSBytes:   s.clientToIMSBytes.Load(),
-		IMSToClientBytes:   s.imsToClientBytes.Load(),
+		ClientToIMSPackets:     rtpOutPackets,
+		IMSToClientPackets:     rtpInPackets,
+		ClientToIMSBytes:       rtpOutBytes,
+		IMSToClientBytes:       rtpInBytes,
+		ClientToIMSRTPPackets:  rtpOutPackets,
+		IMSToClientRTPPackets:  rtpInPackets,
+		ClientToIMSRTCPPackets: s.clientToIMSRTCPPackets.Load(),
+		IMSToClientRTCPPackets: s.imsToClientRTCPPackets.Load(),
+		ClientToIMSRTPBytes:    rtpOutBytes,
+		IMSToClientRTPBytes:    rtpInBytes,
+		ClientToIMSRTCPBytes:   s.clientToIMSRTCPBytes.Load(),
+		IMSToClientRTCPBytes:   s.imsToClientRTCPBytes.Load(),
 	}
 }
 
@@ -172,11 +231,17 @@ func (s *RTPRelaySession) Close() error {
 	if s.imsConn != nil {
 		err = errors.Join(err, s.imsConn.Close())
 	}
+	if s.clientRTCPConn != nil {
+		err = errors.Join(err, s.clientRTCPConn.Close())
+	}
+	if s.imsRTCPConn != nil {
+		err = errors.Join(err, s.imsRTCPConn.Close())
+	}
 	s.wg.Wait()
 	return err
 }
 
-func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, clientToIMS bool) {
+func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, packets, bytes *atomic.Uint64) {
 	defer s.wg.Done()
 	buf := make([]byte, s.bufferSize)
 	for {
@@ -196,13 +261,8 @@ func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn
 		if _, err := out.WriteToUDP(buf[:n], dst); err != nil {
 			continue
 		}
-		if clientToIMS {
-			s.clientToIMSPackets.Add(1)
-			s.clientToIMSBytes.Add(uint64(n))
-		} else {
-			s.imsToClientPackets.Add(1)
-			s.imsToClientBytes.Add(uint64(n))
-		}
+		packets.Add(1)
+		bytes.Add(uint64(n))
 	}
 }
 
@@ -216,11 +276,29 @@ func (s *RTPRelaySession) currentIMSTarget() *net.UDPAddr {
 	return &cp
 }
 
+func (s *RTPRelaySession) currentIMSRTCPTarget() *net.UDPAddr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.imsRTCPTarget == nil {
+		return nil
+	}
+	cp := *s.imsRTCPTarget
+	return &cp
+}
+
 func (s *RTPRelaySession) currentClientTarget() *net.UDPAddr {
 	if s == nil || s.clientTarget == nil {
 		return nil
 	}
 	cp := *s.clientTarget
+	return &cp
+}
+
+func (s *RTPRelaySession) currentClientRTCPTarget() *net.UDPAddr {
+	if s == nil || s.clientRTCPTarget == nil {
+		return nil
+	}
+	cp := *s.clientRTCPTarget
 	return &cp
 }
 
@@ -231,11 +309,25 @@ func (s *RTPRelaySession) clientPort() int {
 	return udpLocalPort(s.clientConn)
 }
 
+func (s *RTPRelaySession) clientRTCPPort() int {
+	if s == nil || s.clientRTCPConn == nil {
+		return 0
+	}
+	return udpLocalPort(s.clientRTCPConn)
+}
+
 func (s *RTPRelaySession) imsPort() int {
 	if s == nil || s.imsConn == nil {
 		return 0
 	}
 	return udpLocalPort(s.imsConn)
+}
+
+func (s *RTPRelaySession) imsRTCPPort() int {
+	if s == nil || s.imsRTCPConn == nil {
+		return 0
+	}
+	return udpLocalPort(s.imsRTCPConn)
 }
 
 func listenUDP(host string, port int) (*net.UDPConn, error) {
@@ -254,6 +346,23 @@ func udpLocalPort(conn *net.UDPConn) int {
 		return addr.Port
 	}
 	return 0
+}
+
+func defaultRTCPPort(info SDPInfo) int {
+	if info.RTCPPort > 0 {
+		return info.RTCPPort
+	}
+	if info.MediaPort > 0 {
+		return info.MediaPort + 1
+	}
+	return 0
+}
+
+func defaultRTCPIP(info SDPInfo) string {
+	if strings.TrimSpace(info.RTCPIP) != "" {
+		return strings.TrimSpace(info.RTCPIP)
+	}
+	return strings.TrimSpace(info.ConnectionIP)
 }
 
 func advertiseIP(explicit, listenIP string) string {
