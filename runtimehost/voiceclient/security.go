@@ -70,17 +70,23 @@ func SelectSecurityAgreement(values []string, client SecurityAgreement) (Securit
 	client = completeSecurityAgreement(client)
 	bestIndex := -1
 	bestScore := -1
+	var best SecurityAgreement
 	for i, offer := range offers {
+		offer = completeSecurityAgreement(offer)
+		if !securityAgreementCompatible(offer, client) {
+			continue
+		}
 		score := securityAgreementScore(offer, client)
 		if score > bestScore {
 			bestIndex = i
 			bestScore = score
+			best = offer
 		}
 	}
 	if bestIndex < 0 {
 		return SecurityAgreement{}, false
 	}
-	return offers[bestIndex], true
+	return best, true
 }
 
 func (a SecurityAgreement) HeaderValue() string {
@@ -239,6 +245,19 @@ func securityAgreementScore(offer, client SecurityAgreement) int {
 		score += securityQValue(q)
 	}
 	return score
+}
+
+func securityAgreementCompatible(offer, client SecurityAgreement) bool {
+	if !strings.EqualFold(offer.Protocol, client.Protocol) {
+		return false
+	}
+	if !strings.EqualFold(offer.Algorithm, client.Algorithm) {
+		return false
+	}
+	if !strings.EqualFold(offer.EncryptionAlgorithm, client.EncryptionAlgorithm) {
+		return false
+	}
+	return true
 }
 
 func securityQValue(value string) int {

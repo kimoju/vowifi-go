@@ -181,6 +181,32 @@ func TestParseAndSelectSecurityAgreement(t *testing.T) {
 	}
 }
 
+func TestSelectSecurityAgreementSkipsIncompatibleOffers(t *testing.T) {
+	values := []string{
+		`tls;q=1.0;alg=hmac-sha-1-96;ealg=null;spi-c=900;spi-s=901;port-c=5070;port-s=5071`,
+		`ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`,
+		`ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`,
+	}
+	selected, ok := SelectSecurityAgreement(values, SecurityAgreement{
+		Protocol:            "ipsec-3gpp",
+		Algorithm:           "hmac-sha-1-96",
+		EncryptionAlgorithm: "null",
+	})
+	if !ok {
+		t.Fatal("SelectSecurityAgreement() ok=false")
+	}
+	if selected.Protocol != "ipsec-3gpp" || selected.Algorithm != "hmac-sha-1-96" || selected.SPIClient != 111 {
+		t.Fatalf("selected=%+v", selected)
+	}
+
+	if selected, ok := SelectSecurityAgreement([]string{
+		`tls;q=1.0;alg=hmac-sha-1-96;ealg=null;spi-c=900;spi-s=901`,
+		`ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444`,
+	}, SecurityAgreement{Protocol: "ipsec-3gpp", Algorithm: "hmac-sha-1-96", EncryptionAlgorithm: "null"}); ok {
+		t.Fatalf("SelectSecurityAgreement() selected incompatible offer: %+v", selected)
+	}
+}
+
 func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
