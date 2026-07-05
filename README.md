@@ -64,10 +64,14 @@ protocol layers needed by VoHive:
 - userspace ESP packet seal/open primitives with SPI/sequence handling,
   AES-CBC payload encryption, HMAC-SHA integrity checks, RFC 4303 padding,
   next-header restoration, and replay-window validation
+- SWu userspace packet tunnel session wiring that builds outbound/inbound ESP
+  SAs from the CHILD_SA result, auto-selects IPv4/IPv6 next headers, sends ESP
+  packets through a transport boundary, opens inbound ESP packets, tracks
+  packet/byte/error/drop counters, and rejects replayed traffic
 
-Kernel/userspace ESP SA installation, packet routing transport, SRTP media,
-advanced RTCP feedback handling, and complete inbound IMS call handling are
-still implemented incrementally behind these APIs.
+Kernel ESP SA installation, real TUN/routing integration, SRTP media, advanced
+RTCP feedback handling, and complete inbound IMS call handling are still
+implemented incrementally behind these APIs.
 
 ## Development
 
