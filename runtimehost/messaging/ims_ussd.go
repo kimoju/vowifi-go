@@ -66,7 +66,7 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 	prepareUSSDInvite(&invite, boundary)
 	resp, err := t.Transport.RoundTripRequest(ctx, invite)
 	if err != nil {
-		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode}, err
+		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true}, err
 	}
 	cfg.RemoteTag = sipHeaderTagValue(firstHeaderValue(resp.Headers, "To"))
 	if contact := sipHeaderURIValue(firstHeaderValue(resp.Headers, "Contact")); contact != "" {
@@ -77,10 +77,11 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 	}
 	if resp.StatusCode >= 200 {
 		if err := t.writeUSSDACK(ctx, cfg); err != nil {
-			return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true}, err
+			return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true, RegistrationRecoveryNeeded: true}, err
 		}
 	}
 	result, err := ussdResultFromSIPResponse(sessionID, resp, false)
+	result.RegistrationRecoveryNeeded = IMSRegistrationRecoveryNeededStatus(resp.StatusCode)
 	if err != nil {
 		result.Done = true
 		return result, err
@@ -133,9 +134,10 @@ func (t *IMSUSSDTransport) ContinueUSSD(ctx context.Context, req USSDRequest) (U
 	prepareUSSDInfo(&info)
 	resp, err := t.Transport.RoundTripRequest(ctx, info)
 	if err != nil {
-		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode}, err
+		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true}, err
 	}
 	result, parseErr := ussdResultFromSIPResponse(sessionID, resp, false)
+	result.RegistrationRecoveryNeeded = IMSRegistrationRecoveryNeededStatus(resp.StatusCode)
 	if parseErr != nil {
 		result.Done = true
 		t.clearSession(sessionID)
@@ -178,12 +180,40 @@ func (t *IMSUSSDTransport) CancelUSSD(ctx context.Context, req USSDRequest) erro
 	resp, err := t.Transport.RoundTripRequest(ctx, bye)
 	t.clearSession(sessionID)
 	if err != nil {
-		return err
+		return IMSRegistrationRecoveryError{Err: err}
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("IMS USSD BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
+		err := fmt.Errorf("IMS USSD BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
+		if IMSRegistrationRecoveryNeededStatus(resp.StatusCode) {
+			return IMSRegistrationRecoveryError{Err: err, StatusCode: resp.StatusCode}
+		}
+		return err
 	}
 	return nil
+}
+
+type IMSRegistrationRecoveryError struct {
+	Err        error
+	StatusCode int
+}
+
+func (e IMSRegistrationRecoveryError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("IMS registration recovery needed after SIP %d", e.StatusCode)
+	}
+	return "IMS registration recovery needed"
+}
+
+func (e IMSRegistrationRecoveryError) Unwrap() error {
+	return e.Err
+}
+
+func IsIMSRegistrationRecoveryError(err error) bool {
+	var recoveryErr IMSRegistrationRecoveryError
+	return errors.As(err, &recoveryErr)
 }
 
 func (t *IMSUSSDTransport) dialogConfig(command, sessionID string, cseq int) (voiceclient.DialogRequestConfig, error) {

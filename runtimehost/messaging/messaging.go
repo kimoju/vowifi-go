@@ -39,12 +39,13 @@ type SendOutcome struct {
 }
 
 type USSDResult struct {
-	SessionID string `json:"session_id,omitempty"`
-	Text      string `json:"text,omitempty"`
-	RawText   string `json:"raw_text,omitempty"`
-	Status    int    `json:"status,omitempty"`
-	DCS       int    `json:"dcs,omitempty"`
-	Done      bool   `json:"done"`
+	SessionID                  string `json:"session_id,omitempty"`
+	Text                       string `json:"text,omitempty"`
+	RawText                    string `json:"raw_text,omitempty"`
+	Status                     int    `json:"status,omitempty"`
+	DCS                        int    `json:"dcs,omitempty"`
+	Done                       bool   `json:"done"`
+	RegistrationRecoveryNeeded bool   `json:"registration_recovery_needed,omitempty"`
 }
 
 type IncomingSMS struct {
@@ -82,11 +83,12 @@ type SMSSendRequest struct {
 }
 
 type SMSSendResult struct {
-	CallID    string
-	RPMR      int
-	State     string
-	SIPCode   int
-	ErrorText string
+	CallID                     string
+	RPMR                       int
+	State                      string
+	SIPCode                    int
+	ErrorText                  string
+	RegistrationRecoveryNeeded bool
 }
 
 type SMSTransport interface {
@@ -180,6 +182,8 @@ func (s *Service) SetSMSTransport(t SMSTransport) {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.transport = t
 }
 
@@ -187,7 +191,27 @@ func (s *Service) SetUSSDTransport(t USSDTransport) {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.ussdTransport = t
+}
+
+func (s *Service) smsTransport() SMSTransport {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transport
+}
+
+func (s *Service) currentUSSDTransport() USSDTransport {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ussdTransport
 }
 
 func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts SendOptions) (SendOutcome, error) {
@@ -212,8 +236,8 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 		partNow := time.Now()
 		res := SMSSendResult{State: "sent"}
 		var sendErr error
-		if s != nil && s.transport != nil {
-			res, sendErr = s.transport.SendSMSPart(ctx, SMSSendRequest{
+		if transport := s.smsTransport(); transport != nil {
+			res, sendErr = transport.SendSMSPart(ctx, SMSSendRequest{
 				DeviceID:  s.deviceID,
 				IMSI:      s.imsi,
 				Peer:      to,
@@ -268,10 +292,11 @@ func (s *Service) SendUSSD(ctx context.Context, command string) (*USSDResult, er
 		return nil, errors.New("ussd command is empty")
 	}
 	sessionID := fmt.Sprintf("ussd-%d", time.Now().UnixNano())
-	if s == nil || s.ussdTransport == nil {
+	transport := s.currentUSSDTransport()
+	if transport == nil {
 		return &USSDResult{SessionID: sessionID, Text: "", Done: true}, nil
 	}
-	res, err := s.ussdTransport.ExecuteUSSD(ctx, USSDRequest{
+	res, err := transport.ExecuteUSSD(ctx, USSDRequest{
 		DeviceID:  s.deviceID,
 		IMSI:      s.imsi,
 		SessionID: sessionID,
@@ -292,13 +317,14 @@ func (s *Service) ContinueUSSD(ctx context.Context, sessionID, input string) (*U
 		return nil, errors.New("ussd session_id is empty")
 	}
 	input = strings.TrimSpace(input)
-	if s == nil || s.ussdTransport == nil {
+	transport := s.currentUSSDTransport()
+	if transport == nil {
 		return &USSDResult{SessionID: sessionID, Text: "", Done: true}, nil
 	}
 	if !s.hasUSSDSession(sessionID) {
 		return nil, fmt.Errorf("ussd session %s is not active", sessionID)
 	}
-	res, err := s.ussdTransport.ContinueUSSD(ctx, USSDRequest{
+	res, err := transport.ContinueUSSD(ctx, USSDRequest{
 		DeviceID:  s.deviceID,
 		IMSI:      s.imsi,
 		SessionID: sessionID,
@@ -318,10 +344,11 @@ func (s *Service) CancelUSSD(ctx context.Context, sessionID string) error {
 	if sessionID == "" {
 		return errors.New("ussd session_id is empty")
 	}
-	if s == nil || s.ussdTransport == nil {
+	transport := s.currentUSSDTransport()
+	if transport == nil {
 		return nil
 	}
-	if err := s.ussdTransport.CancelUSSD(ctx, USSDRequest{
+	if err := transport.CancelUSSD(ctx, USSDRequest{
 		DeviceID:  s.deviceID,
 		IMSI:      s.imsi,
 		SessionID: sessionID,

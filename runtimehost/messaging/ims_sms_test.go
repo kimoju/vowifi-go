@@ -97,6 +97,36 @@ func TestIMSSMSTransportRejectsFailedMessage(t *testing.T) {
 	if result.State != "failed" || result.SIPCode != 403 || result.CallID != "msg-reject-1@vowifi-go" || result.ErrorText != "Forbidden" {
 		t.Fatalf("result=%+v", result)
 	}
+	if result.RegistrationRecoveryNeeded {
+		t.Fatalf("RegistrationRecoveryNeeded=true for non-recoverable 403: %+v", result)
+	}
+}
+
+func TestIMSSMSTransportFlagsRecoverableFailures(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 503, Reason: "Service Unavailable"}}}
+	sms := IMSSMSTransport{
+		Transport:    transport,
+		Profile:      voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060"},
+	}
+
+	result, err := sms.SendSMSPart(context.Background(), SMSSendRequest{
+		Peer: "+18005551212",
+		Part: SMSPart{PartNo: 1, Text: "hello"},
+	})
+	if err == nil || result.SIPCode != 503 || !result.RegistrationRecoveryNeeded {
+		t.Fatalf("SendSMSPart() result=%+v err=%v, want recoverable 503", result, err)
+	}
+
+	transport = &fakeSIPRequestTransport{errors: []error{errors.New("pcscf flow reset")}}
+	sms.Transport = transport
+	result, err = sms.SendSMSPart(context.Background(), SMSSendRequest{
+		Peer: "+18005551212",
+		Part: SMSPart{PartNo: 1, Text: "hello"},
+	})
+	if err == nil || result.SIPCode != 0 || !result.RegistrationRecoveryNeeded {
+		t.Fatalf("SendSMSPart() result=%+v err=%v, want recoverable transport error", result, err)
+	}
 }
 
 func TestIMSSMSTransportRequiresSIPTransport(t *testing.T) {
@@ -110,10 +140,18 @@ type fakeSIPRequestTransport struct {
 	requests  []voiceclient.SIPRequestMessage
 	responses []voiceclient.SIPResponse
 	writes    []voiceclient.SIPRequestMessage
+	errors    []error
 }
 
 func (t *fakeSIPRequestTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
 	t.requests = append(t.requests, msg)
+	if len(t.errors) > 0 {
+		err := t.errors[0]
+		t.errors = t.errors[1:]
+		if err != nil {
+			return voiceclient.SIPResponse{}, err
+		}
+	}
 	if len(t.responses) == 0 {
 		return voiceclient.SIPResponse{StatusCode: 500, Reason: "empty"}, nil
 	}

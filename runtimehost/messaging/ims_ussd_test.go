@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -170,6 +171,36 @@ func TestIMSUSSDTransportACKsRejectedInvite(t *testing.T) {
 	}
 	if _, ok := ussd.session("session-reject"); ok {
 		t.Fatal("rejected USSD INVITE must not leave an active session")
+	}
+}
+
+func TestIMSUSSDTransportFlagsRecoverableFailures(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 503,
+		Reason:     "Service Unavailable",
+		Headers: map[string][]string{
+			"To": {"<sip:*100%23@ims.example;user=dialstring>;tag=unavailable"},
+		},
+	}}}
+	ussd := &IMSUSSDTransport{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+
+	result, err := ussd.ExecuteUSSD(context.Background(), USSDRequest{SessionID: "session-503", Command: "*100#"})
+	if err == nil || result.Status != 503 || !result.Done || !result.RegistrationRecoveryNeeded {
+		t.Fatalf("ExecuteUSSD() result=%+v err=%v, want recoverable 503", result, err)
+	}
+
+	transport = &fakeSIPRequestTransport{errors: []error{errors.New("pcscf flow reset")}}
+	ussd.Transport = transport
+	result, err = ussd.ExecuteUSSD(context.Background(), USSDRequest{SessionID: "session-transport", Command: "*100#"})
+	if err == nil || result.Status != 0 || !result.Done || !result.RegistrationRecoveryNeeded {
+		t.Fatalf("ExecuteUSSD() result=%+v err=%v, want recoverable transport error", result, err)
 	}
 }
 

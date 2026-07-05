@@ -393,12 +393,10 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	if smsTransport == nil {
 		smsTransport = imsResult.SMSTransport
 	}
-	svc.SetSMSTransport(smsTransport)
 	ussdTransport := req.USSDTransport
 	if ussdTransport == nil {
 		ussdTransport = imsResult.USSDTransport
 	}
-	svc.SetUSSDTransport(ussdTransport)
 	voiceConfig := runtimeVoiceAgentConfigFromStart(req)
 	inst := &Instance{
 		state:       state,
@@ -409,6 +407,8 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		imsClose:    imsResult.Close,
 		imsRecover:  imsResult.Recover,
 	}
+	svc.SetSMSTransport(inst.wrapSMSTransport(smsTransport))
+	svc.SetUSSDTransport(inst.wrapUSSDTransport(ussdTransport))
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
@@ -548,7 +548,7 @@ func (i *Instance) StartOutboundCall(ctx context.Context, req voicehost.Outbound
 	if !result.RegistrationRecoveryNeeded {
 		return result, err
 	}
-	recovered, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true)
+	_, recovered, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true)
 	if recoveryErr != nil {
 		return result, runtimeOperationRecoveryError(err, recoveryErr)
 	}
@@ -585,7 +585,7 @@ func (i *Instance) SendDialogInfo(ctx context.Context, req voicehost.DialogInfoR
 	}
 	result, err := agent.SendDialogInfo(ctx, req)
 	if result.RegistrationRecoveryNeeded {
-		if _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
 			return result, runtimeOperationRecoveryError(err, recoveryErr)
 		}
 	}
@@ -599,7 +599,7 @@ func (i *Instance) SendDialogUpdate(ctx context.Context, req voicehost.DialogUpd
 	}
 	result, err := agent.SendDialogUpdate(ctx, req)
 	if result.RegistrationRecoveryNeeded {
-		if _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
 			return result, runtimeOperationRecoveryError(err, recoveryErr)
 		}
 	}
@@ -613,7 +613,7 @@ func (i *Instance) SendDialogReinvite(ctx context.Context, req voicehost.DialogR
 	}
 	result, err := agent.SendDialogReinvite(ctx, req)
 	if result.RegistrationRecoveryNeeded {
-		if _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
 			return result, runtimeOperationRecoveryError(err, recoveryErr)
 		}
 	}
@@ -630,9 +630,9 @@ func runtimeOperationRecoveryError(operationErr, recoveryErr error) error {
 	return errors.Join(operationErr, recoveryErr)
 }
 
-func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, updateVoice bool) (bool, error) {
+func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, updateVoice bool) (IMSRegistrationResult, bool, error) {
 	if i == nil {
-		return false, nil
+		return IMSRegistrationResult{}, false, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -645,23 +645,23 @@ func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, up
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {
-		return false, voicehost.ErrIMSVoiceAgentNotReady
+		return IMSRegistrationResult{}, false, voicehost.ErrIMSVoiceAgentNotReady
 	}
 	if recover == nil {
-		return false, nil
+		return IMSRegistrationResult{}, false, nil
 	}
 	result, err := recover(ctx)
 	if err != nil {
 		i.recordIMSRecoveryFailure(ctx, err)
-		return false, err
+		return IMSRegistrationResult{}, false, err
 	}
 	if !result.Registered {
 		err := fmt.Errorf("IMS registration recovery did not register: %d %s", result.StatusCode, strings.TrimSpace(result.Reason))
 		i.recordIMSRecoveryFailure(ctx, err)
-		return false, err
+		return result, false, err
 	}
 	i.applyIMSRegistrationResult(ctx, result, firstRuntimeNonEmpty(result.Reason, reason, "IMS registration recovered"), updateVoice)
-	return true, nil
+	return result, true, nil
 }
 
 func (i *Instance) recordIMSRecoveryFailure(ctx context.Context, err error) {
@@ -716,13 +716,133 @@ func (i *Instance) applyIMSRegistrationResult(ctx context.Context, result IMSReg
 
 	if svc != nil {
 		if smsTransport != nil {
-			svc.SetSMSTransport(smsTransport)
+			svc.SetSMSTransport(i.wrapSMSTransport(smsTransport))
 		}
 		if ussdTransport != nil {
-			svc.SetUSSDTransport(ussdTransport)
+			svc.SetUSSDTransport(i.wrapUSSDTransport(ussdTransport))
 		}
 	}
 	i.notify(ctx)
+}
+
+type runtimeRecoveringSMSTransport struct {
+	owner *Instance
+	inner messaging.SMSTransport
+}
+
+func (t *runtimeRecoveringSMSTransport) SendSMSPart(ctx context.Context, req messaging.SMSSendRequest) (messaging.SMSSendResult, error) {
+	if t == nil || t.inner == nil {
+		return messaging.SMSSendResult{State: "failed", ErrorText: messaging.ErrSMSTransportUnavailable.Error()}, messaging.ErrSMSTransportUnavailable
+	}
+	result, err := t.inner.SendSMSPart(ctx, req)
+	if !result.RegistrationRecoveryNeeded || t.owner == nil {
+		return result, err
+	}
+	retry := err != nil && result.SIPCode == 0
+	recovery, recovered, recoveryErr := t.owner.recoverIMSRegistration(ctx, result.ErrorText, true)
+	if recoveryErr != nil {
+		return result, runtimeOperationRecoveryError(err, recoveryErr)
+	}
+	if !retry || !recovered || recovery.SMSTransport == nil {
+		return result, err
+	}
+	return recovery.SMSTransport.SendSMSPart(ctx, req)
+}
+
+type runtimeRecoveringUSSDTransport struct {
+	owner *Instance
+	inner messaging.USSDTransport
+}
+
+func (t *runtimeRecoveringUSSDTransport) ExecuteUSSD(ctx context.Context, req messaging.USSDRequest) (messaging.USSDResult, error) {
+	if t == nil || t.inner == nil {
+		return messaging.USSDResult{SessionID: req.SessionID, Done: true}, messaging.ErrUSSDTransportUnavailable
+	}
+	result, err := t.inner.ExecuteUSSD(ctx, req)
+	if !result.RegistrationRecoveryNeeded || t.owner == nil {
+		return result, err
+	}
+	retry := err != nil && result.Status == 0
+	recovery, recovered, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true)
+	if recoveryErr != nil {
+		return result, runtimeOperationRecoveryError(err, recoveryErr)
+	}
+	if !retry || !recovered || recovery.USSDTransport == nil {
+		return result, err
+	}
+	return recovery.USSDTransport.ExecuteUSSD(ctx, req)
+}
+
+func (t *runtimeRecoveringUSSDTransport) ContinueUSSD(ctx context.Context, req messaging.USSDRequest) (messaging.USSDResult, error) {
+	if t == nil || t.inner == nil {
+		return messaging.USSDResult{SessionID: req.SessionID, Done: true}, messaging.ErrUSSDTransportUnavailable
+	}
+	result, err := t.inner.ContinueUSSD(ctx, req)
+	if result.RegistrationRecoveryNeeded && t.owner != nil {
+		if _, _, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true); recoveryErr != nil {
+			return result, runtimeOperationRecoveryError(err, recoveryErr)
+		}
+	}
+	return result, err
+}
+
+func (t *runtimeRecoveringUSSDTransport) CancelUSSD(ctx context.Context, req messaging.USSDRequest) error {
+	if t == nil || t.inner == nil {
+		return messaging.ErrUSSDTransportUnavailable
+	}
+	err := t.inner.CancelUSSD(ctx, req)
+	if err != nil && t.owner != nil && messaging.IsIMSRegistrationRecoveryError(err) {
+		if _, _, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true); recoveryErr != nil {
+			return errors.Join(err, recoveryErr)
+		}
+	}
+	return err
+}
+
+type runtimeRecoveringIMSUSSDDialogTransport struct {
+	*runtimeRecoveringUSSDTransport
+	dialog messaging.IMSUSSDDialogTransport
+}
+
+func (t *runtimeRecoveringIMSUSSDDialogTransport) HandleIMSInfo(ctx context.Context, req messaging.IMSUSSDDialogRequest) (messaging.IMSUSSDDialogResult, error) {
+	if t == nil || t.dialog == nil {
+		return messaging.IMSUSSDDialogResult{}, nil
+	}
+	return t.dialog.HandleIMSInfo(ctx, req)
+}
+
+func (t *runtimeRecoveringIMSUSSDDialogTransport) HandleIMSBye(ctx context.Context, req messaging.IMSUSSDDialogRequest) (messaging.IMSUSSDDialogResult, error) {
+	if t == nil || t.dialog == nil {
+		return messaging.IMSUSSDDialogResult{}, nil
+	}
+	return t.dialog.HandleIMSBye(ctx, req)
+}
+
+func (i *Instance) wrapSMSTransport(t messaging.SMSTransport) messaging.SMSTransport {
+	if i == nil || t == nil {
+		return t
+	}
+	if _, ok := t.(*runtimeRecoveringSMSTransport); ok {
+		return t
+	}
+	return &runtimeRecoveringSMSTransport{owner: i, inner: t}
+}
+
+func (i *Instance) wrapUSSDTransport(t messaging.USSDTransport) messaging.USSDTransport {
+	if i == nil || t == nil {
+		return t
+	}
+	if _, ok := t.(*runtimeRecoveringUSSDTransport); ok {
+		return t
+	}
+	if _, ok := t.(*runtimeRecoveringIMSUSSDDialogTransport); ok {
+		return t
+	}
+	wrapped := &runtimeRecoveringUSSDTransport{owner: i, inner: t}
+	if dialog, ok := t.(messaging.IMSUSSDDialogTransport); ok {
+		return &runtimeRecoveringIMSUSSDDialogTransport{runtimeRecoveringUSSDTransport: wrapped, dialog: dialog}
+	}
+	return wrapped
 }
 
 func (i *Instance) outboundVoiceAgent() voicehost.OutboundCallAgent {

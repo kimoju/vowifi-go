@@ -69,11 +69,13 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 	if err != nil {
 		result.State = "failed"
 		result.ErrorText = err.Error()
+		result.RegistrationRecoveryNeeded = true
 		return result, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		result.State = "failed"
 		result.ErrorText = strings.TrimSpace(firstNonEmpty(resp.Reason, fmt.Sprintf("IMS MESSAGE rejected: %d", resp.StatusCode)))
+		result.RegistrationRecoveryNeeded = IMSRegistrationRecoveryNeededStatus(resp.StatusCode)
 		return result, errors.New(result.ErrorText)
 	}
 	result.State = "sent"
@@ -81,6 +83,15 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		result.State = "accepted"
 	}
 	return result, nil
+}
+
+func IMSRegistrationRecoveryNeededStatus(code int) bool {
+	switch code {
+	case 408, 430, 480, 481, 500, 502, 503, 504, 580:
+		return true
+	default:
+		return code >= 500 && code < 600
+	}
 }
 
 func (t IMSSMSTransport) messagePayload(req SMSSendRequest, rpMR byte) (string, []byte, error) {
