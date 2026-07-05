@@ -402,6 +402,48 @@ func TestRegisterSessionRetriesAuthenticatedMinExpires(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionFallsBackToSupportedDigestChallenge(t *testing.T) {
+	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {
+					`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth-int"`,
+					`Digest realm="ims.example", nonce="md5nonce", algorithm=MD5, qop="auth"`,
+				},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"Contact": {`<sip:user@192.0.2.10:5060>;expires=1800`}},
+		},
+	}}
+	result, err := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-qop-fallback",
+		CNonce:       "cnonce",
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || result.Challenge.Algorithm != "MD5" || result.Challenge.QOP != "auth" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("requests=%d, want 2", len(transport.requests))
+	}
+	auth := transport.requests[1].Headers["Authorization"]
+	if !strings.Contains(auth, `algorithm=MD5`) || !strings.Contains(auth, `nonce="md5nonce"`) || !strings.Contains(auth, `qop=auth`) {
+		t.Fatalf("Authorization=%s", auth)
+	}
+}
+
 func TestRegisterSessionDeregisterRetriesDigestChallenge(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{
@@ -652,6 +694,23 @@ func TestSelectDigestChallengePrefersAKAv2(t *testing.T) {
 	}
 	if ch.Algorithm != "AKAv2-MD5" {
 		t.Fatalf("challenge=%+v, want AKAv2-MD5", ch)
+	}
+}
+
+func TestSelectDigestChallengeSkipsUnsupportedQOP(t *testing.T) {
+	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	ch, err := SelectDigestChallenge(map[string][]string{
+		"WWW-Authenticate": {
+			`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth-int"`,
+			`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`,
+			`Digest realm="ims.example", nonce="md5nonce", algorithm=MD5, qop="auth"`,
+		},
+	}, "WWW-Authenticate")
+	if err != nil {
+		t.Fatalf("SelectDigestChallenge() error = %v", err)
+	}
+	if ch.Algorithm != "AKAv1-MD5" || ch.QOP != "auth" {
+		t.Fatalf("challenge=%+v, want AKAv1-MD5 auth", ch)
 	}
 }
 

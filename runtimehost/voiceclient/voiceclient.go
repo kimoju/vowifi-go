@@ -878,6 +878,12 @@ func SelectDigestChallenge(headers map[string][]string, name string) (DigestChal
 			}
 			continue
 		}
+		if !digestChallengeSupported(ch) {
+			if firstErr == nil {
+				firstErr = unsupportedDigestChallengeError(ch)
+			}
+			continue
+		}
 		score := digestAlgorithmScore(ch.Algorithm)
 		if score > bestScore {
 			best = ch
@@ -891,6 +897,25 @@ func SelectDigestChallenge(headers map[string][]string, name string) (DigestChal
 		return DigestChallenge{}, firstErr
 	}
 	return DigestChallenge{}, ErrInvalidChallenge
+}
+
+func digestChallengeSupported(ch DigestChallenge) bool {
+	return digestAlgorithmScore(ch.Algorithm) > 0 && digestQOPSupported(ch.QOP)
+}
+
+func digestQOPSupported(qop string) bool {
+	qop = strings.TrimSpace(qop)
+	if qop == "" {
+		return true
+	}
+	return firstQOP(qop) == "auth"
+}
+
+func unsupportedDigestChallengeError(ch DigestChallenge) error {
+	if digestAlgorithmScore(ch.Algorithm) <= 0 {
+		return fmt.Errorf("unsupported digest algorithm %q", ch.Algorithm)
+	}
+	return fmt.Errorf("unsupported digest qop %q", ch.QOP)
 }
 
 func BuildRegistrationBinding(profile IMSProfile, contactURI string, resp RegisterResponse, requestedExpires int) RegistrationBinding {
