@@ -1,6 +1,7 @@
 package e911
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
+	"github.com/iniwex5/vowifi-go/engine/swu"
 	"github.com/iniwex5/vowifi-go/engine/swu/eapaka"
 	"github.com/iniwex5/vowifi-go/runtimehost/carrier"
 )
@@ -490,6 +492,163 @@ func TestStartEmergencyAddressUpdateHandlesAuthenticatedEAPRelayNotification(t *
 	}
 }
 
+func TestStartEmergencyAddressUpdateHandlesEAPRelayReauthentication(t *testing.T) {
+	fullIdentity := "310280233641503@private.att.net"
+	reauthIdentity := "reauth-e911"
+	akaResult := e911AKAResult()
+	keys, err := eapaka.DeriveKeys(fullIdentity, akaResult)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	reauth := signedEAPRelayReauthenticationRequest(t, eapaka.TypeAKA, keys, 3, nonceS, []eapaka.Attribute{
+		eapaka.NextPseudonymAttribute("pseudo-next"),
+		eapaka.NextReauthIDAttribute("reauth-next"),
+	}, nil)
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":20,"eap-relay-packet":"` + reauth + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity: Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280", SIPUsername: fullIdentity},
+		EAPReauthentication: swu.EAPReauthenticationState{
+			Identity:  reauthIdentity,
+			Counter:   2,
+			CounterOK: true,
+			Keys:      keys,
+		},
+		Client: client,
+		Random: bytes.NewReader(bytes.Repeat([]byte{0x88}, 32)),
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=1" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("requests=%d, want reauthentication response", len(client.requests))
+	}
+	answer := decodeEntitlementAnswer(t, client.requests[1].Body)
+	if _, ok := answer["aka-res"]; ok {
+		t.Fatalf("reauth answer must not include AKA RES: %s", client.requests[1].Body)
+	}
+	packet := decodeRelayPacket(t, answer)
+	if packet.Code != eapaka.CodeResponse || packet.Subtype != eapaka.SubtypeReauthentication {
+		t.Fatalf("reauth relay response=%+v", packet)
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(response) error = %v", err)
+	}
+	if err := eapaka.VerifyMAC(keys.KAut, raw, nonceS); err != nil {
+		t.Fatalf("VerifyMAC(response) error = %v", err)
+	}
+	attrs := decryptedEAPRelayReauthenticationResponseAttrs(t, keys, packet)
+	counterAttr, ok := eapaka.FindAttribute(attrs, eapaka.AttributeCounter)
+	if !ok {
+		t.Fatalf("reauth response missing AT_COUNTER: %+v", attrs)
+	}
+	counter, err := counterAttr.CounterValue()
+	if err != nil {
+		t.Fatalf("CounterValue() error = %v", err)
+	}
+	if counter != 3 {
+		t.Fatalf("counter=%d", counter)
+	}
+	if _, ok := eapaka.FindAttribute(attrs, eapaka.AttributeCounterTooSmall); ok {
+		t.Fatalf("normal reauth response included AT_COUNTER_TOO_SMALL: %+v", attrs)
+	}
+	expectedKeys, err := eapaka.DeriveReauthenticationKeys(reauthIdentity, keys, 3, nonceS)
+	if err != nil {
+		t.Fatalf("DeriveReauthenticationKeys() error = %v", err)
+	}
+	state := ws.EAPReauthentication
+	if state.Identity != "reauth-next" || state.NextPseudonym != "pseudo-next" || state.Counter != 3 || !state.CounterOK || !state.Reauthenticated || state.CounterTooSmall {
+		t.Fatalf("reauth state=%+v", state)
+	}
+	if state.LastAcceptedCounter != 3 || state.LastRejectedCounter != 0 {
+		t.Fatalf("reauth counters accepted=%d rejected=%d", state.LastAcceptedCounter, state.LastRejectedCounter)
+	}
+	if !bytes.Equal(state.Keys.MSK, expectedKeys.MSK) || !bytes.Equal(state.Keys.EMSK, expectedKeys.EMSK) {
+		t.Fatalf("reauth keys=%+v, want derived keys", state.Keys)
+	}
+	if ws.EAPNextReauthID != "reauth-next" || ws.EAPNextPseudonym != "pseudo-next" {
+		t.Fatalf("websheet EAP aliases reauth=%q pseudonym=%q", ws.EAPNextReauthID, ws.EAPNextPseudonym)
+	}
+}
+
+func TestStartEmergencyAddressUpdateHandlesEAPRelayReauthenticationCounterTooSmall(t *testing.T) {
+	fullIdentity := "310280233641503@private.att.net"
+	reauthIdentity := "reauth-e911"
+	akaResult := e911AKAResult()
+	keys, err := eapaka.DeriveKeys(fullIdentity, akaResult)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	reauth := signedEAPRelayReauthenticationRequest(t, eapaka.TypeAKA, keys, 2, nonceS, nil, nil)
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":21,"eap-relay-packet":"` + reauth + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity: Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280", SIPUsername: fullIdentity},
+		EAPReauthentication: swu.EAPReauthenticationState{
+			Identity:  reauthIdentity,
+			Counter:   5,
+			CounterOK: true,
+			Keys:      keys,
+		},
+		Client: client,
+		Random: bytes.NewReader(bytes.Repeat([]byte{0x99}, 32)),
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	answer := decodeEntitlementAnswer(t, client.requests[1].Body)
+	packet := decodeRelayPacket(t, answer)
+	if packet.Code != eapaka.CodeResponse || packet.Subtype != eapaka.SubtypeReauthentication {
+		t.Fatalf("counter-too-small relay response=%+v", packet)
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(response) error = %v", err)
+	}
+	if err := eapaka.VerifyMAC(keys.KAut, raw, nonceS); err != nil {
+		t.Fatalf("VerifyMAC(response) error = %v", err)
+	}
+	attrs := decryptedEAPRelayReauthenticationResponseAttrs(t, keys, packet)
+	if tooSmall, ok := eapaka.FindAttribute(attrs, eapaka.AttributeCounterTooSmall); !ok {
+		t.Fatalf("missing AT_COUNTER_TOO_SMALL in attrs=%+v", attrs)
+	} else if err := tooSmall.CounterTooSmallValue(); err != nil {
+		t.Fatalf("CounterTooSmallValue() error = %v", err)
+	}
+	state := ws.EAPReauthentication
+	if state.Identity != reauthIdentity || state.Counter != 5 || !state.CounterOK || state.Reauthenticated || !state.CounterTooSmall || state.LastRejectedCounter != 2 {
+		t.Fatalf("counter-too-small state=%+v", state)
+	}
+	if !bytes.Equal(state.Keys.MSK, keys.MSK) || !bytes.Equal(state.Keys.EMSK, keys.EMSK) {
+		t.Fatal("counter-too-small response must preserve previous reauth keys")
+	}
+}
+
 func TestStartEmergencyAddressUpdateSendsClientErrorForUnsupportedEAPRelaySubtype(t *testing.T) {
 	unsupported := eapRelayUnsupportedRequest(t)
 	client := &fakeHTTPClient{responses: []*HTTPResponse{
@@ -760,6 +919,52 @@ func signedEAPRelayNotification(t *testing.T, identity string, aka sim.AKAResult
 	return base64.StdEncoding.EncodeToString(raw)
 }
 
+func signedEAPRelayReauthenticationRequest(t *testing.T, eapType uint8, keys eapaka.Keys, counter uint16, nonceS []byte, encryptedExtra, topLevelExtra []eapaka.Attribute) string {
+	t.Helper()
+	iv := bytes.Repeat([]byte{0x56}, 16)
+	encryptedAttrs := []eapaka.Attribute{
+		eapaka.CounterAttribute(counter),
+		eapaka.NonceSAttribute(nonceS),
+	}
+	encryptedAttrs = append(encryptedAttrs, encryptedExtra...)
+	encrypted, err := eapaka.EncryptAttributes(keys.KEncr, iv, encryptedAttrs)
+	if err != nil {
+		t.Fatalf("EncryptAttributes() error = %v", err)
+	}
+	attrs := []eapaka.Attribute{
+		eapaka.IVAttribute(iv),
+		encrypted,
+	}
+	attrs = append(attrs, topLevelExtra...)
+	attrs = append(attrs, eapaka.MACAttribute(nil))
+	packet := eapaka.Packet{
+		Code:       eapaka.CodeRequest,
+		Identifier: 13,
+		Type:       eapType,
+		Subtype:    eapaka.SubtypeReauthentication,
+		Attributes: attrs,
+	}
+	raw, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	var mac []byte
+	if eapType == eapaka.TypeAKAPrime {
+		mac, err = eapaka.CalculateAKAPrimeMAC(keys.KAut, raw, nil)
+	} else {
+		mac, err = eapaka.CalculateMAC(keys.KAut, raw, nil)
+	}
+	if err != nil {
+		t.Fatalf("CalculateMAC() error = %v", err)
+	}
+	packet.Attributes[len(packet.Attributes)-1] = eapaka.MACAttribute(mac)
+	raw, err = packet.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
 func eapRelayUnsupportedRequest(t *testing.T) string {
 	t.Helper()
 	packet := eapaka.Packet{
@@ -862,4 +1067,21 @@ func decodeRelayPacket(t *testing.T, payload map[string]any) eapaka.Packet {
 		t.Fatalf("relay response parse error = %v", err)
 	}
 	return packet
+}
+
+func decryptedEAPRelayReauthenticationResponseAttrs(t *testing.T, keys eapaka.Keys, packet eapaka.Packet) []eapaka.Attribute {
+	t.Helper()
+	ivAttr, ok := eapaka.FindAttribute(packet.Attributes, eapaka.AttributeIV)
+	if !ok {
+		t.Fatal("missing AT_IV")
+	}
+	encryptedAttr, ok := eapaka.FindAttribute(packet.Attributes, eapaka.AttributeEncrData)
+	if !ok {
+		t.Fatal("missing AT_ENCR_DATA")
+	}
+	attrs, err := eapaka.DecryptEncryptedAttributes(keys.KEncr, ivAttr, encryptedAttr)
+	if err != nil {
+		t.Fatalf("DecryptEncryptedAttributes() error = %v", err)
+	}
+	return attrs
 }
