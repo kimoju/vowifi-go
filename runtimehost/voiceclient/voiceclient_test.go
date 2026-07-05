@@ -82,6 +82,34 @@ func TestBuildAKADigestPasswordAKAv2(t *testing.T) {
 	}
 }
 
+func TestBuildDigestAuthorizationIncludesAUTS(t *testing.T) {
+	ch := DigestChallenge{
+		Realm:     "ims.example",
+		Nonce:     "nonce-sync",
+		Algorithm: "AKAv1-MD5",
+		QOP:       "auth",
+	}
+	auts := bytesFrom(0xA0, 14)
+	got, err := BuildDigestAuthorization(ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "ignored-for-sync-failure",
+		CNonce:   "cnonce",
+		NC:       1,
+		AUTS:     auts,
+	})
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization() error = %v", err)
+	}
+	ha1 := md5Hex("impi@example:ims.example:")
+	ha2 := md5Hex("REGISTER:sip:ims.example")
+	wantResponse := md5Hex(ha1 + ":nonce-sync:00000001:cnonce:auth:" + ha2)
+	if !strings.Contains(got, `auts="`+base64.StdEncoding.EncodeToString(auts)+`"`) || !strings.Contains(got, `response="`+wantResponse+`"`) {
+		t.Fatalf("Authorization=%s", got)
+	}
+}
+
 func TestBuildRegisterHeaders(t *testing.T) {
 	headers := BuildRegisterHeaders(IMSProfile{
 		IMPI:      "310280233641503@private.att.net",
@@ -168,6 +196,73 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 	}
 	if got := strings.ToUpper(hex.EncodeToString(aka.rand)); got != strings.ToUpper(hex.EncodeToString(bytesFrom(0x10, 16))) {
 		t.Fatalf("RAND=%s", got)
+	}
+}
+
+func TestRegisterSessionHandlesAKASynchronizationFailure(t *testing.T) {
+	firstNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	secondNonce := append(bytesFrom(0x60, 16), bytesFrom(0x80, 16)...)
+	firstChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(firstNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	secondChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(secondNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {firstChallenge},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
+			},
+		},
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {secondChallenge},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"P-Associated-URI": {`<sip:user@example>`},
+				"Contact":          {`<sip:user@192.0.2.10:5060>;expires=1200`},
+			},
+		},
+	}}
+	auts := bytesFrom(0xC0, 14)
+	aka := &syncFailureAKAProvider{auts: auts}
+	result, err := RegisterSession{
+		Transport:    transport,
+		AKAProvider:  aka,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-sync",
+		CNonce:       "cnonce",
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || result.Attempts != 3 || result.Binding.Expires != 1200 {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 3 {
+		t.Fatalf("requests=%d, want 3", len(transport.requests))
+	}
+	syncAuth := transport.requests[1].Headers["Authorization"]
+	if !strings.Contains(syncAuth, `auts="`+base64.StdEncoding.EncodeToString(auts)+`"`) || transport.requests[1].Headers["CSeq"] != "2 REGISTER" {
+		t.Fatalf("sync REGISTER auth=%s headers=%+v", syncAuth, transport.requests[1].Headers)
+	}
+	finalAuth := transport.requests[2].Headers["Authorization"]
+	if strings.Contains(finalAuth, `auts=`) || transport.requests[2].Headers["CSeq"] != "3 REGISTER" {
+		t.Fatalf("final REGISTER auth=%s headers=%+v", finalAuth, transport.requests[2].Headers)
+	}
+	if got := transport.requests[2].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=333") {
+		t.Fatalf("Security-Verify=%q", got)
+	}
+	if len(aka.rands) != 2 || !bytesEqual(aka.rands[1], bytesFrom(0x60, 16)) {
+		t.Fatalf("AKA rands=%x", aka.rands)
 	}
 }
 
@@ -343,10 +438,37 @@ func (p *registerAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult
 	return sim.AKAResult{RES: []byte{0xAA, 0xBB, 0xCC, 0xDD}}, nil
 }
 
+type syncFailureAKAProvider struct {
+	auts  []byte
+	rands [][]byte
+	autns [][]byte
+}
+
+func (p *syncFailureAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, error) {
+	p.rands = append(p.rands, append([]byte(nil), rand16...))
+	p.autns = append(p.autns, append([]byte(nil), autn16...))
+	if len(p.rands) == 1 {
+		return sim.AKAResult{AUTS: append([]byte(nil), p.auts...)}, sim.ErrSyncFailure
+	}
+	return sim.AKAResult{RES: []byte{0x11, 0x22, 0x33, 0x44}}, nil
+}
+
 func bytesFrom(start byte, n int) []byte {
 	out := make([]byte, n)
 	for i := range out {
 		out[i] = start + byte(i)
 	}
 	return out
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

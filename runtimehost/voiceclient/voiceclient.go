@@ -42,6 +42,7 @@ type DigestAuthInput struct {
 	Password string
 	CNonce   string
 	NC       int
+	AUTS     []byte
 }
 
 type RegistrationBinding struct {
@@ -161,7 +162,11 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 		return "", fmt.Errorf("unsupported digest algorithm %q", algorithm)
 	}
 
-	ha1 := md5Hex(username + ":" + ch.Realm + ":" + in.Password)
+	password := in.Password
+	if len(in.AUTS) > 0 {
+		password = ""
+	}
+	ha1 := md5Hex(username + ":" + ch.Realm + ":" + password)
 	ha2 := md5Hex(method + ":" + uri)
 	response := ""
 	qop := firstQOP(ch.QOP)
@@ -196,6 +201,9 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 	}
 	if qop != "" {
 		parts = append(parts, `qop=`+qop, `nc=`+ncText, `cnonce="`+quote(cnonce)+`"`)
+	}
+	if len(in.AUTS) > 0 {
+		parts = append(parts, `auts="`+base64.StdEncoding.EncodeToString(in.AUTS)+`"`)
 	}
 	return strings.Join(parts, ", "), nil
 }
@@ -299,33 +307,11 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1}, err
 	}
 
-	password := ""
-	if isAKADigestAlgorithm(ch.Algorithm) {
-		rand16, autn16, ok := ExtractAKAChallengeNonce(ch.Nonce)
-		if !ok {
-			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, ErrInvalidChallenge
-		}
-		if s.AKAProvider == nil {
-			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, errors.New("AKA provider required for IMS digest AKA")
-		}
-		aka, err := s.AKAProvider.CalculateAKA(rand16, autn16)
-		if err != nil {
-			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
-		}
-		password, err = BuildAKADigestPassword(ch.Algorithm, aka)
-		if err != nil {
-			return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
-		}
+	authzInput, syncFailure, err := s.digestAuthInputForChallenge(ch, registrarURI)
+	if err != nil {
+		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
 	}
-
-	authz, err := BuildDigestAuthorization(ch, DigestAuthInput{
-		Method:   "REGISTER",
-		URI:      registrarURI,
-		Username: firstNonEmpty(s.Profile.IMPI, s.Profile.IMPU),
-		Password: password,
-		CNonce:   firstNonEmpty(s.CNonce, "vowifi-go"),
-		NC:       1,
-	})
+	authz, err := BuildDigestAuthorization(ch, authzInput)
 	if err != nil {
 		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: 1, Challenge: ch}, err
 	}
@@ -340,6 +326,55 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if err != nil {
 		return RegisterResult{Attempts: 2, Challenge: ch}, err
 	}
+	if syncFailure {
+		if isSIPSuccess(resp2.StatusCode) {
+			return RegisterResult{
+				Registered: true,
+				StatusCode: resp2.StatusCode,
+				Reason:     resp2.Reason,
+				Attempts:   2,
+				Challenge:  ch,
+				Binding:    BuildRegistrationBinding(s.Profile, contactURI, resp2, expires),
+				AuthHeader: authz,
+			}, nil
+		}
+		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: ch, AuthHeader: authz}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
+		}
+		nextHeaderName := "WWW-Authenticate"
+		nextAuthzHeader := "Authorization"
+		if firstHeader(resp2.Headers, nextHeaderName) == "" {
+			nextHeaderName = "Proxy-Authenticate"
+			nextAuthzHeader = "Proxy-Authorization"
+		}
+		nextChallenge, err := SelectDigestChallenge(resp2.Headers, nextHeaderName)
+		if err != nil {
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: ch, AuthHeader: authz}, err
+		}
+		nextAuthInput, nextSyncFailure, err := s.digestAuthInputForChallenge(nextChallenge, registrarURI)
+		if err != nil {
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: nextChallenge, AuthHeader: authz}, err
+		}
+		if nextSyncFailure {
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: nextChallenge, AuthHeader: authz}, sim.ErrSyncFailure
+		}
+		authz, err = BuildDigestAuthorization(nextChallenge, nextAuthInput)
+		if err != nil {
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: 2, Challenge: nextChallenge, AuthHeader: authz}, err
+		}
+		ch = nextChallenge
+		authzHeader = nextAuthzHeader
+		msg.Headers = BuildRegisterHeaders(s.Profile, contactURI, callID, "3")
+		msg.Headers["Expires"] = strconv.Itoa(expires)
+		msg.Headers[authzHeader] = authz
+		if securityVerify := securityVerifyFromChallenge(resp2.Headers); securityVerify != "" {
+			msg.Headers["Security-Verify"] = securityVerify
+		}
+		resp2, err = s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
+		if err != nil {
+			return RegisterResult{Attempts: 3, Challenge: ch, AuthHeader: authz}, err
+		}
+	}
 	result := RegisterResult{
 		Registered: isSIPSuccess(resp2.StatusCode),
 		StatusCode: resp2.StatusCode,
@@ -349,10 +384,50 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		Binding:    BuildRegistrationBinding(s.Profile, contactURI, resp2, expires),
 		AuthHeader: authz,
 	}
+	if syncFailure {
+		result.Attempts = 3
+	}
 	if !result.Registered {
 		return result, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 	}
 	return result, nil
+}
+
+func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registrarURI string) (DigestAuthInput, bool, error) {
+	input := DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      registrarURI,
+		Username: firstNonEmpty(s.Profile.IMPI, s.Profile.IMPU),
+		CNonce:   firstNonEmpty(s.CNonce, "vowifi-go"),
+		NC:       1,
+	}
+	if !isAKADigestAlgorithm(ch.Algorithm) {
+		return input, false, nil
+	}
+	rand16, autn16, ok := ExtractAKAChallengeNonce(ch.Nonce)
+	if !ok {
+		return input, false, ErrInvalidChallenge
+	}
+	if s.AKAProvider == nil {
+		return input, false, errors.New("AKA provider required for IMS digest AKA")
+	}
+	aka, err := s.AKAProvider.CalculateAKA(rand16, autn16)
+	if errors.Is(err, sim.ErrSyncFailure) {
+		if len(aka.AUTS) == 0 {
+			return input, false, err
+		}
+		input.AUTS = append([]byte(nil), aka.AUTS...)
+		return input, true, nil
+	}
+	if err != nil {
+		return input, false, err
+	}
+	password, err := BuildAKADigestPassword(ch.Algorithm, aka)
+	if err != nil {
+		return input, false, err
+	}
+	input.Password = password
+	return input, false, nil
 }
 
 func SelectDigestChallenge(headers map[string][]string, name string) (DigestChallenge, error) {
