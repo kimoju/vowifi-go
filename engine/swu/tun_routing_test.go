@@ -81,6 +81,54 @@ func TestLinuxTUNRoutingManagerRollsBackOnFailure(t *testing.T) {
 	}
 }
 
+func TestLinuxTUNRoutingManagerInstallsEPDGExclusionsBeforeTunnelRoutes(t *testing.T) {
+	runner := &fakeIPRunner{}
+	manager := LinuxTUNRoutingManager{Runner: runner}
+	state, err := manager.Apply(context.Background(), TUNRoutingConfig{
+		InterfaceName: "vohive0",
+		Addresses:     []string{"10.10.0.2/32"},
+		EPDGRouteExclusions: []EPDGRouteExclusion{{
+			Address:       "198.51.100.7",
+			InterfaceName: "wwan0",
+			Via:           "192.0.2.1",
+			Source:        "192.0.2.23",
+			Table:         "main",
+			Tables:        []string{"200", "main"},
+			Metric:        5,
+		}},
+		Routes: []TUNRoute{{Destination: "default", Table: "200"}},
+		Rules:  []TUNRule{{Priority: 1000, From: "10.10.0.2", Table: "200"}},
+	})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	wantApply := [][]string{
+		{"link", "set", "dev", "vohive0", "up"},
+		{"addr", "add", "10.10.0.2/32", "dev", "vohive0"},
+		{"route", "add", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "main"},
+		{"route", "add", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "200"},
+		{"route", "add", "default", "dev", "vohive0", "table", "200"},
+		{"rule", "add", "priority", "1000", "from", "10.10.0.2/32", "table", "200"},
+	}
+	if !reflect.DeepEqual(runner.commands, wantApply) {
+		t.Fatalf("apply commands=\n%v\nwant\n%v", runner.commands, wantApply)
+	}
+	if err := manager.Cleanup(context.Background(), state); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+	wantAll := append([][]string{}, wantApply...)
+	wantAll = append(wantAll,
+		[]string{"rule", "del", "priority", "1000", "from", "10.10.0.2/32", "table", "200"},
+		[]string{"route", "del", "default", "dev", "vohive0", "table", "200"},
+		[]string{"route", "del", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "200"},
+		[]string{"route", "del", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "main"},
+		[]string{"addr", "del", "10.10.0.2/32", "dev", "vohive0"},
+	)
+	if !reflect.DeepEqual(runner.commands, wantAll) {
+		t.Fatalf("all commands=\n%v\nwant\n%v", runner.commands, wantAll)
+	}
+}
+
 func TestBuildTUNRoutingCommandsRejectsInvalidInput(t *testing.T) {
 	cases := []struct {
 		name string
@@ -91,6 +139,9 @@ func TestBuildTUNRoutingCommandsRejectsInvalidInput(t *testing.T) {
 		{name: "bad address", cfg: TUNRoutingConfig{InterfaceName: "vohive0", Addresses: []string{"not-ip"}}},
 		{name: "bad route destination", cfg: TUNRoutingConfig{InterfaceName: "vohive0", Routes: []TUNRoute{{Destination: "not-ip"}}}},
 		{name: "bad via", cfg: TUNRoutingConfig{InterfaceName: "vohive0", Routes: []TUNRoute{{Destination: "10.0.0.0/24", Via: "not-ip"}}}},
+		{name: "bad epdg", cfg: TUNRoutingConfig{InterfaceName: "vohive0", EPDGRouteExclusions: []EPDGRouteExclusion{{Address: "not-ip", InterfaceName: "wwan0"}}}},
+		{name: "bad epdg interface", cfg: TUNRoutingConfig{InterfaceName: "vohive0", EPDGRouteExclusions: []EPDGRouteExclusion{{Address: "198.51.100.7", InterfaceName: "bad iface"}}}},
+		{name: "bad epdg table", cfg: TUNRoutingConfig{InterfaceName: "vohive0", EPDGRouteExclusions: []EPDGRouteExclusion{{Address: "198.51.100.7", InterfaceName: "wwan0", Table: "bad table"}}}},
 		{name: "missing rule table", cfg: TUNRoutingConfig{InterfaceName: "vohive0", Rules: []TUNRule{{Priority: 1000}}}},
 		{name: "bad token", cfg: TUNRoutingConfig{InterfaceName: "vohive0", Rules: []TUNRule{{FwMark: "0x1 bad", Table: "200"}}}},
 	}

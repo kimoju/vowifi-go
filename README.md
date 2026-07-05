@@ -77,10 +77,13 @@ protocol layers needed by VoHive:
 - Linux TUN dataplane routing helpers for MTU/link setup, inner address
   assignment, route installation, policy rule installation, cleanup, and
   best-effort rollback through the `ip` command boundary
+- automatic ePDG route exclusion helpers that install protected host routes via
+  the outer modem interface, including support for main and policy-routing
+  tables before TUN default routes are applied
 
-Kernel ESP SA installation, automatic ePDG route exclusion, SRTP media,
-advanced RTCP feedback handling, and complete inbound IMS call handling are
-still implemented incrementally behind these APIs.
+Kernel ESP SA installation, SRTP media, advanced RTCP feedback handling, and
+complete inbound IMS call handling are still implemented incrementally behind
+these APIs.
 
 ## Development
 

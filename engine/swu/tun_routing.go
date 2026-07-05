@@ -65,12 +65,23 @@ type TUNRule struct {
 	Table    string
 }
 
-type TUNRoutingConfig struct {
+type EPDGRouteExclusion struct {
+	Address       string
 	InterfaceName string
-	MTU           int
-	Addresses     []string
-	Routes        []TUNRoute
-	Rules         []TUNRule
+	Via           string
+	Source        string
+	Table         string
+	Tables        []string
+	Metric        int
+}
+
+type TUNRoutingConfig struct {
+	InterfaceName       string
+	MTU                 int
+	Addresses           []string
+	EPDGRouteExclusions []EPDGRouteExclusion
+	Routes              []TUNRoute
+	Rules               []TUNRule
 }
 
 type TUNRoutingState struct {
@@ -149,6 +160,13 @@ func buildTUNRoutingCommands(cfg TUNRoutingConfig) ([]ipCommand, error) {
 			undo: []string{"addr", "del", addr, "dev", iface},
 		})
 	}
+	for _, exclusion := range cfg.EPDGRouteExclusions {
+		exclusionCommands, err := epdgRouteExclusionCommands(exclusion)
+		if err != nil {
+			return nil, err
+		}
+		commands = append(commands, exclusionCommands...)
+	}
 	for _, route := range cfg.Routes {
 		args, undo, err := routeCommands(iface, route)
 		if err != nil {
@@ -160,6 +178,59 @@ func buildTUNRoutingCommands(cfg TUNRoutingConfig) ([]ipCommand, error) {
 		args, undo, err := ruleCommands(rule)
 		if err != nil {
 			return nil, err
+		}
+		commands = append(commands, ipCommand{args: args, undo: undo})
+	}
+	return commands, nil
+}
+
+func epdgRouteExclusionCommands(exclusion EPDGRouteExclusion) ([]ipCommand, error) {
+	dst, err := normalizeIPPrefix(exclusion.Address, "epdg address")
+	if err != nil {
+		return nil, err
+	}
+	iface := strings.TrimSpace(exclusion.InterfaceName)
+	if err := validateRoutingInterfaceName(iface); err != nil {
+		return nil, fmt.Errorf("%w: epdg outer interface: %v", ErrInvalidTUNRouting, err)
+	}
+	if exclusion.Metric < 0 {
+		return nil, fmt.Errorf("%w: epdg route metric must be positive", ErrInvalidTUNRouting)
+	}
+	tables, err := normalizedRoutingTables(exclusion.Table, exclusion.Tables)
+	if err != nil {
+		return nil, err
+	}
+	if len(tables) == 0 {
+		tables = []string{""}
+	}
+	var commands []ipCommand
+	for _, table := range tables {
+		args := []string{"route", "add", dst, "dev", iface}
+		undo := []string{"route", "del", dst, "dev", iface}
+		if strings.TrimSpace(exclusion.Via) != "" {
+			via, err := normalizeIPAddress(exclusion.Via, "epdg route via")
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, "via", via)
+			undo = append(undo, "via", via)
+		}
+		if strings.TrimSpace(exclusion.Source) != "" {
+			source, err := normalizeIPAddress(exclusion.Source, "epdg route source")
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, "src", source)
+			undo = append(undo, "src", source)
+		}
+		if exclusion.Metric > 0 {
+			metric := strconv.Itoa(exclusion.Metric)
+			args = append(args, "metric", metric)
+			undo = append(undo, "metric", metric)
+		}
+		if table != "" {
+			args = append(args, "table", table)
+			undo = append(undo, "table", table)
 		}
 		commands = append(commands, ipCommand{args: args, undo: undo})
 	}
@@ -263,6 +334,27 @@ func runIPUndo(ctx context.Context, runner IPCommandRunner, undo []ipCommand) er
 		}
 	}
 	return out
+}
+
+func normalizedRoutingTables(primary string, extra []string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, value := range append([]string{primary}, extra...) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		table, err := normalizeRoutingToken(value, "routing table")
+		if err != nil {
+			return nil, err
+		}
+		if seen[table] {
+			continue
+		}
+		seen[table] = true
+		out = append(out, table)
+	}
+	return out, nil
 }
 
 func validateRoutingInterfaceName(name string) error {
