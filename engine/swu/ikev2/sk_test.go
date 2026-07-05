@@ -113,6 +113,56 @@ func TestUnprotectRejectsTamperedICV(t *testing.T) {
 	}
 }
 
+func TestProtectAllowsEmptyInformational(t *testing.T) {
+	profile, err := KeyMaterialProfileFromSA(DefaultIKEProposal())
+	if err != nil {
+		t.Fatalf("KeyMaterialProfileFromSA() error = %v", err)
+	}
+	keys, err := SplitIKEKeys(profile, incrementalBytes(profile.RequiredLength()))
+	if err != nil {
+		t.Fatalf("SplitIKEKeys() error = %v", err)
+	}
+	header := Header{
+		InitiatorSPI: 0x0102030405060708,
+		ResponderSPI: 0x1112131415161718,
+		ExchangeType: ExchangeINFORMATIONAL,
+		Flags:        FlagInitiator,
+		MessageID:    8,
+	}
+	msg, raw, err := ProtectMessage(header, keys, true, nil, bytes.Repeat([]byte{0x6a}, profile.EncryptionBlockSize))
+	if err != nil {
+		t.Fatalf("ProtectMessage() error = %v", err)
+	}
+	if len(msg.Payloads) != 1 || msg.Payloads[0].NextPayload != PayloadNoNext {
+		t.Fatalf("msg=%+v", msg)
+	}
+	if raw[16] != PayloadSK || raw[28] != PayloadNoNext {
+		t.Fatalf("raw header next=%d SK next=%d", raw[16], raw[28])
+	}
+	_, inner, err := UnprotectMessage(raw, keys, true)
+	if err != nil {
+		t.Fatalf("UnprotectMessage() error = %v", err)
+	}
+	if len(inner) != 0 {
+		t.Fatalf("inner=%+v, want empty", inner)
+	}
+}
+
+func TestProtectRejectsEmptyNonInformational(t *testing.T) {
+	profile, err := KeyMaterialProfileFromSA(DefaultIKEProposal())
+	if err != nil {
+		t.Fatalf("KeyMaterialProfileFromSA() error = %v", err)
+	}
+	keys, err := SplitIKEKeys(profile, incrementalBytes(profile.RequiredLength()))
+	if err != nil {
+		t.Fatalf("SplitIKEKeys() error = %v", err)
+	}
+	_, _, err = ProtectMessage(Header{InitiatorSPI: 1, ResponderSPI: 2, ExchangeType: ExchangeIKE_AUTH, MessageID: 1}, keys, true, nil, bytes.Repeat([]byte{0x5b}, 16))
+	if !errors.Is(err, ErrInvalidSKPayload) {
+		t.Fatalf("ProtectMessage() err=%v, want ErrInvalidSKPayload", err)
+	}
+}
+
 func TestMarshalRejectsOuterPayloadAfterSK(t *testing.T) {
 	_, _, err := MarshalPayloads([]Payload{
 		{Type: PayloadSK, NextPayload: PayloadIDi, Body: []byte{1, 2, 3, 4}},

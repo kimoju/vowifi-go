@@ -14,7 +14,7 @@ import (
 var ErrInvalidSKPayload = errors.New("invalid ikev2 sk payload")
 
 func ProtectMessage(header Header, keys IKEKeys, fromInitiator bool, inner []Payload, iv []byte) (Message, []byte, error) {
-	if len(inner) == 0 {
+	if len(inner) == 0 && header.ExchangeType != ExchangeINFORMATIONAL {
 		return Message{}, nil, fmt.Errorf("%w: no inner payloads", ErrInvalidSKPayload)
 	}
 	if err := validateKeySet(keys); err != nil {

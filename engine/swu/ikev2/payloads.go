@@ -32,6 +32,7 @@ const (
 
 var (
 	ErrInvalidNotify  = errors.New("invalid ikev2 notify payload")
+	ErrInvalidDelete  = errors.New("invalid ikev2 delete payload")
 	ErrInvalidAddress = errors.New("invalid ikev2 address")
 )
 
@@ -77,6 +78,103 @@ func NotifyPayload(n Notify) (Payload, error) {
 		return Payload{}, err
 	}
 	return Payload{Type: PayloadNotify, Body: body}, nil
+}
+
+type Delete struct {
+	ProtocolID uint8
+	SPIs       [][]byte
+}
+
+func (d Delete) MarshalBinary() ([]byte, error) {
+	if err := validateDelete(d); err != nil {
+		return nil, err
+	}
+	spiSize := 0
+	if len(d.SPIs) > 0 {
+		spiSize = len(d.SPIs[0])
+	}
+	out := make([]byte, 4, 4+spiSize*len(d.SPIs))
+	out[0] = d.ProtocolID
+	out[1] = byte(spiSize)
+	binary.BigEndian.PutUint16(out[2:4], uint16(len(d.SPIs)))
+	for _, spi := range d.SPIs {
+		out = append(out, spi...)
+	}
+	return out, nil
+}
+
+func ParseDelete(data []byte) (Delete, error) {
+	if len(data) < 4 {
+		return Delete{}, ErrInvalidDelete
+	}
+	spiSize := int(data[1])
+	spiCount := int(binary.BigEndian.Uint16(data[2:4]))
+	want := 4 + spiSize*spiCount
+	if want != len(data) {
+		return Delete{}, fmt.Errorf("%w: length %d != %d", ErrInvalidDelete, len(data), want)
+	}
+	d := Delete{
+		ProtocolID: data[0],
+		SPIs:       make([][]byte, 0, spiCount),
+	}
+	rest := data[4:]
+	for i := 0; i < spiCount; i++ {
+		d.SPIs = append(d.SPIs, append([]byte(nil), rest[:spiSize]...))
+		rest = rest[spiSize:]
+	}
+	if err := validateDelete(d); err != nil {
+		return Delete{}, err
+	}
+	return d, nil
+}
+
+func DeletePayload(d Delete) (Payload, error) {
+	body, err := d.MarshalBinary()
+	if err != nil {
+		return Payload{}, err
+	}
+	return Payload{Type: PayloadDelete, Body: body}, nil
+}
+
+func IKEDeletePayload() Payload {
+	return Payload{Type: PayloadDelete, Body: []byte{ProtocolIKE, 0, 0, 0}}
+}
+
+func ESPDeletePayload(spis ...[]byte) (Payload, error) {
+	copied := make([][]byte, 0, len(spis))
+	for _, spi := range spis {
+		copied = append(copied, append([]byte(nil), spi...))
+	}
+	return DeletePayload(Delete{ProtocolID: ProtocolESP, SPIs: copied})
+}
+
+func validateDelete(d Delete) error {
+	switch d.ProtocolID {
+	case ProtocolIKE:
+		if len(d.SPIs) != 0 {
+			return fmt.Errorf("%w: IKE delete must not include SPIs", ErrInvalidDelete)
+		}
+		return nil
+	case ProtocolAH, ProtocolESP:
+	default:
+		return fmt.Errorf("%w: protocol %d", ErrInvalidDelete, d.ProtocolID)
+	}
+	if len(d.SPIs) == 0 {
+		return fmt.Errorf("%w: no SPIs", ErrInvalidDelete)
+	}
+	if len(d.SPIs) > 0xffff {
+		return fmt.Errorf("%w: too many SPIs", ErrInvalidDelete)
+	}
+	spiSize := len(d.SPIs[0])
+	if spiSize != 4 {
+		return fmt.Errorf("%w: SPI size %d", ErrInvalidDelete, spiSize)
+	}
+	for _, spi := range d.SPIs {
+		if len(spi) != spiSize {
+			return fmt.Errorf("%w: mixed SPI sizes", ErrInvalidDelete)
+		}
+	}
+	return nil
 }
 
 type KeyExchange struct {

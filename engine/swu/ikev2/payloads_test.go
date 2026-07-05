@@ -28,6 +28,62 @@ func TestNotifyPayloadMarshalParse(t *testing.T) {
 	}
 }
 
+func TestDeletePayloadMarshalParseESP(t *testing.T) {
+	payload, err := ESPDeletePayload(mustHex("01020304"), mustHex("aabbccdd"))
+	if err != nil {
+		t.Fatalf("ESPDeletePayload() error = %v", err)
+	}
+	if payload.Type != PayloadDelete {
+		t.Fatalf("payload.Type=%d, want PayloadDelete", payload.Type)
+	}
+	if got, want := hex.EncodeToString(payload.Body), "0304000201020304aabbccdd"; got != want {
+		t.Fatalf("delete body=%s, want %s", got, want)
+	}
+	parsed, err := ParseDelete(payload.Body)
+	if err != nil {
+		t.Fatalf("ParseDelete() error = %v", err)
+	}
+	if parsed.ProtocolID != ProtocolESP || len(parsed.SPIs) != 2 ||
+		hex.EncodeToString(parsed.SPIs[0]) != "01020304" ||
+		hex.EncodeToString(parsed.SPIs[1]) != "aabbccdd" {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+}
+
+func TestDeletePayloadMarshalParseIKE(t *testing.T) {
+	payload := IKEDeletePayload()
+	if got, want := hex.EncodeToString(payload.Body), "01000000"; got != want {
+		t.Fatalf("delete body=%s, want %s", got, want)
+	}
+	parsed, err := ParseDelete(payload.Body)
+	if err != nil {
+		t.Fatalf("ParseDelete() error = %v", err)
+	}
+	if parsed.ProtocolID != ProtocolIKE || len(parsed.SPIs) != 0 {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+}
+
+func TestDeletePayloadRejectsInvalid(t *testing.T) {
+	cases := [][]byte{
+		{},
+		{ProtocolESP, 4, 0, 2, 1, 2, 3, 4},
+		{ProtocolIKE, 4, 0, 1, 1, 2, 3, 4},
+		{99, 0, 0, 0},
+	}
+	for _, tc := range cases {
+		if _, err := ParseDelete(tc); !errors.Is(err, ErrInvalidDelete) {
+			t.Fatalf("ParseDelete(%x) err=%v, want ErrInvalidDelete", tc, err)
+		}
+	}
+	if _, err := ESPDeletePayload(); !errors.Is(err, ErrInvalidDelete) {
+		t.Fatalf("ESPDeletePayload() err=%v, want ErrInvalidDelete", err)
+	}
+	if _, err := DeletePayload(Delete{ProtocolID: ProtocolESP, SPIs: [][]byte{{1, 2, 3, 4}, {5}}}); !errors.Is(err, ErrInvalidDelete) {
+		t.Fatalf("DeletePayload() err=%v, want ErrInvalidDelete", err)
+	}
+}
+
 func TestKeyExchangePayload(t *testing.T) {
 	payload := KeyExchangePayload(DHGroupCurve25519, []byte{1, 2, 3})
 	if payload.Type != PayloadKE || hex.EncodeToString(payload.Body) != "001f0000010203" {
