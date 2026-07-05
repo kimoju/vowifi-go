@@ -416,6 +416,7 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 		RemoteTag:       "rtag",
 		CSeq:            3,
 		SessionExpires:  1800,
+		MinSE:           90,
 	}
 	invite, err := BuildInviteRequest(cfg, []byte("v=0\r\n"))
 	if err != nil {
@@ -427,7 +428,7 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if invite.Headers["From"] != "<sip:user@example>;tag=ltag" || invite.Headers["To"] != "<sip:+18005551212@ims.example>;tag=rtag" {
 		t.Fatalf("dialog headers=%+v", invite.Headers)
 	}
-	if invite.Headers["Content-Type"] != "application/sdp" || invite.Headers["Session-Expires"] != "1800" {
+	if invite.Headers["Content-Type"] != "application/sdp" || invite.Headers["Session-Expires"] != "1800" || invite.Headers["Min-SE"] != "90" {
 		t.Fatalf("invite headers=%+v", invite.Headers)
 	}
 	bye, err := BuildByeRequest(cfg)
@@ -448,7 +449,7 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildUpdateRequest() error = %v", err)
 	}
-	if update.Method != "UPDATE" || update.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" || update.Headers["Content-Type"] != "application/sdp" || update.Headers["Session-Expires"] != "1800" {
+	if update.Method != "UPDATE" || update.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" || update.Headers["Content-Type"] != "application/sdp" || update.Headers["Session-Expires"] != "1800" || update.Headers["Min-SE"] != "90" {
 		t.Fatalf("update=%+v", update)
 	}
 	prack, err := BuildPrackRequest(cfg, "1 1 INVITE")

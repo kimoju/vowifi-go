@@ -201,7 +201,7 @@ func writeOrderedHeaders(out *bytes.Buffer, headers map[string]string) {
 		"Via", "Route", "Max-Forwards", "To", "From", "Call-ID", "CSeq", "Contact",
 		"Expires", "P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
 		"P-Access-Network-Info", "Security-Client", "Security-Verify", "Authorization",
-		"Proxy-Authorization", "Session-Expires", "Content-Type", "Accept",
+		"Proxy-Authorization", "Session-Expires", "Min-SE", "Content-Type", "Accept",
 	}
 	written := make(map[string]bool, len(order))
 	contentLength := ""
@@ -397,7 +397,7 @@ func writeOrderedHeaderValues(out *bytes.Buffer, headers map[string][]string) {
 		"P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
 		"P-Access-Network-Info", "Security-Client", "Security-Verify",
 		"Authorization", "Proxy-Authorization", "WWW-Authenticate",
-		"Proxy-Authenticate", "Session-Expires", "Content-Type", "Accept",
+		"Proxy-Authenticate", "Session-Expires", "Min-SE", "Content-Type", "Accept",
 	}
 	written := make(map[string]bool, len(order))
 	for _, name := range order {
@@ -660,6 +660,8 @@ func canonicalHeaderName(name string) string {
 		return "Content-Type"
 	case "content-type":
 		return "Content-Type"
+	case "min-se":
+		return "Min-SE"
 	case "f":
 		return "From"
 	case "t":

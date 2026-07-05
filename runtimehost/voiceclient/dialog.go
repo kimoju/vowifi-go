@@ -37,6 +37,7 @@ type DialogRequestConfig struct {
 	RouteSet        []string
 	UserAgent       string
 	SessionExpires  int
+	MinSE           int
 }
 
 func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage, error) {
@@ -51,6 +52,9 @@ func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage,
 	msg.Headers["Supported"] = "100rel, timer, replaces, outbound"
 	if cfg.SessionExpires > 0 {
 		msg.Headers["Session-Expires"] = strconv.Itoa(cfg.SessionExpires)
+	}
+	if cfg.MinSE > 0 {
+		msg.Headers["Min-SE"] = strconv.Itoa(cfg.MinSE)
 	}
 	return msg, nil
 }
@@ -86,6 +90,9 @@ func BuildUpdateRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage,
 	msg.Headers["Supported"] = "timer, replaces, outbound"
 	if cfg.SessionExpires > 0 {
 		msg.Headers["Session-Expires"] = strconv.Itoa(cfg.SessionExpires)
+	}
+	if cfg.MinSE > 0 {
+		msg.Headers["Min-SE"] = strconv.Itoa(cfg.MinSE)
 	}
 	if len(sdp) > 0 {
 		msg.Headers["Content-Type"] = "application/sdp"

@@ -250,6 +250,74 @@ func TestIMSOutboundAgentRejectedInviteAcksFinalResponse(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentRetriesInviteWithMinSE(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 422,
+			Reason:     "Session Interval Too Small",
+			Headers: map[string][]string{
+				"To":     {"<sip:+18005551212@ims.example>;tag=minse-tag"},
+				"Min-SE": {"1800"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport:      transport,
+		SessionExpires: 600,
+		Profile:        voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID:    "call-min-se",
+		Callee:    "+18005551212",
+		RawSDP:    []byte(sampleSDP("192.0.2.50", 4002)),
+		RemoteSDP: SDPInfo{ConnectionIP: "192.0.2.50", MediaPort: 4002},
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("StartOutboundCall() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[0].Method != "INVITE" || transport.requests[1].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	firstInvite := transport.requests[0]
+	retryInvite := transport.requests[1]
+	if firstInvite.Headers["CSeq"] != "1 INVITE" || firstInvite.Headers["Session-Expires"] != "600" || firstInvite.Headers["Min-SE"] != "" {
+		t.Fatalf("first INVITE=%+v", firstInvite)
+	}
+	if retryInvite.Headers["CSeq"] != "2 INVITE" || retryInvite.Headers["Session-Expires"] != "1800" || retryInvite.Headers["Min-SE"] != "1800" {
+		t.Fatalf("retry INVITE=%+v", retryInvite)
+	}
+	if len(transport.writes) != 2 || transport.writes[0].Method != "ACK" || transport.writes[1].Method != "ACK" {
+		t.Fatalf("writes=%+v", transport.writes)
+	}
+	if transport.writes[0].Headers["CSeq"] != "1 ACK" || !strings.Contains(transport.writes[0].Headers["To"], "minse-tag") {
+		t.Fatalf("422 ACK=%+v", transport.writes[0])
+	}
+	if transport.writes[1].Headers["CSeq"] != "2 ACK" || !strings.Contains(transport.writes[1].Headers["To"], "remote-tag") {
+		t.Fatalf("final ACK=%+v", transport.writes[1])
+	}
+
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-min-se"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE requests=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentCancelVoiceCallSendsCancelForEarlyDialog(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 200, Reason: "OK"}}}
 	agent := &IMSOutboundAgent{Transport: transport}

@@ -78,38 +78,63 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 			_ = relay.Close()
 		}
 	}()
-	invite, err := voiceclient.BuildInviteRequest(cfg, inviteBody)
-	if err != nil {
-		return OutboundCallResult{Accepted: false, Reason: "build IMS INVITE failed"}, err
-	}
-	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: cfg, invite: invite, relay: relay, early: true})
-	nextCSeq := cfg.CSeq + 1
+	var invite voiceclient.SIPRequestMessage
+	var resp voiceclient.SIPResponse
+	var err error
+	inviteCSeq := cfg.CSeq
+	nextCSeq := inviteCSeq + 1
+	retriedSessionInterval := false
 	var provisionalSDP SDPInfo
 	var provisionalAnswer []byte
-	resp, err := a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
-		if body, info, ok, err := a.provisionalAnswer(provisional, relay); err != nil {
-			return err
-		} else if ok {
-			provisionalAnswer = body
-			provisionalSDP = info
-		}
-		prack, ok, err := buildReliableProvisionalPRACK(cfg, provisional, nextCSeq)
-		if err != nil || !ok {
-			return err
-		}
-		prackResp, err := a.Transport.RoundTripRequest(ctx, prack)
+	for {
+		cfg.CSeq = inviteCSeq
+		invite, err = voiceclient.BuildInviteRequest(cfg, inviteBody)
 		if err != nil {
-			return fmt.Errorf("IMS PRACK failed: %w", err)
+			return OutboundCallResult{Accepted: false, Reason: "build IMS INVITE failed"}, err
 		}
-		if prackResp.StatusCode < 200 || prackResp.StatusCode >= 300 {
-			return fmt.Errorf("IMS PRACK rejected: %d %s", prackResp.StatusCode, strings.TrimSpace(prackResp.Reason))
+		a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: cfg, invite: invite, relay: relay, early: true})
+		provisionalSDP = SDPInfo{}
+		provisionalAnswer = nil
+		resp, err = a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
+			if body, info, ok, err := a.provisionalAnswer(provisional, relay); err != nil {
+				return err
+			} else if ok {
+				provisionalAnswer = body
+				provisionalSDP = info
+			}
+			prack, ok, err := buildReliableProvisionalPRACK(cfg, provisional, nextCSeq)
+			if err != nil || !ok {
+				return err
+			}
+			prackResp, err := a.Transport.RoundTripRequest(ctx, prack)
+			if err != nil {
+				return fmt.Errorf("IMS PRACK failed: %w", err)
+			}
+			if prackResp.StatusCode < 200 || prackResp.StatusCode >= 300 {
+				return fmt.Errorf("IMS PRACK rejected: %d %s", prackResp.StatusCode, strings.TrimSpace(prackResp.Reason))
+			}
+			nextCSeq++
+			return nil
+		})
+		if err != nil {
+			a.deleteDialog(strings.TrimSpace(req.CallID))
+			return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed"}, err
 		}
-		nextCSeq++
-		return nil
-	})
-	if err != nil {
-		a.deleteDialog(strings.TrimSpace(req.CallID))
-		return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed"}, err
+		if resp.StatusCode == 422 && !retriedSessionInterval {
+			if minSE := minSEHeader(resp.Headers); minSE > cfg.SessionExpires {
+				if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
+					a.deleteDialog(strings.TrimSpace(req.CallID))
+					return OutboundCallResult{Accepted: false, Reason: "IMS INVITE session interval ACK failed"}, err
+				}
+				cfg.SessionExpires = minSE
+				cfg.MinSE = minSE
+				retriedSessionInterval = true
+				inviteCSeq = nextCSeq
+				nextCSeq++
+				continue
+			}
+		}
+		break
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp.StatusCode >= 300 {
@@ -358,6 +383,27 @@ func outboundStatusCode(code, fallback int) int {
 		return code
 	}
 	return fallback
+}
+
+func minSEHeader(headers map[string][]string) int {
+	for key, values := range headers {
+		if !strings.EqualFold(key, "Min-SE") {
+			continue
+		}
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				part = strings.TrimSpace(part)
+				if semi := strings.IndexByte(part, ';'); semi >= 0 {
+					part = part[:semi]
+				}
+				n, err := strconv.Atoi(strings.TrimSpace(part))
+				if err == nil && n > 0 {
+					return n
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func headerHasToken(headers map[string][]string, name, token string) bool {
