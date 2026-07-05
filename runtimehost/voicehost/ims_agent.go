@@ -340,6 +340,31 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 	if err != nil {
 		return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE failed"}, err
 	}
+	if resp.StatusCode == 422 {
+		if retryCfg, ok := retryDialogConfigForMinSE(cfg, update.Headers, resp.Headers); ok {
+			retryUpdate, err := voiceclient.BuildUpdateRequest(retryCfg, body)
+			if err != nil {
+				return DialogUpdateResult{Accepted: false, StatusCode: 500, Reason: "build IMS UPDATE retry failed"}, err
+			}
+			if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
+				retryUpdate.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
+			}
+			applyDialogUpdateHeaders(retryUpdate.Headers, req.Headers)
+			applySessionIntervalHeaders(retryUpdate.Headers, retryCfg)
+			a.mu.Lock()
+			if latest, ok := a.dialogs[callID]; ok {
+				latest.cfg.CSeq = outboundNextCSeq(retryCfg.CSeq)
+				latest.cfg.SessionExpires = retryCfg.SessionExpires
+				latest.cfg.MinSE = retryCfg.MinSE
+				a.dialogs[callID] = latest
+			}
+			a.mu.Unlock()
+			resp, err = a.Transport.RoundTripRequest(ctx, retryUpdate)
+			if err != nil {
+				return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE retry failed"}, err
+			}
+		}
+	}
 	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
 	resultBody := append([]byte(nil), resp.Body...)
 	if accepted && len(resultBody) > 0 && state.relay != nil {
@@ -414,6 +439,8 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 	state.cfg.CSeq = nextCSeq
 	a.dialogs[callID] = state
 	a.mu.Unlock()
+	activeCfg := cfg
+	activeInvite := invite
 	resp, err := a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
 		prack, ok, err := buildReliableProvisionalPRACK(cfg, provisional, nextCSeq)
 		if err != nil || !ok {
@@ -438,10 +465,62 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 	if err != nil {
 		return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE failed"}, err
 	}
+	if resp.StatusCode == 422 {
+		if retryCfg, ok := retryDialogConfigForMinSE(cfg, invite.Headers, resp.Headers); ok {
+			if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
+				return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "IMS re-INVITE session interval ACK failed"}, err
+			}
+			retryCfg.CSeq = nextCSeq
+			retryInvite, err := voiceclient.BuildInviteRequest(retryCfg, body)
+			if err != nil {
+				return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "build IMS re-INVITE retry failed"}, err
+			}
+			if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
+				retryInvite.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
+			}
+			applyDialogUpdateHeaders(retryInvite.Headers, req.Headers)
+			applySessionIntervalHeaders(retryInvite.Headers, retryCfg)
+			nextCSeq = outboundNextCSeq(retryCfg.CSeq)
+			a.mu.Lock()
+			if latest, ok := a.dialogs[callID]; ok {
+				latest.cfg.CSeq = nextCSeq
+				latest.cfg.SessionExpires = retryCfg.SessionExpires
+				latest.cfg.MinSE = retryCfg.MinSE
+				a.dialogs[callID] = latest
+			}
+			a.mu.Unlock()
+			activeCfg = retryCfg
+			activeInvite = retryInvite
+			resp, err = a.roundTripInvite(ctx, retryInvite, func(provisional voiceclient.SIPResponse) error {
+				prack, ok, err := buildReliableProvisionalPRACK(retryCfg, provisional, nextCSeq)
+				if err != nil || !ok {
+					return err
+				}
+				prackResp, err := a.Transport.RoundTripRequest(ctx, prack)
+				if err != nil {
+					return fmt.Errorf("IMS re-INVITE retry PRACK failed: %w", err)
+				}
+				if prackResp.StatusCode < 200 || prackResp.StatusCode >= 300 {
+					return fmt.Errorf("IMS re-INVITE retry PRACK rejected: %d %s", prackResp.StatusCode, strings.TrimSpace(prackResp.Reason))
+				}
+				nextCSeq++
+				a.mu.Lock()
+				if latest, ok := a.dialogs[callID]; ok {
+					latest.cfg.CSeq = nextCSeq
+					a.dialogs[callID] = latest
+				}
+				a.mu.Unlock()
+				return nil
+			})
+			if err != nil {
+				return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE retry failed"}, err
+			}
+		}
+	}
 	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
 	if !accepted {
 		if resp.StatusCode >= 300 {
-			if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
+			if err := a.ackRejectedInvite(ctx, activeCfg, activeInvite, resp); err != nil {
 				return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "IMS re-INVITE rejected ACK failed"}, err
 			}
 		}
@@ -452,8 +531,8 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			Headers:    firstValueSIPHeaders(resp.Headers),
 		}, nil
 	}
-	ackCfg := cfg
-	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
+	ackCfg := activeCfg
+	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), activeCfg.RemoteTag)
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		ackCfg.RemoteTargetURI = contact
 	}
@@ -664,6 +743,56 @@ func minSEHeader(headers map[string][]string) int {
 		}
 	}
 	return 0
+}
+
+func retryDialogConfigForMinSE(cfg voiceclient.DialogRequestConfig, sentHeaders map[string]string, responseHeaders map[string][]string) (voiceclient.DialogRequestConfig, bool) {
+	minSE := minSEHeader(responseHeaders)
+	if minSE <= 0 {
+		return voiceclient.DialogRequestConfig{}, false
+	}
+	sessionExpires := sessionExpiresHeader(sentHeaders)
+	if sessionExpires <= 0 {
+		sessionExpires = cfg.SessionExpires
+	}
+	if sessionExpires < minSE {
+		sessionExpires = minSE
+	}
+	retry := cfg
+	retry.CSeq = outboundNextCSeq(cfg.CSeq)
+	retry.SessionExpires = sessionExpires
+	retry.MinSE = minSE
+	return retry, true
+}
+
+func sessionExpiresHeader(headers map[string]string) int {
+	for key, value := range headers {
+		if !strings.EqualFold(key, "Session-Expires") {
+			continue
+		}
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if semi := strings.IndexByte(part, ';'); semi >= 0 {
+				part = part[:semi]
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(part))
+			if err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func applySessionIntervalHeaders(headers map[string]string, cfg voiceclient.DialogRequestConfig) {
+	if headers == nil {
+		return
+	}
+	if cfg.SessionExpires > 0 {
+		headers["Session-Expires"] = strconv.Itoa(cfg.SessionExpires)
+	}
+	if cfg.MinSE > 0 {
+		headers["Min-SE"] = strconv.Itoa(cfg.MinSE)
+	}
 }
 
 func headerHasToken(headers map[string][]string, name, token string) bool {
