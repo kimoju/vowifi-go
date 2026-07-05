@@ -520,6 +520,7 @@ func (i *Instance) Stop(ctx context.Context) error {
 	i.mu.Lock()
 	tunnel := i.tunnel
 	imsClose := i.imsClose
+	voice := i.voice
 	i.tunnel = nil
 	i.imsClose = nil
 	i.stopped = true
@@ -529,6 +530,9 @@ func (i *Instance) Stop(ctx context.Context) error {
 	i.state.UpdatedAt = time.Now()
 	i.mu.Unlock()
 	var err error
+	if stopper, ok := voice.(interface{ StopSessionTimers() }); ok {
+		stopper.StopSessionTimers()
+	}
 	if tunnel != nil {
 		err = tunnel.Close(ctx)
 	}

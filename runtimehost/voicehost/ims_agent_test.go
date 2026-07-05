@@ -3,6 +3,7 @@ package voicehost
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -460,6 +461,72 @@ func TestIMSOutboundAgentCarriesNegotiatedSessionRefresher(t *testing.T) {
 	}
 	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-session-refresher"}); err != nil {
 		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+}
+
+func TestIMSOutboundAgentAutoRefreshesUACSessionTimer(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":              {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact":         {"<sip:carrier@198.51.100.1:5060>"},
+				"Session-Expires": {"1;refresher=uac"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"X-IMS": {"refresh-ok"}},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport:          transport,
+		SessionRefreshLead: 950 * time.Millisecond,
+		Profile:            voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-auto-refresh",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	requests := waitForIMSRequests(t, transport, 2)
+	agent.StopSessionTimers()
+	if requests[1].Method != "UPDATE" || requests[1].Headers["CSeq"] != "2 UPDATE" ||
+		requests[1].Headers["Session-Expires"] != "1;refresher=uac" || len(requests[1].Body) != 0 {
+		t.Fatalf("refresh UPDATE=%+v body=%q", requests[1], requests[1].Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-auto-refresh"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	requests = transport.requestSnapshot()
+	if len(requests) < 3 || requests[len(requests)-1].Method != "BYE" || requests[len(requests)-1].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after refresh requests=%+v", requests)
+	}
+}
+
+func TestIMSOutboundAgentDoesNotAutoRefreshUASSessionTimer(t *testing.T) {
+	agent := &IMSOutboundAgent{}
+	agent.storeDialog("call-uas-refresh", imsDialogState{cfg: voiceclient.DialogRequestConfig{
+		SessionExpires:   1,
+		SessionRefresher: "uas",
+	}})
+	agent.scheduleDialogSessionRefresh("call-uas-refresh")
+	agent.mu.Lock()
+	state := agent.dialogs["call-uas-refresh"]
+	agent.mu.Unlock()
+	if state.refreshTimer != nil {
+		state.refreshTimer.Stop()
+		t.Fatal("scheduled local refresh for refresher=uas")
 	}
 }
 
@@ -1251,6 +1318,7 @@ func TestIMSOutboundAgentRewritesReliableProvisionalSDPThroughRelay(t *testing.T
 }
 
 type fakeIMSVoiceTransport struct {
+	mu           sync.Mutex
 	requests     []voiceclient.SIPRequestMessage
 	writes       []voiceclient.SIPRequestMessage
 	provisionals []voiceclient.SIPResponse
@@ -1258,27 +1326,34 @@ type fakeIMSVoiceTransport struct {
 }
 
 func (t *fakeIMSVoiceTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.requests = append(t.requests, msg)
-	return t.nextResponse(), nil
+	return t.nextResponseLocked(), nil
 }
 
 func (t *fakeIMSVoiceTransport) RoundTripInvite(ctx context.Context, msg voiceclient.SIPRequestMessage, onProvisional voiceclient.ProvisionalResponseHandler) (voiceclient.SIPResponse, error) {
 	if msg.Headers != nil && msg.Headers["Via"] == "" {
 		msg.Headers["Via"] = "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-fake;rport"
 	}
+	t.mu.Lock()
 	t.requests = append(t.requests, msg)
-	for _, resp := range t.provisionals {
+	provisionals := append([]voiceclient.SIPResponse(nil), t.provisionals...)
+	t.provisionals = nil
+	t.mu.Unlock()
+	for _, resp := range provisionals {
 		if onProvisional != nil {
 			if err := onProvisional(ctx, msg, resp); err != nil {
 				return voiceclient.SIPResponse{}, err
 			}
 		}
 	}
-	t.provisionals = nil
-	return t.nextResponse(), nil
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.nextResponseLocked(), nil
 }
 
-func (t *fakeIMSVoiceTransport) nextResponse() voiceclient.SIPResponse {
+func (t *fakeIMSVoiceTransport) nextResponseLocked() voiceclient.SIPResponse {
 	if len(t.responses) == 0 {
 		return voiceclient.SIPResponse{StatusCode: 500, Reason: "empty"}
 	}
@@ -1288,6 +1363,29 @@ func (t *fakeIMSVoiceTransport) nextResponse() voiceclient.SIPResponse {
 }
 
 func (t *fakeIMSVoiceTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.writes = append(t.writes, msg)
 	return nil
+}
+
+func (t *fakeIMSVoiceTransport) requestSnapshot() []voiceclient.SIPRequestMessage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]voiceclient.SIPRequestMessage(nil), t.requests...)
+}
+
+func waitForIMSRequests(t *testing.T, transport *fakeIMSVoiceTransport, n int) []voiceclient.SIPRequestMessage {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		requests := transport.requestSnapshot()
+		if len(requests) >= n {
+			return requests
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d IMS requests, got %+v", n, requests)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

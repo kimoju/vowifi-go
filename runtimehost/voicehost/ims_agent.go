@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
@@ -14,30 +15,32 @@ import (
 var ErrIMSVoiceAgentNotReady = errors.New("ims voice agent not ready")
 
 type IMSOutboundAgent struct {
-	Transport        voiceclient.SIPRequestTransport
-	Profile          voiceclient.IMSProfile
-	Registration     voiceclient.RegistrationBinding
-	Domain           string
-	UserAgent        string
-	LocalTag         string
-	SessionExpires   int
-	SessionRefresher string
-	RemoteTargetURI  string
-	MediaRelay       *RTPRelayConfig
+	Transport          voiceclient.SIPRequestTransport
+	Profile            voiceclient.IMSProfile
+	Registration       voiceclient.RegistrationBinding
+	Domain             string
+	UserAgent          string
+	LocalTag           string
+	SessionExpires     int
+	SessionRefresher   string
+	SessionRefreshLead time.Duration
+	RemoteTargetURI    string
+	MediaRelay         *RTPRelayConfig
 
 	mu      sync.Mutex
 	dialogs map[string]imsDialogState
 }
 
 type IMSRegistrationUpdate struct {
-	Transport        voiceclient.SIPRequestTransport
-	Profile          voiceclient.IMSProfile
-	Registration     voiceclient.RegistrationBinding
-	Domain           string
-	UserAgent        string
-	SessionExpires   int
-	SessionRefresher string
-	MediaRelay       *RTPRelayConfig
+	Transport          voiceclient.SIPRequestTransport
+	Profile            voiceclient.IMSProfile
+	Registration       voiceclient.RegistrationBinding
+	Domain             string
+	UserAgent          string
+	SessionExpires     int
+	SessionRefresher   string
+	SessionRefreshLead time.Duration
+	MediaRelay         *RTPRelayConfig
 }
 
 type IMSRegistrationUpdater interface {
@@ -71,16 +74,21 @@ func (a *IMSOutboundAgent) UpdateIMSRegistration(update IMSRegistrationUpdate) {
 	if refresher := normalizeSessionRefresher(update.SessionRefresher); refresher != "" {
 		a.SessionRefresher = refresher
 	}
+	if update.SessionRefreshLead > 0 {
+		a.SessionRefreshLead = update.SessionRefreshLead
+	}
 	if update.MediaRelay != nil {
 		a.MediaRelay = update.MediaRelay
 	}
 }
 
 type imsDialogState struct {
-	cfg    voiceclient.DialogRequestConfig
-	invite voiceclient.SIPRequestMessage
-	relay  *RTPRelaySession
-	early  bool
+	cfg          voiceclient.DialogRequestConfig
+	invite       voiceclient.SIPRequestMessage
+	relay        *RTPRelaySession
+	early        bool
+	refreshTimer *time.Timer
+	refreshSeq   uint64
 }
 
 func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCallRequest) (OutboundCallResult, error) {
@@ -252,6 +260,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	byeCfg := cfg
 	byeCfg.CSeq = nextCSeq
 	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: byeCfg, relay: relay})
+	a.scheduleDialogSessionRefresh(strings.TrimSpace(req.CallID))
 	closeRelayOnError = false
 	return OutboundCallResult{
 		Accepted:   true,
@@ -443,6 +452,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 			a.dialogs[callID] = latest
 		}
 		a.mu.Unlock()
+		a.scheduleDialogSessionRefresh(callID)
 	}
 	return DialogUpdateResult{
 		Accepted:                   accepted,
@@ -628,6 +638,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 		a.dialogs[callID] = latest
 	}
 	a.mu.Unlock()
+	a.scheduleDialogSessionRefresh(callID)
 	return DialogReinviteResult{
 		Accepted:    true,
 		StatusCode:  outboundStatusCode(resp.StatusCode, 200),
@@ -713,7 +724,11 @@ func (a *IMSOutboundAgent) storeDialog(callID string, state imsDialogState) {
 	if a.dialogs == nil {
 		a.dialogs = make(map[string]imsDialogState)
 	}
-	a.dialogs[strings.TrimSpace(callID)] = state
+	callID = strings.TrimSpace(callID)
+	if previous, ok := a.dialogs[callID]; ok && previous.refreshTimer != nil && previous.refreshTimer != state.refreshTimer {
+		previous.refreshTimer.Stop()
+	}
+	a.dialogs[callID] = state
 	a.mu.Unlock()
 }
 
@@ -724,12 +739,98 @@ func (a *IMSOutboundAgent) deleteDialog(callID string) {
 	a.mu.Lock()
 	state, ok := a.dialogs[strings.TrimSpace(callID)]
 	if ok {
+		if state.refreshTimer != nil {
+			state.refreshTimer.Stop()
+		}
 		delete(a.dialogs, strings.TrimSpace(callID))
 	}
 	a.mu.Unlock()
 	if ok && state.relay != nil {
 		_ = state.relay.Close()
 	}
+}
+
+func (a *IMSOutboundAgent) StopSessionTimers() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for callID, state := range a.dialogs {
+		if state.refreshTimer != nil {
+			state.refreshTimer.Stop()
+			state.refreshTimer = nil
+			state.refreshSeq++
+			a.dialogs[callID] = state
+		}
+	}
+}
+
+func (a *IMSOutboundAgent) scheduleDialogSessionRefresh(callID string) {
+	callID = strings.TrimSpace(callID)
+	if a == nil || callID == "" {
+		return
+	}
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		a.mu.Unlock()
+		return
+	}
+	if state.refreshTimer != nil {
+		state.refreshTimer.Stop()
+		state.refreshTimer = nil
+	}
+	state.refreshSeq++
+	seq := state.refreshSeq
+	delay := sessionRefreshDelay(state.cfg.SessionExpires, state.cfg.SessionRefresher, a.SessionRefreshLead)
+	if delay <= 0 || state.early {
+		a.dialogs[callID] = state
+		a.mu.Unlock()
+		return
+	}
+	state.refreshTimer = time.AfterFunc(delay, func() {
+		a.runDialogSessionRefresh(callID, seq)
+	})
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+}
+
+func (a *IMSOutboundAgent) runDialogSessionRefresh(callID string, seq uint64) {
+	if a == nil || strings.TrimSpace(callID) == "" {
+		return
+	}
+	callID = strings.TrimSpace(callID)
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok || state.refreshSeq != seq || state.early ||
+		state.cfg.SessionExpires <= 0 || normalizeSessionRefresher(state.cfg.SessionRefresher) != "uac" {
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
+	_, _ = a.SendDialogUpdate(context.Background(), DialogUpdateRequest{CallID: callID})
+}
+
+func sessionRefreshDelay(expires int, refresher string, lead time.Duration) time.Duration {
+	if expires <= 0 || normalizeSessionRefresher(refresher) != "uac" {
+		return 0
+	}
+	interval := time.Duration(expires) * time.Second
+	if interval <= 0 {
+		return 0
+	}
+	if lead > 0 && lead < interval {
+		delay := interval - lead
+		if delay > 0 {
+			return delay
+		}
+	}
+	delay := interval / 2
+	if delay <= 0 {
+		delay = interval
+	}
+	return delay
 }
 
 func (a *IMSOutboundAgent) roundTripInvite(ctx context.Context, invite voiceclient.SIPRequestMessage, onProvisional func(voiceclient.SIPResponse) error) (voiceclient.SIPResponse, error) {
