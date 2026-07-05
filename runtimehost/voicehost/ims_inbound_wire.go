@@ -1,0 +1,322 @@
+package voicehost
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"net"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
+)
+
+type IMSInboundWireServer struct {
+	Agent           *IMSInboundAgent
+	ContactURI      string
+	LocalTag        string
+	UserAgent       string
+	ResponseHeaders map[string]string
+	ReadTimeout     time.Duration
+}
+
+type IMSInboundWireResponse struct {
+	StatusCode int
+	Reason     string
+	Headers    map[string]string
+	Body       []byte
+	NoResponse bool
+}
+
+func (s *IMSInboundWireServer) ServePacket(ctx context.Context, pc net.PacketConn) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if pc == nil {
+		return ErrIMSInboundAgentNotReady
+	}
+	buf := make([]byte, 65535)
+	for {
+		if err := pc.SetReadDeadline(time.Now().Add(s.readTimeout())); err != nil {
+			return err
+		}
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if isTimeout(err) {
+				continue
+			}
+			return err
+		}
+		raw := append([]byte(nil), buf[:n]...)
+		go s.handlePacket(ctx, pc, addr, raw)
+	}
+}
+
+func (s *IMSInboundWireServer) ServeListener(ctx context.Context, ln net.Listener) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ln == nil {
+		return ErrIMSInboundAgentNotReady
+	}
+	for {
+		if deadline, ok := ln.(interface{ SetDeadline(time.Time) error }); ok {
+			if err := deadline.SetDeadline(time.Now().Add(s.readTimeout())); err != nil {
+				return err
+			}
+		}
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if isTimeout(err) {
+				continue
+			}
+			return err
+		}
+		go s.handleConn(ctx, conn)
+	}
+}
+
+func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	switch method {
+	case "INVITE":
+		return s.handleInvite(ctx, req)
+	case "ACK":
+		if s == nil || s.Agent == nil {
+			return nil, ErrIMSInboundAgentNotReady
+		}
+		return nil, s.Agent.AckInboundCall(ctx, DialogInfo{CallID: wireCallID(req)})
+	case "BYE":
+		if s == nil || s.Agent == nil {
+			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+		}
+		if err := s.Agent.EndInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); err != nil {
+			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, err.Error()))}, err
+		}
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}, nil
+	case "CANCEL":
+		if s == nil || s.Agent == nil {
+			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+		}
+		if err := s.Agent.CancelInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); err != nil {
+			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, err.Error()))}, err
+		}
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}, nil
+	default:
+		resp := wireResponse(405, "Method Not Allowed")
+		resp.Headers["Allow"] = "INVITE, ACK, CANCEL, BYE"
+		return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, nil
+	}
+}
+
+func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	responses := []IMSInboundWireResponse{wireResponse(100, "Trying")}
+	if s == nil || s.Agent == nil {
+		return append(responses, s.withResponseHeaders(wireResponse(503, "Service Unavailable"))), ErrIMSInboundAgentNotReady
+	}
+	result, err := s.Agent.HandleInboundInvite(ctx, InboundCallRequest{
+		CallID:          wireCallID(req),
+		CallerURI:       wireHeaderURI(req, "From"),
+		CalleeURI:       wireCalleeURI(req),
+		RemoteTag:       sipHeaderTag(firstVoiceHeader(req.Headers, "From")),
+		RemoteTargetURI: wireHeaderURI(req, "Contact"),
+		CSeq:            wireCSeq(req),
+		RawSDP:          append([]byte(nil), req.Body...),
+		Headers:         cloneSIPHeaders(req.Headers),
+	})
+	final := wireResponse(inboundStatusCode(result.StatusCode, 500), firstVoiceNonEmpty(result.Reason, "Server Internal Error"))
+	if result.Accepted {
+		final.StatusCode = inboundStatusCode(result.StatusCode, 200)
+		final.Reason = firstVoiceNonEmpty(result.Reason, "OK")
+		final.Body = append([]byte(nil), result.RawSDP...)
+		if len(final.Body) == 0 {
+			final.Body = BuildSDPAnswer(result.LocalSDP)
+		}
+		final.Headers["Contact"] = "<" + s.contactURI() + ">"
+		if len(final.Body) > 0 {
+			final.Headers["Content-Type"] = "application/sdp"
+		}
+	}
+	responses = append(responses, s.withResponseHeaders(final))
+	return responses, err
+}
+
+func (s *IMSInboundWireServer) handlePacket(ctx context.Context, pc net.PacketConn, addr net.Addr, raw []byte) {
+	req, err := voiceclient.ParseSIPRequest(raw)
+	if err != nil {
+		_ = writePacketSIPResponse(pc, addr, voiceclient.SIPIncomingRequest{}, wireResponse(400, "Bad Request"))
+		return
+	}
+	responses, _ := s.HandleRequest(ctx, req)
+	for _, resp := range responses {
+		if resp.NoResponse {
+			continue
+		}
+		_ = writePacketSIPResponse(pc, addr, taggedWireRequest(req, s.localTag()), resp)
+	}
+}
+
+func (s *IMSInboundWireServer) handleConn(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	for {
+		if err := conn.SetDeadline(time.Now().Add(s.readTimeout())); err != nil {
+			return
+		}
+		raw, err := voiceclient.ReadSIPStreamMessage(reader)
+		if err != nil {
+			return
+		}
+		req, err := voiceclient.ParseSIPRequest(raw)
+		if err != nil {
+			_ = writeStreamSIPResponse(conn, voiceclient.SIPIncomingRequest{}, wireResponse(400, "Bad Request"))
+			return
+		}
+		responses, _ := s.HandleRequest(ctx, req)
+		for _, resp := range responses {
+			if resp.NoResponse {
+				continue
+			}
+			if err := writeStreamSIPResponse(conn, taggedWireRequest(req, s.localTag()), resp); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func writePacketSIPResponse(pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) error {
+	wire, err := voiceclient.BuildSIPResponseWire(req, resp.StatusCode, resp.Reason, resp.Headers, resp.Body)
+	if err != nil {
+		return err
+	}
+	_, err = pc.WriteTo(wire, addr)
+	return err
+}
+
+func writeStreamSIPResponse(conn net.Conn, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) error {
+	wire, err := voiceclient.BuildSIPResponseWire(req, resp.StatusCode, resp.Reason, resp.Headers, resp.Body)
+	if err != nil {
+		return err
+	}
+	_, err = conn.Write(wire)
+	return err
+}
+
+func wireResponse(statusCode int, reason string) IMSInboundWireResponse {
+	return IMSInboundWireResponse{StatusCode: statusCode, Reason: reason, Headers: make(map[string]string)}
+}
+
+func (s *IMSInboundWireServer) withResponseHeaders(resp IMSInboundWireResponse) IMSInboundWireResponse {
+	if resp.Headers == nil {
+		resp.Headers = make(map[string]string)
+	}
+	if s == nil {
+		return resp
+	}
+	for key, value := range s.ResponseHeaders {
+		if strings.TrimSpace(key) != "" && strings.TrimSpace(value) != "" {
+			resp.Headers[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+	}
+	if strings.TrimSpace(s.UserAgent) != "" {
+		resp.Headers["Server"] = strings.TrimSpace(s.UserAgent)
+	}
+	return resp
+}
+
+func (s *IMSInboundWireServer) contactURI() string {
+	if s == nil {
+		return "sip:vowifi-go@127.0.0.1:5060"
+	}
+	contact := firstVoiceNonEmpty(s.ContactURI)
+	if contact == "" && s.Agent != nil {
+		contact = firstVoiceNonEmpty(s.Agent.LocalContactURI, s.Agent.Registration.ContactURI, s.Agent.Profile.IMPU)
+	}
+	if contact == "" {
+		contact = "sip:vowifi-go@127.0.0.1:5060"
+	}
+	return strings.Trim(contact, "<>")
+}
+
+func (s *IMSInboundWireServer) localTag() string {
+	if s == nil {
+		return "vowifi-go"
+	}
+	tag := firstVoiceNonEmpty(s.LocalTag)
+	if tag == "" && s.Agent != nil {
+		tag = firstVoiceNonEmpty(s.Agent.LocalTag)
+	}
+	return firstVoiceNonEmpty(tag, "vowifi-go")
+}
+
+func (s *IMSInboundWireServer) readTimeout() time.Duration {
+	if s == nil || s.ReadTimeout <= 0 {
+		return time.Second
+	}
+	return s.ReadTimeout
+}
+
+func taggedWireRequest(req voiceclient.SIPIncomingRequest, tag string) voiceclient.SIPIncomingRequest {
+	out := req
+	out.Headers = cloneSIPHeaders(req.Headers)
+	to := firstVoiceHeader(out.Headers, "To")
+	if to == "" || sipHeaderTag(to) != "" {
+		return out
+	}
+	out.Headers["To"] = []string{to + ";tag=" + firstVoiceNonEmpty(tag, "vowifi-go")}
+	return out
+}
+
+func wireCallID(req voiceclient.SIPIncomingRequest) string {
+	return firstVoiceHeader(req.Headers, "Call-ID")
+}
+
+func wireCSeq(req voiceclient.SIPIncomingRequest) int {
+	value := firstVoiceHeader(req.Headers, "CSeq")
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return 1
+	}
+	cseq, err := strconv.Atoi(fields[0])
+	if err != nil || cseq <= 0 {
+		return 1
+	}
+	return cseq
+}
+
+func wireHeaderURI(req voiceclient.SIPIncomingRequest, name string) string {
+	return sipHeaderURI(firstVoiceHeader(req.Headers, name))
+}
+
+func wireCalleeURI(req voiceclient.SIPIncomingRequest) string {
+	if uri := wireHeaderURI(req, "To"); uri != "" {
+		return uri
+	}
+	return strings.TrimSpace(req.URI)
+}
+
+func cloneSIPHeaders(headers map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(headers))
+	for key, values := range headers {
+		out[key] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}

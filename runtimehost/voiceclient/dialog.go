@@ -16,6 +16,13 @@ type SIPRequestMessage struct {
 	Body    []byte
 }
 
+type SIPIncomingRequest struct {
+	Method  string
+	URI     string
+	Headers map[string][]string
+	Body    []byte
+}
+
 type DialogRequestConfig struct {
 	Profile         IMSProfile
 	Registration    RegistrationBinding

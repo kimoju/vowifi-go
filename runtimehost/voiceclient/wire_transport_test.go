@@ -25,6 +25,41 @@ func TestParseSIPResponseWithFoldedAndCompactHeaders(t *testing.T) {
 	}
 }
 
+func TestParseSIPRequestAndBuildResponseWire(t *testing.T) {
+	req, err := ParseSIPRequest([]byte("INVITE sip:user@example SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-a\r\nTo: <sip:user@example>\r\nFrom: <sip:caller@example>;tag=remote\r\nCall-ID: call-1\r\nCSeq: 7 INVITE\r\nSubject: hello\r\n world\r\nl: 5\r\n\r\nabcde ignored"))
+	if err != nil {
+		t.Fatalf("ParseSIPRequest() error = %v", err)
+	}
+	if req.Method != "INVITE" || req.URI != "sip:user@example" || string(req.Body) != "abcde" {
+		t.Fatalf("request=%+v body=%q", req, req.Body)
+	}
+	if got := req.Headers["Subject"]; len(got) != 1 || got[0] != "hello world" {
+		t.Fatalf("Subject=%+v", got)
+	}
+	wire, err := BuildSIPResponseWire(req, 200, "OK", map[string]string{
+		"Contact":      "<sip:user@192.0.2.10:5060>",
+		"Content-Type": "application/sdp",
+	}, []byte("answer"))
+	if err != nil {
+		t.Fatalf("BuildSIPResponseWire() error = %v", err)
+	}
+	text := string(wire)
+	for _, want := range []string{
+		"SIP/2.0 200 OK\r\n",
+		"Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-a\r\n",
+		"To: <sip:user@example>\r\n",
+		"From: <sip:caller@example>;tag=remote\r\n",
+		"Call-ID: call-1\r\n",
+		"CSeq: 7 INVITE\r\n",
+		"Contact: <sip:user@192.0.2.10:5060>\r\n",
+		"Content-Length: 6\r\n\r\nanswer",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("response wire missing %q in %q", want, text)
+		}
+	}
+}
+
 func TestSIPURIAddrParsesHostPortAndIPv6(t *testing.T) {
 	cases := map[string]string{
 		"sip:ims.example":                  "ims.example:5060",

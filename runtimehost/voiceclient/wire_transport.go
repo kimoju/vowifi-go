@@ -269,6 +269,79 @@ func ParseSIPResponse(raw []byte) (RegisterResponse, error) {
 	}, nil
 }
 
+func ParseSIPRequest(raw []byte) (SIPIncomingRequest, error) {
+	head, body, err := splitSIPMessage(raw)
+	if err != nil {
+		return SIPIncomingRequest{}, err
+	}
+	lines := splitHeaderLines(head)
+	if len(lines) == 0 {
+		return SIPIncomingRequest{}, ErrInvalidSIPMessage
+	}
+	parts := strings.Fields(lines[0])
+	if len(parts) != 3 || !strings.EqualFold(parts[2], "SIP/2.0") {
+		return SIPIncomingRequest{}, fmt.Errorf("%w: invalid request line", ErrInvalidSIPMessage)
+	}
+	method := strings.ToUpper(strings.TrimSpace(parts[0]))
+	uri := strings.TrimSpace(parts[1])
+	if method == "" || uri == "" {
+		return SIPIncomingRequest{}, fmt.Errorf("%w: empty method or URI", ErrInvalidSIPMessage)
+	}
+	headers, err := parseSIPHeaders(lines[1:])
+	if err != nil {
+		return SIPIncomingRequest{}, err
+	}
+	if n, ok := contentLength(headers); ok && n <= len(body) {
+		body = body[:n]
+	}
+	return SIPIncomingRequest{
+		Method:  method,
+		URI:     uri,
+		Headers: headers,
+		Body:    append([]byte(nil), body...),
+	}, nil
+}
+
+func BuildSIPResponseWire(req SIPIncomingRequest, statusCode int, reason string, headers map[string]string, body []byte) ([]byte, error) {
+	if statusCode <= 0 {
+		return nil, fmt.Errorf("%w: invalid response status", ErrInvalidSIPMessage)
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = defaultSIPReason(statusCode)
+	}
+	outHeaders := make(map[string][]string, len(headers)+6)
+	copyIncomingHeader(outHeaders, req.Headers, "Via")
+	copyIncomingHeader(outHeaders, req.Headers, "To")
+	copyIncomingHeader(outHeaders, req.Headers, "From")
+	copyIncomingHeader(outHeaders, req.Headers, "Call-ID")
+	copyIncomingHeader(outHeaders, req.Headers, "CSeq")
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || strings.EqualFold(key, "Content-Length") {
+			continue
+		}
+		canonical := canonicalHeaderName(key)
+		outHeaders[canonical] = append(outHeaders[canonical], value)
+	}
+	outHeaders["Content-Length"] = []string{strconv.Itoa(len(body))}
+	var out bytes.Buffer
+	out.WriteString("SIP/2.0 ")
+	out.WriteString(strconv.Itoa(statusCode))
+	out.WriteString(" ")
+	out.WriteString(reason)
+	out.WriteString("\r\n")
+	writeOrderedHeaderValues(&out, outHeaders)
+	out.WriteString("\r\n")
+	out.Write(body)
+	return out.Bytes(), nil
+}
+
+func ReadSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
+	return readSIPStreamMessage(r)
+}
+
 func splitSIPMessage(raw []byte) (string, []byte, error) {
 	if idx := bytes.Index(raw, []byte("\r\n\r\n")); idx >= 0 {
 		return string(raw[:idx]), raw[idx+4:], nil
@@ -277,6 +350,82 @@ func splitSIPMessage(raw []byte) (string, []byte, error) {
 		return string(raw[:idx]), raw[idx+2:], nil
 	}
 	return "", nil, fmt.Errorf("%w: missing header terminator", ErrInvalidSIPMessage)
+}
+
+func writeOrderedHeaderValues(out *bytes.Buffer, headers map[string][]string) {
+	order := []string{
+		"Via", "Record-Route", "Route", "Max-Forwards", "To", "From", "Call-ID",
+		"CSeq", "Contact", "Expires", "P-Associated-URI", "Service-Route", "Path",
+		"P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
+		"P-Access-Network-Info", "Security-Client", "Security-Verify",
+		"Authorization", "Proxy-Authorization", "WWW-Authenticate",
+		"Proxy-Authenticate", "Session-Expires", "Content-Type", "Accept",
+	}
+	written := make(map[string]bool, len(order))
+	for _, name := range order {
+		for key, values := range headers {
+			if !strings.EqualFold(key, name) {
+				continue
+			}
+			for _, value := range values {
+				if strings.TrimSpace(value) == "" {
+					continue
+				}
+				out.WriteString(name)
+				out.WriteString(": ")
+				out.WriteString(strings.TrimSpace(value))
+				out.WriteString("\r\n")
+			}
+			written[strings.ToLower(key)] = true
+		}
+	}
+	for key, values := range headers {
+		if written[strings.ToLower(key)] {
+			continue
+		}
+		for _, value := range values {
+			if strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
+				continue
+			}
+			out.WriteString(key)
+			out.WriteString(": ")
+			out.WriteString(strings.TrimSpace(value))
+			out.WriteString("\r\n")
+		}
+	}
+}
+
+func copyIncomingHeader(dst map[string][]string, src map[string][]string, name string) {
+	for key, values := range src {
+		if strings.EqualFold(key, name) && len(values) > 0 {
+			dst[name] = append(dst[name], trimHeaderValues(values)...)
+		}
+	}
+}
+
+func defaultSIPReason(code int) string {
+	switch code {
+	case 100:
+		return "Trying"
+	case 180:
+		return "Ringing"
+	case 200:
+		return "OK"
+	case 400:
+		return "Bad Request"
+	case 481:
+		return "Call/Transaction Does Not Exist"
+	case 486:
+		return "Busy Here"
+	case 488:
+		return "Not Acceptable Here"
+	case 500:
+		return "Server Internal Error"
+	case 503:
+		return "Service Unavailable"
+	default:
+		return "Status"
+	}
 }
 
 func splitHeaderLines(head string) []string {
