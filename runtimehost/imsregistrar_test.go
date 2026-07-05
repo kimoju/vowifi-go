@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -261,6 +262,7 @@ func TestWireIMSRegistrarDefaultFlowReusesRegisterSocketForSMS(t *testing.T) {
 		ContactPort:    5060,
 		Timeout:        time.Second,
 		MaxRetransmits: 1,
+		DisableRefresh: true,
 	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
 		DeviceID: "dev-1",
 		TraceID:  "trace-1",
@@ -292,6 +294,102 @@ func TestWireIMSRegistrarDefaultFlowReusesRegisterSocketForSMS(t *testing.T) {
 	if !strings.Contains(requests[0].wire, "REGISTER sip:ims.mnc280.mcc310.3gppnetwork.org SIP/2.0") ||
 		!strings.Contains(requests[1].wire, "MESSAGE sip:+18005551212@ims.mnc280.mcc310.3gppnetwork.org SIP/2.0") {
 		t.Fatalf("unexpected wires: %+v", requests)
+	}
+}
+
+func TestWireIMSRegistrarRefreshesRegistrationAndCloseUsesLatestCSeq(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	type seenRequest struct {
+		addr string
+		wire string
+	}
+	seen := make(chan []seenRequest, 1)
+	refreshed := make(chan struct{}, 1)
+	go func() {
+		var requests []seenRequest
+		buf := make([]byte, 65535)
+		for i := 0; i < 6; i++ {
+			_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				seen <- append(requests, seenRequest{wire: "read error: " + err.Error()})
+				return
+			}
+			wire := string(append([]byte(nil), buf[:n]...))
+			requests = append(requests, seenRequest{addr: addr.String(), wire: wire})
+			resp := "SIP/2.0 200 OK\r\n" +
+				"P-Associated-URI: <sip:user@ims.example>\r\n" +
+				"Contact: <sip:user@192.0.2.10:5060>;expires=60\r\n" +
+				"Content-Length: 0\r\n\r\n"
+			_, _ = pc.WriteTo([]byte(resp), addr)
+			if i == 1 {
+				refreshed <- struct{}{}
+			}
+			if strings.Contains(wire, "Expires: 0\r\n") {
+				seen <- requests
+				return
+			}
+		}
+		seen <- requests
+	}()
+
+	res, err := WireIMSRegistrar{
+		ServerAddr:            pc.LocalAddr().String(),
+		ContactHost:           "192.0.2.10",
+		ContactPort:           5060,
+		Expires:               60,
+		RefreshInterval:       100 * time.Millisecond,
+		RefreshRetryInterval:  100 * time.Millisecond,
+		Timeout:               time.Second,
+		MaxRetransmits:        1,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-1",
+		TraceID:  "trace-refresh",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if res.Close == nil {
+		t.Fatal("Close=nil, want default flow cleanup")
+	}
+	select {
+	case <-refreshed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for refresh REGISTER")
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := res.Close(closeCtx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	requests := <-seen
+	if len(requests) < 3 {
+		t.Fatalf("requests=%d %+v", len(requests), requests)
+	}
+	for i := range requests {
+		if requests[i].addr == "" || requests[i].addr != requests[0].addr {
+			t.Fatalf("REGISTER lifecycle used different flows: %+v", requests)
+		}
+		wantCSeq := "CSeq: " + strconv.Itoa(i+1) + " REGISTER\r\n"
+		if !strings.Contains(requests[i].wire, wantCSeq) {
+			t.Fatalf("request %d missing %q: %q", i, wantCSeq, requests[i].wire)
+		}
+	}
+	if !strings.Contains(requests[0].wire, "Expires: 60\r\n") ||
+		!strings.Contains(requests[1].wire, "Expires: 60\r\n") {
+		t.Fatalf("register/refresh wires=%q\n%q", requests[0].wire, requests[1].wire)
+	}
+	last := requests[len(requests)-1]
+	if !strings.Contains(last.wire, "Expires: 0\r\n") || !strings.Contains(last.wire, "expires=0") {
+		t.Fatalf("deregister wire=%q", last.wire)
 	}
 }
 

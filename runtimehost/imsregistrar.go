@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/identity"
@@ -37,6 +38,10 @@ type WireIMSRegistrar struct {
 	Resolver              voiceclient.SIPServerResolver
 	Timeout               time.Duration
 	Expires               int
+	DisableRefresh        bool
+	RefreshInterval       time.Duration
+	RefreshLead           time.Duration
+	RefreshRetryInterval  time.Duration
 	UserAgent             string
 	CallID                string
 	CNonce                string
@@ -98,6 +103,11 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 	voiceTransport := r.voiceTransport(cfg, profile, result.Binding, defaultFlow)
 	smsTransport := r.smsTransport(cfg, profile, result.Binding, voiceTransport)
 	ussdTransport := r.ussdTransport(cfg, profile, result.Binding, voiceTransport)
+	maintenance := newIMSRegistrationMaintenance(defaultFlow, registerSession, result, r)
+	var closeRegistration func(context.Context) error
+	if maintenance != nil {
+		closeRegistration = maintenance.Close
+	}
 	return IMSRegistrationResult{
 		Registered:     result.Registered,
 		StatusCode:     result.StatusCode,
@@ -108,7 +118,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		VoiceTransport: voiceTransport,
 		SMSTransport:   smsTransport,
 		USSDTransport:  ussdTransport,
-		Close:          closeDefaultSIPFlow(defaultFlow, registerSession, result),
+		Close:          closeRegistration,
 	}, nil
 }
 
@@ -160,22 +170,192 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 	}
 }
 
-func closeDefaultSIPFlow(flow *voiceclient.WireSIPFlow, session voiceclient.RegisterSession, result voiceclient.RegisterResult) func(context.Context) error {
+type imsRegistrationMaintenance struct {
+	flow    *voiceclient.WireSIPFlow
+	session voiceclient.RegisterSession
+	config  WireIMSRegistrar
+
+	mu             sync.Mutex
+	registered     bool
+	binding        voiceclient.RegistrationBinding
+	nextCSeq       int
+	authHeader     string
+	authHeaderName string
+	cancel         context.CancelFunc
+	done           chan struct{}
+	closed         bool
+}
+
+func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voiceclient.RegisterSession, result voiceclient.RegisterResult, config WireIMSRegistrar) *imsRegistrationMaintenance {
 	if flow == nil {
 		return nil
 	}
-	return func(ctx context.Context) error {
-		var err error
-		if result.Registered {
-			_, err = session.Deregister(ctx, voiceclient.DeregisterRequest{
-				Binding:        result.Binding,
-				CSeq:           result.NextCSeq,
-				AuthHeader:     result.AuthHeader,
-				AuthHeaderName: result.AuthHeaderName,
-			})
-		}
-		return errors.Join(err, flow.Close())
+	nextCSeq := result.NextCSeq
+	if nextCSeq <= 0 {
+		nextCSeq = 1
 	}
+	m := &imsRegistrationMaintenance{
+		flow:           flow,
+		session:        session,
+		config:         config,
+		registered:     result.Registered,
+		binding:        result.Binding,
+		nextCSeq:       nextCSeq,
+		authHeader:     result.AuthHeader,
+		authHeaderName: result.AuthHeaderName,
+	}
+	if result.Registered && !config.DisableRefresh {
+		ctx, cancel := context.WithCancel(context.Background())
+		m.cancel = cancel
+		m.done = make(chan struct{})
+		go m.refreshLoop(ctx)
+	}
+	return m
+}
+
+func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.closed = true
+	cancel := m.cancel
+	done := m.done
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	m.mu.Lock()
+	registered := m.registered
+	req := voiceclient.DeregisterRequest{
+		Binding:        m.binding,
+		CSeq:           m.nextCSeq,
+		AuthHeader:     m.authHeader,
+		AuthHeaderName: m.authHeaderName,
+	}
+	m.registered = false
+	m.mu.Unlock()
+
+	var deregisterErr error
+	if registered {
+		_, deregisterErr = m.session.Deregister(ctx, req)
+	}
+	return errors.Join(deregisterErr, m.flow.Close())
+}
+
+func (m *imsRegistrationMaintenance) refreshLoop(ctx context.Context) {
+	defer close(m.done)
+	for {
+		if !m.wait(ctx, m.refreshDelay()) {
+			return
+		}
+		for {
+			if err := m.refresh(ctx); err != nil {
+				if !m.wait(ctx, m.refreshRetryInterval()) {
+					return
+				}
+				continue
+			}
+			break
+		}
+	}
+}
+
+func (m *imsRegistrationMaintenance) wait(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
+	m.mu.Lock()
+	if !m.registered {
+		m.mu.Unlock()
+		return nil
+	}
+	req := voiceclient.RefreshRequest{
+		Binding:        m.binding,
+		CSeq:           m.nextCSeq,
+		AuthHeader:     m.authHeader,
+		AuthHeaderName: m.authHeaderName,
+	}
+	m.mu.Unlock()
+
+	result, err := m.session.Refresh(ctx, req)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if result.Refreshed {
+		m.registered = true
+		m.binding = result.Binding
+		m.nextCSeq = result.NextCSeq
+		m.authHeader = result.AuthHeader
+		m.authHeaderName = result.AuthHeaderName
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *imsRegistrationMaintenance) refreshDelay() time.Duration {
+	if m.config.RefreshInterval > 0 {
+		return m.config.RefreshInterval
+	}
+	m.mu.Lock()
+	expires := m.binding.Expires
+	m.mu.Unlock()
+	if expires <= 0 {
+		expires = m.session.Expires
+	}
+	if expires <= 0 {
+		expires = 3600
+	}
+	ttl := time.Duration(expires) * time.Second
+	lead := m.config.RefreshLead
+	if lead <= 0 {
+		lead = ttl / 10
+		if lead < 5*time.Second {
+			lead = 5 * time.Second
+		}
+		if lead > time.Minute {
+			lead = time.Minute
+		}
+	}
+	delay := ttl - lead
+	if delay <= 0 {
+		delay = ttl / 2
+	}
+	if delay <= 0 {
+		delay = 30 * time.Second
+	}
+	return delay
+}
+
+func (m *imsRegistrationMaintenance) refreshRetryInterval() time.Duration {
+	if m.config.RefreshRetryInterval > 0 {
+		return m.config.RefreshRetryInterval
+	}
+	return 30 * time.Second
 }
 
 func (r WireIMSRegistrar) smsTransport(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, binding voiceclient.RegistrationBinding, voiceTransport voiceclient.SIPRequestTransport) messaging.SMSTransport {

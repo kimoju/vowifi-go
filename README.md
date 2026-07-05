@@ -44,6 +44,9 @@ protocol layers needed by VoHive:
 - IMS REGISTER session flow with 401/407 authentication retry, associated URI,
   Service-Route, Path, Security-Server, and Contact expiry capture, plus a
   runtime `IMSRegistrar` adapter for the wire transport
+- IMS REGISTER refresh maintenance on the reusable SIP flow, including
+  expiry-based renewal, retry scheduling, binding/auth/CSeq state updates, and
+  shutdown de-registration with the latest registration state
 - IMS de-registration flow for shutdown cleanup, sending `REGISTER` with
   `Expires: 0`, Contact `expires=0`, Security-Verify, and Digest/AKA retry on
   401/407 challenges

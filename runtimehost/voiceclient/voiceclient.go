@@ -117,6 +117,26 @@ type DeregisterResult struct {
 	Attempts     int
 }
 
+type RefreshRequest struct {
+	Binding        RegistrationBinding
+	CallID         string
+	CSeq           int
+	Expires        int
+	AuthHeader     string
+	AuthHeaderName string
+}
+
+type RefreshResult struct {
+	Refreshed      bool
+	StatusCode     int
+	Reason         string
+	Attempts       int
+	Binding        RegistrationBinding
+	AuthHeader     string
+	AuthHeaderName string
+	NextCSeq       int
+}
+
 func ParseWWWAuthenticate(header string) (DigestChallenge, error) {
 	header = strings.TrimSpace(header)
 	if header == "" {
@@ -544,11 +564,168 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 	return result, nil
 }
 
+func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (RefreshResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.Transport == nil {
+		return RefreshResult{}, errors.New("nil SIP register transport")
+	}
+	registrarURI := strings.TrimSpace(s.RegistrarURI)
+	contactURI := firstNonEmpty(req.Binding.ContactURI, s.ContactURI)
+	if registrarURI == "" || contactURI == "" {
+		return RefreshResult{}, errors.New("registrar URI and contact URI are required")
+	}
+	callID := firstNonEmpty(req.CallID, s.CallID, "vowifi-go-register")
+	cseq := req.CSeq
+	if cseq <= 0 {
+		cseq = 1
+	}
+	expires := req.Expires
+	if expires <= 0 {
+		expires = req.Binding.Expires
+	}
+	if expires <= 0 {
+		expires = s.Expires
+	}
+	if expires <= 0 {
+		expires = 3600
+	}
+	attempts := 0
+	sendRefresh := func(cseq int, authHeaderName, authz string, challengeHeaders map[string][]string) (RegisterResponse, error) {
+		msg := RegisterMessage{
+			URI:     registrarURI,
+			Headers: BuildRegisterHeaders(s.Profile, contactURI, callID, strconv.Itoa(cseq)),
+		}
+		msg.Headers["Expires"] = strconv.Itoa(expires)
+		if securityClient := strings.TrimSpace(req.Binding.SecurityClient); securityClient != "" {
+			msg.Headers["Security-Client"] = securityClient
+		}
+		if strings.TrimSpace(authHeaderName) != "" && strings.TrimSpace(authz) != "" {
+			msg.Headers[authHeaderName] = authz
+		}
+		if securityVerify := securityVerifyFromChallenge(challengeHeaders); securityVerify != "" {
+			msg.Headers["Security-Verify"] = securityVerify
+		} else if len(req.Binding.SecurityVerify) > 0 {
+			msg.Headers["Security-Verify"] = strings.Join(trimHeaderValues(req.Binding.SecurityVerify), ", ")
+		}
+		attempts++
+		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
+	}
+	authHeaderName := firstNonEmpty(req.AuthHeaderName, "Authorization")
+	resp, err := sendRefresh(cseq, authHeaderName, req.AuthHeader, nil)
+	if err != nil {
+		return RefreshResult{Attempts: attempts}, err
+	}
+	if isSIPSuccess(resp.StatusCode) {
+		binding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp, expires, securityClientFromBinding(req.Binding), nil))
+		return RefreshResult{
+			Refreshed:      true,
+			StatusCode:     resp.StatusCode,
+			Reason:         resp.Reason,
+			Attempts:       attempts,
+			Binding:        binding,
+			AuthHeader:     req.AuthHeader,
+			AuthHeaderName: authHeaderName,
+			NextCSeq:       cseq + 1,
+		}, nil
+	}
+	if resp.StatusCode != 401 && resp.StatusCode != 407 {
+		result := RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}
+		return result, fmt.Errorf("%w: refresh %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
+	}
+	challengeHeader := "WWW-Authenticate"
+	authHeaderName = "Authorization"
+	if firstHeader(resp.Headers, challengeHeader) == "" {
+		challengeHeader = "Proxy-Authenticate"
+		authHeaderName = "Proxy-Authorization"
+	}
+	ch, err := SelectDigestChallenge(resp.Headers, challengeHeader)
+	if err != nil {
+		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
+	}
+	authInput, syncFailure, err := s.digestAuthInputForChallenge(ch, registrarURI)
+	if err != nil {
+		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
+	}
+	if syncFailure {
+		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, sim.ErrSyncFailure
+	}
+	authz, err := BuildDigestAuthorization(ch, authInput)
+	if err != nil {
+		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
+	}
+	cseq++
+	resp2, err := sendRefresh(cseq, authHeaderName, authz, resp.Headers)
+	if err != nil {
+		return RefreshResult{Attempts: attempts}, err
+	}
+	resultBinding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClientFromBinding(req.Binding), resp.Headers))
+	result := RefreshResult{
+		Refreshed:      isSIPSuccess(resp2.StatusCode),
+		StatusCode:     resp2.StatusCode,
+		Reason:         resp2.Reason,
+		Attempts:       attempts,
+		Binding:        resultBinding,
+		AuthHeader:     authz,
+		AuthHeaderName: authHeaderName,
+		NextCSeq:       cseq + 1,
+	}
+	if !result.Refreshed {
+		return result, fmt.Errorf("%w: refresh %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
+	}
+	return result, nil
+}
+
 func (s RegisterSession) securityClientAgreement() SecurityAgreement {
 	if isZeroSecurityAgreement(s.SecurityClient) {
 		return DefaultSecurityClientAgreement(s.SecurityRandom)
 	}
 	return completeSecurityAgreement(s.SecurityClient)
+}
+
+func securityClientFromBinding(binding RegistrationBinding) SecurityAgreement {
+	if agreement, ok := parseSecurityAgreement(binding.SecurityClient); ok {
+		return agreement
+	}
+	return SecurityAgreement{}
+}
+
+func mergeRefreshBinding(previous, next RegistrationBinding) RegistrationBinding {
+	if strings.TrimSpace(next.ContactURI) == "" {
+		next.ContactURI = previous.ContactURI
+	}
+	if strings.TrimSpace(next.PublicIdentity) == "" {
+		next.PublicIdentity = previous.PublicIdentity
+	}
+	if len(next.AssociatedURIs) == 0 {
+		next.AssociatedURIs = append([]string(nil), previous.AssociatedURIs...)
+	}
+	if len(next.ServiceRoutes) == 0 {
+		next.ServiceRoutes = append([]string(nil), previous.ServiceRoutes...)
+	}
+	if len(next.Paths) == 0 {
+		next.Paths = append([]string(nil), previous.Paths...)
+	}
+	if strings.TrimSpace(next.SecurityClient) == "" {
+		next.SecurityClient = previous.SecurityClient
+	}
+	if len(next.SecurityServer) == 0 {
+		next.SecurityServer = append([]string(nil), previous.SecurityServer...)
+	}
+	if len(next.SecurityVerify) == 0 {
+		next.SecurityVerify = append([]string(nil), previous.SecurityVerify...)
+	}
+	if isZeroSecurityAgreement(next.SecurityAgreement) {
+		next.SecurityAgreement = previous.SecurityAgreement
+	}
+	if next.Expires <= 0 {
+		next.Expires = previous.Expires
+	}
+	if strings.TrimSpace(next.RegistrarContact) == "" {
+		next.RegistrarContact = previous.RegistrarContact
+	}
+	return next
 }
 
 func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registrarURI string) (DigestAuthInput, bool, error) {
