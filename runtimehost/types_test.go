@@ -85,6 +85,7 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 		},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"info-ok"}}},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"update-ok"}}, Body: runtimeSDP("198.51.100.23", 49172)},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"To": {"<sip:+18005551212@ims.example>;tag=remote"}, "X-IMS": {"reinvite-ok"}}, Body: runtimeSDP("198.51.100.24", 49174)},
 		{StatusCode: 200, Reason: "OK"},
 	}}
 	gw := voicehost.NewGateway()
@@ -183,10 +184,28 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if len(transport.requests) != 3 || transport.requests[2].Method != "UPDATE" || transport.requests[2].Headers["CSeq"] != "3 UPDATE" {
 		t.Fatalf("UPDATE requests=%+v", transport.requests)
 	}
+	reinviter, ok := gw.GetAgent("dev-voice").(voicehost.DialogReinviter)
+	if !ok {
+		t.Fatalf("gateway agent=%T, want dialog reinviter", gw.GetAgent("dev-voice"))
+	}
+	reinviteResult, err := reinviter.SendDialogReinvite(context.Background(), voicehost.DialogReinviteRequest{
+		CallID:      "call-runtime-voice",
+		ContentType: "application/sdp",
+		Body:        runtimeSDP("192.0.2.46", 4004),
+	})
+	if err != nil || !reinviteResult.Accepted || reinviteResult.Headers["X-IMS"] != "reinvite-ok" {
+		t.Fatalf("SendDialogReinvite() result=%+v err=%v", reinviteResult, err)
+	}
+	if len(transport.requests) != 4 || transport.requests[3].Method != "INVITE" || transport.requests[3].Headers["CSeq"] != "4 INVITE" {
+		t.Fatalf("re-INVITE requests=%+v", transport.requests)
+	}
+	if len(transport.writes) != 2 || transport.writes[1].Method != "ACK" || transport.writes[1].Headers["CSeq"] != "4 ACK" {
+		t.Fatalf("writes after re-INVITE=%+v", transport.writes)
+	}
 	if err := terminator.EndVoiceCall(context.Background(), voicehost.DialogInfo{CallID: "call-runtime-voice"}); err != nil {
 		t.Fatalf("EndVoiceCall() error = %v", err)
 	}
-	if len(transport.requests) != 4 || transport.requests[3].Method != "BYE" || transport.requests[3].Headers["CSeq"] != "4 BYE" {
+	if len(transport.requests) != 5 || transport.requests[4].Method != "BYE" || transport.requests[4].Headers["CSeq"] != "5 BYE" {
 		t.Fatalf("requests after BYE=%+v", transport.requests)
 	}
 }

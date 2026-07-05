@@ -514,6 +514,14 @@ func (i *Instance) SendDialogUpdate(ctx context.Context, req voicehost.DialogUpd
 	return agent.SendDialogUpdate(ctx, req)
 }
 
+func (i *Instance) SendDialogReinvite(ctx context.Context, req voicehost.DialogReinviteRequest) (voicehost.DialogReinviteResult, error) {
+	agent := i.dialogReinviter()
+	if agent == nil {
+		return voicehost.DialogReinviteResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
+	}
+	return agent.SendDialogReinvite(ctx, req)
+}
+
 func (i *Instance) outboundVoiceAgent() voicehost.OutboundCallAgent {
 	if i == nil {
 		return nil
@@ -576,6 +584,20 @@ func (i *Instance) dialogUpdater() voicehost.DialogUpdater {
 	}
 	i.mu.RLock()
 	agent, _ := i.voice.(voicehost.DialogUpdater)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogReinviter() voicehost.DialogReinviter {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogReinviter)
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {

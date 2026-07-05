@@ -10,17 +10,20 @@ import (
 )
 
 type fakeOutboundAgent struct {
-	requests     []OutboundCallRequest
-	infos        []DialogInfoRequest
-	updates      []DialogUpdateRequest
-	terminated   []DialogInfo
-	canceled     []DialogInfo
-	result       OutboundCallResult
-	infoResult   DialogInfoResult
-	updateResult DialogUpdateResult
-	err          error
-	infoErr      error
-	updateErr    error
+	requests       []OutboundCallRequest
+	infos          []DialogInfoRequest
+	updates        []DialogUpdateRequest
+	reinvites      []DialogReinviteRequest
+	terminated     []DialogInfo
+	canceled       []DialogInfo
+	result         OutboundCallResult
+	infoResult     DialogInfoResult
+	updateResult   DialogUpdateResult
+	reinviteResult DialogReinviteResult
+	err            error
+	infoErr        error
+	updateErr      error
+	reinviteErr    error
 }
 
 func (a *fakeOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCallRequest) (OutboundCallResult, error) {
@@ -58,6 +61,14 @@ func (a *fakeOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpda
 		return DialogUpdateResult{}, a.updateErr
 	}
 	return a.updateResult, nil
+}
+
+func (a *fakeOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogReinviteRequest) (DialogReinviteResult, error) {
+	a.reinvites = append(a.reinvites, req)
+	if a.reinviteErr != nil {
+		return DialogReinviteResult{}, a.reinviteErr
+	}
+	return a.reinviteResult, nil
 }
 
 type fakeServerTransaction struct {
@@ -145,6 +156,49 @@ func TestGatewayHandleClientInvitePropagatesOutboundRejectStatus(t *testing.T) {
 	}
 	if status := g.DeviceStatus("dev-1"); status["active_dialogs"] != 0 {
 		t.Fatalf("DeviceStatus=%+v, want no active dialog", status)
+	}
+}
+
+func TestGatewayHandleClientInviteRoutesEstablishedDialogReinvite(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{
+		result: OutboundCallResult{
+			Accepted: true,
+			LocalSDP: SDPInfo{ConnectionIP: "192.0.2.20", MediaPort: 5004, Payloads: []int{0, 101}},
+		},
+		reinviteResult: DialogReinviteResult{
+			Accepted:    true,
+			StatusCode:  200,
+			Reason:      "OK",
+			ContentType: "application/sdp",
+			Body:        []byte(sampleSDP("203.0.113.40", 49180)),
+			Headers:     map[string]string{"X-IMS": "reinvite-ok"},
+		},
+	}
+	g.RegisterAgent("dev-1", agent)
+	g.HandleClientInvite("dev-1", newInviteRequest("call-reinvite", "18005551212", sampleSDP("198.51.100.10", 4002)), &fakeServerTransaction{})
+
+	tx := &fakeServerTransaction{}
+	req := newInviteRequest("call-reinvite", "18005551212", sampleSDP("198.51.100.20", 4010))
+	req.AppendHeader(sip.NewHeader("Session-Expires", "1800"))
+	g.HandleClientInvite("dev-1", req, tx)
+
+	if len(agent.requests) != 1 {
+		t.Fatalf("StartOutboundCall requests=%d, want only initial INVITE", len(agent.requests))
+	}
+	if len(agent.reinvites) != 1 {
+		t.Fatalf("reinvites=%d", len(agent.reinvites))
+	}
+	got := agent.reinvites[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-reinvite" || got.ContentType != "application/sdp" ||
+		got.Headers["Session-Expires"] != "1800" || !strings.Contains(string(got.Body), "m=audio 4010") {
+		t.Fatalf("DialogReinviteRequest=%+v body=%q", got, got.Body)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "application/sdp" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "reinvite-ok" ||
+		!strings.Contains(string(tx.responses[0].Body()), "m=audio 49180") {
+		t.Fatalf("responses=%+v", tx.responses)
 	}
 }
 

@@ -362,6 +362,130 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 	}, nil
 }
 
+func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogReinviteRequest) (DialogReinviteResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.Transport == nil {
+		return DialogReinviteResult{Accepted: false, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return DialogReinviteResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	body := append([]byte(nil), req.Body...)
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		a.mu.Unlock()
+		return DialogReinviteResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.cfg
+	nextCSeq := outboundNextCSeq(cfg.CSeq)
+	if len(body) > 0 && state.relay != nil {
+		clientSDP, err := ParseSDP(body)
+		if err != nil {
+			a.mu.Unlock()
+			return DialogReinviteResult{Accepted: false, StatusCode: 488, Reason: "invalid client re-INVITE SDP"}, err
+		}
+		if err := state.relay.SetClientRemote(clientSDP); err != nil {
+			a.mu.Unlock()
+			return DialogReinviteResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client re-INVITE failed"}, err
+		}
+		body = RewriteSDPMediaEndpoint(body, state.relay.IMSEndpoint())
+	}
+	invite, err := voiceclient.BuildInviteRequest(cfg, body)
+	if err != nil {
+		a.mu.Unlock()
+		return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "build IMS re-INVITE failed"}, err
+	}
+	if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
+		invite.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
+	}
+	applyDialogUpdateHeaders(invite.Headers, req.Headers)
+	state.cfg.CSeq = nextCSeq
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+	resp, err := a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
+		prack, ok, err := buildReliableProvisionalPRACK(cfg, provisional, nextCSeq)
+		if err != nil || !ok {
+			return err
+		}
+		prackResp, err := a.Transport.RoundTripRequest(ctx, prack)
+		if err != nil {
+			return fmt.Errorf("IMS re-INVITE PRACK failed: %w", err)
+		}
+		if prackResp.StatusCode < 200 || prackResp.StatusCode >= 300 {
+			return fmt.Errorf("IMS re-INVITE PRACK rejected: %d %s", prackResp.StatusCode, strings.TrimSpace(prackResp.Reason))
+		}
+		nextCSeq++
+		a.mu.Lock()
+		if latest, ok := a.dialogs[callID]; ok {
+			latest.cfg.CSeq = nextCSeq
+			a.dialogs[callID] = latest
+		}
+		a.mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE failed"}, err
+	}
+	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if !accepted {
+		if resp.StatusCode >= 300 {
+			if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
+				return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "IMS re-INVITE rejected ACK failed"}, err
+			}
+		}
+		return DialogReinviteResult{
+			Accepted:   false,
+			StatusCode: outboundStatusCode(resp.StatusCode, 488),
+			Reason:     firstVoiceNonEmpty(resp.Reason, "re-INVITE rejected"),
+			Headers:    firstValueSIPHeaders(resp.Headers),
+		}, nil
+	}
+	ackCfg := cfg
+	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+		ackCfg.RemoteTargetURI = contact
+	}
+	ack, err := voiceclient.BuildAckRequest(ackCfg)
+	if err != nil {
+		return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "build IMS re-INVITE ACK failed"}, err
+	}
+	if err := a.Transport.WriteRequest(ctx, ack); err != nil {
+		return DialogReinviteResult{Accepted: false, StatusCode: 503, Reason: "IMS re-INVITE ACK failed"}, err
+	}
+	resultBody := append([]byte(nil), resp.Body...)
+	if len(resultBody) > 0 && state.relay != nil {
+		imsSDP, err := ParseSDP(resultBody)
+		if err != nil {
+			return DialogReinviteResult{Accepted: false, StatusCode: 488, Reason: "invalid IMS re-INVITE SDP answer"}, err
+		}
+		if err := state.relay.SetIMSRemote(imsSDP); err != nil {
+			return DialogReinviteResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS re-INVITE failed"}, err
+		}
+		resultBody = RewriteSDPMediaEndpoint(resultBody, state.relay.ClientEndpoint())
+	}
+	if ackCfg.RemoteTargetURI != cfg.RemoteTargetURI || ackCfg.RemoteTag != cfg.RemoteTag {
+		a.mu.Lock()
+		if latest, ok := a.dialogs[callID]; ok {
+			latest.cfg.RemoteTargetURI = ackCfg.RemoteTargetURI
+			latest.cfg.RemoteTag = ackCfg.RemoteTag
+			a.dialogs[callID] = latest
+		}
+		a.mu.Unlock()
+	}
+	return DialogReinviteResult{
+		Accepted:    true,
+		StatusCode:  outboundStatusCode(resp.StatusCode, 200),
+		Reason:      firstVoiceNonEmpty(resp.Reason, "OK"),
+		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:        resultBody,
+		Headers:     firstValueSIPHeaders(resp.Headers),
+	}, nil
+}
+
 func (a *IMSOutboundAgent) ackRejectedInvite(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
 	ackCfg := cfg
 	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)

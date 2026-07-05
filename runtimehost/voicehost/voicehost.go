@@ -45,6 +45,10 @@ type DialogUpdater interface {
 	SendDialogUpdate(context.Context, DialogUpdateRequest) (DialogUpdateResult, error)
 }
 
+type DialogReinviter interface {
+	SendDialogReinvite(context.Context, DialogReinviteRequest) (DialogReinviteResult, error)
+}
+
 type OutboundCallRequest struct {
 	DeviceID  string
 	CallID    string
@@ -103,6 +107,23 @@ type DialogUpdateRequest struct {
 }
 
 type DialogUpdateResult struct {
+	Accepted    bool
+	StatusCode  int
+	Reason      string
+	ContentType string
+	Body        []byte
+	Headers     map[string]string
+}
+
+type DialogReinviteRequest struct {
+	DeviceID    string
+	CallID      string
+	ContentType string
+	Body        []byte
+	Headers     map[string]string
+}
+
+type DialogReinviteResult struct {
 	Accepted    bool
 	StatusCode  int
 	Reason      string
@@ -244,11 +265,6 @@ func (g *Gateway) HandleClientInvite(deviceID string, req *sip.Request, tx sip.S
 	if tx == nil || req == nil {
 		return
 	}
-	agent, _ := g.GetAgent(deviceID).(OutboundCallAgent)
-	if agent == nil {
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
-		return
-	}
 	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
@@ -257,6 +273,15 @@ func (g *Gateway) HandleClientInvite(deviceID string, req *sip.Request, tx sip.S
 	remoteSDP, err := ParseSDP(req.Body())
 	if err != nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 488, "Invalid SDP", nil))
+		return
+	}
+	if dialog := g.dialog(callID); dialog.State == DialogStateEstablished {
+		g.handleClientReinvite(deviceID, req, tx, callID)
+		return
+	}
+	agent, _ := g.GetAgent(deviceID).(OutboundCallAgent)
+	if agent == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
 	callee := sipCallee(req)
@@ -294,6 +319,49 @@ func (g *Gateway) HandleClientInvite(deviceID string, req *sip.Request, tx sip.S
 	res := sip.NewResponseFromRequest(req, 200, "OK", body)
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, State: DialogStateEstablished})
+	_ = tx.Respond(res)
+}
+
+func (g *Gateway) handleClientReinvite(deviceID string, req *sip.Request, tx sip.ServerTransaction, callID string) {
+	reinviter, _ := g.GetAgent(deviceID).(DialogReinviter)
+	if reinviter == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
+		return
+	}
+	contentType := sipHeaderValue(req, "Content-Type")
+	if strings.TrimSpace(contentType) != "" && !isSIPSDPContentType(contentType) {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 415, "Unsupported Media Type", nil))
+		return
+	}
+	result, err := reinviter.SendDialogReinvite(context.Background(), DialogReinviteRequest{
+		DeviceID:    strings.TrimSpace(deviceID),
+		CallID:      callID,
+		ContentType: contentType,
+		Body:        append([]byte(nil), req.Body()...),
+		Headers:     sipRequestHeaderMap(req),
+	})
+	if err != nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi re-INVITE failed", nil))
+		return
+	}
+	statusCode := localFinalStatusCode(result.StatusCode, 488)
+	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	if result.Accepted {
+		statusCode = localDialogInfoStatusCode(result.StatusCode, true)
+	}
+	body := append([]byte(nil), result.Body...)
+	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
+	if len(body) > 0 {
+		res.AppendHeader(sip.NewHeader("Content-Type", firstVoiceNonEmpty(result.ContentType, "application/sdp")))
+	}
+	for key, value := range result.Headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
 	_ = tx.Respond(res)
 }
 

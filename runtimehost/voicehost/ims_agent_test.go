@@ -273,6 +273,79 @@ func TestIMSOutboundAgentRewritesInDialogUpdateThroughRelay(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentSendsInDialogReinviteAndAdvancesCSeq(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":           {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact":      {"<sip:updated@198.51.100.2:5060>"},
+				"Content-Type": {"application/sdp"},
+				"X-IMS":        {"reinvite-ok"},
+			},
+			Body: []byte(sampleSDP("203.0.113.20", 49180)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-reinvite",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogReinvite(context.Background(), DialogReinviteRequest{
+		CallID:      "call-reinvite",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("192.0.2.60", 4010)),
+		Headers:     map[string]string{"Session-Expires": "1800"},
+	})
+	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "reinvite-ok" || !strings.Contains(string(result.Body), "m=audio 49180") {
+		t.Fatalf("SendDialogReinvite() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	reinvite := transport.requests[1]
+	if reinvite.URI != "sip:carrier@198.51.100.1:5060" || reinvite.Headers["CSeq"] != "2 INVITE" ||
+		reinvite.Headers["Content-Type"] != "application/sdp" || reinvite.Headers["Session-Expires"] != "1800" ||
+		!strings.Contains(string(reinvite.Body), "m=audio 4010 RTP/AVP") {
+		t.Fatalf("re-INVITE=%+v body=%q", reinvite, reinvite.Body)
+	}
+	if len(transport.writes) != 2 || transport.writes[1].Method != "ACK" ||
+		transport.writes[1].URI != "sip:updated@198.51.100.2:5060" ||
+		transport.writes[1].Headers["CSeq"] != "2 ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-reinvite"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
+		transport.requests[2].URI != "sip:updated@198.51.100.2:5060" ||
+		transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after re-INVITE=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{
 		provisionals: []voiceclient.SIPResponse{
