@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
@@ -103,7 +104,11 @@ func TestIMSSMSTransportRejectsFailedMessage(t *testing.T) {
 }
 
 func TestIMSSMSTransportFlagsRecoverableFailures(t *testing.T) {
-	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 503, Reason: "Service Unavailable"}}}
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 503,
+		Reason:     "Service Unavailable",
+		Headers:    map[string][]string{"Retry-After": {"3"}},
+	}}}
 	sms := IMSSMSTransport{
 		Transport:    transport,
 		Profile:      voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
@@ -114,7 +119,7 @@ func TestIMSSMSTransportFlagsRecoverableFailures(t *testing.T) {
 		Peer: "+18005551212",
 		Part: SMSPart{PartNo: 1, Text: "hello"},
 	})
-	if err == nil || result.SIPCode != 503 || !result.RegistrationRecoveryNeeded {
+	if err == nil || result.SIPCode != 503 || !result.RegistrationRecoveryNeeded || result.RetryAfter != 3*time.Second {
 		t.Fatalf("SendSMSPart() result=%+v err=%v, want recoverable 503", result, err)
 	}
 

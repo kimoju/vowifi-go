@@ -39,13 +39,14 @@ type SendOutcome struct {
 }
 
 type USSDResult struct {
-	SessionID                  string `json:"session_id,omitempty"`
-	Text                       string `json:"text,omitempty"`
-	RawText                    string `json:"raw_text,omitempty"`
-	Status                     int    `json:"status,omitempty"`
-	DCS                        int    `json:"dcs,omitempty"`
-	Done                       bool   `json:"done"`
-	RegistrationRecoveryNeeded bool   `json:"registration_recovery_needed,omitempty"`
+	SessionID                  string        `json:"session_id,omitempty"`
+	Text                       string        `json:"text,omitempty"`
+	RawText                    string        `json:"raw_text,omitempty"`
+	Status                     int           `json:"status,omitempty"`
+	DCS                        int           `json:"dcs,omitempty"`
+	Done                       bool          `json:"done"`
+	RegistrationRecoveryNeeded bool          `json:"registration_recovery_needed,omitempty"`
+	RetryAfter                 time.Duration `json:"retry_after,omitempty"`
 }
 
 type IncomingSMS struct {
@@ -89,6 +90,7 @@ type SMSSendResult struct {
 	SIPCode                    int
 	ErrorText                  string
 	RegistrationRecoveryNeeded bool
+	RetryAfter                 time.Duration
 }
 
 type SMSTransport interface {

@@ -348,7 +348,55 @@ func ParseSIPResponse(raw []byte) (RegisterResponse, error) {
 		Reason:     reason,
 		Headers:    headers,
 		Body:       append([]byte(nil), body...),
+		RetryAfter: SIPRetryAfterDelay(headers),
 	}, nil
+}
+
+func SIPResponseRetryAfter(resp RegisterResponse) time.Duration {
+	if resp.RetryAfter > 0 {
+		return resp.RetryAfter
+	}
+	return SIPRetryAfterDelay(resp.Headers)
+}
+
+func SIPRetryAfterDelay(headers map[string][]string) time.Duration {
+	var delay time.Duration
+	for _, value := range rawHeaderValues(headers, "Retry-After") {
+		parsed, ok := parseSIPRetryAfterValue(value)
+		if !ok {
+			continue
+		}
+		if parsed > delay {
+			delay = parsed
+		}
+	}
+	return delay
+}
+
+func parseSIPRetryAfterValue(value string) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	end := 0
+	for end < len(value) {
+		switch value[end] {
+		case ' ', '\t', ';', '(', ',':
+			goto parse
+		default:
+			end++
+		}
+	}
+parse:
+	token := strings.TrimSpace(value[:end])
+	if token == "" {
+		return 0, false
+	}
+	seconds, err := strconv.Atoi(token)
+	if err != nil || seconds < 0 {
+		return 0, false
+	}
+	return time.Duration(seconds) * time.Second, true
 }
 
 func ParseSIPRequest(raw []byte) (SIPIncomingRequest, error) {

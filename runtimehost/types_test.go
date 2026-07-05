@@ -382,6 +382,87 @@ func TestRuntimeIMSRecoveryAfterDialogInfoRecoverableResponse(t *testing.T) {
 	}
 }
 
+func TestRuntimeIMSRecoveryHonorsRetryAfterContext(t *testing.T) {
+	transport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote"},
+				"Contact": {"<sip:remote@pcscf.ims.example>"},
+			},
+			Body: runtimeSDP("198.51.100.22", 49170),
+		},
+		{
+			StatusCode: 503,
+			Reason:     "Service Unavailable",
+			Headers:    map[string][]string{"Retry-After": {"1"}},
+		},
+	}}
+	profile := voiceclient.IMSProfile{
+		IMPI:   "user@ims.example",
+		IMPU:   "sip:user@ims.example",
+		Domain: "ims.example",
+	}
+	binding := voiceclient.RegistrationBinding{
+		ContactURI:     "sip:user@192.0.2.10:5060",
+		PublicIdentity: "sip:user@ims.example",
+		ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+	}
+	recoveries := 0
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
+		Registered:     true,
+		StatusCode:     200,
+		Reason:         "ims registered",
+		Profile:        profile,
+		Binding:        binding,
+		VoiceTransport: transport,
+		Recover: func(ctx context.Context) (IMSRegistrationResult, error) {
+			recoveries++
+			return IMSRegistrationResult{Registered: true, StatusCode: 200, Reason: "ims recovered", Profile: profile, Binding: binding, VoiceTransport: transport}, nil
+		},
+	}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:     "dev-retry-after",
+		TraceID:      "trace-retry-after",
+		IMSRegistrar: registrar,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if _, err := inst.StartOutboundCall(context.Background(), voicehost.OutboundCallRequest{
+		DeviceID: "dev-retry-after",
+		CallID:   "call-retry-after",
+		Callee:   "+18005551212",
+		RemoteSDP: voicehost.SDPInfo{
+			ConnectionIP: "192.0.2.44",
+			MediaPort:    4000,
+			Payloads:     []int{0, 8},
+			Direction:    "sendrecv",
+		},
+		RawSDP: runtimeSDP("192.0.2.44", 4000),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	result, err := inst.SendDialogInfo(ctx, voicehost.DialogInfoRequest{
+		CallID:      "call-retry-after",
+		ContentType: "application/dtmf-relay",
+		InfoPackage: "dtmf",
+		Body:        []byte("Signal=5\r\nDuration=100\r\n"),
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SendDialogInfo() result=%+v err=%v, want context deadline", result, err)
+	}
+	if !result.RegistrationRecoveryNeeded || result.RetryAfter != time.Second {
+		t.Fatalf("SendDialogInfo() result=%+v, want RetryAfter=1s", result)
+	}
+	if recoveries != 0 {
+		t.Fatalf("recoveries=%d, want 0 before Retry-After elapses", recoveries)
+	}
+}
+
 func TestRuntimeIMSRecoveryRetriesSMSPartAfterTransportFailure(t *testing.T) {
 	firstTransport := &runtimeVoiceTransport{errors: []error{errors.New("stale sms pcscf flow")}}
 	recoveredTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}

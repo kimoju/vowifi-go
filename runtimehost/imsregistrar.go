@@ -253,7 +253,7 @@ func (m *imsRegistrationMaintenance) Recover(ctx context.Context) (IMSRegistrati
 	if m == nil {
 		return IMSRegistrationResult{}, errors.New("IMS registration maintenance unavailable")
 	}
-	if err := m.recoverRegistration(ctx, errors.New("requested IMS registration recovery")); err != nil {
+	if err := m.recoverRegistration(ctx, errors.New("requested IMS registration recovery"), 0); err != nil {
 		return IMSRegistrationResult{}, err
 	}
 	return m.result("IMS registration recovered"), nil
@@ -366,7 +366,7 @@ func (m *imsRegistrationMaintenance) keepaliveLoop(ctx context.Context) {
 			if ctx.Err() != nil || errors.Is(err, voiceclient.ErrSIPFlowClosed) {
 				return
 			}
-			_ = m.recoverRegistration(ctx, err)
+			_ = m.recoverRegistration(ctx, err, 0)
 		}
 	}
 }
@@ -400,7 +400,7 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 	result, err := m.session.Refresh(ctx, req)
 	if err != nil {
 		if m.shouldRecoverRegistration(result, err) {
-			return m.recoverRegistration(ctx, err)
+			return m.recoverRegistration(ctx, err, result.RetryAfter)
 		}
 		return err
 	}
@@ -419,7 +419,7 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 	return nil
 }
 
-func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, cause error) error {
+func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, cause error, retryAfter time.Duration) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -429,6 +429,18 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	m.recoverMu.Lock()
 	defer m.recoverMu.Unlock()
 
+	m.mu.Lock()
+	if m.closed || !m.registered {
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+	if retryAfter > 0 && !m.wait(ctx, retryAfter) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return context.Canceled
+	}
 	m.mu.Lock()
 	if m.closed || !m.registered {
 		m.mu.Unlock()

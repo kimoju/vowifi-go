@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
@@ -130,6 +131,39 @@ func TestIMSUSSDTransportCancelSendsBye(t *testing.T) {
 	}
 }
 
+func TestIMSUSSDTransportCancelRecoveryErrorCarriesRetryAfter(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:*100%23@ims.example;user=dialstring>;tag=as-tag"},
+				"Contact": {"<sip:ussd-as@ims.example>"},
+			},
+		},
+		{
+			StatusCode: 503,
+			Reason:     "Service Unavailable",
+			Headers:    map[string][]string{"Retry-After": {"5"}},
+		},
+	}}
+	ussd := &IMSUSSDTransport{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := ussd.ExecuteUSSD(context.Background(), USSDRequest{SessionID: "session-bye-503", Command: "*100#"}); err != nil {
+		t.Fatalf("ExecuteUSSD() error = %v", err)
+	}
+	err := ussd.CancelUSSD(context.Background(), USSDRequest{SessionID: "session-bye-503"})
+	if err == nil || !IsIMSRegistrationRecoveryError(err) || IMSRegistrationRecoveryRetryAfter(err) != 5*time.Second {
+		t.Fatalf("CancelUSSD() err=%v retryAfter=%v, want recovery 5s", err, IMSRegistrationRecoveryRetryAfter(err))
+	}
+}
+
 func TestIMSUSSDTransportACKsRejectedInvite(t *testing.T) {
 	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{
 		StatusCode: 486,
@@ -179,7 +213,8 @@ func TestIMSUSSDTransportFlagsRecoverableFailures(t *testing.T) {
 		StatusCode: 503,
 		Reason:     "Service Unavailable",
 		Headers: map[string][]string{
-			"To": {"<sip:*100%23@ims.example;user=dialstring>;tag=unavailable"},
+			"To":          {"<sip:*100%23@ims.example;user=dialstring>;tag=unavailable"},
+			"Retry-After": {"4"},
 		},
 	}}}
 	ussd := &IMSUSSDTransport{
@@ -192,7 +227,7 @@ func TestIMSUSSDTransportFlagsRecoverableFailures(t *testing.T) {
 	}
 
 	result, err := ussd.ExecuteUSSD(context.Background(), USSDRequest{SessionID: "session-503", Command: "*100#"})
-	if err == nil || result.Status != 503 || !result.Done || !result.RegistrationRecoveryNeeded {
+	if err == nil || result.Status != 503 || !result.Done || !result.RegistrationRecoveryNeeded || result.RetryAfter != 4*time.Second {
 		t.Fatalf("ExecuteUSSD() result=%+v err=%v, want recoverable 503", result, err)
 	}
 

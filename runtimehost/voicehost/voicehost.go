@@ -62,6 +62,7 @@ type OutboundCallResult struct {
 	StatusCode                 int
 	Reason                     string
 	RegistrationRecoveryNeeded bool
+	RetryAfter                 time.Duration
 	LocalSDP                   SDPInfo
 	RawSDP                     []byte
 }
@@ -95,6 +96,7 @@ type DialogInfoResult struct {
 	StatusCode                 int
 	Reason                     string
 	RegistrationRecoveryNeeded bool
+	RetryAfter                 time.Duration
 	ContentType                string
 	Body                       []byte
 	Headers                    map[string]string
@@ -113,6 +115,7 @@ type DialogUpdateResult struct {
 	StatusCode                 int
 	Reason                     string
 	RegistrationRecoveryNeeded bool
+	RetryAfter                 time.Duration
 	ContentType                string
 	Body                       []byte
 	Headers                    map[string]string
@@ -131,6 +134,7 @@ type DialogReinviteResult struct {
 	StatusCode                 int
 	Reason                     string
 	RegistrationRecoveryNeeded bool
+	RetryAfter                 time.Duration
 	ContentType                string
 	Body                       []byte
 	Headers                    map[string]string

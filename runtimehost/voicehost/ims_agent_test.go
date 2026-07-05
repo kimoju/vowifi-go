@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
@@ -157,7 +158,11 @@ func TestIMSOutboundAgentDialogInfo481RequestsRegistrationRecovery(t *testing.T)
 			},
 			Body: []byte(sampleSDP("203.0.113.10", 49170)),
 		},
-		{StatusCode: 481, Reason: "Call/Transaction Does Not Exist"},
+		{
+			StatusCode: 481,
+			Reason:     "Call/Transaction Does Not Exist",
+			Headers:    map[string][]string{"Retry-After": {"6"}},
+		},
 	}}
 	agent := &IMSOutboundAgent{
 		Transport: transport,
@@ -183,7 +188,7 @@ func TestIMSOutboundAgentDialogInfo481RequestsRegistrationRecovery(t *testing.T)
 	if err != nil {
 		t.Fatalf("SendDialogInfo() error = %v", err)
 	}
-	if result.Accepted || result.StatusCode != 481 || !result.RegistrationRecoveryNeeded {
+	if result.Accepted || result.StatusCode != 481 || !result.RegistrationRecoveryNeeded || result.RetryAfter != 6*time.Second {
 		t.Fatalf("SendDialogInfo() result=%+v", result)
 	}
 }
@@ -268,7 +273,11 @@ func TestIMSOutboundAgentDialogUpdate503RequestsRegistrationRecovery(t *testing.
 			},
 			Body: []byte(sampleSDP("203.0.113.10", 49170)),
 		},
-		{StatusCode: 503, Reason: "Service Unavailable"},
+		{
+			StatusCode: 503,
+			Reason:     "Service Unavailable",
+			Headers:    map[string][]string{"Retry-After": {"8"}},
+		},
 	}}
 	agent := &IMSOutboundAgent{
 		Transport: transport,
@@ -291,7 +300,7 @@ func TestIMSOutboundAgentDialogUpdate503RequestsRegistrationRecovery(t *testing.
 	if err != nil {
 		t.Fatalf("SendDialogUpdate() error = %v", err)
 	}
-	if result.Accepted || result.StatusCode != 503 || !result.RegistrationRecoveryNeeded {
+	if result.Accepted || result.StatusCode != 503 || !result.RegistrationRecoveryNeeded || result.RetryAfter != 8*time.Second {
 		t.Fatalf("SendDialogUpdate() result=%+v", result)
 	}
 }
@@ -530,7 +539,10 @@ func TestIMSOutboundAgentDialogReinvite481RequestsRegistrationRecovery(t *testin
 		{
 			StatusCode: 481,
 			Reason:     "Call/Transaction Does Not Exist",
-			Headers:    map[string][]string{"To": {"<sip:+18005551212@ims.example>;tag=gone-tag"}},
+			Headers: map[string][]string{
+				"To":          {"<sip:+18005551212@ims.example>;tag=gone-tag"},
+				"Retry-After": {"9"},
+			},
 		},
 	}}
 	agent := &IMSOutboundAgent{
@@ -556,7 +568,7 @@ func TestIMSOutboundAgentDialogReinvite481RequestsRegistrationRecovery(t *testin
 	if err != nil {
 		t.Fatalf("SendDialogReinvite() error = %v", err)
 	}
-	if result.Accepted || result.StatusCode != 481 || !result.RegistrationRecoveryNeeded {
+	if result.Accepted || result.StatusCode != 481 || !result.RegistrationRecoveryNeeded || result.RetryAfter != 9*time.Second {
 		t.Fatalf("SendDialogReinvite() result=%+v", result)
 	}
 	if len(transport.writes) != 2 || transport.writes[1].Method != "ACK" ||
@@ -840,7 +852,10 @@ func TestIMSOutboundAgentInvite503RequestsRegistrationRecovery(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{
 		StatusCode: 503,
 		Reason:     "Service Unavailable",
-		Headers:    map[string][]string{"To": {"<sip:+18005551212@ims.example>;tag=unavailable-tag"}},
+		Headers: map[string][]string{
+			"To":          {"<sip:+18005551212@ims.example>;tag=unavailable-tag"},
+			"Retry-After": {"7"},
+		},
 	}}}
 	agent := &IMSOutboundAgent{
 		Transport: transport,
@@ -858,7 +873,7 @@ func TestIMSOutboundAgentInvite503RequestsRegistrationRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartOutboundCall() error = %v", err)
 	}
-	if result.Accepted || result.StatusCode != 503 || !result.RegistrationRecoveryNeeded {
+	if result.Accepted || result.StatusCode != 503 || !result.RegistrationRecoveryNeeded || result.RetryAfter != 7*time.Second {
 		t.Fatalf("StartOutboundCall() result=%+v", result)
 	}
 	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" {

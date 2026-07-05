@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
@@ -66,7 +67,7 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 	prepareUSSDInvite(&invite, boundary)
 	resp, err := t.Transport.RoundTripRequest(ctx, invite)
 	if err != nil {
-		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true}, err
+		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
 	}
 	cfg.RemoteTag = sipHeaderTagValue(firstHeaderValue(resp.Headers, "To"))
 	if contact := sipHeaderURIValue(firstHeaderValue(resp.Headers, "Contact")); contact != "" {
@@ -77,7 +78,7 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 	}
 	if resp.StatusCode >= 200 {
 		if err := t.writeUSSDACK(ctx, cfg); err != nil {
-			return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true, RegistrationRecoveryNeeded: true}, err
+			return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
 		}
 	}
 	result, err := ussdResultFromSIPResponse(sessionID, resp, false)
@@ -134,7 +135,7 @@ func (t *IMSUSSDTransport) ContinueUSSD(ctx context.Context, req USSDRequest) (U
 	prepareUSSDInfo(&info)
 	resp, err := t.Transport.RoundTripRequest(ctx, info)
 	if err != nil {
-		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true}, err
+		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
 	}
 	result, parseErr := ussdResultFromSIPResponse(sessionID, resp, false)
 	result.RegistrationRecoveryNeeded = IMSRegistrationRecoveryNeededStatus(resp.StatusCode)
@@ -180,12 +181,12 @@ func (t *IMSUSSDTransport) CancelUSSD(ctx context.Context, req USSDRequest) erro
 	resp, err := t.Transport.RoundTripRequest(ctx, bye)
 	t.clearSession(sessionID)
 	if err != nil {
-		return IMSRegistrationRecoveryError{Err: err}
+		return IMSRegistrationRecoveryError{Err: err, StatusCode: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}
 	}
 	if resp.StatusCode >= 300 {
 		err := fmt.Errorf("IMS USSD BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 		if IMSRegistrationRecoveryNeededStatus(resp.StatusCode) {
-			return IMSRegistrationRecoveryError{Err: err, StatusCode: resp.StatusCode}
+			return IMSRegistrationRecoveryError{Err: err, StatusCode: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}
 		}
 		return err
 	}
@@ -195,6 +196,7 @@ func (t *IMSUSSDTransport) CancelUSSD(ctx context.Context, req USSDRequest) erro
 type IMSRegistrationRecoveryError struct {
 	Err        error
 	StatusCode int
+	RetryAfter time.Duration
 }
 
 func (e IMSRegistrationRecoveryError) Error() string {
@@ -214,6 +216,14 @@ func (e IMSRegistrationRecoveryError) Unwrap() error {
 func IsIMSRegistrationRecoveryError(err error) bool {
 	var recoveryErr IMSRegistrationRecoveryError
 	return errors.As(err, &recoveryErr)
+}
+
+func IMSRegistrationRecoveryRetryAfter(err error) time.Duration {
+	var recoveryErr IMSRegistrationRecoveryError
+	if !errors.As(err, &recoveryErr) {
+		return 0
+	}
+	return recoveryErr.RetryAfter
 }
 
 func (t *IMSUSSDTransport) dialogConfig(command, sessionID string, cseq int) (voiceclient.DialogRequestConfig, error) {
@@ -346,12 +356,14 @@ func ussdResultFromSIPResponse(sessionID string, resp voiceclient.SIPResponse, d
 	contentType := firstHeaderValue(resp.Headers, "Content-Type")
 	payload, ok, err := DecodeIMSUSSDDocument(contentType, resp.Body)
 	if err != nil {
-		return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true}, err
+		return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
 	}
 	if ok {
-		return ussdResultFromPayload(sessionID, payload, resp.StatusCode), nil
+		result := ussdResultFromPayload(sessionID, payload, resp.StatusCode)
+		result.RetryAfter = voiceclient.SIPResponseRetryAfter(resp)
+		return result, nil
 	}
-	return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: doneFallback}, nil
+	return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: doneFallback, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, nil
 }
 
 func encodeUSSDDialString(command string) string {

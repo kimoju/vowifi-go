@@ -192,6 +192,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 			StatusCode:                 outboundStatusCode(resp.StatusCode, 486),
 			Reason:                     firstVoiceNonEmpty(resp.Reason, fmt.Sprintf("IMS rejected call: %d", resp.StatusCode)),
 			RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+			RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
 		}, nil
 	}
 	if routeSet := recordRouteSet(resp.Headers); len(routeSet) > 0 {
@@ -332,6 +333,7 @@ func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoReq
 		StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
 		Reason:                     firstVoiceNonEmpty(resp.Reason, "OK"),
 		RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+		RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
 		ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
 		Body:                       append([]byte(nil), resp.Body...),
 		Headers:                    firstValueSIPHeaders(resp.Headers),
@@ -435,6 +437,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 		StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
 		Reason:                     firstVoiceNonEmpty(resp.Reason, "OK"),
 		RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+		RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
 		ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
 		Body:                       resultBody,
 		Headers:                    firstValueSIPHeaders(resp.Headers),
@@ -575,6 +578,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			StatusCode:                 outboundStatusCode(resp.StatusCode, 488),
 			Reason:                     firstVoiceNonEmpty(resp.Reason, "re-INVITE rejected"),
 			RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+			RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
 			Headers:                    firstValueSIPHeaders(resp.Headers),
 		}, nil
 	}

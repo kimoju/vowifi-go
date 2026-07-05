@@ -655,7 +655,7 @@ func TestWireIMSRegistrarRecoversRegistrationAfterRefresh503(t *testing.T) {
 	}
 	select {
 	case <-recovered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for recovery REGISTER")
 	}
 	time.Sleep(20 * time.Millisecond)

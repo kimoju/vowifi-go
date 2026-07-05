@@ -9,6 +9,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
 )
@@ -896,6 +897,31 @@ func TestRegisterSessionRefreshRetriesDigestChallenge(t *testing.T) {
 	if second["Expires"] != "600" || second["CSeq"] != "12 REGISTER" || !strings.Contains(second["Authorization"], `nonce="nonce-refresh"`) ||
 		!strings.Contains(second["Security-Verify"], "spi-c=701") {
 		t.Fatalf("second refresh headers=%+v", second)
+	}
+}
+
+func TestRegisterSessionRefreshReturnsRetryAfter(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{{
+		StatusCode: 503,
+		Reason:     "Service Unavailable",
+		Headers:    map[string][]string{"Retry-After": {"4"}},
+	}}}
+	session := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-refresh-retry-after",
+	}
+	result, err := session.Refresh(context.Background(), RefreshRequest{
+		Binding: RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060"},
+		CSeq:    7,
+	})
+	if err == nil || !errors.Is(err, ErrRegistrationRejected) {
+		t.Fatalf("Refresh() result=%+v err=%v, want registration rejection", result, err)
+	}
+	if result.StatusCode != 503 || result.RetryAfter != 4*time.Second {
+		t.Fatalf("Refresh() result=%+v, want RetryAfter=4s", result)
 	}
 }
 

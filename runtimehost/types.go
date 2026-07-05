@@ -548,7 +548,7 @@ func (i *Instance) StartOutboundCall(ctx context.Context, req voicehost.Outbound
 	if !result.RegistrationRecoveryNeeded {
 		return result, err
 	}
-	_, recovered, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true)
+	_, recovered, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter)
 	if recoveryErr != nil {
 		return result, runtimeOperationRecoveryError(err, recoveryErr)
 	}
@@ -585,7 +585,7 @@ func (i *Instance) SendDialogInfo(ctx context.Context, req voicehost.DialogInfoR
 	}
 	result, err := agent.SendDialogInfo(ctx, req)
 	if result.RegistrationRecoveryNeeded {
-		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter); recoveryErr != nil {
 			return result, runtimeOperationRecoveryError(err, recoveryErr)
 		}
 	}
@@ -599,7 +599,7 @@ func (i *Instance) SendDialogUpdate(ctx context.Context, req voicehost.DialogUpd
 	}
 	result, err := agent.SendDialogUpdate(ctx, req)
 	if result.RegistrationRecoveryNeeded {
-		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter); recoveryErr != nil {
 			return result, runtimeOperationRecoveryError(err, recoveryErr)
 		}
 	}
@@ -613,7 +613,7 @@ func (i *Instance) SendDialogReinvite(ctx context.Context, req voicehost.DialogR
 	}
 	result, err := agent.SendDialogReinvite(ctx, req)
 	if result.RegistrationRecoveryNeeded {
-		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true); recoveryErr != nil {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter); recoveryErr != nil {
 			return result, runtimeOperationRecoveryError(err, recoveryErr)
 		}
 	}
@@ -630,7 +630,7 @@ func runtimeOperationRecoveryError(operationErr, recoveryErr error) error {
 	return errors.Join(operationErr, recoveryErr)
 }
 
-func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, updateVoice bool) (IMSRegistrationResult, bool, error) {
+func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, updateVoice bool, retryAfter time.Duration) (IMSRegistrationResult, bool, error) {
 	if i == nil {
 		return IMSRegistrationResult{}, false, nil
 	}
@@ -649,6 +649,15 @@ func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, up
 	}
 	if recover == nil {
 		return IMSRegistrationResult{}, false, nil
+	}
+	if retryAfter > 0 {
+		timer := time.NewTimer(retryAfter)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return IMSRegistrationResult{}, false, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	result, err := recover(ctx)
 	if err != nil {
@@ -739,7 +748,7 @@ func (t *runtimeRecoveringSMSTransport) SendSMSPart(ctx context.Context, req mes
 		return result, err
 	}
 	retry := err != nil && result.SIPCode == 0
-	recovery, recovered, recoveryErr := t.owner.recoverIMSRegistration(ctx, result.ErrorText, true)
+	recovery, recovered, recoveryErr := t.owner.recoverIMSRegistration(ctx, result.ErrorText, true, result.RetryAfter)
 	if recoveryErr != nil {
 		return result, runtimeOperationRecoveryError(err, recoveryErr)
 	}
@@ -763,7 +772,7 @@ func (t *runtimeRecoveringUSSDTransport) ExecuteUSSD(ctx context.Context, req me
 		return result, err
 	}
 	retry := err != nil && result.Status == 0
-	recovery, recovered, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true)
+	recovery, recovered, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true, result.RetryAfter)
 	if recoveryErr != nil {
 		return result, runtimeOperationRecoveryError(err, recoveryErr)
 	}
@@ -779,7 +788,7 @@ func (t *runtimeRecoveringUSSDTransport) ContinueUSSD(ctx context.Context, req m
 	}
 	result, err := t.inner.ContinueUSSD(ctx, req)
 	if result.RegistrationRecoveryNeeded && t.owner != nil {
-		if _, _, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true); recoveryErr != nil {
+		if _, _, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true, result.RetryAfter); recoveryErr != nil {
 			return result, runtimeOperationRecoveryError(err, recoveryErr)
 		}
 	}
@@ -792,7 +801,7 @@ func (t *runtimeRecoveringUSSDTransport) CancelUSSD(ctx context.Context, req mes
 	}
 	err := t.inner.CancelUSSD(ctx, req)
 	if err != nil && t.owner != nil && messaging.IsIMSRegistrationRecoveryError(err) {
-		if _, _, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true); recoveryErr != nil {
+		if _, _, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true, messaging.IMSRegistrationRecoveryRetryAfter(err)); recoveryErr != nil {
 			return errors.Join(err, recoveryErr)
 		}
 	}

@@ -173,6 +173,10 @@ protocol layers needed by VoHive:
   such as 481, 503, transport errors, and other transient IMS 5xx responses to
   trigger IMS re-registration, refresh voice/SMS/USSD transports, and retry an
   initial INVITE once after successful recovery
+- recoverable IMS failures propagate SIP `Retry-After` delay hints from
+  REGISTER refresh, voice dialogs, SMS MESSAGE, and USSD transactions so runtime
+  recovery waits instead of immediately hammering a temporarily unavailable
+  P-CSCF or registrar
 - runtime SMS and USSD operations consume the same recoverable IMS failure
   signal, refresh IMS registration and message transports, and retry only the
   initial SMS part or USSD INVITE when the original attempt failed before a SIP

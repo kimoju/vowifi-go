@@ -45,6 +45,26 @@ func TestParseSIPResponseWithFoldedAndCompactHeaders(t *testing.T) {
 	}
 }
 
+func TestSIPRetryAfterDelayParsesDeltaSeconds(t *testing.T) {
+	resp, err := ParseSIPResponse([]byte(strings.Join([]string{
+		"SIP/2.0 503 Service Unavailable",
+		"Retry-After: 2 (maintenance);duration=60",
+		"Retry-After: 5",
+		"Content-Length: 0",
+		"",
+		"",
+	}, "\r\n")))
+	if err != nil {
+		t.Fatalf("ParseSIPResponse() error = %v", err)
+	}
+	if resp.RetryAfter != 5*time.Second || SIPResponseRetryAfter(resp) != 5*time.Second {
+		t.Fatalf("RetryAfter=%v helper=%v, want 5s", resp.RetryAfter, SIPResponseRetryAfter(resp))
+	}
+	if got := SIPRetryAfterDelay(map[string][]string{"Retry-After": {"invalid", "3;duration=10"}}); got != 3*time.Second {
+		t.Fatalf("SIPRetryAfterDelay()=%v, want 3s", got)
+	}
+}
+
 func TestParseSIPRequestAndBuildResponseWire(t *testing.T) {
 	raw := strings.Join([]string{
 		"INVITE sip:user@example SIP/2.0",
