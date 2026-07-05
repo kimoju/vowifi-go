@@ -169,6 +169,7 @@ type Service struct {
 	ussdTransport USSDTransport
 	mu            sync.Mutex
 	ussdSessions  map[string]USSDResult
+	smsConcat     map[smsConcatKey]*smsConcatState
 }
 
 func NewService(deviceID, imsi string, store DeliveryStore, dispatch eventhost.Dispatcher) *Service {

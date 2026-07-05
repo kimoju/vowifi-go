@@ -28,6 +28,26 @@ type IMSMessageResult struct {
 	UnsupportedContent bool
 }
 
+const (
+	smsConcatTTL     = 10 * time.Minute
+	smsConcatMaxSets = 64
+)
+
+type smsConcatKey struct {
+	sender    string
+	recipient string
+	ref       int
+	refBits   int
+	total     int
+}
+
+type smsConcatState struct {
+	parts     map[int]string
+	timestamp time.Time
+	firstSeen time.Time
+	updatedAt time.Time
+}
+
 func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {
 	contentType := strings.ToLower(strings.TrimSpace(msg.ContentType))
 	if semi := strings.IndexByte(contentType, ';'); semi >= 0 {
@@ -128,6 +148,15 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 			Content:   deliver.Text,
 			Timestamp: deliver.Timestamp,
 		}
+		if deliver.Concat.IsConcat {
+			assembled, ready := s.collectSMSConcatPart(incoming, deliver.Concat, time.Now())
+			if !ready {
+				out.ReplyContentType = IMS3GPPSMSContentType
+				out.ReplyBody = BuildSMSRPAck(rpdu.MR)
+				return out, nil
+			}
+			incoming = assembled
+		}
 		if err := s.HandleIncomingSMS(ctx, incoming); err != nil {
 			out.StatusCode = 400
 			out.Reason = err.Error()
@@ -175,6 +204,107 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 		out.ReplyContentType = IMS3GPPSMSContentType
 		out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseTemporaryFailure)
 		return out, err
+	}
+}
+
+func (s *Service) collectSMSConcatPart(incoming IncomingSMS, concat SMSConcatInfo, now time.Time) (IncomingSMS, bool) {
+	if s == nil || !validSMSConcatInfo(concat) {
+		return incoming, true
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	key := smsConcatKey{
+		sender:    strings.TrimSpace(incoming.Sender),
+		recipient: strings.TrimSpace(incoming.Recipient),
+		ref:       concat.Ref,
+		refBits:   concat.RefBits,
+		total:     concat.Total,
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupSMSConcatLocked(now)
+	if s.smsConcat == nil {
+		s.smsConcat = make(map[smsConcatKey]*smsConcatState)
+	}
+	state := s.smsConcat[key]
+	if state == nil {
+		if len(s.smsConcat) >= smsConcatMaxSets {
+			s.evictOldestSMSConcatLocked()
+		}
+		state = &smsConcatState{
+			parts:     make(map[int]string, concat.Total),
+			firstSeen: now,
+		}
+		s.smsConcat[key] = state
+	}
+	state.updatedAt = now
+	if !incoming.Timestamp.IsZero() && (state.timestamp.IsZero() || concat.Seq == 1) {
+		state.timestamp = incoming.Timestamp
+	}
+	if _, exists := state.parts[concat.Seq]; !exists {
+		state.parts[concat.Seq] = incoming.Content
+	}
+	if len(state.parts) < concat.Total {
+		return IncomingSMS{}, false
+	}
+
+	var content strings.Builder
+	for seq := 1; seq <= concat.Total; seq++ {
+		part, ok := state.parts[seq]
+		if !ok {
+			return IncomingSMS{}, false
+		}
+		content.WriteString(part)
+	}
+	delete(s.smsConcat, key)
+
+	incoming.Content = content.String()
+	if !state.timestamp.IsZero() {
+		incoming.Timestamp = state.timestamp
+	}
+	return incoming, true
+}
+
+func validSMSConcatInfo(concat SMSConcatInfo) bool {
+	return concat.IsConcat &&
+		concat.Total > 1 &&
+		concat.Seq >= 1 &&
+		concat.Seq <= concat.Total &&
+		(concat.RefBits == 8 || concat.RefBits == 16)
+}
+
+func (s *Service) cleanupSMSConcatLocked(now time.Time) {
+	for key, state := range s.smsConcat {
+		updatedAt := state.updatedAt
+		if updatedAt.IsZero() {
+			updatedAt = state.firstSeen
+		}
+		if updatedAt.IsZero() || now.Sub(updatedAt) > smsConcatTTL {
+			delete(s.smsConcat, key)
+		}
+	}
+}
+
+func (s *Service) evictOldestSMSConcatLocked() {
+	var oldestKey smsConcatKey
+	var oldestAt time.Time
+	found := false
+	for key, state := range s.smsConcat {
+		at := state.updatedAt
+		if at.IsZero() {
+			at = state.firstSeen
+		}
+		if !found || at.Before(oldestAt) {
+			oldestKey = key
+			oldestAt = at
+			found = true
+		}
+	}
+	if found {
+		delete(s.smsConcat, oldestKey)
 	}
 }
 

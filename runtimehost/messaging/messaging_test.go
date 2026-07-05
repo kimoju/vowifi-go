@@ -207,14 +207,13 @@ func TestHandleIMSMessageDispatchesRPDataAndReturnsAck(t *testing.T) {
 	dispatch := &fakeDispatcher{}
 	svc := NewService("dev-1", "310280233641503", nil, dispatch)
 	tpdu := mustHex(t, "0005810180F600006270502143650005E8329BFD06")
-	body := append([]byte{0x01, 0x33, 0x00, 0x00, byte(len(tpdu))}, tpdu...)
 
 	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
 		FromURI:     "sip:smsc@ims.example",
 		ToURI:       "sip:user@ims.example",
 		CallID:      "sms-downlink-1",
 		ContentType: IMS3GPPSMSContentType,
-		Body:        body,
+		Body:        imsRPDataBody(0x33, tpdu),
 	})
 	if err != nil {
 		t.Fatalf("HandleIMSMessage() error = %v", err)
@@ -228,6 +227,108 @@ func TestHandleIMSMessageDispatchesRPDataAndReturnsAck(t *testing.T) {
 	got, ok := dispatch.events[0].(eventhost.SMSReceived)
 	if !ok || got.Sender != "10086" || got.Content != "hello" {
 		t.Fatalf("event=%+v", dispatch.events[0])
+	}
+}
+
+func TestHandleIMSMessageReassemblesConcatSMSBeforeDispatch(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+	part1 := mustHex(t, "4005810180F6000862705021436500080500037A02014F60")
+	part2 := mustHex(t, "4005810180F6000862705021436500080500037A0202597D")
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		CallID:      "sms-downlink-2",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x34, part2),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage(part2) error = %v", err)
+	}
+	if result.StatusCode != 200 || result.Incoming != nil || string(result.ReplyBody) != string(BuildSMSRPAck(0x34)) {
+		t.Fatalf("part2 result=%+v", result)
+	}
+	if len(dispatch.events) != 0 {
+		t.Fatalf("events after partial=%d", len(dispatch.events))
+	}
+
+	result, err = svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		CallID:      "sms-downlink-1",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x33, part1),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage(part1) error = %v", err)
+	}
+	if result.StatusCode != 200 || result.Incoming == nil || result.Incoming.Content != "你好" || string(result.ReplyBody) != string(BuildSMSRPAck(0x33)) {
+		t.Fatalf("part1 result=%+v", result)
+	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events after complete=%d", len(dispatch.events))
+	}
+	got, ok := dispatch.events[0].(eventhost.SMSReceived)
+	if !ok || got.Sender != "10086" || got.Content != "你好" {
+		t.Fatalf("event=%+v", dispatch.events[0])
+	}
+}
+
+func TestHandleIMSMessageIgnoresDuplicateConcatPartUntilComplete(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+	part1 := mustHex(t, "4005810180F6000862705021436500080500037A02014F60")
+	part2 := mustHex(t, "4005810180F6000862705021436500080500037A0202597D")
+
+	for i := 0; i < 2; i++ {
+		result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+			FromURI:     "sip:smsc@ims.example",
+			ToURI:       "sip:user@ims.example",
+			ContentType: IMS3GPPSMSContentType,
+			Body:        imsRPDataBody(byte(0x40+i), part2),
+		})
+		if err != nil {
+			t.Fatalf("HandleIMSMessage(part2 duplicate %d) error = %v", i, err)
+		}
+		if result.Incoming != nil || len(dispatch.events) != 0 {
+			t.Fatalf("duplicate result=%+v events=%d", result, len(dispatch.events))
+		}
+	}
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x42, part1),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage(part1) error = %v", err)
+	}
+	if result.Incoming == nil || result.Incoming.Content != "你好" || len(dispatch.events) != 1 {
+		t.Fatalf("complete result=%+v events=%d", result, len(dispatch.events))
+	}
+}
+
+func TestHandleIMSMessageMalformedConcatFallsBackToSingleSMS(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+	tpdu := mustHex(t, "4005810180F6000862705021436500080500037A02004F60")
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x35, tpdu),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.Incoming == nil || result.Incoming.Content != "你" || string(result.ReplyBody) != string(BuildSMSRPAck(0x35)) {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%d", len(dispatch.events))
 	}
 }
 
@@ -349,4 +450,11 @@ func (s *fakeDeliveryStore) UpdateSMSDeliveryState(messageID, state, lastError s
 
 func (s *fakeDeliveryStore) GetSMSDeliveryStatus(messageID string) (*DeliveryStatus, error) {
 	return nil, ErrDeliveryNotFound
+}
+
+func imsRPDataBody(rpMR byte, tpdu []byte) []byte {
+	body := make([]byte, 0, 5+len(tpdu))
+	body = append(body, 0x01, rpMR, 0x00, 0x00, byte(len(tpdu)))
+	body = append(body, tpdu...)
+	return body
 }
