@@ -80,10 +80,12 @@ protocol layers needed by VoHive:
 - automatic ePDG route exclusion helpers that install protected host routes via
   the outer modem interface, including support for main and policy-routing
   tables before TUN default routes are applied
+- Linux kernel XFRM/IPsec helpers that install ESP tunnel states, outbound/
+  inbound/forward policies, optional marks, reqids, and XFRM interfaces from
+  IKEv2 CHILD_SA key material with rollback and cleanup support
 
-Kernel ESP SA installation, SRTP media, advanced RTCP feedback handling, and
-complete inbound IMS call handling are still implemented incrementally behind
-these APIs.
+SRTP media, advanced RTCP feedback handling, and complete inbound IMS call
+handling are still implemented incrementally behind these APIs.
 
 ## Development
 
