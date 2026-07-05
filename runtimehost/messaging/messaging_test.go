@@ -85,7 +85,8 @@ func TestUSSDTransportSessionLifecycle(t *testing.T) {
 		executeResult:  USSDResult{Text: "1. Balance\n2. Data", RawText: "menu", Status: 1, DCS: 15, Done: false},
 		continueResult: USSDResult{Text: "Balance: 10", Status: 0, DCS: 15, Done: true},
 	}
-	svc := NewService("dev-1", "310280233641503", nil, nil)
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
 	svc.SetUSSDTransport(transport)
 
 	first, err := svc.SendUSSD(context.Background(), "*100#")
@@ -98,6 +99,13 @@ func TestUSSDTransportSessionLifecycle(t *testing.T) {
 	if len(transport.executeRequests) != 1 || transport.executeRequests[0].Command != "*100#" {
 		t.Fatalf("execute requests=%+v", transport.executeRequests)
 	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	firstEvent, ok := dispatch.events[0].(eventhost.USSDUpdated)
+	if !ok || firstEvent.DevID != "dev-1" || firstEvent.SessionID != first.SessionID || firstEvent.Text != "1. Balance\n2. Data" || firstEvent.RawText != "menu" || firstEvent.Status != 1 || firstEvent.DCS != 15 || firstEvent.Done || firstEvent.Time.IsZero() {
+		t.Fatalf("event=%+v", dispatch.events[0])
+	}
 
 	next, err := svc.ContinueUSSD(context.Background(), first.SessionID, "1")
 	if err != nil {
@@ -108,6 +116,13 @@ func TestUSSDTransportSessionLifecycle(t *testing.T) {
 	}
 	if len(transport.continueRequests) != 1 || transport.continueRequests[0].Input != "1" {
 		t.Fatalf("continue requests=%+v", transport.continueRequests)
+	}
+	if len(dispatch.events) != 2 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	nextEvent, ok := dispatch.events[1].(eventhost.USSDUpdated)
+	if !ok || nextEvent.SessionID != first.SessionID || nextEvent.Text != "Balance: 10" || nextEvent.Status != 0 || nextEvent.DCS != 15 || !nextEvent.Done || nextEvent.Time.IsZero() {
+		t.Fatalf("event=%+v", dispatch.events[1])
 	}
 	if _, err := svc.ContinueUSSD(context.Background(), first.SessionID, "1"); err == nil {
 		t.Fatal("ContinueUSSD() err=nil after session completion, want inactive session error")

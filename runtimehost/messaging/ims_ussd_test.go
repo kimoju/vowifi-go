@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
 	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
 )
 
@@ -134,7 +135,8 @@ func TestIMSUSSDTransportHandlesInboundInfoAndBye(t *testing.T) {
 			PublicIdentity: "sip:user@ims.example",
 		},
 	}
-	svc := NewService("dev-1", "310280233641503", nil, nil)
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
 	svc.SetUSSDTransport(ussd)
 	first, err := svc.SendUSSD(context.Background(), "*100#")
 	if err != nil {
@@ -161,6 +163,13 @@ func TestIMSUSSDTransportHandlesInboundInfoAndBye(t *testing.T) {
 	if !info.Handled || info.StatusCode != 200 || info.USSD.Text != "1. Balance\n2. Data" || info.USSD.Done || !svc.hasUSSDSession(first.SessionID) {
 		t.Fatalf("info=%+v active=%v", info, svc.hasUSSDSession(first.SessionID))
 	}
+	if len(dispatch.events) != 2 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	infoEvent, ok := dispatch.events[1].(eventhost.USSDUpdated)
+	if !ok || infoEvent.DevID != "dev-1" || infoEvent.SessionID != first.SessionID || infoEvent.Text != "1. Balance\n2. Data" || infoEvent.Done || infoEvent.Time.IsZero() {
+		t.Fatalf("event=%+v", dispatch.events[1])
+	}
 
 	byeXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "Bye", Operation: IMSUSSDOperationNotify})
 	if err != nil {
@@ -177,5 +186,12 @@ func TestIMSUSSDTransportHandlesInboundInfoAndBye(t *testing.T) {
 	}
 	if !bye.Handled || bye.StatusCode != 200 || bye.USSD.Text != "Bye" || !bye.USSD.Done || svc.hasUSSDSession(first.SessionID) {
 		t.Fatalf("bye=%+v active=%v", bye, svc.hasUSSDSession(first.SessionID))
+	}
+	if len(dispatch.events) != 3 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	byeEvent, ok := dispatch.events[2].(eventhost.USSDUpdated)
+	if !ok || byeEvent.SessionID != first.SessionID || byeEvent.Text != "Bye" || !byeEvent.Done || byeEvent.Time.IsZero() {
+		t.Fatalf("event=%+v", dispatch.events[2])
 	}
 }

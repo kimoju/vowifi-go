@@ -485,6 +485,21 @@ func TestInstanceHandlesIMSUSSDInfoAndBye(t *testing.T) {
 	}
 }
 
+func TestRuntimeHostExposesUSSDUpdatedEventAlias(t *testing.T) {
+	ev := EventUSSDUpdated{
+		DevID:     "dev-1",
+		SessionID: "ussd-1",
+		Text:      "ok",
+		Done:      true,
+		Time:      time.Now(),
+	}
+	var module ModuleEvent = ev
+	got, ok := module.(eventhost.USSDUpdated)
+	if !ok || got.DevID != "dev-1" || got.SessionID != "ussd-1" || got.Text != "ok" || !got.Done || got.Time.IsZero() {
+		t.Fatalf("event=%+v", module)
+	}
+}
+
 type runtimeSMSTransport struct {
 	requests []messaging.SMSSendRequest
 }

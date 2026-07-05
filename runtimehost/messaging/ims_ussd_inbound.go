@@ -53,6 +53,7 @@ func (s *Service) HandleIMSUSSDInfo(ctx context.Context, req IMSUSSDDialogReques
 	if strings.TrimSpace(result.USSD.SessionID) != "" {
 		result.USSD = normalizeUSSDResult(result.USSD, result.USSD.SessionID)
 		s.recordUSSDSession(result.USSD)
+		s.dispatchUSSDUpdated(ctx, result.USSD)
 	}
 	return result, err
 }
@@ -77,6 +78,7 @@ func (s *Service) HandleIMSUSSDBye(ctx context.Context, req IMSUSSDDialogRequest
 	if strings.TrimSpace(result.USSD.SessionID) != "" {
 		result.USSD = normalizeUSSDResult(result.USSD, result.USSD.SessionID)
 		s.recordUSSDSession(result.USSD)
+		s.dispatchUSSDUpdated(ctx, result.USSD)
 	}
 	return result, err
 }

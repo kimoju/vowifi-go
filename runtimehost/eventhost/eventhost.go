@@ -26,6 +26,17 @@ type SMSSent struct {
 	TotalParts int
 }
 
+type USSDUpdated struct {
+	DevID     string
+	SessionID string
+	Text      string
+	RawText   string
+	Status    int
+	DCS       int
+	Done      bool
+	Time      time.Time
+}
+
 type LocalNumberLearned struct {
 	DevID  string
 	IMSI   string

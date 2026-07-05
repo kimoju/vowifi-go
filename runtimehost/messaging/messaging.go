@@ -281,6 +281,7 @@ func (s *Service) SendUSSD(ctx context.Context, command string) (*USSDResult, er
 	}
 	res = normalizeUSSDResult(res, sessionID)
 	s.recordUSSDSession(res)
+	s.dispatchUSSDUpdated(ctx, res)
 	return &res, nil
 }
 
@@ -307,6 +308,7 @@ func (s *Service) ContinueUSSD(ctx context.Context, sessionID, input string) (*U
 	}
 	res = normalizeUSSDResult(res, sessionID)
 	s.recordUSSDSession(res)
+	s.dispatchUSSDUpdated(ctx, res)
 	return &res, nil
 }
 
@@ -551,6 +553,22 @@ func (s *Service) recordUSSDSession(res USSDResult) {
 		s.ussdSessions = make(map[string]USSDResult)
 	}
 	s.ussdSessions[res.SessionID] = res
+}
+
+func (s *Service) dispatchUSSDUpdated(ctx context.Context, res USSDResult) {
+	if s == nil || s.dispatch == nil || strings.TrimSpace(res.SessionID) == "" {
+		return
+	}
+	s.dispatch.Dispatch(ctx, eventhost.USSDUpdated{
+		DevID:     s.deviceID,
+		SessionID: res.SessionID,
+		Text:      res.Text,
+		RawText:   res.RawText,
+		Status:    res.Status,
+		DCS:       res.DCS,
+		Done:      res.Done,
+		Time:      time.Now(),
+	})
 }
 
 func (s *Service) hasUSSDSession(sessionID string) bool {

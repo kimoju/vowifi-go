@@ -719,6 +719,7 @@ type EventDispatcher = eventhost.Dispatcher
 type ModuleEvent = eventhost.Event
 type EventSMSReceived = eventhost.SMSReceived
 type EventSMSSent = eventhost.SMSSent
+type EventUSSDUpdated = eventhost.USSDUpdated
 type EventLocalNumberLearned = eventhost.LocalNumberLearned
 type EventLogNotify = eventhost.LogNotify
 
