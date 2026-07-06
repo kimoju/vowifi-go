@@ -12,16 +12,19 @@ import (
 type fakeOutboundAgent struct {
 	requests       []OutboundCallRequest
 	infos          []DialogInfoRequest
+	pracks         []DialogPrackRequest
 	updates        []DialogUpdateRequest
 	reinvites      []DialogReinviteRequest
 	terminated     []DialogInfo
 	canceled       []DialogInfo
 	result         OutboundCallResult
 	infoResult     DialogInfoResult
+	prackResult    DialogPrackResult
 	updateResult   DialogUpdateResult
 	reinviteResult DialogReinviteResult
 	err            error
 	infoErr        error
+	prackErr       error
 	updateErr      error
 	reinviteErr    error
 }
@@ -53,6 +56,14 @@ func (a *fakeOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoRe
 		return DialogInfoResult{}, a.infoErr
 	}
 	return a.infoResult, nil
+}
+
+func (a *fakeOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrackRequest) (DialogPrackResult, error) {
+	a.pracks = append(a.pracks, req)
+	if a.prackErr != nil {
+		return DialogPrackResult{}, a.prackErr
+	}
+	return a.prackResult, nil
 }
 
 func (a *fakeOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdateRequest) (DialogUpdateResult, error) {
@@ -278,6 +289,53 @@ func TestGatewayHandleClientInfoSendsDialogInfo(t *testing.T) {
 	}
 }
 
+func TestGatewayHandleClientPrackSendsDialogPrack(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{prackResult: DialogPrackResult{
+		Accepted:    true,
+		StatusCode:  200,
+		Reason:      "OK",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("203.0.113.45", 49182)),
+		Headers:     map[string]string{"X-IMS": "prack-ok"},
+	}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newPrackRequest("call-prack", "1 1 INVITE", sampleSDP("198.51.100.30", 4012))
+	req.AppendHeader(sip.NewHeader("X-Client", "prack"))
+
+	g.HandleClientPrack("dev-1", req, tx)
+
+	if len(agent.pracks) != 1 {
+		t.Fatalf("pracks=%d", len(agent.pracks))
+	}
+	got := agent.pracks[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-prack" || got.RAck != "1 1 INVITE" ||
+		got.ContentType != "application/sdp" || got.Headers["X-Client"] != "prack" ||
+		got.Headers["RAck"] != "" || !strings.Contains(string(got.Body), "m=audio 4012") {
+		t.Fatalf("DialogPrackRequest=%+v body=%q", got, got.Body)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "application/sdp" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "prack-ok" ||
+		!strings.Contains(string(tx.responses[0].Body()), "m=audio 49182") {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
+func TestGatewayHandleClientPrackRequiresRAck(t *testing.T) {
+	g := NewGateway()
+	g.RegisterAgent("dev-1", &fakeOutboundAgent{})
+	tx := &fakeServerTransaction{}
+	req := newPrackRequest("call-prack", "", "")
+
+	g.HandleClientPrack("dev-1", req, tx)
+
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 400 {
+		t.Fatalf("PRACK responses=%v", responseCodes(tx.responses))
+	}
+}
+
 func TestGatewayHandleClientUpdateSendsDialogUpdate(t *testing.T) {
 	g := NewGateway()
 	agent := &fakeOutboundAgent{updateResult: DialogUpdateResult{
@@ -385,6 +443,19 @@ func newInfoRequest(callID, contentType, body string) *sip.Request {
 func newUpdateRequest(callID, sdp string) *sip.Request {
 	req := sip.NewRequest(sip.UPDATE, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
 	appendCommonHeaders(req, callID, "18005551212")
+	if strings.TrimSpace(sdp) != "" {
+		req.SetBody([]byte(sdp))
+		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	}
+	return req
+}
+
+func newPrackRequest(callID, rack, sdp string) *sip.Request {
+	req := sip.NewRequest(sip.PRACK, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
+	appendCommonHeaders(req, callID, "18005551212")
+	if strings.TrimSpace(rack) != "" {
+		req.AppendHeader(sip.NewHeader("RAck", rack))
+	}
 	if strings.TrimSpace(sdp) != "" {
 		req.SetBody([]byte(sdp))
 		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))

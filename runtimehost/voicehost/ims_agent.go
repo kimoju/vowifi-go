@@ -359,6 +359,92 @@ func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoReq
 	}, nil
 }
 
+func (a *IMSOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrackRequest) (DialogPrackResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.Transport == nil {
+		return DialogPrackResult{Accepted: false, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return DialogPrackResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	rack := strings.TrimSpace(req.RAck)
+	if rack == "" {
+		return DialogPrackResult{Accepted: false, StatusCode: 400, Reason: "RAck empty"}, errors.New("RAck is empty")
+	}
+	body := append([]byte(nil), req.Body...)
+	localSDPBody := append([]byte(nil), req.Body...)
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		a.mu.Unlock()
+		return DialogPrackResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.cfg
+	if len(body) > 0 && state.relay != nil {
+		clientSDP, err := ParseSDP(body)
+		if err != nil {
+			a.mu.Unlock()
+			return DialogPrackResult{Accepted: false, StatusCode: 488, Reason: "invalid client PRACK SDP"}, err
+		}
+		if err := state.relay.SetClientRemote(clientSDP); err != nil {
+			a.mu.Unlock()
+			return DialogPrackResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client PRACK failed"}, err
+		}
+		body = RewriteSDPMediaEndpoint(body, state.relay.IMSEndpoint())
+	}
+	prack, err := voiceclient.BuildPrackRequestWithBody(cfg, rack, req.ContentType, body)
+	if err != nil {
+		a.mu.Unlock()
+		return DialogPrackResult{Accepted: false, StatusCode: 500, Reason: "build IMS PRACK failed"}, err
+	}
+	applyDialogUpdateHeaders(prack.Headers, req.Headers)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+	resp, err := a.Transport.RoundTripRequest(ctx, prack)
+	if err != nil {
+		return DialogPrackResult{Accepted: false, Reason: "IMS PRACK failed", RegistrationRecoveryNeeded: true}, err
+	}
+	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
+	resultBody := append([]byte(nil), resp.Body...)
+	if accepted && len(resultBody) > 0 && state.relay != nil {
+		imsSDP, err := ParseSDP(resultBody)
+		if err != nil {
+			return DialogPrackResult{Accepted: false, StatusCode: 488, Reason: "invalid IMS PRACK SDP answer"}, err
+		}
+		if err := state.relay.SetIMSRemote(imsSDP); err != nil {
+			return DialogPrackResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS PRACK failed"}, err
+		}
+		resultBody = RewriteSDPMediaEndpoint(resultBody, state.relay.ClientEndpoint())
+	}
+	if accepted {
+		a.mu.Lock()
+		if latest, ok := a.dialogs[callID]; ok {
+			if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+				latest.cfg.RemoteTargetURI = contact
+			}
+			if len(localSDPBody) > 0 {
+				latest.localSDPBody = append([]byte(nil), localSDPBody...)
+			}
+			a.dialogs[callID] = latest
+		}
+		a.mu.Unlock()
+	}
+	return DialogPrackResult{
+		Accepted:                   accepted,
+		StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
+		Reason:                     firstVoiceNonEmpty(resp.Reason, "OK"),
+		RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+		RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+		ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:                       resultBody,
+		Headers:                    firstValueSIPHeaders(resp.Headers),
+	}, nil
+}
+
 func (a *IMSOutboundAgent) SendDialogOptions(ctx context.Context, req DialogOptionsRequest) (DialogOptionsResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1237,7 +1323,7 @@ func applyIncomingInfoHeaders(dst map[string]string, infoPackage string, headers
 
 func isProtectedDialogHeader(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "to", "from", "call-id", "cseq", "max-forwards", "route", "record-route", "via", "contact", "content-length", "content-type":
+	case "to", "from", "call-id", "cseq", "max-forwards", "route", "record-route", "via", "contact", "content-length", "content-type", "rack":
 		return true
 	default:
 		return false

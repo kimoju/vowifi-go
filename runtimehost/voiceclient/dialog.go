@@ -107,12 +107,19 @@ func BuildUpdateRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage,
 }
 
 func BuildPrackRequest(cfg DialogRequestConfig, rack string) (SIPRequestMessage, error) {
-	msg, err := buildDialogRequest("PRACK", cfg, nil)
+	return BuildPrackRequestWithBody(cfg, rack, "", nil)
+}
+
+func BuildPrackRequestWithBody(cfg DialogRequestConfig, rack, contentType string, body []byte) (SIPRequestMessage, error) {
+	msg, err := buildDialogRequest("PRACK", cfg, body)
 	if err != nil {
 		return SIPRequestMessage{}, err
 	}
 	if strings.TrimSpace(rack) != "" {
 		msg.Headers["RAck"] = strings.TrimSpace(rack)
+	}
+	if len(body) > 0 {
+		msg.Headers["Content-Type"] = firstNonEmpty(contentType, "application/sdp")
 	}
 	return msg, nil
 }

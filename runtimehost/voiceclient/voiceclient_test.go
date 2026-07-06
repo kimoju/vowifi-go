@@ -1231,6 +1231,14 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if prack.Method != "PRACK" || prack.Headers["RAck"] != "1 1 INVITE" || prack.Headers["CSeq"] != "3 PRACK" {
 		t.Fatalf("prack=%+v", prack)
 	}
+	prackBody, err := BuildPrackRequestWithBody(cfg, "2 3 INVITE", "application/sdp", []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatalf("BuildPrackRequestWithBody() error = %v", err)
+	}
+	if prackBody.Method != "PRACK" || prackBody.Headers["RAck"] != "2 3 INVITE" ||
+		prackBody.Headers["Content-Type"] != "application/sdp" || string(prackBody.Body) != "v=0\r\n" {
+		t.Fatalf("prack with body=%+v body=%q", prackBody, prackBody.Body)
+	}
 	info, err := BuildInfoRequest(cfg, "application/vnd.3gpp.ussd+xml", []byte("<ussd-data/>"))
 	if err != nil {
 		t.Fatalf("BuildInfoRequest() error = %v", err)

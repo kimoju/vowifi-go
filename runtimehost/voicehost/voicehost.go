@@ -41,6 +41,10 @@ type DialogInfoSender interface {
 	SendDialogInfo(context.Context, DialogInfoRequest) (DialogInfoResult, error)
 }
 
+type DialogPrackSender interface {
+	SendDialogPrack(context.Context, DialogPrackRequest) (DialogPrackResult, error)
+}
+
 type DialogOptionsSender interface {
 	SendDialogOptions(context.Context, DialogOptionsRequest) (DialogOptionsResult, error)
 }
@@ -111,6 +115,17 @@ type DialogInfoResult struct {
 	Body                       []byte
 	Headers                    map[string]string
 }
+
+type DialogPrackRequest struct {
+	DeviceID    string
+	CallID      string
+	RAck        string
+	ContentType string
+	Body        []byte
+	Headers     map[string]string
+}
+
+type DialogPrackResult = DialogInfoResult
 
 type DialogOptionsRequest struct {
 	DeviceID string
@@ -435,9 +450,64 @@ func (g *Gateway) HandleClientCancel(deviceID string, req *sip.Request, tx sip.S
 }
 
 func (g *Gateway) HandleClientPrack(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
-	if tx != nil && req != nil {
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
+	if tx == nil || req == nil {
+		return
 	}
+	sender, _ := g.GetAgent(deviceID).(DialogPrackSender)
+	if sender == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
+		return
+	}
+	callID := sipCallID(req)
+	if callID == "" {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
+		return
+	}
+	rack := sipHeaderValue(req, "RAck")
+	if strings.TrimSpace(rack) == "" {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing RAck", nil))
+		return
+	}
+	body := append([]byte(nil), req.Body()...)
+	contentType := sipHeaderValue(req, "Content-Type")
+	if len(body) > 0 {
+		if strings.TrimSpace(contentType) != "" && !isSIPSDPContentType(contentType) {
+			_ = tx.Respond(sip.NewResponseFromRequest(req, 415, "Unsupported Media Type", nil))
+			return
+		}
+		if _, err := ParseSDP(body); err != nil {
+			_ = tx.Respond(sip.NewResponseFromRequest(req, 488, "Invalid SDP", nil))
+			return
+		}
+	}
+	result, err := sender.SendDialogPrack(context.Background(), DialogPrackRequest{
+		DeviceID:    strings.TrimSpace(deviceID),
+		CallID:      callID,
+		RAck:        rack,
+		ContentType: contentType,
+		Body:        body,
+		Headers:     sipRequestHeaderMap(req),
+	})
+	if err != nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi PRACK failed", nil))
+		return
+	}
+	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)
+	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	resBody := append([]byte(nil), result.Body...)
+	res := sip.NewResponseFromRequest(req, statusCode, reason, resBody)
+	if len(resBody) > 0 {
+		res.AppendHeader(sip.NewHeader("Content-Type", firstVoiceNonEmpty(result.ContentType, "application/sdp")))
+	}
+	for key, value := range result.Headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
+	_ = tx.Respond(res)
 }
 
 func (g *Gateway) HandleClientInfo(deviceID string, req *sip.Request, tx sip.ServerTransaction) {

@@ -84,6 +84,7 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 			},
 			Body: runtimeSDP("198.51.100.22", 49170),
 		},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"prack-ok"}}},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"options-ok"}}},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"info-ok"}}},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"dtmf-ok"}}},
@@ -162,6 +163,21 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if !ok {
 		t.Fatalf("gateway agent=%T, want dialog info sender", gw.GetAgent("dev-voice"))
 	}
+	prackSender, ok := gw.GetAgent("dev-voice").(voicehost.DialogPrackSender)
+	if !ok {
+		t.Fatalf("gateway agent=%T, want dialog PRACK sender", gw.GetAgent("dev-voice"))
+	}
+	prackResult, err := prackSender.SendDialogPrack(context.Background(), voicehost.DialogPrackRequest{
+		CallID: "call-runtime-voice",
+		RAck:   "1 1 INVITE",
+	})
+	if err != nil || !prackResult.Accepted || prackResult.Headers["X-IMS"] != "prack-ok" {
+		t.Fatalf("SendDialogPrack() result=%+v err=%v", prackResult, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "PRACK" || transport.requests[1].Headers["CSeq"] != "2 PRACK" ||
+		transport.requests[1].Headers["RAck"] != "1 1 INVITE" {
+		t.Fatalf("PRACK requests=%+v", transport.requests)
+	}
 	optionsSender, ok := gw.GetAgent("dev-voice").(voicehost.DialogOptionsSender)
 	if !ok {
 		t.Fatalf("gateway agent=%T, want dialog OPTIONS sender", gw.GetAgent("dev-voice"))
@@ -170,7 +186,7 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if err != nil || !optionsResult.Accepted || optionsResult.Headers["X-IMS"] != "options-ok" {
 		t.Fatalf("SendDialogOptions() result=%+v err=%v", optionsResult, err)
 	}
-	if len(transport.requests) != 2 || transport.requests[1].Method != "OPTIONS" || transport.requests[1].Headers["CSeq"] != "2 OPTIONS" {
+	if len(transport.requests) != 3 || transport.requests[2].Method != "OPTIONS" || transport.requests[2].Headers["CSeq"] != "3 OPTIONS" {
 		t.Fatalf("OPTIONS requests=%+v", transport.requests)
 	}
 	infoResult, err := sender.SendDialogInfo(context.Background(), voicehost.DialogInfoRequest{
@@ -182,7 +198,7 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if err != nil || !infoResult.Accepted || infoResult.Headers["X-IMS"] != "info-ok" {
 		t.Fatalf("SendDialogInfo() result=%+v err=%v", infoResult, err)
 	}
-	if len(transport.requests) != 3 || transport.requests[2].Method != "INFO" || transport.requests[2].Headers["CSeq"] != "3 INFO" {
+	if len(transport.requests) != 4 || transport.requests[3].Method != "INFO" || transport.requests[3].Headers["CSeq"] != "4 INFO" {
 		t.Fatalf("INFO requests=%+v", transport.requests)
 	}
 	dtmfSender, ok := gw.GetAgent("dev-voice").(voicehost.DialogDTMFSender)
@@ -197,8 +213,8 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if err != nil || !dtmfResult.Accepted || dtmfResult.Headers["X-IMS"] != "dtmf-ok" {
 		t.Fatalf("SendDialogDTMF() result=%+v err=%v", dtmfResult, err)
 	}
-	if len(transport.requests) != 4 || transport.requests[3].Method != "INFO" || transport.requests[3].Headers["CSeq"] != "4 INFO" ||
-		transport.requests[3].Headers["Info-Package"] != voicehost.DTMFInfoPackage || string(transport.requests[3].Body) != "Signal=9\r\nDuration=110\r\n" {
+	if len(transport.requests) != 5 || transport.requests[4].Method != "INFO" || transport.requests[4].Headers["CSeq"] != "5 INFO" ||
+		transport.requests[4].Headers["Info-Package"] != voicehost.DTMFInfoPackage || string(transport.requests[4].Body) != "Signal=9\r\nDuration=110\r\n" {
 		t.Fatalf("DTMF requests=%+v", transport.requests)
 	}
 	holdController, ok := gw.GetAgent("dev-voice").(voicehost.DialogHoldController)
@@ -209,16 +225,16 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if err != nil || !holdResult.Accepted || holdResult.Headers["X-IMS"] != "hold-ok" {
 		t.Fatalf("SendDialogHold() result=%+v err=%v", holdResult, err)
 	}
-	if len(transport.requests) != 5 || transport.requests[4].Method != "UPDATE" || transport.requests[4].Headers["CSeq"] != "5 UPDATE" ||
-		!strings.Contains(string(transport.requests[4].Body), "a=sendonly\r\n") {
+	if len(transport.requests) != 6 || transport.requests[5].Method != "UPDATE" || transport.requests[5].Headers["CSeq"] != "6 UPDATE" ||
+		!strings.Contains(string(transport.requests[5].Body), "a=sendonly\r\n") {
 		t.Fatalf("hold requests=%+v", transport.requests)
 	}
 	resumeResult, err := holdController.SendDialogResume(context.Background(), voicehost.DialogResumeRequest{CallID: "call-runtime-voice"})
 	if err != nil || !resumeResult.Accepted || resumeResult.Headers["X-IMS"] != "resume-ok" {
 		t.Fatalf("SendDialogResume() result=%+v err=%v", resumeResult, err)
 	}
-	if len(transport.requests) != 6 || transport.requests[5].Method != "UPDATE" || transport.requests[5].Headers["CSeq"] != "6 UPDATE" ||
-		!strings.Contains(string(transport.requests[5].Body), "a=sendrecv\r\n") {
+	if len(transport.requests) != 7 || transport.requests[6].Method != "UPDATE" || transport.requests[6].Headers["CSeq"] != "7 UPDATE" ||
+		!strings.Contains(string(transport.requests[6].Body), "a=sendrecv\r\n") {
 		t.Fatalf("resume requests=%+v", transport.requests)
 	}
 	updater, ok := gw.GetAgent("dev-voice").(voicehost.DialogUpdater)
@@ -233,7 +249,7 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if err != nil || !updateResult.Accepted || updateResult.Headers["X-IMS"] != "update-ok" {
 		t.Fatalf("SendDialogUpdate() result=%+v err=%v", updateResult, err)
 	}
-	if len(transport.requests) != 7 || transport.requests[6].Method != "UPDATE" || transport.requests[6].Headers["CSeq"] != "7 UPDATE" {
+	if len(transport.requests) != 8 || transport.requests[7].Method != "UPDATE" || transport.requests[7].Headers["CSeq"] != "8 UPDATE" {
 		t.Fatalf("UPDATE requests=%+v", transport.requests)
 	}
 	reinviter, ok := gw.GetAgent("dev-voice").(voicehost.DialogReinviter)
@@ -248,16 +264,16 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if err != nil || !reinviteResult.Accepted || reinviteResult.Headers["X-IMS"] != "reinvite-ok" {
 		t.Fatalf("SendDialogReinvite() result=%+v err=%v", reinviteResult, err)
 	}
-	if len(transport.requests) != 8 || transport.requests[7].Method != "INVITE" || transport.requests[7].Headers["CSeq"] != "8 INVITE" {
+	if len(transport.requests) != 9 || transport.requests[8].Method != "INVITE" || transport.requests[8].Headers["CSeq"] != "9 INVITE" {
 		t.Fatalf("re-INVITE requests=%+v", transport.requests)
 	}
-	if len(transport.writes) != 2 || transport.writes[1].Method != "ACK" || transport.writes[1].Headers["CSeq"] != "8 ACK" {
+	if len(transport.writes) != 2 || transport.writes[1].Method != "ACK" || transport.writes[1].Headers["CSeq"] != "9 ACK" {
 		t.Fatalf("writes after re-INVITE=%+v", transport.writes)
 	}
 	if err := terminator.EndVoiceCall(context.Background(), voicehost.DialogInfo{CallID: "call-runtime-voice"}); err != nil {
 		t.Fatalf("EndVoiceCall() error = %v", err)
 	}
-	if len(transport.requests) != 9 || transport.requests[8].Method != "BYE" || transport.requests[8].Headers["CSeq"] != "9 BYE" {
+	if len(transport.requests) != 10 || transport.requests[9].Method != "BYE" || transport.requests[9].Headers["CSeq"] != "10 BYE" {
 		t.Fatalf("requests after BYE=%+v", transport.requests)
 	}
 }
