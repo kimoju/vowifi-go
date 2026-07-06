@@ -184,6 +184,89 @@ func TestIMSInboundWireServerSendsTryingBeforeClientFinal(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerSendsProvisionalBeforeClientFinal(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+	client, err := net.Dial("udp", pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	transport := newProvisionalBlockingInboundTransport([]voiceclient.SIPResponse{
+		{
+			StatusCode: 183,
+			Reason:     "Session Progress",
+			Headers: map[string][]string{
+				"Require": {"100rel"},
+				"RSeq":    {"91"},
+			},
+			Body: []byte(sampleSDP("127.0.0.1", 4002)),
+		},
+	})
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		LocalTag:       "ue-tag",
+		ContactURI:     "sip:vowifi@127.0.0.1:5060",
+		ReadTimeout:    50 * time.Millisecond,
+		TransactionTTL: time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.ServePacket(ctx, pc)
+	}()
+
+	invite := wireIMSInvite("wire-call-early-provisional", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170)))
+	if _, err := client.Write(invite); err != nil {
+		t.Fatalf("client INVITE Write() error = %v", err)
+	}
+	trying := readUDPWireResponse(t, client)
+	if trying.StatusCode != 100 {
+		t.Fatalf("first response=%+v, want 100", trying)
+	}
+	if req := transport.readRequest(t); req.Method != "INVITE" {
+		t.Fatalf("client request=%+v", req)
+	}
+	provisional := readUDPWireResponse(t, client)
+	if provisional.StatusCode != 183 ||
+		firstVoiceHeader(provisional.Headers, "Require") != "100rel" ||
+		firstVoiceHeader(provisional.Headers, "RSeq") != "91" ||
+		firstVoiceHeader(provisional.Headers, "Contact") != "<sip:vowifi@127.0.0.1:5060>" ||
+		!strings.Contains(string(provisional.Body), "m=audio 4002 RTP/AVP") {
+		t.Fatalf("provisional=%+v body=%q", provisional, provisional.Body)
+	}
+
+	transport.respond(voiceclient.SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+		Body:       []byte(sampleSDP("127.0.0.1", 4004)),
+	})
+	ok := readUDPWireResponse(t, client)
+	if ok.StatusCode != 200 || !strings.Contains(string(ok.Body), "m=audio 4004 RTP/AVP") {
+		t.Fatalf("final response=%+v body=%q", ok, ok.Body)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ServePacket() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("ServePacket() did not stop")
+	}
+}
+
 func TestIMSInboundWireServerCancelsPendingInvite(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -263,6 +346,59 @@ func TestIMSInboundWireServerCancelsPendingInvite(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("ServePacket() did not stop")
+	}
+}
+
+func TestIMSInboundWireServerForwardsProvisionalInviteResponses(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{
+		provisionals: []voiceclient.SIPResponse{
+			{
+				StatusCode: 183,
+				Reason:     "Session Progress",
+				Headers: map[string][]string{
+					"Require": {"100rel"},
+					"RSeq":    {"77"},
+					"Contact": {"<sip:client@127.0.0.1:5070>"},
+				},
+				Body: []byte(sampleSDP("127.0.0.1", 4002)),
+			},
+		},
+		responses: []voiceclient.SIPResponse{
+			{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+				Body:       []byte(sampleSDP("127.0.0.1", 4004)),
+			},
+		},
+	}
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		ContactURI: "sip:vowifi@127.0.0.1:5060",
+	}
+	invite := parseWireIncoming(t, wireIMSInvite("wire-call-provisional", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170))))
+	responses, err := server.HandleRequest(context.Background(), invite)
+	if err != nil {
+		t.Fatalf("HandleRequest(INVITE) error = %v", err)
+	}
+	if len(responses) != 3 || responses[0].StatusCode != 100 || responses[1].StatusCode != 183 || responses[2].StatusCode != 200 {
+		t.Fatalf("responses=%+v", responses)
+	}
+	if responses[1].Reason != "Session Progress" ||
+		responses[1].Headers["Require"] != "100rel" ||
+		responses[1].Headers["RSeq"] != "77" ||
+		responses[1].Headers["Contact"] != "<sip:vowifi@127.0.0.1:5060>" ||
+		responses[1].Headers["Content-Type"] != "application/sdp" ||
+		!strings.Contains(string(responses[1].Body), "m=audio 4002 RTP/AVP") {
+		t.Fatalf("provisional response=%+v body=%q", responses[1], responses[1].Body)
+	}
+	if responses[2].Headers["Contact"] != "<sip:vowifi@127.0.0.1:5060>" ||
+		!strings.Contains(string(responses[2].Body), "m=audio 4004 RTP/AVP") {
+		t.Fatalf("final response=%+v body=%q", responses[2], responses[2].Body)
 	}
 }
 
@@ -983,6 +1119,69 @@ func (t *blockingWireInboundTransport) readRequest(tb testing.TB) voiceclient.SI
 }
 
 func (t *blockingWireInboundTransport) respond(resp voiceclient.SIPResponse) {
+	t.responses <- resp
+}
+
+type provisionalBlockingInboundTransport struct {
+	requests     chan voiceclient.SIPRequestMessage
+	writes       chan voiceclient.SIPRequestMessage
+	responses    chan voiceclient.SIPResponse
+	provisionals []voiceclient.SIPResponse
+}
+
+func newProvisionalBlockingInboundTransport(provisionals []voiceclient.SIPResponse) *provisionalBlockingInboundTransport {
+	return &provisionalBlockingInboundTransport{
+		requests:     make(chan voiceclient.SIPRequestMessage, 8),
+		writes:       make(chan voiceclient.SIPRequestMessage, 8),
+		responses:    make(chan voiceclient.SIPResponse, 8),
+		provisionals: append([]voiceclient.SIPResponse(nil), provisionals...),
+	}
+}
+
+func (t *provisionalBlockingInboundTransport) RoundTripInvite(ctx context.Context, msg voiceclient.SIPRequestMessage, onProvisional voiceclient.ProvisionalResponseHandler) (voiceclient.SIPResponse, error) {
+	t.requests <- msg
+	for _, resp := range t.provisionals {
+		if onProvisional != nil {
+			if err := onProvisional(ctx, msg, resp); err != nil {
+				return voiceclient.SIPResponse{}, err
+			}
+		}
+	}
+	select {
+	case resp := <-t.responses:
+		return resp, nil
+	case <-ctx.Done():
+		return voiceclient.SIPResponse{}, ctx.Err()
+	}
+}
+
+func (t *provisionalBlockingInboundTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	t.requests <- msg
+	select {
+	case resp := <-t.responses:
+		return resp, nil
+	case <-ctx.Done():
+		return voiceclient.SIPResponse{}, ctx.Err()
+	}
+}
+
+func (t *provisionalBlockingInboundTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
+	t.writes <- msg
+	return nil
+}
+
+func (t *provisionalBlockingInboundTransport) readRequest(tb testing.TB) voiceclient.SIPRequestMessage {
+	tb.Helper()
+	select {
+	case msg := <-t.requests:
+		return msg
+	case <-time.After(time.Second):
+		tb.Fatalf("timed out waiting for client request")
+		return voiceclient.SIPRequestMessage{}
+	}
+}
+
+func (t *provisionalBlockingInboundTransport) respond(resp voiceclient.SIPResponse) {
 	t.responses <- resp
 }
 

@@ -352,15 +352,29 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 		}
 		responses[0].NoResponse = true
 	}
-	final, err := s.handleInviteFinal(ctx, req)
+	pendingResponses := []IMSInboundWireResponse{trying}
+	provisionals := []IMSInboundWireResponse{}
+	final, err := s.handleInviteFinal(ctx, req, func(result InboundCallResult) error {
+		provisional := s.inviteResultResponse(result, 180, "Ringing")
+		if key != "" {
+			pendingResponses = append(pendingResponses, provisional)
+			s.storeTransaction(key, pendingResponses)
+		}
+		if emit != nil {
+			return emit(provisional)
+		}
+		provisionals = append(provisionals, provisional)
+		return nil
+	})
+	responses = append(responses, provisionals...)
 	responses = append(responses, final)
 	if key != "" {
-		s.storeTransaction(key, []IMSInboundWireResponse{trying, final})
+		s.storeTransaction(key, append(append([]IMSInboundWireResponse(nil), pendingResponses...), final))
 	}
 	return responses, err
 }
 
-func (s *IMSInboundWireServer) handleInviteFinal(ctx context.Context, req voiceclient.SIPIncomingRequest) (IMSInboundWireResponse, error) {
+func (s *IMSInboundWireServer) handleInviteFinal(ctx context.Context, req voiceclient.SIPIncomingRequest, onProvisional func(InboundCallResult) error) (IMSInboundWireResponse, error) {
 	if s == nil || s.Agent == nil {
 		return s.withResponseHeaders(wireResponse(503, "Service Unavailable")), ErrIMSInboundAgentNotReady
 	}
@@ -373,22 +387,29 @@ func (s *IMSInboundWireServer) handleInviteFinal(ctx context.Context, req voicec
 		CSeq:            wireCSeq(req),
 		RawSDP:          append([]byte(nil), req.Body...),
 		Headers:         cloneSIPHeaders(req.Headers),
+		onProvisional:   onProvisional,
 	})
-	final := wireResponse(inboundStatusCode(result.StatusCode, 500), firstVoiceNonEmpty(result.Reason, "Server Internal Error"))
+	return s.inviteResultResponse(result, 500, "Server Internal Error"), err
+}
+
+func (s *IMSInboundWireServer) inviteResultResponse(result InboundCallResult, fallbackStatus int, fallbackReason string) IMSInboundWireResponse {
+	final := wireResponse(inboundStatusCode(result.StatusCode, fallbackStatus), firstVoiceNonEmpty(result.Reason, fallbackReason))
 	if result.Accepted {
 		final.StatusCode = inboundStatusCode(result.StatusCode, 200)
 		final.Reason = firstVoiceNonEmpty(result.Reason, "OK")
-		final.Body = append([]byte(nil), result.RawSDP...)
-		if len(final.Body) == 0 {
-			final.Body = BuildSDPAnswer(result.LocalSDP)
-		}
+	}
+	if result.Accepted || (final.StatusCode > 100 && final.StatusCode < 200) {
 		final.Headers["Contact"] = "<" + s.contactURI() + ">"
-		if len(final.Body) > 0 {
-			final.Headers["Content-Type"] = "application/sdp"
-		}
+	}
+	final.Body = append([]byte(nil), result.RawSDP...)
+	if len(final.Body) == 0 && result.Accepted {
+		final.Body = BuildSDPAnswer(result.LocalSDP)
+	}
+	if len(final.Body) > 0 {
+		final.Headers["Content-Type"] = "application/sdp"
 	}
 	applyInboundWireResultHeaders(final.Headers, result.Headers)
-	return s.withResponseHeaders(final), err
+	return s.withResponseHeaders(final)
 }
 
 func applyInboundWireResultHeaders(dst map[string]string, src map[string]string) {

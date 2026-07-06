@@ -165,12 +165,14 @@ protocol layers needed by VoHive:
   SIP client, parse SDP answers, forward ACK/BYE/CANCEL dialog requests, and
   support RTP relay allocation with IMS-offer/client-answer SDP rewriting,
   including early-dialog CANCEL forwarding with original INVITE Via reuse and
-  487 Request Terminated mapping for the canceled INVITE transaction
+  487 Request Terminated mapping for the canceled INVITE transaction, plus
+  local 18x provisional response forwarding with early SDP/RTP relay rewriting
 - wire-level inbound IMS SIP adapters for UDP/TCP listeners, SIP request
   parsing, provisional/final response construction, incoming INVITE/ACK/BYE/
   CANCEL dispatch, response To-tagging, transaction response caching for
   retransmitted requests, immediate `100 Trying` emission for socket-served
-  INVITEs, in-progress INVITE transaction caching while local client final
+  INVITEs, forwarding of reliable provisional headers such as `Require: 100rel`
+  and `RSeq`, in-progress INVITE transaction caching while local client final
   responses are pending, and loopback-tested socket handling
 - IMS in-dialog interworking for UPDATE, PRACK, and OPTIONS, including SDP
   session refresh forwarding, RAck propagation, RTP relay endpoint rewriting

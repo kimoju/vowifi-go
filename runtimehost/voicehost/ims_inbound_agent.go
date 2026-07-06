@@ -39,6 +39,7 @@ type InboundCallRequest struct {
 	RemoteSDP       SDPInfo
 	RawSDP          []byte
 	Headers         map[string][]string
+	onProvisional   func(InboundCallResult) error
 }
 
 type InboundCallResult struct {
@@ -136,7 +137,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		}
 		ensureInboundClientInviteVia(&invite, cfg)
 		a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay, early: true})
-		resp, err = a.roundTripClientInvite(ctx, invite)
+		resp, err = a.roundTripClientInvite(ctx, invite, inboundProvisionalHandler(req.onProvisional, relay))
 		if err != nil {
 			a.deleteInboundDialog(callID)
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client INVITE failed"}, err
@@ -246,7 +247,7 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 		ensureInboundClientInviteVia(&invite, cfg)
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		a.storeInboundDialog(callID, state)
-		resp, err = a.roundTripClientInvite(ctx, invite)
+		resp, err = a.roundTripClientInvite(ctx, invite, inboundProvisionalHandler(req.onProvisional, state.relay))
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client re-INVITE failed"}, err
 		}
@@ -390,6 +391,42 @@ func cloneSIPRequestMessage(msg voiceclient.SIPRequestMessage) voiceclient.SIPRe
 		}
 	}
 	return out
+}
+
+func inboundProvisionalHandler(onProvisional func(InboundCallResult) error, relay *RTPRelaySession) func(voiceclient.SIPResponse) error {
+	if onProvisional == nil {
+		return nil
+	}
+	return func(resp voiceclient.SIPResponse) error {
+		if resp.StatusCode <= 100 || resp.StatusCode >= 200 {
+			return nil
+		}
+		result := InboundCallResult{
+			Accepted:   false,
+			StatusCode: inboundStatusCode(resp.StatusCode, 180),
+			Reason:     firstVoiceNonEmpty(resp.Reason, "Ringing"),
+			RawSDP:     append([]byte(nil), resp.Body...),
+			Headers:    firstValueSIPHeaders(resp.Headers),
+		}
+		if len(resp.Body) > 0 {
+			localSDP, err := ParseSDP(resp.Body)
+			if err != nil {
+				return fmt.Errorf("invalid client provisional SDP answer: %w", err)
+			}
+			if relay != nil {
+				if err := relay.SetClientRemote(localSDP); err != nil {
+					return fmt.Errorf("RTP relay client provisional setup failed: %w", err)
+				}
+				result.RawSDP = RewriteSDPMediaEndpoint(resp.Body, relay.IMSEndpoint())
+				localSDP, err = ParseSDP(result.RawSDP)
+				if err != nil {
+					return fmt.Errorf("invalid RTP relay provisional SDP answer: %w", err)
+				}
+			}
+			result.LocalSDP = localSDP
+		}
+		return onProvisional(result)
+	}
 }
 
 func applyInboundSessionIntervalHeaders(cfg *voiceclient.DialogRequestConfig, headers map[string][]string) {
@@ -749,12 +786,17 @@ func (a *IMSInboundAgent) closeInboundDialog(callID string) {
 	a.deleteInboundDialog(callID)
 }
 
-func (a *IMSInboundAgent) roundTripClientInvite(ctx context.Context, invite voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+func (a *IMSInboundAgent) roundTripClientInvite(ctx context.Context, invite voiceclient.SIPRequestMessage, onProvisional func(voiceclient.SIPResponse) error) (voiceclient.SIPResponse, error) {
 	if a == nil || a.ClientTransport == nil {
 		return voiceclient.SIPResponse{}, ErrIMSInboundAgentNotReady
 	}
 	if inviteTransport, ok := a.ClientTransport.(voiceclient.SIPInviteTransport); ok {
-		return inviteTransport.RoundTripInvite(ctx, invite, nil)
+		return inviteTransport.RoundTripInvite(ctx, invite, func(_ context.Context, _ voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
+			if onProvisional == nil {
+				return nil
+			}
+			return onProvisional(resp)
+		})
 	}
 	return a.ClientTransport.RoundTripRequest(ctx, invite)
 }

@@ -239,6 +239,57 @@ func TestIMSInboundAgentCancelEstablishedDialogNoops(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentForwardsProvisionalInviteResponses(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{
+		provisionals: []voiceclient.SIPResponse{
+			{
+				StatusCode: 183,
+				Reason:     "Session Progress",
+				Headers: map[string][]string{
+					"Require": {"100rel"},
+					"RSeq":    {"42"},
+					"Contact": {"<sip:client@192.0.2.50:5060>"},
+				},
+				Body: []byte(sampleSDP("192.0.2.50", 4002)),
+			},
+		},
+		responses: []voiceclient.SIPResponse{
+			{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+				Body:       []byte(sampleSDP("192.0.2.50", 4004)),
+			},
+		},
+	}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	var provisionals []InboundCallResult
+	result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-provisional",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+		onProvisional: func(result InboundCallResult) error {
+			provisionals = append(provisionals, result)
+			return nil
+		},
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	if len(provisionals) != 1 || provisionals[0].StatusCode != 183 ||
+		provisionals[0].Headers["Require"] != "100rel" ||
+		provisionals[0].Headers["RSeq"] != "42" ||
+		provisionals[0].LocalSDP.MediaPort != 4002 ||
+		!strings.Contains(string(provisionals[0].RawSDP), "m=audio 4002 RTP/AVP") {
+		t.Fatalf("provisionals=%+v", provisionals)
+	}
+}
+
 func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
