@@ -1272,6 +1272,22 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if !strings.Contains(refer.Headers["Security-Verify"], "spi-c=111") {
 		t.Fatalf("refer Security-Verify=%q", refer.Headers["Security-Verify"])
 	}
+	notify, err := BuildNotifyRequest(cfg, "refer", "terminated;reason=noresource", "message/sipfrag", []byte("SIP/2.0 200 OK\r\n"))
+	if err != nil {
+		t.Fatalf("BuildNotifyRequest() error = %v", err)
+	}
+	if notify.Method != "NOTIFY" || notify.Headers["CSeq"] != "3 NOTIFY" ||
+		notify.Headers["Event"] != "refer" ||
+		notify.Headers["Subscription-State"] != "terminated;reason=noresource" ||
+		notify.Headers["Allow-Events"] != "refer" ||
+		notify.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" ||
+		notify.Headers["Content-Type"] != "message/sipfrag" ||
+		string(notify.Body) != "SIP/2.0 200 OK\r\n" {
+		t.Fatalf("notify=%+v body=%q", notify, notify.Body)
+	}
+	if !strings.Contains(notify.Headers["Security-Verify"], "spi-c=111") {
+		t.Fatalf("notify Security-Verify=%q", notify.Headers["Security-Verify"])
+	}
 	options, err := BuildOptionsRequest(cfg)
 	if err != nil {
 		t.Fatalf("BuildOptionsRequest() error = %v", err)

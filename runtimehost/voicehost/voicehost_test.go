@@ -15,6 +15,7 @@ type fakeOutboundAgent struct {
 	pracks         []DialogPrackRequest
 	options        []DialogOptionsRequest
 	refers         []DialogReferRequest
+	notifies       []DialogNotifyRequest
 	updates        []DialogUpdateRequest
 	reinvites      []DialogReinviteRequest
 	terminated     []DialogInfo
@@ -24,6 +25,7 @@ type fakeOutboundAgent struct {
 	prackResult    DialogPrackResult
 	optionsResult  DialogOptionsResult
 	referResult    DialogReferResult
+	notifyResult   DialogNotifyResult
 	updateResult   DialogUpdateResult
 	reinviteResult DialogReinviteResult
 	err            error
@@ -31,6 +33,7 @@ type fakeOutboundAgent struct {
 	prackErr       error
 	optionsErr     error
 	referErr       error
+	notifyErr      error
 	updateErr      error
 	reinviteErr    error
 }
@@ -86,6 +89,14 @@ func (a *fakeOutboundAgent) SendDialogRefer(ctx context.Context, req DialogRefer
 		return DialogReferResult{}, a.referErr
 	}
 	return a.referResult, nil
+}
+
+func (a *fakeOutboundAgent) SendDialogNotify(ctx context.Context, req DialogNotifyRequest) (DialogNotifyResult, error) {
+	a.notifies = append(a.notifies, req)
+	if a.notifyErr != nil {
+		return DialogNotifyResult{}, a.notifyErr
+	}
+	return a.notifyResult, nil
 }
 
 func (a *fakeOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdateRequest) (DialogUpdateResult, error) {
@@ -437,6 +448,59 @@ func TestGatewayHandleClientReferRequiresReferTo(t *testing.T) {
 	}
 }
 
+func TestGatewayHandleClientNotifySendsDialogNotify(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{notifyResult: DialogNotifyResult{
+		Accepted:    true,
+		StatusCode:  200,
+		Reason:      "OK",
+		ContentType: "message/sipfrag",
+		Body:        []byte("SIP/2.0 200 OK\r\n"),
+		Headers:     map[string]string{"X-IMS": "notify-ok"},
+	}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newNotifyRequest("call-notify", "refer", "terminated;reason=noresource", "message/sipfrag", "SIP/2.0 200 OK\r\n")
+	req.AppendHeader(sip.NewHeader("X-Client", "notify"))
+
+	g.HandleClientNotify("dev-1", req, tx)
+
+	if len(agent.notifies) != 1 {
+		t.Fatalf("notifies=%d", len(agent.notifies))
+	}
+	got := agent.notifies[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-notify" ||
+		got.Event != "refer" || got.SubscriptionState != "terminated;reason=noresource" ||
+		got.ContentType != "message/sipfrag" || got.Headers["X-Client"] != "notify" ||
+		got.Headers["Event"] != "" || got.Headers["Subscription-State"] != "" ||
+		string(got.Body) != "SIP/2.0 200 OK\r\n" {
+		t.Fatalf("DialogNotifyRequest=%+v body=%q", got, got.Body)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "message/sipfrag" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "notify-ok" ||
+		string(tx.responses[0].Body()) != "SIP/2.0 200 OK\r\n" {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
+func TestGatewayHandleClientNotifyRequiresEventAndSubscriptionState(t *testing.T) {
+	g := NewGateway()
+	g.RegisterAgent("dev-1", &fakeOutboundAgent{})
+
+	missingEvent := &fakeServerTransaction{}
+	g.HandleClientNotify("dev-1", newNotifyRequest("call-notify", "", "terminated", "", ""), missingEvent)
+	if len(missingEvent.responses) != 1 || missingEvent.responses[0].StatusCode != 400 {
+		t.Fatalf("NOTIFY missing Event responses=%v", responseCodes(missingEvent.responses))
+	}
+
+	missingState := &fakeServerTransaction{}
+	g.HandleClientNotify("dev-1", newNotifyRequest("call-notify", "refer", "", "", ""), missingState)
+	if len(missingState.responses) != 1 || missingState.responses[0].StatusCode != 400 {
+		t.Fatalf("NOTIFY missing Subscription-State responses=%v", responseCodes(missingState.responses))
+	}
+}
+
 func TestGatewayHandleClientUpdateSendsDialogUpdate(t *testing.T) {
 	g := NewGateway()
 	agent := &fakeOutboundAgent{updateResult: DialogUpdateResult{
@@ -578,6 +642,24 @@ func newReferRequest(callID, referTo, referredBy string) *sip.Request {
 	}
 	if strings.TrimSpace(referredBy) != "" {
 		req.AppendHeader(sip.NewHeader("Referred-By", referredBy))
+	}
+	return req
+}
+
+func newNotifyRequest(callID, event, subscriptionState, contentType, body string) *sip.Request {
+	req := sip.NewRequest(sip.NOTIFY, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
+	appendCommonHeaders(req, callID, "18005551212")
+	if strings.TrimSpace(event) != "" {
+		req.AppendHeader(sip.NewHeader("Event", event))
+	}
+	if strings.TrimSpace(subscriptionState) != "" {
+		req.AppendHeader(sip.NewHeader("Subscription-State", subscriptionState))
+	}
+	if strings.TrimSpace(body) != "" {
+		req.SetBody([]byte(body))
+	}
+	if strings.TrimSpace(contentType) != "" {
+		req.AppendHeader(sip.NewHeader("Content-Type", contentType))
 	}
 	return req
 }

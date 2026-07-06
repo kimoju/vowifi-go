@@ -173,6 +173,28 @@ func BuildReferRequest(cfg DialogRequestConfig, referTo, referredBy string) (SIP
 	return msg, nil
 }
 
+func BuildNotifyRequest(cfg DialogRequestConfig, event, subscriptionState, contentType string, body []byte) (SIPRequestMessage, error) {
+	event = strings.TrimSpace(event)
+	if event == "" {
+		return SIPRequestMessage{}, fmt.Errorf("%w: Event is empty", ErrInvalidDialogConfig)
+	}
+	subscriptionState = strings.TrimSpace(subscriptionState)
+	if subscriptionState == "" {
+		return SIPRequestMessage{}, fmt.Errorf("%w: Subscription-State is empty", ErrInvalidDialogConfig)
+	}
+	msg, err := buildDialogRequest("NOTIFY", cfg, body)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	msg.Headers["Event"] = event
+	msg.Headers["Subscription-State"] = subscriptionState
+	msg.Headers["Allow-Events"] = "refer"
+	if len(body) > 0 {
+		msg.Headers["Content-Type"] = firstNonEmpty(contentType, "message/sipfrag")
+	}
+	return msg, nil
+}
+
 func BuildOptionsRequest(cfg DialogRequestConfig) (SIPRequestMessage, error) {
 	msg, err := buildDialogRequest("OPTIONS", cfg, nil)
 	if err != nil {
@@ -220,11 +242,11 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 		"CSeq":                  strconv.Itoa(cseq) + " " + method,
 		"Max-Forwards":          "70",
 		"User-Agent":            firstNonEmpty(cfg.UserAgent, cfg.Profile.UserAgent, "vowifi-go"),
-		"Allow":                 "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, OPTIONS",
+		"Allow":                 "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, NOTIFY, OPTIONS",
 		"P-Preferred-Identity":  "<" + localURI + ">",
 		"P-Access-Network-Info": "IEEE-802.11",
 	}
-	if contactURI != "" && (method == "INVITE" || method == "UPDATE" || method == "INFO") {
+	if contactURI != "" && (method == "INVITE" || method == "UPDATE" || method == "INFO" || method == "NOTIFY") {
 		headers["Contact"] = "<" + contactURI + ">"
 	}
 	if route := routeHeader(firstNonEmptySlice(cfg.RouteSet, cfg.Registration.ServiceRoutes)); route != "" {

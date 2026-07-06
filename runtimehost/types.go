@@ -638,6 +638,20 @@ func (i *Instance) SendDialogRefer(ctx context.Context, req voicehost.DialogRefe
 	return result, err
 }
 
+func (i *Instance) SendDialogNotify(ctx context.Context, req voicehost.DialogNotifyRequest) (voicehost.DialogNotifyResult, error) {
+	agent := i.dialogNotifySender()
+	if agent == nil {
+		return voicehost.DialogNotifyResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
+	}
+	result, err := agent.SendDialogNotify(ctx, req)
+	if result.RegistrationRecoveryNeeded {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter); recoveryErr != nil {
+			return result, runtimeOperationRecoveryError(err, recoveryErr)
+		}
+	}
+	return result, err
+}
+
 func (i *Instance) SendDialogDTMF(ctx context.Context, req voicehost.DialogDTMFRequest) (voicehost.DialogDTMFResult, error) {
 	if agent := i.dialogDTMFSender(); agent != nil {
 		result, err := agent.SendDialogDTMF(ctx, req)
@@ -1036,6 +1050,20 @@ func (i *Instance) dialogReferSender() voicehost.DialogReferSender {
 	}
 	i.mu.RLock()
 	agent, _ := i.voice.(voicehost.DialogReferSender)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogNotifySender() voicehost.DialogNotifySender {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogNotifySender)
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {

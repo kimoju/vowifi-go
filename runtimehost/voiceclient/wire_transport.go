@@ -282,7 +282,8 @@ func writeOrderedHeaders(out *bytes.Buffer, headers map[string]string) {
 		"Expires", "P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
 		"P-Preferred-Service", "Accept-Contact",
 		"P-Access-Network-Info", "Security-Client", "Security-Verify", "Authorization",
-		"Proxy-Authorization", "Session-Expires", "Min-SE", "Content-Type", "Accept",
+		"Proxy-Authorization", "Session-Expires", "Min-SE", "Event", "Subscription-State",
+		"Allow-Events", "Content-Type", "Accept",
 	}
 	written := make(map[string]bool, len(order))
 	contentLength := ""
@@ -638,7 +639,8 @@ func writeOrderedHeaderValues(out *bytes.Buffer, headers map[string][]string) {
 		"P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
 		"P-Access-Network-Info", "Security-Client", "Security-Verify",
 		"Authorization", "Proxy-Authorization", "WWW-Authenticate",
-		"Proxy-Authenticate", "Session-Expires", "Min-SE", "Content-Type", "Accept",
+		"Proxy-Authenticate", "Session-Expires", "Min-SE", "Event", "Subscription-State",
+		"Allow-Events", "Content-Type", "Accept",
 	}
 	written := make(map[string]bool, len(order))
 	for _, name := range order {
@@ -948,6 +950,8 @@ func canonicalHeaderName(name string) string {
 		return "Allow-Events"
 	case "allow-events":
 		return "Allow-Events"
+	case "subscription-state":
+		return "Subscription-State"
 	case "x":
 		return "Session-Expires"
 	case "session-expires":
