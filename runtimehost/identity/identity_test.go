@@ -141,6 +141,41 @@ func TestPrepareStartPrefersDomainMatchedSIPIMPU(t *testing.T) {
 	}
 }
 
+func TestPrepareStartDerivesIMEIFromDeviceID(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		DeviceID: "quectel-imei-490154203237518-control",
+		Profile:  Profile{IMSI: "001010123456789"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.Profile.IMEI != "490154203237518" || prepared.IdentityIMEISource != IMEISourceDeviceID {
+		t.Fatalf("IMEI=%q source=%q, want device-derived IMEI", prepared.Profile.IMEI, prepared.IdentityIMEISource)
+	}
+}
+
+func TestPrepareStartKeepsProfileIMEI(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		DeviceID: "quectel-imei-490154203237518-control",
+		Profile:  Profile{IMSI: "001010123456789", IMEI: "356938035643809"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.Profile.IMEI != "356938035643809" || prepared.IdentityIMEISource != IMEISourceProfile {
+		t.Fatalf("IMEI=%q source=%q, want profile IMEI", prepared.Profile.IMEI, prepared.IdentityIMEISource)
+	}
+}
+
+func TestExtractIMEIIgnoresNonIMEIDeviceID(t *testing.T) {
+	if got := ExtractIMEI("dev-1"); got != "" {
+		t.Fatalf("ExtractIMEI(dev-1) = %q, want empty", got)
+	}
+	if got := ExtractIMEI("prefix-490154203237518-suffix"); got != "490154203237518" {
+		t.Fatalf("ExtractIMEI() = %q, want IMEI", got)
+	}
+}
+
 type partialAccess struct {
 	id Identity
 }

@@ -38,6 +38,7 @@ type EmergencySIPHeaderConfig struct {
 type EmergencySIPRequestInfo struct {
 	RequestURI string
 	Headers    map[string]string
+	Routes     []EmergencyRoute
 }
 
 func NormalizeEmergencyServiceURN(s string) string {
@@ -114,6 +115,23 @@ func BuildEmergencySIPRequestInfo(cfg EmergencySIPHeaderConfig) EmergencySIPRequ
 	}
 }
 
+func BuildUsableEmergencySIPRequestInfo(snapshot EntitlementSnapshot, cfg EmergencySIPHeaderConfig) (EmergencySIPRequestInfo, bool) {
+	if !snapshot.Usable() {
+		return EmergencySIPRequestInfo{}, false
+	}
+	serviceURN, routes, ok := usableEmergencySIPService(snapshot, cfg.ServiceURN)
+	if !ok {
+		return EmergencySIPRequestInfo{}, false
+	}
+	cfg.ServiceURN = serviceURN
+	if strings.TrimSpace(cfg.GeolocationURI) == "" && !emergencyAddressHasGeolocation(cfg.Address) {
+		cfg.Address = snapshot.Info.Address
+	}
+	info := BuildEmergencySIPRequestInfo(cfg)
+	info.Routes = copyEmergencyRoutes(routes)
+	return info, true
+}
+
 func emergencyGeolocationHeader(cfg EmergencySIPHeaderConfig) string {
 	if uri := strings.TrimSpace(cfg.GeolocationURI); uri != "" {
 		return formatGeolocationURI(uri)
@@ -124,6 +142,41 @@ func emergencyGeolocationHeader(cfg EmergencySIPHeaderConfig) string {
 		return ""
 	}
 	return formatGeolocationURI("geo:" + lat + "," + lon)
+}
+
+func usableEmergencySIPService(snapshot EntitlementSnapshot, requested string) (string, []EmergencyRoute, bool) {
+	requested = normalizeEmergencyServiceURN(requested)
+	if requested != "" {
+		routes := snapshot.UsableRoutes(requested)
+		if containsEmergencyServiceURN(snapshot.UsableServiceURNs(), requested) || len(routes) > 0 {
+			return requested, routes, true
+		}
+		return "", nil, false
+	}
+	for _, urn := range snapshot.UsableServiceURNs() {
+		urn = normalizeEmergencyServiceURN(urn)
+		if urn != "" {
+			return urn, snapshot.UsableRoutes(urn), true
+		}
+	}
+	return "", nil, false
+}
+
+func containsEmergencyServiceURN(urns []string, urn string) bool {
+	urn = normalizeEmergencyServiceURN(urn)
+	if urn == "" {
+		return false
+	}
+	for _, candidate := range urns {
+		if strings.EqualFold(normalizeEmergencyServiceURN(candidate), urn) {
+			return true
+		}
+	}
+	return false
+}
+
+func emergencyAddressHasGeolocation(address EmergencyAddress) bool {
+	return strings.TrimSpace(address.Latitude) != "" && strings.TrimSpace(address.Longitude) != ""
 }
 
 func formatGeolocationURI(uri string) string {

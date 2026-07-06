@@ -73,6 +73,12 @@ func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (
 		return IMSMessageResult{StatusCode: 200, Reason: "OK", Incoming: &incoming}, nil
 	case IMS3GPPSMSContentType:
 		return s.handleIMS3GPPSMS(ctx, msg)
+	case imsIMDNContentType:
+		return s.handleIMSIMDNMessage(ctx, msg, IMSCPIMMessage{
+			Headers:     msg.Headers,
+			ContentType: contentType,
+			Body:        msg.Body,
+		})
 	default:
 		err := errors.New("unsupported IMS MESSAGE content type")
 		return IMSMessageResult{StatusCode: 415, Reason: err.Error(), UnsupportedContent: true}, err
@@ -83,6 +89,9 @@ func (s *Service) handleIMSCPIMMessage(ctx context.Context, msg IMSMessageReques
 	cpim, err := ParseIMSCPIMMessage(msg.Body)
 	if err != nil {
 		return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
+	}
+	if cpim.ContentType == imsIMDNContentType {
+		return s.handleIMSIMDNMessage(ctx, msg, cpim)
 	}
 	nested := msg
 	nested.ContentType = cpim.ContentType
@@ -99,6 +108,30 @@ func (s *Service) handleIMSCPIMMessage(ctx context.Context, msg IMSMessageReques
 		result.ReplyBody = reply
 	}
 	return result, err
+}
+
+func (s *Service) handleIMSIMDNMessage(ctx context.Context, msg IMSMessageRequest, cpim IMSCPIMMessage) (IMSMessageResult, error) {
+	imdn, err := parseIMSCPIMIMDNReport(cpim)
+	if err != nil {
+		return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
+	}
+	report := SMSDeliveryReport{
+		InReplyTo: firstNonEmpty(imdn.MessageID, imsHeaderValue(msg.Headers, "In-Reply-To")),
+		CallID:    firstNonEmpty(msg.CallID, imsHeaderValue(msg.Headers, "Call-ID")),
+		State:     imdn.State,
+		SIPCode:   200,
+		ErrorText: imdn.ErrorText,
+		ReportAt:  imdn.DateTime,
+		Recipient: firstNonEmpty(imdn.OriginalRecipientURI, imdn.RecipientURI),
+	}
+	_, err = s.HandleSMSDeliveryReport(ctx, report)
+	out := IMSMessageResult{StatusCode: 200, Reason: "OK", DeliveryReport: &report}
+	if err != nil && !errors.Is(err, ErrDeliveryNotFound) {
+		out.StatusCode = 500
+		out.Reason = err.Error()
+		return out, err
+	}
+	return out, nil
 }
 
 func imsHeaderValue(headers map[string][]string, key string) string {

@@ -171,6 +171,7 @@ type RTPRelayDirectionQuality struct {
 	RTPMaxJitter         uint32
 	RTPStreams           []RTPStreamStats
 	RTCPReports          []RTPRelayRTCPReportQuality
+	RTCPMaxRoundTripTime time.Duration
 }
 
 type RTPRelayRTCPReportQuality struct {
@@ -183,6 +184,7 @@ type RTPRelayRTCPReportQuality struct {
 	Jitter             uint32
 	LastSenderReport   uint32
 	Delay              uint32
+	RoundTripTime      time.Duration
 }
 
 type RTPRelaySession struct {
@@ -222,6 +224,7 @@ type RTPRelaySession struct {
 	rtcpQualityMu          sync.Mutex
 	clientToIMSRTCPReports map[rtpRelayRTCPReportKey]RTPRelayRTCPReportQuality
 	imsToClientRTCPReports map[rtpRelayRTCPReportKey]RTPRelayRTCPReportQuality
+	rtcpSenderReportTiming map[rtpRelayRTCPSenderReportKey]rtpRelayRTCPSenderReportTiming
 
 	clientToIMSRTPPackets                atomic.Uint64
 	imsToClientRTPPackets                atomic.Uint64
@@ -273,6 +276,16 @@ type rtpDTMFSequenceState struct {
 type rtpRelayRTCPReportKey struct {
 	reporterSSRC uint32
 	mediaSSRC    uint32
+}
+
+type rtpRelayRTCPSenderReportKey struct {
+	direction RTCPFeedbackDirection
+	ssrc      uint32
+}
+
+type rtpRelayRTCPSenderReportTiming struct {
+	lastSenderReport uint32
+	observedAt       time.Time
 }
 
 func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SDPInfo) (*RTPRelaySession, error) {
@@ -563,6 +576,11 @@ func newRTPRelayDirectionQuality(direction RTCPFeedbackDirection, rtpPackets, rt
 		quality.RTPOutOfOrderPackets += stream.OutOfOrderPackets
 		if stream.Jitter > quality.RTPMaxJitter {
 			quality.RTPMaxJitter = stream.Jitter
+		}
+	}
+	for _, report := range reports {
+		if report.RoundTripTime > quality.RTCPMaxRoundTripTime {
+			quality.RTCPMaxRoundTripTime = report.RoundTripTime
 		}
 	}
 	quality.RTPFractionLost = rtpRelayFractionLost(quality.RTPLostPackets, quality.RTPExpectedPackets)
@@ -1350,8 +1368,10 @@ func (s *RTPRelaySession) inspectRTCPFeedback(direction RTCPFeedbackDirection, p
 }
 
 func (s *RTPRelaySession) inspectRTCPFeedbackPacket(direction RTCPFeedbackDirection, packet []byte) (RTCPFeedbackSummary, error) {
+	observedAt := time.Now()
 	return InspectRTCPFeedback(direction, packet, func(event RTCPFeedbackEvent) {
-		s.recordRTCPReportQuality(event)
+		s.recordRTCPSenderReport(event, observedAt)
+		s.recordRTCPReportQuality(event, observedAt)
 		emitRTCPFeedback(s.rtcpFeedbackHandler, event)
 	})
 }
@@ -1377,7 +1397,40 @@ func (s *RTPRelaySession) recordRTCPFeedbackSummary(summary RTCPFeedbackSummary)
 	s.rtcpUnknownPackets.Add(summary.UnknownPackets)
 }
 
-func (s *RTPRelaySession) recordRTCPReportQuality(event RTCPFeedbackEvent) {
+func (s *RTPRelaySession) recordRTCPSenderReport(event RTCPFeedbackEvent, observedAt time.Time) {
+	if s == nil || observedAt.IsZero() {
+		return
+	}
+	sr, ok := event.Packet.(*rtcp.SenderReport)
+	if !ok || sr.NTPTime == 0 {
+		return
+	}
+	direction, err := normalizeRTCPFeedbackDirection(event.Direction)
+	if err != nil {
+		return
+	}
+	timing := rtpRelayRTCPSenderReportTiming{
+		lastSenderReport: rtcpLastSenderReport(sr.NTPTime),
+		observedAt:       observedAt,
+	}
+	s.rtcpQualityMu.Lock()
+	if s.rtcpSenderReportTiming == nil {
+		s.rtcpSenderReportTiming = make(map[rtpRelayRTCPSenderReportKey]rtpRelayRTCPSenderReportTiming)
+	}
+	s.rtcpSenderReportTiming[rtpRelayRTCPSenderReportKey{direction: direction, ssrc: sr.SSRC}] = timing
+	s.rtcpQualityMu.Unlock()
+
+	s.rtpStatsMu.Lock()
+	defer s.rtpStatsMu.Unlock()
+	switch direction {
+	case RTCPFeedbackClientToIMS:
+		_, _ = s.clientToIMSRTPStats.ObserveRTCPSenderReport(sr.SSRC, sr.NTPTime, observedAt)
+	case RTCPFeedbackIMSToClient:
+		_, _ = s.imsToClientRTPStats.ObserveRTCPSenderReport(sr.SSRC, sr.NTPTime, observedAt)
+	}
+}
+
+func (s *RTPRelaySession) recordRTCPReportQuality(event RTCPFeedbackEvent, observedAt time.Time) {
 	if s == nil || len(event.Reports) == 0 {
 		return
 	}
@@ -1401,6 +1454,7 @@ func (s *RTPRelaySession) recordRTCPReportQuality(event RTCPFeedbackEvent) {
 	}
 	for _, report := range event.Reports {
 		key := rtpRelayRTCPReportKey{reporterSSRC: event.SSRC, mediaSSRC: report.SSRC}
+		roundTripTime := s.rtcpReportRoundTripTimeLocked(direction, report, observedAt)
 		reports[key] = RTPRelayRTCPReportQuality{
 			Direction:          direction,
 			ReporterSSRC:       event.SSRC,
@@ -1411,7 +1465,35 @@ func (s *RTPRelaySession) recordRTCPReportQuality(event RTCPFeedbackEvent) {
 			Jitter:             report.Jitter,
 			LastSenderReport:   report.LastSenderReport,
 			Delay:              report.Delay,
+			RoundTripTime:      roundTripTime,
 		}
+	}
+}
+
+func (s *RTPRelaySession) rtcpReportRoundTripTimeLocked(direction RTCPFeedbackDirection, report RTCPReceptionReport, observedAt time.Time) time.Duration {
+	if report.LastSenderReport == 0 || observedAt.IsZero() {
+		return 0
+	}
+	timing := s.rtcpSenderReportTiming[rtpRelayRTCPSenderReportKey{direction: oppositeRTCPFeedbackDirection(direction), ssrc: report.SSRC}]
+	if timing.lastSenderReport != report.LastSenderReport || timing.observedAt.IsZero() {
+		return 0
+	}
+	elapsed := observedAt.Sub(timing.observedAt)
+	delay := rtcpCompactDelayDuration(report.Delay)
+	if elapsed <= delay {
+		return 0
+	}
+	return elapsed - delay
+}
+
+func oppositeRTCPFeedbackDirection(direction RTCPFeedbackDirection) RTCPFeedbackDirection {
+	switch direction {
+	case RTCPFeedbackClientToIMS:
+		return RTCPFeedbackIMSToClient
+	case RTCPFeedbackIMSToClient:
+		return RTCPFeedbackClientToIMS
+	default:
+		return ""
 	}
 }
 

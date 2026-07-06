@@ -24,7 +24,15 @@ type InformationalResult struct {
 	RequestBytes  []byte
 	ResponseBytes []byte
 	ResponseInner []Payload
+	Response      InformationalContent
 	NextMessageID uint32
+}
+
+type InformationalContent struct {
+	Payloads    []Payload
+	Notifies    []Notify
+	Deletes     []Delete
+	NotifyError error
 }
 
 func RunInformationalExchange(ctx context.Context, cfg InformationalConfig) (InformationalResult, error) {
@@ -54,14 +62,15 @@ func RunInformationalExchange(ctx context.Context, cfg InformationalConfig) (Inf
 	if err != nil {
 		return InformationalResult{}, err
 	}
-	_, inner, err := ParseInformationalResponseFrom(respBytes, cfg.Init, keys, cfg.MessageID, !requestFromInitiator)
+	_, response, err := ParseInformationalResponseContentFrom(respBytes, cfg.Init, keys, cfg.MessageID, !requestFromInitiator)
 	if err != nil {
 		return InformationalResult{}, err
 	}
 	return InformationalResult{
 		RequestBytes:  append([]byte(nil), reqBytes...),
 		ResponseBytes: append([]byte(nil), respBytes...),
-		ResponseInner: clonePayloads(inner),
+		ResponseInner: clonePayloads(response.Payloads),
+		Response:      cloneInformationalContent(response),
 		NextMessageID: cfg.MessageID + 1,
 	}, nil
 }
@@ -96,25 +105,81 @@ func ParseInformationalResponse(raw []byte, init InitResult, keys IKEKeys, messa
 }
 
 func ParseInformationalRequestFrom(raw []byte, init InitResult, keys IKEKeys, messageID uint32, fromInitiator bool) (Message, []Payload, error) {
-	msg, inner, err := UnprotectMessage(raw, keys, fromInitiator)
+	msg, content, err := ParseInformationalRequestContentFrom(raw, init, keys, messageID, fromInitiator)
 	if err != nil {
 		return Message{}, nil, err
 	}
-	if err := validateInformationalHeader(msg.Header, init, messageID, fromInitiator, false); err != nil {
-		return Message{}, nil, err
-	}
-	return msg, inner, nil
+	return msg, content.Payloads, nil
 }
 
 func ParseInformationalResponseFrom(raw []byte, init InitResult, keys IKEKeys, messageID uint32, fromInitiator bool) (Message, []Payload, error) {
-	msg, inner, err := UnprotectMessage(raw, keys, fromInitiator)
+	msg, content, err := ParseInformationalResponseContentFrom(raw, init, keys, messageID, fromInitiator)
 	if err != nil {
 		return Message{}, nil, err
 	}
-	if err := validateInformationalHeader(msg.Header, init, messageID, fromInitiator, true); err != nil {
-		return Message{}, nil, err
+	return msg, content.Payloads, nil
+}
+
+func ParseInformationalRequestContent(raw []byte, init InitResult, keys IKEKeys, messageID uint32) (Message, InformationalContent, error) {
+	return ParseInformationalRequestContentFrom(raw, init, keys, messageID, true)
+}
+
+func ParseInformationalResponseContent(raw []byte, init InitResult, keys IKEKeys, messageID uint32) (Message, InformationalContent, error) {
+	return ParseInformationalResponseContentFrom(raw, init, keys, messageID, false)
+}
+
+func ParseInformationalRequestContentFrom(raw []byte, init InitResult, keys IKEKeys, messageID uint32, fromInitiator bool) (Message, InformationalContent, error) {
+	msg, inner, err := UnprotectMessage(raw, keys, fromInitiator)
+	if err != nil {
+		return Message{}, InformationalContent{}, err
 	}
-	return msg, inner, nil
+	if err := validateInformationalHeader(msg.Header, init, messageID, fromInitiator, false); err != nil {
+		return Message{}, InformationalContent{}, err
+	}
+	content, err := ParseInformationalContent(inner)
+	if err != nil {
+		return Message{}, InformationalContent{}, err
+	}
+	return msg, content, nil
+}
+
+func ParseInformationalResponseContentFrom(raw []byte, init InitResult, keys IKEKeys, messageID uint32, fromInitiator bool) (Message, InformationalContent, error) {
+	msg, inner, err := UnprotectMessage(raw, keys, fromInitiator)
+	if err != nil {
+		return Message{}, InformationalContent{}, err
+	}
+	if err := validateInformationalHeader(msg.Header, init, messageID, fromInitiator, true); err != nil {
+		return Message{}, InformationalContent{}, err
+	}
+	content, err := ParseInformationalContent(inner)
+	if err != nil {
+		return Message{}, InformationalContent{}, err
+	}
+	return msg, content, nil
+}
+
+func ParseInformationalContent(payloads []Payload) (InformationalContent, error) {
+	content := InformationalContent{Payloads: clonePayloads(payloads)}
+	for _, payload := range payloads {
+		switch payload.Type {
+		case PayloadNotify:
+			notify, err := ParseNotify(payload.Body)
+			if err != nil {
+				return InformationalContent{}, fmt.Errorf("%w: %w", ErrInvalidInformational, err)
+			}
+			content.Notifies = append(content.Notifies, cloneNotify(notify))
+			if content.NotifyError == nil {
+				content.NotifyError = NotifyErrorFor(notify)
+			}
+		case PayloadDelete:
+			deletePayload, err := ParseDelete(payload.Body)
+			if err != nil {
+				return InformationalContent{}, fmt.Errorf("%w: %w", ErrInvalidInformational, err)
+			}
+			content.Deletes = append(content.Deletes, cloneDelete(deletePayload))
+		}
+	}
+	return content, nil
 }
 
 func informationalHeader(init InitResult, messageID uint32, fromInitiator bool, response bool) Header {
@@ -160,4 +225,47 @@ func informationalIV(random io.Reader, profile KeyMaterialProfile, override []by
 		return append([]byte(nil), override...), nil
 	}
 	return RandomIV(random, profile)
+}
+
+func cloneInformationalContent(in InformationalContent) InformationalContent {
+	return InformationalContent{
+		Payloads:    clonePayloads(in.Payloads),
+		Notifies:    cloneNotifies(in.Notifies),
+		Deletes:     cloneDeletes(in.Deletes),
+		NotifyError: cloneNotifyError(in.NotifyError),
+	}
+}
+
+func cloneNotifies(in []Notify) []Notify {
+	out := make([]Notify, len(in))
+	for i, notify := range in {
+		out[i] = cloneNotify(notify)
+	}
+	return out
+}
+
+func cloneDeletes(in []Delete) []Delete {
+	out := make([]Delete, len(in))
+	for i, deletePayload := range in {
+		out[i] = cloneDelete(deletePayload)
+	}
+	return out
+}
+
+func cloneDelete(in Delete) Delete {
+	return Delete{
+		ProtocolID: in.ProtocolID,
+		SPIs:       cloneByteSlices(in.SPIs),
+	}
+}
+
+func cloneNotifyError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var notifyErr *NotifyError
+	if errors.As(err, &notifyErr) {
+		return NotifyErrorFor(notifyErr.Notify)
+	}
+	return err
 }

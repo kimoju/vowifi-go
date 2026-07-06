@@ -11,6 +11,30 @@ import (
 )
 
 var ErrSIPFlowClosed = errors.New("SIP flow is closed")
+var ErrSIPFinalResponseTimeout = errors.New("SIP final response timeout")
+
+type sipFinalResponseTimeoutError struct {
+	Method string
+	Err    error
+}
+
+func (e sipFinalResponseTimeoutError) Error() string {
+	method := strings.ToUpper(strings.TrimSpace(e.Method))
+	if method == "" {
+		method = "SIP"
+	}
+	if e.Err == nil {
+		return method + " final response timeout"
+	}
+	return method + " final response timeout: " + e.Err.Error()
+}
+
+func (e sipFinalResponseTimeoutError) Unwrap() []error {
+	if e.Err == nil {
+		return []error{ErrSIPFinalResponseTimeout}
+	}
+	return []error{ErrSIPFinalResponseTimeout, e.Err}
+}
 
 type WireSIPFlow struct {
 	Network               string
@@ -65,7 +89,7 @@ func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) e
 	defer f.mu.Unlock()
 	attempts := 0
 	shouldRetry := func(err error) bool {
-		if ctx.Err() != nil || !isSIPRetryableTransportError(err) {
+		if ctx.Err() != nil || errors.Is(err, ErrSIPFinalResponseTimeout) || !isSIPRetryableTransportError(err) {
 			return false
 		}
 		attempts++
@@ -214,7 +238,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 	attempts := 0
 	redirects := 0
 	shouldRetry := func(err error) bool {
-		if ctx.Err() != nil || !isSIPRetryableTransportError(err) {
+		if ctx.Err() != nil || errors.Is(err, ErrSIPFinalResponseTimeout) || !isSIPRetryableTransportError(err) {
 			return false
 		}
 		attempts++
@@ -281,7 +305,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 			continue
 		}
 		if strings.HasPrefix(network, "tcp") {
-			resp, err := readFinalSIPResponse(ctx, f.reader, attempt, onProvisional)
+			resp, err := readFinalSIPFlowResponse(ctx, f.reader, attempt, onProvisional)
 			if err != nil {
 				f.closeConnLocked()
 				if ctx.Err() != nil {
@@ -343,6 +367,9 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 				return SIPResponse{}, ctx.Err()
 			}
 			if !isSIPTimeout(err) || !time.Now().Before(deadline) {
+				if gotResponse && isSIPTimeout(err) {
+					return SIPResponse{}, sipFinalResponseTimeoutError{Method: msg.Method, Err: err}
+				}
 				return SIPResponse{}, err
 			}
 			if !gotResponse && !retransmitExhausted && shouldSIPRetransmit(retransmits, f.MaxRetransmits) {
@@ -371,6 +398,35 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 		}
 		if !isSIPProvisionalResponse(resp.StatusCode) {
 			drainSIPUDPFinalResponses(ctx, conn, msg, sipFinalResponseDrainDuration(msg.Method, f.FinalResponseDrain))
+			return resp, nil
+		}
+		if onProvisional != nil && shouldReportSIPProvisionalResponse(msg.Method) {
+			if err := onProvisional(ctx, msg, resp); err != nil {
+				return SIPResponse{}, err
+			}
+		}
+		gotResponse = true
+	}
+}
+
+func readFinalSIPFlowResponse(ctx context.Context, reader *bufio.Reader, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
+	gotResponse := false
+	for {
+		raw, err := readSIPStreamMessage(reader)
+		if err != nil {
+			if gotResponse && isSIPTimeout(err) {
+				return SIPResponse{}, sipFinalResponseTimeoutError{Method: msg.Method, Err: err}
+			}
+			return SIPResponse{}, err
+		}
+		resp, err := ParseSIPResponse(raw)
+		if err != nil {
+			return SIPResponse{}, err
+		}
+		if !sipResponseMatchesRequest(resp, msg) {
+			continue
+		}
+		if !isSIPProvisionalResponse(resp.StatusCode) {
 			return resp, nil
 		}
 		if onProvisional != nil && shouldReportSIPProvisionalResponse(msg.Method) {

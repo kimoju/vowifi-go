@@ -3,6 +3,7 @@ package voiceclient
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -761,6 +762,168 @@ func TestWireSIPFlowWaitsForNonInviteFinalAfterProvisional(t *testing.T) {
 	})
 	if err != nil || resp.StatusCode != 202 {
 		t.Fatalf("RoundTripRequest() response=%+v err=%v", resp, err)
+	}
+	if msg := <-serverErr; msg != "" {
+		t.Fatal(msg)
+	}
+}
+
+func TestWireSIPFlowFinalResponseTimeoutAfterProvisionalDoesNotFailOver(t *testing.T) {
+	first, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(first) error = %v", err)
+	}
+	defer first.Close()
+	second, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(second) error = %v", err)
+	}
+	defer second.Close()
+
+	firstSeen := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = first.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := first.ReadFrom(buf)
+		if err != nil {
+			firstSeen <- "read error: " + err.Error()
+			return
+		}
+		requestWire := string(append([]byte(nil), buf[:n]...))
+		req, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			firstSeen <- "parse request error: " + err.Error()
+			return
+		}
+		trying, err := BuildSIPResponseWire(req, 100, "Trying", nil, nil)
+		if err != nil {
+			firstSeen <- "build trying error: " + err.Error()
+			return
+		}
+		if _, err := first.WriteTo(trying, addr); err != nil {
+			firstSeen <- "write trying error: " + err.Error()
+			return
+		}
+		_ = first.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+		n, _, err = first.ReadFrom(buf)
+		if err == nil {
+			firstSeen <- "unexpected retransmit after 100 Trying: " + string(append([]byte(nil), buf[:n]...))
+			return
+		}
+		firstSeen <- requestWire
+	}()
+
+	secondSeen := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = second.SetReadDeadline(time.Now().Add(380 * time.Millisecond))
+		n, _, err := second.ReadFrom(buf)
+		if err != nil {
+			secondSeen <- ""
+			return
+		}
+		secondSeen <- string(append([]byte(nil), buf[:n]...))
+	}()
+
+	resolverCalls := 0
+	flow := &WireSIPFlow{
+		Network: "udp",
+		Resolver: SIPServerCandidateResolverFunc(func(ctx context.Context, network, uri string) ([]string, error) {
+			resolverCalls++
+			return []string{first.LocalAddr().String(), second.LocalAddr().String()}, nil
+		}),
+		Timeout:               250 * time.Millisecond,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+		MaxRetransmits:        1,
+	}
+	defer flow.Close()
+	resp, err := flow.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sip:+18005551212@example",
+		Headers: map[string]string{
+			"To":           "<sip:+18005551212@example>",
+			"From":         "<sip:user@example>;tag=sms",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-final-timeout-message",
+			"CSeq":         "1 MESSAGE",
+			"Max-Forwards": "70",
+		},
+		Body: []byte("hello"),
+	})
+	firstWire := <-firstSeen
+	if err == nil || !errors.Is(err, ErrSIPFinalResponseTimeout) {
+		t.Fatalf("RoundTripRequest() response=%+v err=%v, first=%q, want final response timeout", resp, err, firstWire)
+	}
+	if !strings.Contains(firstWire, "MESSAGE sip:+18005551212@example") {
+		t.Fatalf("first target wire=%q", firstWire)
+	}
+	if wire := <-secondSeen; wire != "" {
+		t.Fatalf("unexpected failover request to second target: %q", wire)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("resolver calls=%d, want 1", resolverCalls)
+	}
+}
+
+func TestWireSIPFlowTCPFinalResponseTimeoutAfterProvisional(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer ln.Close()
+
+	serverErr := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErr <- "accept error: " + err.Error()
+			return
+		}
+		defer conn.Close()
+		raw, err := readSIPStreamMessage(bufio.NewReader(conn))
+		if err != nil {
+			serverErr <- "read error: " + err.Error()
+			return
+		}
+		req, err := ParseSIPRequest(raw)
+		if err != nil {
+			serverErr <- "parse request error: " + err.Error()
+			return
+		}
+		ringing, err := BuildSIPResponseWire(req, 180, "Ringing", nil, nil)
+		if err != nil {
+			serverErr <- "build ringing error: " + err.Error()
+			return
+		}
+		if _, err := conn.Write(ringing); err != nil {
+			serverErr <- "write ringing error: " + err.Error()
+			return
+		}
+		time.Sleep(320 * time.Millisecond)
+		serverErr <- ""
+	}()
+
+	flow := &WireSIPFlow{
+		Network:    "tcp",
+		ServerAddr: ln.Addr().String(),
+		Timeout:    200 * time.Millisecond,
+	}
+	defer flow.Close()
+	resp, err := flow.RoundTripInvite(context.Background(), SIPRequestMessage{
+		Method: "INVITE",
+		URI:    "sip:+18005551212@example",
+		Headers: map[string]string{
+			"To":           "<sip:+18005551212@example>",
+			"From":         "<sip:user@example>;tag=call",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-tcp-final-timeout-invite",
+			"CSeq":         "1 INVITE",
+			"Max-Forwards": "70",
+		},
+	}, nil)
+	if err == nil || !errors.Is(err, ErrSIPFinalResponseTimeout) {
+		t.Fatalf("RoundTripInvite() response=%+v err=%v, want final response timeout", resp, err)
 	}
 	if msg := <-serverErr; msg != "" {
 		t.Fatal(msg)

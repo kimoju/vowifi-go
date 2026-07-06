@@ -748,6 +748,89 @@ func TestRTPRelaySessionReportsQualitySnapshot(t *testing.T) {
 	}
 }
 
+func TestRTPRelaySessionEstimatesRTTFromSenderAndReceiverReports(t *testing.T) {
+	clientPeer := listenTestUDP(t)
+	defer clientPeer.Close()
+	clientRTCPPeer := listenTestUDP(t)
+	defer clientRTCPPeer.Close()
+	imsPeer := listenTestUDP(t)
+	defer imsPeer.Close()
+	imsRTCPPeer := listenTestUDP(t)
+	defer imsRTCPPeer.Close()
+
+	clientAddr := clientPeer.LocalAddr().(*net.UDPAddr)
+	clientRTCPAddr := clientRTCPPeer.LocalAddr().(*net.UDPAddr)
+	imsAddr := imsPeer.LocalAddr().(*net.UDPAddr)
+	imsRTCPAddr := imsRTCPPeer.LocalAddr().(*net.UDPAddr)
+	relay, err := NewRTPRelaySession(context.Background(), RTPRelayConfig{
+		ClientListenIP:    "127.0.0.1",
+		ClientAdvertiseIP: "127.0.0.1",
+		IMSListenIP:       "127.0.0.1",
+		IMSAdvertiseIP:    "127.0.0.1",
+	}, SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: clientAddr.Port, RTCPPort: clientRTCPAddr.Port})
+	if err != nil {
+		t.Fatalf("NewRTPRelaySession() error = %v", err)
+	}
+	defer relay.Close()
+	if err := relay.SetIMSRemote(SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: imsAddr.Port, RTCPPort: imsRTCPAddr.Port}); err != nil {
+		t.Fatalf("SetIMSRemote() error = %v", err)
+	}
+
+	clientRTCPEndpoint := udpRTCPAddrFromSDP(t, relay.ClientEndpoint())
+	imsRTCPEndpoint := udpRTCPAddrFromSDP(t, relay.IMSEndpoint())
+	mediaSSRC := uint32(0x70717273)
+	ntpTime := rtcpNTPTime(time.Unix(123, 456*time.Millisecond.Nanoseconds()))
+	imsSenderReport, err := rtcp.Marshal([]rtcp.Packet{&rtcp.SenderReport{SSRC: mediaSSRC, NTPTime: ntpTime}})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal(sender report) error = %v", err)
+	}
+	if _, err := imsRTCPPeer.WriteToUDP(imsSenderReport, imsRTCPEndpoint); err != nil {
+		t.Fatalf("IMS RTCP WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, clientRTCPPeer); !bytes.Equal(got, imsSenderReport) {
+		t.Fatalf("client RTCP got=%x, want %x", got, imsSenderReport)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	clientReceiverReport, err := rtcp.Marshal([]rtcp.Packet{&rtcp.ReceiverReport{
+		SSRC: 0x81828384,
+		Reports: []rtcp.ReceptionReport{{
+			SSRC:             mediaSSRC,
+			LastSenderReport: rtcpLastSenderReport(ntpTime),
+			Delay:            rtcpCompactDelay(5 * time.Millisecond),
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal(receiver report) error = %v", err)
+	}
+	if _, err := clientRTCPPeer.WriteToUDP(clientReceiverReport, clientRTCPEndpoint); err != nil {
+		t.Fatalf("client RTCP WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, imsRTCPPeer); !bytes.Equal(got, clientReceiverReport) {
+		t.Fatalf("IMS RTCP got=%x, want %x", got, clientReceiverReport)
+	}
+
+	quality := waitRelayQuality(t, relay, func(quality RTPRelayQualityStats) bool {
+		return len(quality.ClientToIMS.RTCPReports) == 1 && quality.ClientToIMS.RTCPReports[0].RoundTripTime > 0
+	})
+	if len(quality.ClientToIMS.RTCPReports) != 1 {
+		t.Fatalf("quality=%+v", quality)
+	}
+	report := quality.ClientToIMS.RTCPReports[0]
+	if report.LastSenderReport != rtcpLastSenderReport(ntpTime) || report.Delay != rtcpCompactDelay(5*time.Millisecond) {
+		t.Fatalf("report quality=%+v", report)
+	}
+	if report.RoundTripTime <= 0 || report.RoundTripTime > time.Second {
+		t.Fatalf("RoundTripTime=%v", report.RoundTripTime)
+	}
+	if quality.ClientToIMS.RTCPMaxRoundTripTime != report.RoundTripTime {
+		t.Fatalf("max RTT=%v report RTT=%v", quality.ClientToIMS.RTCPMaxRoundTripTime, report.RoundTripTime)
+	}
+	if quality.IMSToClient.RTCPMaxRoundTripTime != 0 {
+		t.Fatalf("IMS-to-client max RTT=%v", quality.IMSToClient.RTCPMaxRoundTripTime)
+	}
+}
+
 func TestRTPRelaySessionSendsSenderReportWithSourceDescription(t *testing.T) {
 	clientPeer := listenTestUDP(t)
 	defer clientPeer.Close()

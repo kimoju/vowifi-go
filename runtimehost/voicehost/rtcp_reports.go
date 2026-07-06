@@ -10,6 +10,8 @@ import (
 const maxRTCPReceiverReportBlocks = 31
 const maxRTCPPositiveLostPackets = 0x7fffff
 const ntpEpochOffsetSeconds = 2208988800
+const rtcpCompactNTPUnitsPerSecond = 1 << 16
+const maxRTCPCompactDelay = ^uint32(0)
 
 type RTCPSenderReportConfig struct {
 	SSRC           uint32
@@ -87,6 +89,8 @@ func rtcpReceptionReportBlocks(stats []RTPStreamStats) []rtcp.ReceptionReport {
 			TotalLost:          rtcpReportLostPackets(stream.LostPackets),
 			LastSequenceNumber: stream.LastSequenceNumber,
 			Jitter:             stream.Jitter,
+			LastSenderReport:   stream.LastSenderReport,
+			Delay:              stream.Delay,
 		})
 	}
 	return reports
@@ -106,4 +110,30 @@ func rtcpNTPTime(t time.Time) uint64 {
 	}
 	fraction := (uint64(t.Nanosecond()) << 32) / uint64(time.Second)
 	return uint64(seconds)<<32 | fraction
+}
+
+func rtcpLastSenderReport(ntpTime uint64) uint32 {
+	return uint32(ntpTime >> 16)
+}
+
+func rtcpCompactDelay(d time.Duration) uint32 {
+	if d <= 0 {
+		return 0
+	}
+	seconds := uint64(d / time.Second)
+	remainder := uint64(d % time.Second)
+	if seconds >= rtcpCompactNTPUnitsPerSecond {
+		return maxRTCPCompactDelay
+	}
+	units := seconds*rtcpCompactNTPUnitsPerSecond + remainder*rtcpCompactNTPUnitsPerSecond/uint64(time.Second)
+	if units > uint64(maxRTCPCompactDelay) {
+		return maxRTCPCompactDelay
+	}
+	return uint32(units)
+}
+
+func rtcpCompactDelayDuration(delay uint32) time.Duration {
+	seconds := delay / rtcpCompactNTPUnitsPerSecond
+	fraction := delay % rtcpCompactNTPUnitsPerSecond
+	return time.Duration(seconds)*time.Second + time.Duration(fraction)*time.Second/rtcpCompactNTPUnitsPerSecond
 }

@@ -69,6 +69,139 @@ func TestInformationalESPDeleteRoundTrip(t *testing.T) {
 	}
 }
 
+func TestInformationalContentClassifiesNotifyAndDelete(t *testing.T) {
+	init, keys := informationalFixture(t)
+	notifyPayload, err := NotifyPayload(Notify{
+		NotifyType:       NotifyUnacceptableAddresses,
+		NotificationData: []byte{0xaa},
+	})
+	if err != nil {
+		t.Fatalf("NotifyPayload() error = %v", err)
+	}
+	deletePayload, err := ESPDeletePayload(mustHex("01020304"))
+	if err != nil {
+		t.Fatalf("ESPDeletePayload() error = %v", err)
+	}
+	_, raw, err := BuildInformationalResponse(init, keys, 15, []Payload{
+		MOBIKESupportedNotify(),
+		notifyPayload,
+		deletePayload,
+	}, bytes.Repeat([]byte{0x7a}, keys.Profile.EncryptionBlockSize))
+	if err != nil {
+		t.Fatalf("BuildInformationalResponse() error = %v", err)
+	}
+
+	_, content, err := ParseInformationalResponseContent(raw, init, keys, 15)
+	if err != nil {
+		t.Fatalf("ParseInformationalResponseContent() error = %v", err)
+	}
+	if len(content.Payloads) != 3 || len(content.Notifies) != 2 || len(content.Deletes) != 1 {
+		t.Fatalf("content=%+v", content)
+	}
+	if !errors.Is(content.NotifyError, ErrIKEv2NotifyError) ||
+		!errors.Is(content.NotifyError, ErrNotifyUnacceptableAddresses) {
+		t.Fatalf("NotifyError=%v, want ErrIKEv2NotifyError and ErrNotifyUnacceptableAddresses", content.NotifyError)
+	}
+	var notifyErr *NotifyError
+	if !errors.As(content.NotifyError, &notifyErr) {
+		t.Fatalf("NotifyError=%T, want *NotifyError", content.NotifyError)
+	}
+	if notifyErr.Notify.NotifyType != NotifyUnacceptableAddresses ||
+		hex.EncodeToString(notifyErr.Notify.NotificationData) != "aa" {
+		t.Fatalf("notifyErr=%+v", notifyErr)
+	}
+	if content.Notifies[0].NotifyType != NotifyMOBIKESupported ||
+		content.Notifies[1].NotifyType != NotifyUnacceptableAddresses {
+		t.Fatalf("notifies=%+v", content.Notifies)
+	}
+	if content.Deletes[0].ProtocolID != ProtocolESP || len(content.Deletes[0].SPIs) != 1 ||
+		hex.EncodeToString(content.Deletes[0].SPIs[0]) != "01020304" {
+		t.Fatalf("deletes=%+v", content.Deletes)
+	}
+
+	_, inner, err := ParseInformationalResponse(raw, init, keys, 15)
+	if err != nil {
+		t.Fatalf("ParseInformationalResponse() error = %v", err)
+	}
+	if len(inner) != len(content.Payloads) {
+		t.Fatalf("inner=%+v content.Payloads=%+v", inner, content.Payloads)
+	}
+}
+
+func TestInformationalRejectsMalformedNotifyDelete(t *testing.T) {
+	init, keys := informationalFixture(t)
+	cases := []struct {
+		name    string
+		payload Payload
+		want    error
+	}{
+		{
+			name:    "notify",
+			payload: Payload{Type: PayloadNotify, Body: []byte{ProtocolIKE, 0, 0}},
+			want:    ErrInvalidNotify,
+		},
+		{
+			name:    "delete",
+			payload: Payload{Type: PayloadDelete, Body: []byte{ProtocolESP, 4, 0, 1, 1, 2, 3}},
+			want:    ErrInvalidDelete,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, raw, err := BuildInformationalRequest(init, keys, 16, []Payload{tc.payload}, bytes.Repeat([]byte{0x7b}, keys.Profile.EncryptionBlockSize))
+			if err != nil {
+				t.Fatalf("BuildInformationalRequest() error = %v", err)
+			}
+			_, _, err = ParseInformationalRequest(raw, init, keys, 16)
+			if !errors.Is(err, ErrInvalidInformational) || !errors.Is(err, tc.want) {
+				t.Fatalf("ParseInformationalRequest() err=%v, want ErrInvalidInformational and %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunInformationalExchangeReturnsResponseContent(t *testing.T) {
+	init, keys := informationalFixture(t)
+	notifyPayload, err := NotifyPayload(Notify{NotifyType: NotifyInvalidSyntax})
+	if err != nil {
+		t.Fatalf("NotifyPayload() error = %v", err)
+	}
+	deletePayload, err := ESPDeletePayload(mustHex("aabbccdd"))
+	if err != nil {
+		t.Fatalf("ESPDeletePayload() error = %v", err)
+	}
+	transport := &informationalExchangeTransport{
+		t:                    t,
+		init:                 init,
+		keys:                 keys,
+		messageID:            17,
+		requestFromInitiator: true,
+		responseInner:        []Payload{notifyPayload, deletePayload},
+	}
+	res, err := RunInformationalExchange(context.Background(), InformationalConfig{
+		Transport: transport,
+		Init:      init,
+		Keys:      keys,
+		MessageID: 17,
+		IV:        bytes.Repeat([]byte{0x7c}, keys.Profile.EncryptionBlockSize),
+	})
+	if err != nil {
+		t.Fatalf("RunInformationalExchange() error = %v", err)
+	}
+	if len(res.ResponseInner) != 2 || len(res.Response.Payloads) != 2 ||
+		len(res.Response.Notifies) != 1 || len(res.Response.Deletes) != 1 {
+		t.Fatalf("res=%+v", res)
+	}
+	if !errors.Is(res.Response.NotifyError, ErrIKEv2NotifyError) ||
+		!errors.Is(res.Response.NotifyError, ErrNotifyInvalidSyntax) {
+		t.Fatalf("Response.NotifyError=%v, want ErrIKEv2NotifyError and ErrNotifyInvalidSyntax", res.Response.NotifyError)
+	}
+	if res.Response.Deletes[0].ProtocolID != ProtocolESP ||
+		hex.EncodeToString(res.Response.Deletes[0].SPIs[0]) != "aabbccdd" {
+		t.Fatalf("Response.Deletes=%+v", res.Response.Deletes)
+	}
+}
+
 func TestInformationalResponderOriginatedDPDRoundTrip(t *testing.T) {
 	init, keys := informationalFixture(t)
 	_, requestRaw, err := BuildInformationalRequestFrom(init, keys, 12, false, nil, bytes.Repeat([]byte{0x75}, keys.Profile.EncryptionBlockSize))

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIMSCPIMMessageHeaderRoundTrip(t *testing.T) {
@@ -163,6 +164,55 @@ func TestParseIMSCPIMMessageMergesCanonicalAndAliasedIMDNHeaders(t *testing.T) {
 	}
 	if got := parsed.Headers["x.Message-ID"]; len(got) != 0 {
 		t.Fatalf("alias key still present: %+v", got)
+	}
+}
+
+func TestParseIMSCPIMIMDNReportDeliveryFailure(t *testing.T) {
+	payload := strings.Join([]string{
+		`<?xml version="1.0" encoding="UTF-8"?>`,
+		`<imdn xmlns="urn:ietf:params:xml:ns:imdn">`,
+		`  <message-id>msg-123-1@vowifi-go</message-id>`,
+		`  <datetime>2026-07-07T02:03:04.123Z</datetime>`,
+		`  <recipient-uri>tel:+18005551212</recipient-uri>`,
+		`  <original-recipient-uri>tel:+18005550000</original-recipient-uri>`,
+		`  <delivery-notification><status><failed/></status></delivery-notification>`,
+		`</imdn>`,
+	}, "")
+	body := []byte(strings.Join([]string{
+		"From: <sip:smsc@ims.example>",
+		"To: <sip:user@ims.example>",
+		"NS: x <urn:ietf:params:imdn>",
+		"x.Message-ID: header-message-id",
+		"x.Original-To: tel:+18005559999",
+		"",
+		"Content-Type: message/imdn+xml; charset=UTF-8",
+		"Content-Disposition: notification",
+		"Content-Length: " + strconv.Itoa(len(payload)),
+		"",
+		payload,
+	}, "\r\n"))
+
+	cpim, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	report, err := parseIMSCPIMIMDNReport(cpim)
+	if err != nil {
+		t.Fatalf("parseIMSCPIMIMDNReport() error = %v", err)
+	}
+
+	if report.MessageID != "msg-123-1@vowifi-go" || report.Notification != "delivery" || report.Status != "failed" || report.State != "failed" {
+		t.Fatalf("report=%+v", report)
+	}
+	if report.RecipientURI != "tel:+18005551212" || report.OriginalRecipientURI != "tel:+18005550000" {
+		t.Fatalf("report recipients=%+v", report)
+	}
+	wantAt := time.Date(2026, 7, 7, 2, 3, 4, 123000000, time.UTC)
+	if !report.DateTime.Equal(wantAt) {
+		t.Fatalf("DateTime=%s want %s", report.DateTime, wantAt)
+	}
+	if !strings.Contains(report.ErrorText, "failed") {
+		t.Fatalf("ErrorText=%q", report.ErrorText)
 	}
 }
 

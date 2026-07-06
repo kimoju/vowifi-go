@@ -3,6 +3,7 @@ package messaging
 import (
 	"bufio"
 	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"mime"
@@ -10,11 +11,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const IMSCPIMContentType = "message/cpim"
 
 const imsCPIMIMDNNamespace = "urn:ietf:params:imdn"
+const imsIMDNContentType = "message/imdn+xml"
 
 type IMSCPIMMessage struct {
 	Headers        map[string][]string
@@ -60,6 +63,151 @@ func ParseIMSCPIMMessage(body []byte) (IMSCPIMMessage, error) {
 		ContentType:    contentType,
 		Body:           append([]byte(nil), content...),
 	}, nil
+}
+
+type imsCPIMIMDNReport struct {
+	MessageID            string
+	DateTime             time.Time
+	RecipientURI         string
+	OriginalRecipientURI string
+	Notification         string
+	Status               string
+	State                string
+	ErrorText            string
+}
+
+type imsIMDNXMLDocument struct {
+	XMLName              xml.Name             `xml:"imdn"`
+	MessageID            string               `xml:"message-id"`
+	DateTime             string               `xml:"datetime"`
+	RecipientURI         string               `xml:"recipient-uri"`
+	OriginalRecipientURI string               `xml:"original-recipient-uri"`
+	Delivery             *imsIMDNNotification `xml:"delivery-notification"`
+	Display              *imsIMDNNotification `xml:"display-notification"`
+	Processing           *imsIMDNNotification `xml:"processing-notification"`
+}
+
+type imsIMDNNotification struct {
+	Status imsIMDNStatus `xml:"status"`
+}
+
+type imsIMDNStatus struct {
+	Delivered *struct{} `xml:"delivered"`
+	Displayed *struct{} `xml:"displayed"`
+	Processed *struct{} `xml:"processed"`
+	Stored    *struct{} `xml:"stored"`
+	Failed    *struct{} `xml:"failed"`
+	Forbidden *struct{} `xml:"forbidden"`
+	Error     *struct{} `xml:"error"`
+}
+
+func parseIMSCPIMIMDNReport(cpim IMSCPIMMessage) (imsCPIMIMDNReport, error) {
+	if normalizedIMSMessageContentType(cpim.ContentType) != imsIMDNContentType {
+		return imsCPIMIMDNReport{}, fmt.Errorf("not IMDN content type: %s", cpim.ContentType)
+	}
+	headers := cloneCPIMHeaders(cpim.Headers)
+	normalizeCPIMIMDNHeaders(headers)
+
+	var doc imsIMDNXMLDocument
+	decoder := xml.NewDecoder(bytes.NewReader(cpim.Body))
+	if err := decoder.Decode(&doc); err != nil {
+		return imsCPIMIMDNReport{}, fmt.Errorf("IMDN XML: %w", err)
+	}
+	if !strings.EqualFold(doc.XMLName.Local, "imdn") {
+		return imsCPIMIMDNReport{}, fmt.Errorf("IMDN root is %q, want imdn", doc.XMLName.Local)
+	}
+
+	notification, status := imsIMDNNotificationStatus(doc)
+	if status == "" {
+		return imsCPIMIMDNReport{}, errors.New("IMDN status is empty")
+	}
+	state, ok := imsIMDNDeliveryState(status)
+	if !ok {
+		return imsCPIMIMDNReport{}, fmt.Errorf("unsupported IMDN status: %s", status)
+	}
+	reportAt, err := parseIMSCPIMIMDNTime(firstNonEmpty(doc.DateTime, firstCPIMHeaderValue(headers, "DateTime"), firstCPIMHeaderValue(headers, "imdn.DateTime")))
+	if err != nil {
+		return imsCPIMIMDNReport{}, err
+	}
+
+	return imsCPIMIMDNReport{
+		MessageID:            firstNonEmpty(doc.MessageID, firstCPIMHeaderValue(headers, "imdn.Message-ID")),
+		DateTime:             reportAt,
+		RecipientURI:         firstNonEmpty(doc.RecipientURI, firstCPIMHeaderValue(headers, "To")),
+		OriginalRecipientURI: firstNonEmpty(doc.OriginalRecipientURI, firstCPIMHeaderValue(headers, "imdn.Original-To")),
+		Notification:         notification,
+		Status:               status,
+		State:                state,
+		ErrorText:            imsIMDNErrorText(notification, status, state),
+	}, nil
+}
+
+func imsIMDNNotificationStatus(doc imsIMDNXMLDocument) (string, string) {
+	if doc.Delivery != nil {
+		return "delivery", doc.Delivery.Status.value()
+	}
+	if doc.Display != nil {
+		return "display", doc.Display.Status.value()
+	}
+	if doc.Processing != nil {
+		return "processing", doc.Processing.Status.value()
+	}
+	return "", ""
+}
+
+func (s imsIMDNStatus) value() string {
+	switch {
+	case s.Delivered != nil:
+		return "delivered"
+	case s.Displayed != nil:
+		return "displayed"
+	case s.Processed != nil:
+		return "processed"
+	case s.Stored != nil:
+		return "stored"
+	case s.Failed != nil:
+		return "failed"
+	case s.Forbidden != nil:
+		return "forbidden"
+	case s.Error != nil:
+		return "error"
+	default:
+		return ""
+	}
+}
+
+func imsIMDNDeliveryState(status string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "delivered", "displayed", "processed":
+		return "delivered", true
+	case "stored":
+		return "accepted", true
+	case "failed", "forbidden", "error":
+		return "failed", true
+	default:
+		return "", false
+	}
+}
+
+func parseIMSCPIMIMDNTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, nil
+	}
+	reportAt, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid IMDN datetime: %q", value)
+	}
+	return reportAt, nil
+}
+
+func imsIMDNErrorText(notification, status, state string) string {
+	if state != "failed" {
+		return ""
+	}
+	notification = firstNonEmpty(notification, "delivery")
+	status = firstNonEmpty(status, "failed")
+	return "IMDN " + notification + " notification " + status
 }
 
 func BuildIMSCPIMMessage(from, to, contentType string, body []byte) ([]byte, error) {

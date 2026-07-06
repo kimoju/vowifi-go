@@ -14,6 +14,9 @@ const (
 	IMSIdentitySourceProfile = "profile"
 	IMSIdentitySourceISIM    = "isim"
 
+	IMEISourceProfile  = "profile"
+	IMEISourceDeviceID = "device_id"
+
 	AKAAppPreferenceUSIM       = "usim"
 	AKAAppPreferenceAuto       = "auto"
 	AKAAppPreferenceISIM       = "isim"
@@ -92,6 +95,13 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 	if profile.IMSI == "" {
 		return PreparedSession{}, errors.New("IMSI is empty")
 	}
+	imeiSource := IMEISourceProfile
+	if profile.IMEI == "" {
+		if imei := ExtractIMEI(in.DeviceID); imei != "" {
+			profile.IMEI = imei
+			imeiSource = IMEISourceDeviceID
+		}
+	}
 	prepared := PreparedSession{
 		Profile: profile,
 		EffectiveCarrier: EffectiveCarrier{
@@ -101,7 +111,7 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 		},
 		EPDGAddr:           defaultEPDG(profile),
 		EPDGSource:         "derived",
-		IdentityIMEISource: "profile",
+		IdentityIMEISource: imeiSource,
 		IMSIdentity: IMSIdentityResolution{
 			RequestedSource:  IMSIdentitySourceProfile,
 			ActualSource:     IMSIdentitySourceProfile,
@@ -135,6 +145,25 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 		}
 	}
 	return prepared, nil
+}
+
+func ExtractIMEI(value string) string {
+	var digits []byte
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b >= '0' && b <= '9' {
+			digits = append(digits, b)
+			continue
+		}
+		if len(digits) == 15 {
+			return string(digits)
+		}
+		digits = digits[:0]
+	}
+	if len(digits) == 15 {
+		return string(digits)
+	}
+	return ""
 }
 
 func selectISIMIMPU(impus []string, domain string, profile Profile) string {

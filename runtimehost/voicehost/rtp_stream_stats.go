@@ -20,11 +20,14 @@ type RTPStreamStats struct {
 	FractionLost       uint8
 	LastSequenceNumber uint32
 	Jitter             uint32
+	LastSenderReport   uint32
+	Delay              uint32
 }
 
 // RTPStreamStatsTracker keeps RTP reception statistics split by SSRC.
 type RTPStreamStatsTracker struct {
-	streams map[uint32]*rtpStreamStatsState
+	streams       map[uint32]*rtpStreamStatsState
+	senderReports map[uint32]rtpStreamSenderReportState
 }
 
 // NewRTPStreamStatsTracker returns an empty tracker. The zero value is also usable.
@@ -47,21 +50,55 @@ func (t *RTPStreamStatsTracker) ObserveRTPPacket(packet []byte, arrival time.Tim
 	state := t.streams[header.SSRC]
 	if state == nil {
 		state = newRTPStreamStatsState(header, arrival)
+		if senderReport, ok := t.senderReports[header.SSRC]; ok {
+			state.senderReport = senderReport
+		}
 		t.streams[header.SSRC] = state
-		return state.snapshot(), nil
+		return state.snapshotAt(arrival), nil
 	}
 	state.observe(header, arrival, clockRate)
-	return state.snapshot(), nil
+	return state.snapshotAt(arrival), nil
+}
+
+// ObserveRTCPSenderReport records the newest SR timing for an RTP source so
+// future RTCP reception reports can include LSR/DLSR timing fields.
+func (t *RTPStreamStatsTracker) ObserveRTCPSenderReport(ssrc uint32, ntpTime uint64, arrival time.Time) (RTPStreamStats, bool) {
+	if ntpTime == 0 {
+		return RTPStreamStats{}, false
+	}
+	if arrival.IsZero() {
+		arrival = time.Now()
+	}
+	report := rtpStreamSenderReportState{
+		lastSenderReport: rtcpLastSenderReport(ntpTime),
+		arrival:          arrival,
+	}
+	if t.senderReports == nil {
+		t.senderReports = make(map[uint32]rtpStreamSenderReportState)
+	}
+	t.senderReports[ssrc] = report
+	state := t.streams[ssrc]
+	if state == nil {
+		return RTPStreamStats{}, false
+	}
+	state.senderReport = report
+	return state.snapshotAt(arrival), true
 }
 
 // Stats returns deterministic snapshots ordered by SSRC.
 func (t *RTPStreamStatsTracker) Stats() []RTPStreamStats {
+	return t.StatsAt(time.Now())
+}
+
+// StatsAt returns deterministic snapshots ordered by SSRC with DLSR measured
+// against now for streams that have observed an RTCP sender report.
+func (t *RTPStreamStatsTracker) StatsAt(now time.Time) []RTPStreamStats {
 	if t == nil || len(t.streams) == 0 {
 		return nil
 	}
 	out := make([]RTPStreamStats, 0, len(t.streams))
 	for _, state := range t.streams {
-		out = append(out, state.snapshot())
+		out = append(out, state.snapshotAt(now))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].SSRC < out[j].SSRC
@@ -71,6 +108,11 @@ func (t *RTPStreamStatsTracker) Stats() []RTPStreamStats {
 
 // StatsForSSRC returns a snapshot for one SSRC when the tracker has observed it.
 func (t *RTPStreamStatsTracker) StatsForSSRC(ssrc uint32) (RTPStreamStats, bool) {
+	return t.StatsForSSRCAt(ssrc, time.Now())
+}
+
+// StatsForSSRCAt returns a snapshot for one SSRC with DLSR measured against now.
+func (t *RTPStreamStatsTracker) StatsForSSRCAt(ssrc uint32, now time.Time) (RTPStreamStats, bool) {
 	if t == nil {
 		return RTPStreamStats{}, false
 	}
@@ -78,7 +120,7 @@ func (t *RTPStreamStatsTracker) StatsForSSRC(ssrc uint32) (RTPStreamStats, bool)
 	if state == nil {
 		return RTPStreamStats{}, false
 	}
-	return state.snapshot(), true
+	return state.snapshotAt(now), true
 }
 
 type rtpStreamStatsState struct {
@@ -90,6 +132,12 @@ type rtpStreamStatsState struct {
 	baseTimestamp uint32
 	lastTransit   int64
 	jitter        float64
+	senderReport  rtpStreamSenderReportState
+}
+
+type rtpStreamSenderReportState struct {
+	lastSenderReport uint32
+	arrival          time.Time
 }
 
 func newRTPStreamStatsState(header rtpPacketHeader, arrival time.Time) *rtpStreamStatsState {
@@ -161,9 +209,15 @@ func (s *rtpStreamStatsState) recalculateLoss() {
 	s.stats.FractionLost = uint8(fraction)
 }
 
-func (s *rtpStreamStatsState) snapshot() RTPStreamStats {
+func (s *rtpStreamStatsState) snapshotAt(now time.Time) RTPStreamStats {
 	stats := s.stats
 	stats.LastSequenceNumber = s.maxSeq
+	stats.LastSenderReport = s.senderReport.lastSenderReport
+	if !now.IsZero() && !s.senderReport.arrival.IsZero() {
+		stats.Delay = rtcpCompactDelay(now.Sub(s.senderReport.arrival))
+	} else {
+		stats.Delay = 0
+	}
 	return stats
 }
 
