@@ -664,15 +664,37 @@ func (a *IMSInboundAgent) HandleInboundPrack(ctx context.Context, req InboundDia
 	cfg := state.clientCfg
 	prackCSeq := inboundCSeq(req.CSeq)
 	cfg.CSeq = prackCSeq
-	prack, err := voiceclient.BuildPrackRequest(cfg, firstVoiceNonEmpty(req.RAck, firstVoiceHeader(req.Headers, "RAck")))
-	if err != nil {
-		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client PRACK failed"}, err
+	rack := firstVoiceNonEmpty(req.RAck, firstVoiceHeader(req.Headers, "RAck"))
+	var resp voiceclient.SIPResponse
+	var prack voiceclient.SIPRequestMessage
+	var err error
+	redirectRetries := 0
+	for {
+		prack, err = voiceclient.BuildPrackRequest(cfg, rack)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client PRACK failed"}, err
+		}
+		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
+		a.storeInboundDialog(callID, state)
+		resp, err = a.ClientTransport.RoundTripRequest(ctx, prack)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client PRACK failed"}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextInboundClientCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
-	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, prackCSeq)
-	a.storeInboundDialog(callID, state)
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, prack)
-	if err != nil {
-		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client PRACK failed"}, err
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
+		cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, prackCSeq)
+		state.clientCfg = cfg
+		a.storeInboundDialog(callID, state)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 500), Reason: firstVoiceNonEmpty(resp.Reason, "PRACK rejected")}, nil

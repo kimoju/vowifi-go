@@ -595,6 +595,90 @@ func TestIMSOutboundAgentSendsDialogOptions(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentFollowsPrackAndOptionsRedirectContacts(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers:    map[string][]string{"Contact": {"<sip:prack-redirect@198.51.100.20:5060>"}},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"Contact": {"<sip:prack-final@198.51.100.21:5060>"}, "X-IMS": {"prack-redirect-ok"}},
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers:    map[string][]string{"Contact": {"<sip:options-redirect@198.51.100.30:5060>"}},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"Contact": {"<sip:options-final@198.51.100.31:5060>"}, "X-IMS": {"options-redirect-ok"}},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-prack-options-redirect",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	prackResult, err := agent.SendDialogPrack(context.Background(), DialogPrackRequest{
+		CallID: "call-prack-options-redirect",
+		RAck:   "1 1 INVITE",
+	})
+	if err != nil || !prackResult.Accepted || prackResult.Headers["X-IMS"] != "prack-redirect-ok" {
+		t.Fatalf("SendDialogPrack() result=%+v err=%v", prackResult, err)
+	}
+	optionsResult, err := agent.SendDialogOptions(context.Background(), DialogOptionsRequest{
+		CallID: "call-prack-options-redirect",
+	})
+	if err != nil || !optionsResult.Accepted || optionsResult.Headers["X-IMS"] != "options-redirect-ok" {
+		t.Fatalf("SendDialogOptions() result=%+v err=%v", optionsResult, err)
+	}
+	if len(transport.requests) != 5 {
+		t.Fatalf("dialog requests=%+v", transport.requests)
+	}
+	check := func(index int, method, uri, cseq string) {
+		t.Helper()
+		if transport.requests[index].Method != method || transport.requests[index].URI != uri || transport.requests[index].Headers["CSeq"] != cseq {
+			t.Fatalf("request[%d]=%+v", index, transport.requests[index])
+		}
+	}
+	check(1, "PRACK", "sip:carrier@198.51.100.1:5060", "2 PRACK")
+	check(2, "PRACK", "sip:prack-redirect@198.51.100.20:5060", "3 PRACK")
+	check(3, "OPTIONS", "sip:prack-final@198.51.100.21:5060", "4 OPTIONS")
+	check(4, "OPTIONS", "sip:options-redirect@198.51.100.30:5060", "5 OPTIONS")
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-prack-options-redirect"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 6 || transport.requests[5].Method != "BYE" ||
+		transport.requests[5].URI != "sip:options-final@198.51.100.31:5060" ||
+		transport.requests[5].Headers["CSeq"] != "6 BYE" {
+		t.Fatalf("BYE after redirects=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentSendsDialogRefer(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

@@ -545,18 +545,29 @@ func (a *IMSOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrackR
 		}
 		body = RewriteSDPMediaEndpoint(body, state.relay.IMSEndpoint())
 	}
-	prack, err := voiceclient.BuildPrackRequestWithBody(cfg, rack, req.ContentType, body)
-	if err != nil {
-		a.mu.Unlock()
-		return DialogPrackResult{Accepted: false, StatusCode: 500, Reason: "build IMS PRACK failed"}, err
-	}
-	applyDialogUpdateHeaders(prack.Headers, req.Headers)
-	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
-	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.roundTripRequest(ctx, prack)
-	if err != nil {
-		return DialogPrackResult{Accepted: false, Reason: "IMS PRACK failed", RegistrationRecoveryNeeded: true}, err
+
+	var resp voiceclient.SIPResponse
+	redirectRetries := 0
+	for {
+		prack, err := voiceclient.BuildPrackRequestWithBody(cfg, rack, req.ContentType, body)
+		if err != nil {
+			return DialogPrackResult{Accepted: false, StatusCode: 500, Reason: "build IMS PRACK failed"}, err
+		}
+		applyDialogUpdateHeaders(prack.Headers, req.Headers)
+		a.storeOutboundDialogAttempt(callID, cfg)
+		resp, err = a.roundTripRequest(ctx, prack)
+		if err != nil {
+			return DialogPrackResult{Accepted: false, Reason: "IMS PRACK failed", RegistrationRecoveryNeeded: true}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
 	resultBody := append([]byte(nil), resp.Body...)
@@ -613,21 +624,36 @@ func (a *IMSOutboundAgent) SendDialogOptions(ctx context.Context, req DialogOpti
 		return DialogOptionsResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
 	cfg := state.cfg
-	options, err := voiceclient.BuildOptionsRequest(cfg)
-	if err != nil {
-		a.mu.Unlock()
-		return DialogOptionsResult{Accepted: false, StatusCode: 500, Reason: "build IMS OPTIONS failed"}, err
-	}
-	applyDialogUpdateHeaders(options.Headers, req.Headers)
-	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
-	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.roundTripRequest(ctx, options)
-	if err != nil {
-		return DialogOptionsResult{Accepted: false, Reason: "IMS OPTIONS failed", RegistrationRecoveryNeeded: true}, err
+
+	var resp voiceclient.SIPResponse
+	redirectRetries := 0
+	for {
+		options, err := voiceclient.BuildOptionsRequest(cfg)
+		if err != nil {
+			return DialogOptionsResult{Accepted: false, StatusCode: 500, Reason: "build IMS OPTIONS failed"}, err
+		}
+		applyDialogUpdateHeaders(options.Headers, req.Headers)
+		a.storeOutboundDialogAttempt(callID, cfg)
+		resp, err = a.roundTripRequest(ctx, options)
+		if err != nil {
+			return DialogOptionsResult{Accepted: false, Reason: "IMS OPTIONS failed", RegistrationRecoveryNeeded: true}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
+	}
+	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if accepted {
+		a.updateOutboundDialogContact(callID, resp.Headers)
 	}
 	return DialogOptionsResult{
-		Accepted:                   resp.StatusCode >= 200 && resp.StatusCode < 300,
+		Accepted:                   accepted,
 		StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
 		Reason:                     firstVoiceNonEmpty(resp.Reason, "OK"),
 		RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),

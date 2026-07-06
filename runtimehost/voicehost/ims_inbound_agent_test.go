@@ -664,6 +664,76 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentFollowsClientPrackRedirectContact(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers:    map[string][]string{"Contact": {"<sip:prack-redirect@127.0.0.1:5080>"}},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"Contact": {"<sip:prack-final@192.0.2.60:5060>"}, "X-Client": {"prack-redirect-ok"}},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-prack-redirect",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	result, err := agent.HandleInboundPrack(context.Background(), InboundDialogRequest{
+		CallID: "in-call-prack-redirect",
+		CSeq:   2,
+		RAck:   "1 1 INVITE",
+	})
+	if err != nil || !result.Accepted || result.Headers["X-Client"] != "prack-redirect-ok" {
+		t.Fatalf("HandleInboundPrack() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 3 || transport.requests[1].Method != "PRACK" ||
+		transport.requests[2].Method != "PRACK" {
+		t.Fatalf("PRACK requests=%+v", transport.requests)
+	}
+	firstPrack := transport.requests[1]
+	redirectPrack := transport.requests[2]
+	if firstPrack.URI != "sip:client@192.0.2.50:5060" ||
+		firstPrack.Headers["CSeq"] != "2 PRACK" ||
+		firstPrack.Headers["RAck"] != "1 1 INVITE" {
+		t.Fatalf("first PRACK=%+v", firstPrack)
+	}
+	if redirectPrack.URI != "sip:prack-redirect@127.0.0.1:5080" ||
+		redirectPrack.Headers["CSeq"] != "3 PRACK" ||
+		redirectPrack.Headers["RAck"] != "1 1 INVITE" {
+		t.Fatalf("redirect PRACK=%+v", redirectPrack)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-prack-redirect"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 4 || transport.requests[3].Method != "BYE" ||
+		transport.requests[3].URI != "sip:prack-final@192.0.2.60:5060" ||
+		transport.requests[3].Headers["CSeq"] != "4 BYE" {
+		t.Fatalf("BYE after PRACK redirect=%+v", transport.requests)
+	}
+}
+
 func TestIMSInboundAgentHandlesRefer(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
