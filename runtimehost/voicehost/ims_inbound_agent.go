@@ -850,16 +850,30 @@ func (a *IMSInboundAgent) HandleInboundMessage(ctx context.Context, req IMSMessa
 	cfg := state.clientCfg
 	messageCSeq := inboundCSeq(req.CSeq)
 	cfg.CSeq = messageCSeq
-	msg, err := voiceclient.BuildMessageRequest(cfg, req.ContentType, req.Body)
-	if err != nil {
-		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client MESSAGE failed"}, err
-	}
-	applyIncomingInfoHeaders(msg.Headers, "", req.Headers)
-	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, messageCSeq)
-	a.storeInboundDialog(callID, state)
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, msg)
-	if err != nil {
-		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client MESSAGE failed"}, err
+	var resp voiceclient.SIPResponse
+	var msg voiceclient.SIPRequestMessage
+	var err error
+	redirectRetries := 0
+	for {
+		msg, err = voiceclient.BuildMessageRequest(cfg, req.ContentType, req.Body)
+		if err != nil {
+			return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client MESSAGE failed"}, err
+		}
+		applyIncomingInfoHeaders(msg.Headers, "", req.Headers)
+		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		a.storeInboundDialog(callID, state)
+		resp, err = a.ClientTransport.RoundTripRequest(ctx, msg)
+		if err != nil {
+			return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client MESSAGE failed"}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextInboundClientCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
@@ -895,16 +909,30 @@ func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequ
 	cfg := state.clientCfg
 	infoCSeq := inboundCSeq(req.CSeq)
 	cfg.CSeq = infoCSeq
-	info, err := voiceclient.BuildInfoRequest(cfg, req.ContentType, req.Body)
-	if err != nil {
-		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client INFO failed"}, err
-	}
-	applyIncomingInfoHeaders(info.Headers, req.InfoPackage, req.Headers)
-	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, infoCSeq)
-	a.storeInboundDialog(callID, state)
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, info)
-	if err != nil {
-		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client INFO failed"}, err
+	var resp voiceclient.SIPResponse
+	var info voiceclient.SIPRequestMessage
+	var err error
+	redirectRetries := 0
+	for {
+		info, err = voiceclient.BuildInfoRequest(cfg, req.ContentType, req.Body)
+		if err != nil {
+			return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client INFO failed"}, err
+		}
+		applyIncomingInfoHeaders(info.Headers, req.InfoPackage, req.Headers)
+		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		a.storeInboundDialog(callID, state)
+		resp, err = a.ClientTransport.RoundTripRequest(ctx, info)
+		if err != nil {
+			return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client INFO failed"}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextInboundClientCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact

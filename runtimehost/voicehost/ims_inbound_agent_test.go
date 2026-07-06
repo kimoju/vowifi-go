@@ -943,6 +943,121 @@ func TestIMSInboundAgentHandlesMessage(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentFollowsClientMessageAndInfoRedirectContacts(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers: map[string][]string{
+				"Contact": {"<sip:message-redirect@127.0.0.1:5080>"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact":      {"<sip:message-final@192.0.2.90:5060>"},
+				"Content-Type": {"text/plain"},
+				"X-Client":     {"message-redirect-ok"},
+			},
+			Body: []byte("delivered"),
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers: map[string][]string{
+				"Contact": {"<sip:info-redirect@127.0.0.1:5081>"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact":  {"<sip:info-final@192.0.2.91:5060>"},
+				"X-Client": {"info-redirect-ok"},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-message-info-redirect",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	messageResult, err := agent.HandleInboundMessage(context.Background(), IMSMessageRequest{
+		CallID:      "in-call-message-info-redirect",
+		CSeq:        2,
+		ContentType: "text/plain",
+		Body:        []byte("hello"),
+	})
+	if err != nil || messageResult.StatusCode != 200 ||
+		messageResult.Headers["X-Client"] != "message-redirect-ok" ||
+		string(messageResult.Body) != "delivered" {
+		t.Fatalf("HandleInboundMessage() result=%+v err=%v", messageResult, err)
+	}
+	infoResult, err := agent.HandleInboundInfo(context.Background(), IMSInfoRequest{
+		CallID:      "in-call-message-info-redirect",
+		CSeq:        5,
+		ContentType: "application/dtmf-relay",
+		InfoPackage: "dtmf",
+		Body:        []byte("Signal=5\r\nDuration=120\r\n"),
+	})
+	if err != nil || infoResult.StatusCode != 200 || infoResult.Headers["X-Client"] != "info-redirect-ok" {
+		t.Fatalf("HandleInboundInfo() result=%+v err=%v", infoResult, err)
+	}
+	if len(transport.requests) != 5 || transport.requests[1].Method != "MESSAGE" ||
+		transport.requests[2].Method != "MESSAGE" ||
+		transport.requests[3].Method != "INFO" ||
+		transport.requests[4].Method != "INFO" {
+		t.Fatalf("dialog requests=%+v", transport.requests)
+	}
+	firstMessage := transport.requests[1]
+	redirectMessage := transport.requests[2]
+	if firstMessage.URI != "sip:client@192.0.2.50:5060" || firstMessage.Headers["CSeq"] != "2 MESSAGE" {
+		t.Fatalf("first MESSAGE=%+v", firstMessage)
+	}
+	if redirectMessage.URI != "sip:message-redirect@127.0.0.1:5080" ||
+		redirectMessage.Headers["CSeq"] != "3 MESSAGE" ||
+		string(redirectMessage.Body) != "hello" {
+		t.Fatalf("redirect MESSAGE=%+v body=%q", redirectMessage, redirectMessage.Body)
+	}
+	firstInfo := transport.requests[3]
+	redirectInfo := transport.requests[4]
+	if firstInfo.URI != "sip:message-final@192.0.2.90:5060" || firstInfo.Headers["CSeq"] != "5 INFO" {
+		t.Fatalf("first INFO=%+v", firstInfo)
+	}
+	if redirectInfo.URI != "sip:info-redirect@127.0.0.1:5081" ||
+		redirectInfo.Headers["CSeq"] != "6 INFO" ||
+		redirectInfo.Headers["Info-Package"] != "dtmf" {
+		t.Fatalf("redirect INFO=%+v", redirectInfo)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-message-info-redirect"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 6 || transport.requests[5].Method != "BYE" ||
+		transport.requests[5].URI != "sip:info-final@192.0.2.91:5060" ||
+		transport.requests[5].Headers["CSeq"] != "7 BYE" {
+		t.Fatalf("BYE after redirects=%+v", transport.requests)
+	}
+}
+
 func TestIMSInboundAgentPropagatesSessionTimerHeaders(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
