@@ -195,6 +195,9 @@ protocol layers needed by VoHive:
   clear-relay counters, generated RTCP packet send paths toward IMS or client
   media legs, and SRTP plaintext-stage event callbacks plus generated SRTCP
   protection during media transforms
+- RTP stream quality helpers for per-SSRC packet/loss/duplicate/out-of-order,
+  extended-sequence, and interarrival-jitter tracking, plus RTCP Receiver
+  Report block generation from observed RTP streams
 - RTP telephone-event DTMF helpers for RFC 4733-style packet construction,
   RFC 4733-style packet-train generation with marker/sequence/timestamp/end
   repetition semantics, SDP dynamic payload discovery, relay-side event
