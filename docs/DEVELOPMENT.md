@@ -70,13 +70,16 @@ replace github.com/boa-z/vowifi-go v1.1.2 => ../vowifi-go
 Run the compatibility guard against a local VoHive checkout:
 
 ```sh
-VOHIVE_DIR=/path/to/vohive GO=/usr/local/go/bin/go make compat-vohive
+VOHIVE_DIR=/path/to/vohive GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt make compat-vohive
 ```
 
 The script clones or copies the VoHive checkout into a temporary directory,
-rewrites legacy `vowifi-go` imports there when needed, injects a temporary
-`replace` pointing at this repository, then runs the focused VoHive test set.
-The source VoHive checkout is not modified.
+rewrites legacy `vowifi-go` module references there to
+`github.com/boa-z/vowifi-go` when needed, verifies no legacy module references
+remain, confirms the temporary VoHive module resolves
+`github.com/boa-z/vowifi-go` through a `replace` pointing at this repository,
+then runs the focused VoHive test set. The source VoHive checkout is not
+modified.
 
 Useful overrides:
 
@@ -85,5 +88,7 @@ Useful overrides:
 - `VOHIVE_COMPAT_BUILD_PACKAGES` optionally adds `go build` package checks.
 - `VOHIVE_COMPAT_TMPDIR` chooses the parent directory for temporary clones and
   Go build work.
+- `VOWIFI_MODULE` changes the expected current module path; leave it unset for
+  the canonical `github.com/boa-z/vowifi-go` check.
 - `VOWIFI_COMPAT_LEGACY_BASE` changes the legacy import owner/base rewritten
   inside the temporary VoHive copy.

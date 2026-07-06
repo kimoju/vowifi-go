@@ -20,7 +20,7 @@ help:
 > @printf '  make test        run go test -count=1 ./...\n'
 > @printf '  make race        run optional go test -race -count=1 ./...\n'
 > @printf '  make coverage    run optional coverage tests and print a summary\n'
-> @printf '  make compat-vohive run old VoHive compatibility checks with VOHIVE_DIR\n'
+> @printf '  make compat-vohive run old VoHive compatibility and module-path checks\n'
 > @printf '\nOverride tools with: GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt make ci\n'
 
 ci:

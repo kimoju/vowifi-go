@@ -93,6 +93,43 @@ func TestNotifyErrorClassification(t *testing.T) {
 	}
 }
 
+func TestInvalidKEPayloadAlternativeGroup(t *testing.T) {
+	notify := Notify{
+		NotifyType:       NotifyInvalidKEPayload,
+		NotificationData: []byte{0, byte(DHGroup2048BitMODP)},
+	}
+	group, ok, err := notify.InvalidKEPayloadAlternativeGroup()
+	if err != nil || !ok || group != DHGroup2048BitMODP {
+		t.Fatalf("InvalidKEPayloadAlternativeGroup() group=%d ok=%t err=%v", group, ok, err)
+	}
+
+	notifyErr := NotifyErrorFor(notify)
+	group, ok, err = InvalidKEPayloadAlternativeGroupFromError(notifyErr)
+	if err != nil || !ok || group != DHGroup2048BitMODP {
+		t.Fatalf("InvalidKEPayloadAlternativeGroupFromError() group=%d ok=%t err=%v", group, ok, err)
+	}
+
+	group, ok, err = (Notify{NotifyType: NotifyMOBIKESupported}).InvalidKEPayloadAlternativeGroup()
+	if err != nil || ok || group != 0 {
+		t.Fatalf("non-INVALID_KE_PAYLOAD group=%d ok=%t err=%v", group, ok, err)
+	}
+	group, ok, err = InvalidKEPayloadAlternativeGroupFromError(errors.New("other"))
+	if err != nil || ok || group != 0 {
+		t.Fatalf("non-notify error group=%d ok=%t err=%v", group, ok, err)
+	}
+
+	for _, data := range [][]byte{
+		nil,
+		{0x00},
+		{0x00, byte(DHGroup2048BitMODP), 0xff},
+	} {
+		group, ok, err = (Notify{NotifyType: NotifyInvalidKEPayload, NotificationData: data}).InvalidKEPayloadAlternativeGroup()
+		if !ok || !errors.Is(err, ErrInvalidNotify) || group != 0 {
+			t.Fatalf("malformed data=%x group=%d ok=%t err=%v, want ErrInvalidNotify", data, group, ok, err)
+		}
+	}
+}
+
 func TestDeletePayloadMarshalParseESP(t *testing.T) {
 	payload, err := ESPDeletePayload(mustHex("01020304"), mustHex("aabbccdd"))
 	if err != nil {

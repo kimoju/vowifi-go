@@ -110,6 +110,70 @@ func TestBuildUsableEmergencySIPRequestInfoUsesEntitlementSnapshot(t *testing.T)
 	}
 }
 
+func TestEntitlementCacheUsableEmergencySIPRequestInfoBuildsFromRefreshWindowSnapshot(t *testing.T) {
+	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	cache := NewEntitlementCache(EntitlementCachePolicy{RefreshBefore: 2 * time.Minute})
+	cache.Store(EntitlementInfo{
+		Status:      1000,
+		ServiceURNs: []string{"ambulance", "fire"},
+		Routes: []EmergencyRoute{
+			{ServiceURN: "ambulance", PCSCF: []string{"pcscf-ambulance.ims.example"}},
+			{Endpoints: []string{"sips:any@example.test"}},
+		},
+		Address: EmergencyAddress{
+			Latitude:  "40.7128",
+			Longitude: "-74.0060",
+		},
+		CacheMaxAge: 5 * time.Minute,
+	}, base)
+
+	info, snapshot, ok := cache.UsableEmergencySIPRequestInfo(EmergencySIPHeaderConfig{
+		AccessNetworkInfo:  EmergencyAccessNetworkInfo{Raw: "IEEE-802.11"},
+		GeolocationRouting: true,
+	}, base.Add(4*time.Minute))
+	if !ok {
+		t.Fatalf("UsableEmergencySIPRequestInfo() ok=false for refresh-window snapshot: %+v", snapshot)
+	}
+	if !snapshot.RefreshRequired || snapshot.RefreshReason != EntitlementRefreshReasonRefreshWindow {
+		t.Fatalf("snapshot=%+v, want refresh-window but still usable", snapshot)
+	}
+	if info.RequestURI != "urn:service:sos.ambulance" {
+		t.Fatalf("RequestURI=%q", info.RequestURI)
+	}
+	if info.Headers["P-Access-Network-Info"] != "IEEE-802.11" {
+		t.Fatalf("P-Access-Network-Info=%q", info.Headers["P-Access-Network-Info"])
+	}
+	if info.Headers["Geolocation"] != "<geo:40.7128,-74.0060>;inserted-by=endpoint" {
+		t.Fatalf("Geolocation=%q", info.Headers["Geolocation"])
+	}
+	if len(info.Routes) != 2 {
+		t.Fatalf("routes=%+v, want selected service route plus generic route", info.Routes)
+	}
+	if !sameStrings(info.Routes[0].PCSCF, []string{"pcscf-ambulance.ims.example"}) {
+		t.Fatalf("service route=%+v", info.Routes[0])
+	}
+	if !sameStrings(info.Routes[1].Endpoints, []string{"sips:any@example.test"}) {
+		t.Fatalf("generic route=%+v", info.Routes[1])
+	}
+
+	info.Routes[0].PCSCF[0] = "changed.example"
+	nextInfo, _, ok := cache.UsableEmergencySIPRequestInfo(EmergencySIPHeaderConfig{ServiceURN: "ambulance"}, base.Add(4*time.Minute))
+	if !ok {
+		t.Fatal("second UsableEmergencySIPRequestInfo() ok=false")
+	}
+	if !sameStrings(nextInfo.Routes[0].PCSCF, []string{"pcscf-ambulance.ims.example"}) {
+		t.Fatalf("route copy leaked into cache helper: %+v", nextInfo.Routes[0])
+	}
+
+	_, expired, ok := cache.UsableEmergencySIPRequestInfo(EmergencySIPHeaderConfig{ServiceURN: "ambulance"}, base.Add(5*time.Minute))
+	if ok {
+		t.Fatalf("expired snapshot should not build runtime SIP request info: %+v", expired)
+	}
+	if expired.RefreshReason != EntitlementRefreshReasonExpired {
+		t.Fatalf("expired snapshot reason=%q", expired.RefreshReason)
+	}
+}
+
 func TestBuildUsableEmergencySIPRequestInfoRejectsStaleOrUnsupportedEntitlement(t *testing.T) {
 	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
 	cache := NewEntitlementCache(EntitlementCachePolicy{})

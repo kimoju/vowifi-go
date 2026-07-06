@@ -146,6 +146,82 @@ func TestSIPFailureRecoveryClassifiesRecoverableFailures(t *testing.T) {
 	}
 }
 
+type sipTestTimeoutError struct{}
+
+func (sipTestTimeoutError) Error() string   { return "timeout" }
+func (sipTestTimeoutError) Timeout() bool   { return true }
+func (sipTestTimeoutError) Temporary() bool { return true }
+
+func TestSIPTransactionFailureForClassifiesTimeoutsAndRetryAfter(t *testing.T) {
+	tests := []struct {
+		name                     string
+		method                   string
+		resp                     SIPResponse
+		err                      error
+		wantMethod               string
+		wantTransaction          sipTransactionKind
+		wantStatus               int
+		wantTimedOut             bool
+		wantFinalResponseTimeout bool
+		wantRetryAfter           time.Duration
+		wantRetryAfterPresent    bool
+	}{
+		{
+			name:            "non invite transport timeout",
+			method:          "MESSAGE",
+			err:             sipTestTimeoutError{},
+			wantMethod:      "MESSAGE",
+			wantTransaction: sipTransactionNonInvite,
+			wantTimedOut:    true,
+		},
+		{
+			name:                     "invite final response timeout",
+			method:                   " invite ",
+			err:                      sipFinalResponseTimeoutError{Method: "INVITE", Err: sipTestTimeoutError{}},
+			wantMethod:               "INVITE",
+			wantTransaction:          sipTransactionInvite,
+			wantTimedOut:             true,
+			wantFinalResponseTimeout: true,
+		},
+		{
+			name:                  "non invite 408 retry after zero",
+			method:                "OPTIONS",
+			resp:                  SIPResponse{StatusCode: 408, Headers: map[string][]string{"Retry-After": {"0"}}},
+			wantMethod:            "OPTIONS",
+			wantStatus:            408,
+			wantTimedOut:          true,
+			wantRetryAfterPresent: true,
+		},
+		{
+			name:                  "invite 503 retry after",
+			method:                "INVITE",
+			resp:                  SIPResponse{StatusCode: 503, Headers: map[string][]string{"Retry-After": {"7"}}},
+			wantMethod:            "INVITE",
+			wantTransaction:       sipTransactionInvite,
+			wantStatus:            503,
+			wantRetryAfter:        7 * time.Second,
+			wantRetryAfterPresent: true,
+		},
+		{
+			name:            "503 invalid retry after",
+			method:          "MESSAGE",
+			resp:            SIPResponse{StatusCode: 503, Headers: map[string][]string{"Retry-After": {"later"}}},
+			wantMethod:      "MESSAGE",
+			wantTransaction: sipTransactionNonInvite,
+			wantStatus:      503,
+		},
+	}
+	for _, tc := range tests {
+		got := sipTransactionFailureFor(tc.method, tc.resp, tc.err)
+		if got.Method != tc.wantMethod || got.Transaction != tc.wantTransaction ||
+			got.StatusCode != tc.wantStatus || got.TimedOut != tc.wantTimedOut ||
+			got.FinalResponseTimeout != tc.wantFinalResponseTimeout ||
+			got.RetryAfter != tc.wantRetryAfter || got.RetryAfterPresent != tc.wantRetryAfterPresent {
+			t.Fatalf("%s classification=%+v", tc.name, got)
+		}
+	}
+}
+
 func TestSIPFinalResponseDrainDurationSkipsInvite(t *testing.T) {
 	if got := sipFinalResponseDrainDuration("INVITE", time.Second); got != 0 {
 		t.Fatalf("sipFinalResponseDrainDuration(INVITE)=%v, want 0", got)

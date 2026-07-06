@@ -115,7 +115,17 @@ func BuildEmergencySIPRequestInfo(cfg EmergencySIPHeaderConfig) EmergencySIPRequ
 	}
 }
 
+// UsableEmergencySIPRequestInfo builds runtime SIP request metadata from this
+// snapshot when the cached entitlement data is still locally usable.
+func (s EntitlementSnapshot) UsableEmergencySIPRequestInfo(cfg EmergencySIPHeaderConfig) (EmergencySIPRequestInfo, bool) {
+	return buildUsableEmergencySIPRequestInfo(s, cfg)
+}
+
 func BuildUsableEmergencySIPRequestInfo(snapshot EntitlementSnapshot, cfg EmergencySIPHeaderConfig) (EmergencySIPRequestInfo, bool) {
+	return buildUsableEmergencySIPRequestInfo(snapshot, cfg)
+}
+
+func buildUsableEmergencySIPRequestInfo(snapshot EntitlementSnapshot, cfg EmergencySIPHeaderConfig) (EmergencySIPRequestInfo, bool) {
 	if !snapshot.Usable() {
 		return EmergencySIPRequestInfo{}, false
 	}

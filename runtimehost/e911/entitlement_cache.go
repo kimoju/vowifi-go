@@ -137,6 +137,14 @@ func (c *EntitlementCache) UsableRoutes(service string, now time.Time) []Emergen
 	return c.Snapshot(now).UsableRoutes(service)
 }
 
+// UsableEmergencySIPRequestInfo snapshots the cache and builds runtime SIP
+// request metadata when cached entitlement data is still locally usable.
+func (c *EntitlementCache) UsableEmergencySIPRequestInfo(cfg EmergencySIPHeaderConfig, now time.Time) (EmergencySIPRequestInfo, EntitlementSnapshot, bool) {
+	snapshot := c.Snapshot(now)
+	info, ok := snapshot.UsableEmergencySIPRequestInfo(cfg)
+	return info, snapshot, ok
+}
+
 // Reset drops cached entitlement state.
 func (c *EntitlementCache) Reset() {
 	if c == nil {

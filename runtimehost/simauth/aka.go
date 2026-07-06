@@ -118,7 +118,8 @@ func BuildUSIMAuthAPDU(rand16, autn16 []byte, includeLe bool) ([]byte, error) {
 
 func ParseUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAResult, error) {
 	if sw1 != 0x90 || sw2 != 0x00 {
-		return AKAResult{}, fmt.Errorf("APDU status is not 9000: %02X%02X", sw1, sw2)
+		resp := Response{SW1: sw1, SW2: sw2}
+		return AKAResult{}, newStatusMessageError(fmt.Sprintf("APDU status is not 9000: %02X%02X", sw1, sw2), resp)
 	}
 	if len(body) < 2 {
 		return AKAResult{}, fmt.Errorf("AKA response body too short: %d", len(body))

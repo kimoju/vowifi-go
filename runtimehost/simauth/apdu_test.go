@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	swusim "github.com/boa-z/vowifi-go/engine/sim"
+	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
 )
 
 type fakeTransport struct {
@@ -68,6 +69,36 @@ func TestTransmitHandlesRetryLengthAndGetResponse(t *testing.T) {
 	}
 	if !reflect.DeepEqual(getResponse.calls, []string{"00A40004026F02", "00C0000002"}) {
 		t.Fatalf("get-response calls = %#v", getResponse.calls)
+	}
+}
+
+func TestAPDUStatusErrorsCarryRecoveryStatus(t *testing.T) {
+	ft := &fakeTransport{responses: []string{"6F00"}}
+	resp, err := SelectFile(ft, 1, 0x6F02)
+	if err == nil {
+		t.Fatal("SelectFile(6F00) err=nil, want status error")
+	}
+	if resp.StatusString() != "6F00" {
+		t.Fatalf("response status = %s, want 6F00", resp.StatusString())
+	}
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("SelectFile(6F00) err=%T, want StatusError", err)
+	}
+	if statusErr.Status() != 0x6F00 || statusErr.StatusString() != "6F00" {
+		t.Fatalf("status error status = %s/%04X, want 6F00", statusErr.StatusString(), statusErr.Status())
+	}
+	if got := simtransport.ClassifyError(err); got != simtransport.RecoveryClassSIMBusy {
+		t.Fatalf("ClassifyError(StatusError) = %q, want SIM busy", got)
+	}
+
+	_, err = ParseUSIMAuthResponse(nil, 0x62, 0x82)
+	statusErr = nil
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("ParseUSIMAuthResponse(6282) err=%T, want StatusError", err)
+	}
+	if got := simtransport.ClassifyError(err); got != simtransport.RecoveryClassEmptyEF {
+		t.Fatalf("ClassifyError(AKA StatusError) = %q, want empty EF", got)
 	}
 }
 

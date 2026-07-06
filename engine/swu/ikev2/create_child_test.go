@@ -147,6 +147,46 @@ func TestRunCREATECHILDSAClassifiesResponseNotifyErrors(t *testing.T) {
 	}
 }
 
+func TestRunCREATECHILDSAExposesInvalidKEAlternativeGroup(t *testing.T) {
+	init := fakeInitResult(t)
+	transport := &createChildTransport{
+		t:         t,
+		init:      init,
+		messageID: 10,
+		localSPI:  []byte{0xca, 0xfe, 0xba, 0xbe},
+		responseNotify: &Notify{
+			NotifyType:       NotifyInvalidKEPayload,
+			NotificationData: []byte{0, byte(DHGroup2048BitMODP)},
+		},
+	}
+	_, err := RunCREATE_CHILD_SA(context.Background(), CreateChildSAConfig{
+		Transport: transport,
+		Init:      init,
+		ChildSPI:  transport.localSPI,
+		Nonce:     bytes.Repeat([]byte{0x48}, 32),
+		MessageID: 10,
+		IV:        bytes.Repeat([]byte{0x96}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if !errors.Is(err, ErrInvalidCreateChild) ||
+		!errors.Is(err, ErrIKEv2NotifyError) ||
+		!errors.Is(err, ErrNotifyInvalidKEPayload) {
+		t.Fatalf("RunCREATE_CHILD_SA() err=%v, want ErrInvalidCreateChild, ErrIKEv2NotifyError, and ErrNotifyInvalidKEPayload", err)
+	}
+
+	group, ok, parseErr := InvalidKEPayloadAlternativeGroupFromError(err)
+	if parseErr != nil || !ok || group != DHGroup2048BitMODP {
+		t.Fatalf("InvalidKEPayloadAlternativeGroupFromError() group=%d ok=%t err=%v", group, ok, parseErr)
+	}
+	var notifyErr *NotifyError
+	if !errors.As(err, &notifyErr) {
+		t.Fatalf("RunCREATE_CHILD_SA() err=%T, want *NotifyError", err)
+	}
+	group, ok, parseErr = notifyErr.InvalidKEPayloadAlternativeGroup()
+	if parseErr != nil || !ok || group != DHGroup2048BitMODP {
+		t.Fatalf("NotifyError.InvalidKEPayloadAlternativeGroup() group=%d ok=%t err=%v", group, ok, parseErr)
+	}
+}
+
 func TestRunCREATECHILDSARejectsUnsupportedSelectedSA(t *testing.T) {
 	init := fakeInitResult(t)
 	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}

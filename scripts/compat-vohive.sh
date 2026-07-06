@@ -44,6 +44,64 @@ run() {
 	"$@"
 }
 
+find_module_refs() {
+	local module_path="$1"
+	grep -RIl --exclude-dir=.git -- "$module_path" . 2>/dev/null || true
+}
+
+verify_local_module() {
+	local module_path
+	if ! module_path="$(
+		cd "$ROOT"
+		env GOWORK=off TMPDIR="$tmpdir/go-tmp" GOTMPDIR="$tmpdir/go-tmp" "$GO_BIN" list -m -f '{{.Path}}'
+	)"; then
+		printf 'failed to read local vowifi-go module path\n' >&2
+		return 1
+	fi
+	if [[ "$module_path" != "$VOWIFI_MODULE" ]]; then
+		printf 'local vowifi-go module path mismatch: expected %s, got %s\n' "$VOWIFI_MODULE" "$module_path" >&2
+		return 1
+	fi
+	printf '\n==> verified local vowifi-go module path: %s\n' "$module_path"
+}
+
+verify_rewritten_modules() {
+	local remaining_legacy=()
+	local current_refs=()
+
+	if [[ "$LEGACY_MODULE" != "$VOWIFI_MODULE" ]]; then
+		mapfile -t remaining_legacy < <(find_module_refs "$LEGACY_MODULE")
+		if [[ ${#remaining_legacy[@]} -gt 0 ]]; then
+			printf 'legacy vowifi-go module references remain after rewrite:\n' >&2
+			printf '  %s\n' "${remaining_legacy[@]}" >&2
+			return 1
+		fi
+	fi
+
+	mapfile -t current_refs < <(find_module_refs "$VOWIFI_MODULE")
+	if [[ ${#current_refs[@]} -eq 0 ]]; then
+		printf 'temporary VoHive copy does not reference %s after module rewrite\n' "$VOWIFI_MODULE" >&2
+		return 1
+	fi
+	printf '\n==> verified temporary VoHive module references use %s\n' "$VOWIFI_MODULE"
+}
+
+verify_vowifi_replace() {
+	local replace_path
+	if ! replace_path="$(
+		env GOWORK=off TMPDIR="$tmpdir/go-tmp" GOTMPDIR="$tmpdir/go-tmp" \
+			"$GO_BIN" list -m -f '{{with .Replace}}{{.Path}}{{end}}' "$VOWIFI_MODULE"
+	)"; then
+		printf 'VoHive does not resolve %s after module rewrite and tidy\n' "$VOWIFI_MODULE" >&2
+		return 1
+	fi
+	if [[ "$replace_path" != "$ROOT" ]]; then
+		printf 'VoHive resolves %s via unexpected replace path: %s\n' "$VOWIFI_MODULE" "${replace_path:-<none>}" >&2
+		return 1
+	fi
+	printf '\n==> verified VoHive resolves %s through this checkout\n' "$VOWIFI_MODULE"
+}
+
 VOHIVE_DIR="${VOHIVE_DIR:-${1:-}}"
 if [[ -z "$VOHIVE_DIR" ]]; then
 	usage >&2
@@ -88,15 +146,19 @@ fi
 cd "$workdir"
 mkdir -p "$tmpdir/go-tmp"
 
+verify_local_module
+
 mapfile -t legacy_files < <(grep -RIl --exclude-dir=.git -- "$LEGACY_MODULE" . 2>/dev/null || true)
 if [[ ${#legacy_files[@]} -gt 0 ]]; then
 	printf '\n==> rewriting legacy vowifi-go imports in temporary VoHive copy\n'
 	LEGACY_MODULE="$LEGACY_MODULE" VOWIFI_MODULE="$VOWIFI_MODULE" \
 	perl -0pi -e 's/\Q$ENV{LEGACY_MODULE}\E/$ENV{VOWIFI_MODULE}/g' "${legacy_files[@]}"
 fi
+verify_rewritten_modules
 
 run env GOWORK=off TMPDIR="$tmpdir/go-tmp" GOTMPDIR="$tmpdir/go-tmp" "$GO_BIN" mod edit -replace "${VOWIFI_MODULE}=${ROOT}"
 run env GOWORK=off TMPDIR="$tmpdir/go-tmp" GOTMPDIR="$tmpdir/go-tmp" "$GO_BIN" mod tidy
+verify_vowifi_replace
 
 read -r -a test_packages <<< "$VOHIVE_COMPAT_PACKAGES"
 if [[ ${#test_packages[@]} -gt 0 ]]; then

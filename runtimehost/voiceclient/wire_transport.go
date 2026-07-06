@@ -416,6 +416,69 @@ func SIPResponseRetryAfter(resp RegisterResponse) time.Duration {
 	return SIPRetryAfterDelay(resp.Headers)
 }
 
+type sipTransactionKind int
+
+const (
+	sipTransactionNonInvite sipTransactionKind = iota
+	sipTransactionInvite
+)
+
+type sipTransactionFailure struct {
+	Method               string
+	Transaction          sipTransactionKind
+	StatusCode           int
+	TimedOut             bool
+	FinalResponseTimeout bool
+	RetryAfter           time.Duration
+	RetryAfterPresent    bool
+}
+
+func sipTransactionFailureFor(method string, resp SIPResponse, err error) sipTransactionFailure {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	out := sipTransactionFailure{
+		Method:      method,
+		Transaction: sipTransactionKindForMethod(method),
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrSIPFinalResponseTimeout):
+			out.TimedOut = true
+			out.FinalResponseTimeout = true
+		case isSIPTimeout(err):
+			out.TimedOut = true
+		}
+	}
+	if resp.StatusCode == 0 {
+		return out
+	}
+	out.StatusCode = resp.StatusCode
+	if resp.StatusCode == 408 {
+		out.TimedOut = true
+	}
+	if sipRetryAfterResponseStatus(resp.StatusCode) {
+		out.RetryAfter, out.RetryAfterPresent = sipResponseRetryAfterDelay(resp)
+	}
+	return out
+}
+
+func sipTransactionKindForMethod(method string) sipTransactionKind {
+	if strings.EqualFold(strings.TrimSpace(method), "INVITE") {
+		return sipTransactionInvite
+	}
+	return sipTransactionNonInvite
+}
+
+func sipRetryAfterResponseStatus(code int) bool {
+	return code == 408 || code == 503
+}
+
+func sipResponseRetryAfterDelay(resp RegisterResponse) (time.Duration, bool) {
+	if resp.RetryAfter > 0 {
+		return resp.RetryAfter, true
+	}
+	return sipRetryAfterDelay(resp.Headers)
+}
+
 type sipFailureKind int
 
 const (
@@ -524,18 +587,25 @@ func sipTargetsWithRedirects(targets []string, currentIndex int, redirects []str
 }
 
 func SIPRetryAfterDelay(headers map[string][]string) time.Duration {
+	delay, _ := sipRetryAfterDelay(headers)
+	return delay
+}
+
+func sipRetryAfterDelay(headers map[string][]string) (time.Duration, bool) {
 	var delay time.Duration
+	seen := false
 	now := time.Now()
 	for _, value := range rawHeaderValues(headers, "Retry-After") {
 		parsed, ok := parseSIPRetryAfterValueAt(value, now)
 		if !ok {
 			continue
 		}
+		seen = true
 		if parsed > delay {
 			delay = parsed
 		}
 	}
-	return delay
+	return delay, seen
 }
 
 func parseSIPRetryAfterValue(value string) (time.Duration, bool) {

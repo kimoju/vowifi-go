@@ -18,6 +18,10 @@ func TestClassifyRecoveryErrors(t *testing.T) {
 		{name: "bare 6a82", err: errors.New("6A82"), want: RecoveryClassFileNotFound},
 		{name: "apdu busy status", err: errors.New("READ BINARY 6F02 failed: SW=9300"), want: RecoveryClassSIMBusy},
 		{name: "invalidated status", err: errors.New("READ RECORD 6F04 #1 failed: status=6283"), want: RecoveryClassSIMBusy},
+		{name: "technical problem status", err: errors.New("AUTHENTICATE failed: SW=6F00"), want: RecoveryClassSIMBusy},
+		{name: "empty ef status", err: errors.New("READ BINARY 6F03 failed: SW=6282"), want: RecoveryClassEmptyEF},
+		{name: "wrong length status", err: errors.New("AT+CSIM response status=6700"), want: RecoveryClassMalformedReply},
+		{name: "numeric cme sim busy", err: errors.New("AT CME ERROR: 14"), want: RecoveryClassSIMBusy},
 		{name: "sim busy", err: errors.New("AT CME ERROR: SIM busy"), want: RecoveryClassSIMBusy},
 		{name: "empty ef", err: errors.New("ISIM identity data empty"), want: RecoveryClassEmptyEF},
 		{name: "malformed apdu", err: errors.New("APDU response too short: 1"), want: RecoveryClassMalformedReply},
@@ -33,6 +37,25 @@ func TestClassifyRecoveryErrors(t *testing.T) {
 	}
 }
 
+type statusErrorForTest struct {
+	status uint16
+}
+
+func (e statusErrorForTest) Error() string {
+	return "status-bearing error"
+}
+
+func (e statusErrorForTest) Status() uint16 {
+	return e.status
+}
+
+func TestClassifyRecoveryErrorFromStatusCarrier(t *testing.T) {
+	err := errors.Join(errors.New("logical-channel ISIM identity"), statusErrorForTest{status: 0x6F00})
+	if got := ClassifyError(err); got != RecoveryClassSIMBusy {
+		t.Fatalf("ClassifyError(status carrier) = %q, want SIM busy", got)
+	}
+}
+
 func TestStatusStringRecoveryClass(t *testing.T) {
 	tests := []struct {
 		status string
@@ -41,8 +64,13 @@ func TestStatusStringRecoveryClass(t *testing.T) {
 		{status: "9000", want: RecoveryClassNone},
 		{status: "6a82", want: RecoveryClassFileNotFound},
 		{status: "0x6A83", want: RecoveryClassFileNotFound},
+		{status: "9404", want: RecoveryClassFileNotFound},
+		{status: "6282", want: RecoveryClassEmptyEF},
 		{status: "9300", want: RecoveryClassSIMBusy},
 		{status: "6283", want: RecoveryClassSIMBusy},
+		{status: "6400", want: RecoveryClassSIMBusy},
+		{status: "6F00", want: RecoveryClassSIMBusy},
+		{status: "6A86", want: RecoveryClassMalformedReply},
 		{status: "not-status", want: RecoveryClassNone},
 	}
 

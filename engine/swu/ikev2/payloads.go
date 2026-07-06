@@ -106,6 +106,40 @@ func (e *NotifyError) Is(target error) bool {
 	return target == ErrIKEv2NotifyError || target == e.Err
 }
 
+// InvalidKEPayloadAlternativeGroup returns the responder's suggested DH group
+// when this notification is INVALID_KE_PAYLOAD.
+func (n Notify) InvalidKEPayloadAlternativeGroup() (uint16, bool, error) {
+	if n.NotifyType != NotifyInvalidKEPayload {
+		return 0, false, nil
+	}
+	if len(n.NotificationData) != 2 {
+		return 0, true, fmt.Errorf("%w: INVALID_KE_PAYLOAD alternative group length %d", ErrInvalidNotify, len(n.NotificationData))
+	}
+	return binary.BigEndian.Uint16(n.NotificationData), true, nil
+}
+
+// InvalidKEPayloadAlternativeGroup returns the suggested DH group carried by an
+// INVALID_KE_PAYLOAD notify error.
+func (e *NotifyError) InvalidKEPayloadAlternativeGroup() (uint16, bool, error) {
+	if e == nil {
+		return 0, false, nil
+	}
+	return e.Notify.InvalidKEPayloadAlternativeGroup()
+}
+
+// InvalidKEPayloadAlternativeGroupFromError extracts an INVALID_KE_PAYLOAD
+// suggested DH group from a wrapped NotifyError.
+func InvalidKEPayloadAlternativeGroupFromError(err error) (uint16, bool, error) {
+	if err == nil {
+		return 0, false, nil
+	}
+	var notifyErr *NotifyError
+	if !errors.As(err, &notifyErr) {
+		return 0, false, nil
+	}
+	return notifyErr.InvalidKEPayloadAlternativeGroup()
+}
+
 func (n Notify) MarshalBinary() ([]byte, error) {
 	if len(n.SPI) > 0xff {
 		return nil, fmt.Errorf("%w: spi too long", ErrInvalidNotify)

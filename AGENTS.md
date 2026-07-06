@@ -78,12 +78,13 @@ After changes that affect public runtime behavior, also validate the old VoHive
 consumer from a local VoHive checkout:
 
 ```sh
-go test ./internal/vowifihost ./internal/device ./internal/api ./internal/notify ./internal/e911 -run 'VoWiFi|RuntimeStart|StartRuntime|Tunnel|MOBIKE|Dataplane|IMS|Voice|USSD|E911|Emergency|Websheet'
-go build ./cmd/vohive
-rm -f vohive
+VOHIVE_DIR=/path/to/vohive GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt make compat-vohive
 ```
 
-The VoHive checkout should remain clean unless the user explicitly requested a
+The compatibility script uses a temporary VoHive copy, rewrites legacy
+`vowifi-go` module references to `github.com/boa-z/vowifi-go`, verifies the
+rewrite and temporary `replace`, then runs the focused package checks. The
+VoHive checkout should remain clean unless the user explicitly requested a
 change there.
 
 ## Documentation

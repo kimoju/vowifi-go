@@ -28,6 +28,48 @@ type Response struct {
 	SW2  byte
 }
 
+type StatusError struct {
+	Operation string
+	Response  Response
+	message   string
+}
+
+func (e *StatusError) Error() string {
+	if e == nil {
+		return "APDU status error"
+	}
+	if e.message != "" {
+		return e.message
+	}
+	op := strings.TrimSpace(e.Operation)
+	if op == "" {
+		op = "APDU"
+	}
+	return fmt.Sprintf("%s failed: SW=%s", op, e.Response.StatusString())
+}
+
+func (e *StatusError) Status() uint16 {
+	if e == nil {
+		return 0
+	}
+	return e.Response.Status()
+}
+
+func (e *StatusError) StatusString() string {
+	if e == nil {
+		return "0000"
+	}
+	return e.Response.StatusString()
+}
+
+func newStatusError(operation string, resp Response) error {
+	return &StatusError{Operation: operation, Response: resp}
+}
+
+func newStatusMessageError(message string, resp Response) error {
+	return &StatusError{Response: resp, message: message}
+}
+
 func (r Response) Success() bool {
 	return r.SW1 == 0x90 && r.SW2 == 0x00
 }
@@ -148,7 +190,7 @@ func SelectFile(t LogicalChannelTransport, channel int, fid uint16) (Response, e
 		return Response{}, err
 	}
 	if !resp.Success() {
-		return resp, fmt.Errorf("SELECT %04X failed: SW=%s", fid, resp.StatusString())
+		return resp, newStatusError(fmt.Sprintf("SELECT %04X", fid), resp)
 	}
 	return resp, nil
 }
@@ -173,7 +215,7 @@ func ReadTransparentEF(t LogicalChannelTransport, channel int, fid uint16) ([]by
 			return nil, resp, err
 		}
 		if !resp.Success() {
-			return nil, resp, fmt.Errorf("READ BINARY %04X offset=%d failed: SW=%s", fid, offset, resp.StatusString())
+			return nil, resp, newStatusError(fmt.Sprintf("READ BINARY %04X offset=%d", fid, offset), resp)
 		}
 		out = append(out, resp.Body...)
 		if len(resp.Body) == 0 || size == 256 && len(resp.Body) < chunk {
@@ -209,7 +251,7 @@ func ReadLinearFixedEF(t LogicalChannelTransport, channel int, fid uint16, maxRe
 			break
 		}
 		if !resp.Success() {
-			return nil, resp, fmt.Errorf("READ RECORD %04X #%d failed: SW=%s", fid, rec, resp.StatusString())
+			return nil, resp, newStatusError(fmt.Sprintf("READ RECORD %04X #%d", fid, rec), resp)
 		}
 		records = append(records, append([]byte(nil), resp.Body...))
 	}
