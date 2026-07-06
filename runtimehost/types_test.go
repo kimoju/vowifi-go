@@ -761,6 +761,80 @@ func TestRuntimeIMSRecoveryRetriesSMSPartAfterTransportFailure(t *testing.T) {
 	}
 }
 
+func TestRuntimeIMSRecoveryRetriesSMSPartAfterRecoverableSIPStatus(t *testing.T) {
+	firstTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 503, Reason: "Service Unavailable"}}}
+	recoveredTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
+	profile := voiceclient.IMSProfile{
+		IMPI:   "user@ims.example",
+		IMPU:   "sip:user@ims.example",
+		Domain: "ims.example",
+	}
+	initialBinding := voiceclient.RegistrationBinding{
+		ContactURI:     "sip:user@192.0.2.10:5060",
+		PublicIdentity: "sip:user@ims.example",
+		ServiceRoutes:  []string{"<sip:pcscf1.ims.example;lr>"},
+	}
+	recoveredBinding := voiceclient.RegistrationBinding{
+		ContactURI:     "sip:user@192.0.2.20:5060",
+		PublicIdentity: "sip:user@ims.example",
+		ServiceRoutes:  []string{"<sip:pcscf2.ims.example;lr>"},
+	}
+	recoveries := 0
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
+		Registered: true,
+		StatusCode: 200,
+		Reason:     "ims registered",
+		Profile:    profile,
+		Binding:    initialBinding,
+		SMSTransport: messaging.IMSSMSTransport{
+			Transport:    firstTransport,
+			Profile:      profile,
+			Registration: initialBinding,
+		},
+		Recover: func(ctx context.Context) (IMSRegistrationResult, error) {
+			recoveries++
+			return IMSRegistrationResult{
+				Registered: true,
+				StatusCode: 200,
+				Reason:     "ims recovered",
+				Profile:    profile,
+				Binding:    recoveredBinding,
+				SMSTransport: messaging.IMSSMSTransport{
+					Transport:    recoveredTransport,
+					Profile:      profile,
+					Registration: recoveredBinding,
+				},
+			}, nil
+		},
+	}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:     "dev-sms-recover-503",
+		TraceID:      "trace-sms-recover-503",
+		Profile:      identity.Profile{IMSI: "310280233641503"},
+		IMSRegistrar: registrar,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	out, err := inst.SendSMSWithOptions(context.Background(), "+18005551212", "hello", messaging.SendOptions{})
+	if err != nil || out.State != "sent" || out.Parts != 1 {
+		t.Fatalf("SendSMSWithOptions() out=%+v err=%v", out, err)
+	}
+	if recoveries != 1 {
+		t.Fatalf("recoveries=%d, want 1", recoveries)
+	}
+	if len(firstTransport.requests) != 1 || firstTransport.requests[0].Headers["Route"] != "<sip:pcscf1.ims.example;lr>" {
+		t.Fatalf("initial SMS requests=%+v", firstTransport.requests)
+	}
+	if len(recoveredTransport.requests) != 1 || recoveredTransport.requests[0].Method != "MESSAGE" ||
+		recoveredTransport.requests[0].Headers["Route"] != "<sip:pcscf2.ims.example;lr>" {
+		t.Fatalf("recovered SMS requests=%+v", recoveredTransport.requests)
+	}
+	if st := inst.State(); !st.IMSReady || st.LastReason != "ims recovered" {
+		t.Fatalf("state=%+v", st)
+	}
+}
+
 func TestRuntimeIMSRecoveryRetriesUSSDInviteAfterTransportFailure(t *testing.T) {
 	firstTransport := &runtimeVoiceTransport{errors: []error{errors.New("stale ussd pcscf flow")}}
 	recoveredTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{
@@ -832,6 +906,97 @@ func TestRuntimeIMSRecoveryRetriesUSSDInviteAfterTransportFailure(t *testing.T) 
 	}
 	if len(firstTransport.requests) != 1 || firstTransport.requests[0].Headers["Route"] != "<sip:pcscf1.ims.example;lr>" {
 		t.Fatalf("initial USSD requests=%+v", firstTransport.requests)
+	}
+	if len(recoveredTransport.requests) != 1 || recoveredTransport.requests[0].Method != "INVITE" ||
+		recoveredTransport.requests[0].Headers["Route"] != "<sip:pcscf2.ims.example;lr>" {
+		t.Fatalf("recovered USSD requests=%+v", recoveredTransport.requests)
+	}
+	if len(recoveredTransport.writes) != 1 || recoveredTransport.writes[0].Method != "ACK" {
+		t.Fatalf("recovered USSD writes=%+v", recoveredTransport.writes)
+	}
+	if st := inst.State(); !st.IMSReady || st.LastReason != "ims recovered" {
+		t.Fatalf("state=%+v", st)
+	}
+}
+
+func TestRuntimeIMSRecoveryRetriesUSSDInviteAfterRecoverableSIPStatus(t *testing.T) {
+	firstTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 503,
+		Reason:     "Service Unavailable",
+		Headers: map[string][]string{
+			"To": {"<sip:*100%23@ims.example;user=dialstring>;tag=unavailable"},
+		},
+	}}}
+	recoveredTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers: map[string][]string{
+			"To":      {"<sip:*100%23@ims.example;user=dialstring>;tag=recovered"},
+			"Contact": {"<sip:ussd-as@ims.example>"},
+		},
+	}}}
+	profile := voiceclient.IMSProfile{
+		IMPI:   "user@ims.example",
+		IMPU:   "sip:user@ims.example",
+		Domain: "ims.example",
+	}
+	initialBinding := voiceclient.RegistrationBinding{
+		ContactURI:     "sip:user@192.0.2.10:5060",
+		PublicIdentity: "sip:user@ims.example",
+		ServiceRoutes:  []string{"<sip:pcscf1.ims.example;lr>"},
+	}
+	recoveredBinding := voiceclient.RegistrationBinding{
+		ContactURI:     "sip:user@192.0.2.20:5060",
+		PublicIdentity: "sip:user@ims.example",
+		ServiceRoutes:  []string{"<sip:pcscf2.ims.example;lr>"},
+	}
+	recoveries := 0
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
+		Registered: true,
+		StatusCode: 200,
+		Reason:     "ims registered",
+		Profile:    profile,
+		Binding:    initialBinding,
+		USSDTransport: &messaging.IMSUSSDTransport{
+			Transport:    firstTransport,
+			Profile:      profile,
+			Registration: initialBinding,
+		},
+		Recover: func(ctx context.Context) (IMSRegistrationResult, error) {
+			recoveries++
+			return IMSRegistrationResult{
+				Registered: true,
+				StatusCode: 200,
+				Reason:     "ims recovered",
+				Profile:    profile,
+				Binding:    recoveredBinding,
+				USSDTransport: &messaging.IMSUSSDTransport{
+					Transport:    recoveredTransport,
+					Profile:      profile,
+					Registration: recoveredBinding,
+				},
+			}, nil
+		},
+	}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:     "dev-ussd-recover-503",
+		TraceID:      "trace-ussd-recover-503",
+		Profile:      identity.Profile{IMSI: "310280233641503"},
+		IMSRegistrar: registrar,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := inst.Service().SendUSSD(context.Background(), "*100#")
+	if err != nil || result == nil || result.Status != 200 || result.Done {
+		t.Fatalf("SendUSSD() result=%+v err=%v", result, err)
+	}
+	if recoveries != 1 {
+		t.Fatalf("recoveries=%d, want 1", recoveries)
+	}
+	if len(firstTransport.requests) != 1 || firstTransport.requests[0].Headers["Route"] != "<sip:pcscf1.ims.example;lr>" ||
+		len(firstTransport.writes) != 1 || firstTransport.writes[0].Method != "ACK" {
+		t.Fatalf("initial USSD requests=%+v writes=%+v", firstTransport.requests, firstTransport.writes)
 	}
 	if len(recoveredTransport.requests) != 1 || recoveredTransport.requests[0].Method != "INVITE" ||
 		recoveredTransport.requests[0].Headers["Route"] != "<sip:pcscf2.ims.example;lr>" {

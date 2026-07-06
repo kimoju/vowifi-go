@@ -916,7 +916,7 @@ func (t *runtimeRecoveringSMSTransport) SendSMSPart(ctx context.Context, req mes
 	if !result.RegistrationRecoveryNeeded || t.owner == nil {
 		return result, err
 	}
-	retry := err != nil && result.SIPCode == 0
+	retry := runtimeShouldRetryRecoverableIMSStatus(err, result.SIPCode)
 	recovery, recovered, recoveryErr := t.owner.recoverIMSRegistration(ctx, result.ErrorText, true, result.RetryAfter)
 	if recoveryErr != nil {
 		return result, runtimeOperationRecoveryError(err, recoveryErr)
@@ -940,7 +940,7 @@ func (t *runtimeRecoveringUSSDTransport) ExecuteUSSD(ctx context.Context, req me
 	if !result.RegistrationRecoveryNeeded || t.owner == nil {
 		return result, err
 	}
-	retry := err != nil && result.Status == 0
+	retry := runtimeShouldRetryRecoverableIMSStatus(err, result.Status)
 	recovery, recovered, recoveryErr := t.owner.recoverIMSRegistration(ctx, "USSD registration recovery", true, result.RetryAfter)
 	if recoveryErr != nil {
 		return result, runtimeOperationRecoveryError(err, recoveryErr)
@@ -949,6 +949,19 @@ func (t *runtimeRecoveringUSSDTransport) ExecuteUSSD(ctx context.Context, req me
 		return result, err
 	}
 	return recovery.USSDTransport.ExecuteUSSD(ctx, req)
+}
+
+func runtimeShouldRetryRecoverableIMSStatus(err error, status int) bool {
+	if err == nil {
+		return false
+	}
+	if status == 0 {
+		return true
+	}
+	if status >= 200 && status < 300 {
+		return false
+	}
+	return messaging.IMSRegistrationRecoveryNeededStatus(status)
 }
 
 func (t *runtimeRecoveringUSSDTransport) ContinueUSSD(ctx context.Context, req messaging.USSDRequest) (messaging.USSDResult, error) {

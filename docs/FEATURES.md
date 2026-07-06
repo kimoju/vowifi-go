@@ -279,7 +279,8 @@ protocol layers needed by VoHive:
 - runtime SMS and USSD operations consume the same recoverable IMS failure
   signal, refresh IMS registration and message transports, and retry only the
   initial SMS part or USSD INVITE when the original attempt failed before a SIP
-  final response was received
+  final response was received or when IMS returned a recoverable final response
+  such as 408/503
 - local softphone in-dialog SIP UPDATE forwarding to IMS dialogs, including
   session refresh/media renegotiation SDP validation, RTP relay endpoint
   rewriting, response body/header mapping, remote Contact refresh, and dialog
