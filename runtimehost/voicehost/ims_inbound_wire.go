@@ -205,16 +205,13 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 			responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(481, "Call/Transaction Does Not Exist"))}
 			break
 		}
-		if callErr := s.Agent.CancelInboundCall(ctx, DialogInfo{
+		result, callErr := s.Agent.CancelInboundCallWithResult(ctx, DialogInfo{
 			CallID:      wireCallID(req),
 			ContentType: firstVoiceHeader(req.Headers, "Content-Type"),
 			Body:        append([]byte(nil), req.Body...),
 			Headers:     firstValueSIPHeaders(req.Headers),
-		}); callErr != nil {
-			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, callErr.Error()))}, callErr
-			break
-		}
-		responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}
+		})
+		responses, err = s.dialogInfoResultResponse(result, callErr), callErr
 	default:
 		resp := wireResponse(405, "Method Not Allowed")
 		resp.Headers["Allow"] = s.allowHeader()

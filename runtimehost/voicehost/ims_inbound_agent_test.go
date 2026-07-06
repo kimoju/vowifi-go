@@ -264,6 +264,63 @@ func TestIMSInboundAgentCancelEstablishedDialogNoops(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentCancelInboundCallWithResultReturnsClientResponse(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 481,
+			Reason:     "Call/Transaction Does Not Exist",
+			Headers: map[string][]string{
+				"Content-Type": {"message/sipfrag"},
+				"X-Client":     {"cancel-miss"},
+			},
+			Body: []byte("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{ClientTransport: transport}
+	inviteVia := "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-inbound-invite;rport"
+	agent.storeInboundDialog("in-call-cancel-result", imsInboundDialogState{
+		early: true,
+		invite: voiceclient.SIPRequestMessage{
+			Headers: map[string]string{"Via": inviteVia},
+		},
+		clientCfg: voiceclient.DialogRequestConfig{
+			Profile:         voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+			LocalURI:        "sip:+18005551212@ims.example",
+			RemoteURI:       "sip:user@ims.example",
+			RemoteTargetURI: "sip:client@127.0.0.1:5070",
+			CallID:          "in-call-cancel-result",
+			LocalTag:        "ims-tag",
+			CSeq:            1,
+		},
+	})
+
+	result, err := agent.CancelInboundCallWithResult(context.Background(), DialogInfo{CallID: "in-call-cancel-result"})
+	if err == nil || !strings.Contains(err.Error(), "client CANCEL rejected") {
+		t.Fatalf("CancelInboundCallWithResult() err=%v, want client CANCEL rejection", err)
+	}
+	if result.Accepted || result.StatusCode != 481 || result.Reason != "Call/Transaction Does Not Exist" ||
+		result.ContentType != "message/sipfrag" ||
+		string(result.Body) != "SIP/2.0 481 Call/Transaction Does Not Exist\r\n" ||
+		result.Headers["X-Client"] != "cancel-miss" {
+		t.Fatalf("result=%+v body=%q", result, result.Body)
+	}
+	if len(transport.requests) != 1 || transport.requests[0].Method != "CANCEL" || transport.requests[0].Headers["Via"] != inviteVia {
+		t.Fatalf("CANCEL requests=%+v", transport.requests)
+	}
+	state, ok := agent.inboundDialog("in-call-cancel-result")
+	if !ok || state.canceled {
+		t.Fatalf("dialog state after rejected CANCEL=%+v ok=%v", state, ok)
+	}
+	if err := agent.CancelInboundCall(context.Background(), DialogInfo{CallID: "in-call-cancel-result"}); err != nil {
+		t.Fatalf("CancelInboundCall() retry error = %v", err)
+	}
+	state, ok = agent.inboundDialog("in-call-cancel-result")
+	if !ok || !state.canceled {
+		t.Fatalf("dialog state after accepted CANCEL=%+v ok=%v", state, ok)
+	}
+}
+
 func TestIMSInboundAgentForwardsProvisionalInviteResponses(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{
 		provisionals: []voiceclient.SIPResponse{

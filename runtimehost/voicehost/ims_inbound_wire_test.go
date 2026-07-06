@@ -1735,7 +1735,15 @@ func TestIMSInboundWireServerReturnsAgentByeCancelErrors(t *testing.T) {
 			},
 			Body: []byte("SIP/2.0 503 client bye failed\r\n"),
 		},
-		{StatusCode: 503, Reason: "client cancel failed"},
+		{
+			StatusCode: 481,
+			Reason:     "client cancel missed",
+			Headers: map[string][]string{
+				"Content-Type": {"message/sipfrag"},
+				"X-Client":     {"cancel-miss"},
+			},
+			Body: []byte("SIP/2.0 481 client cancel missed\r\n"),
+		},
 	})
 	agent := &IMSInboundAgent{ClientTransport: transport}
 	agent.storeInboundDialog("wire-error-call", imsInboundDialogState{
@@ -1795,7 +1803,11 @@ func TestIMSInboundWireServerReturnsAgentByeCancelErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "client CANCEL rejected") {
 		t.Fatalf("HandleRequest(CANCEL) err=%v, want client CANCEL rejection", err)
 	}
-	if len(responses) != 1 || responses[0].StatusCode != 500 || !strings.Contains(responses[0].Reason, "client CANCEL rejected") {
+	if len(responses) != 1 || responses[0].StatusCode != 481 ||
+		responses[0].Reason != "client cancel missed" ||
+		responses[0].Headers["Content-Type"] != "message/sipfrag" ||
+		responses[0].Headers["X-Client"] != "cancel-miss" ||
+		string(responses[0].Body) != "SIP/2.0 481 client cancel missed\r\n" {
 		t.Fatalf("CANCEL responses=%+v", responses)
 	}
 	if req := transport.readRequest(t); req.Method != "CANCEL" {
