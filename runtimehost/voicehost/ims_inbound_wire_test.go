@@ -894,6 +894,58 @@ func TestIMSInboundWireServerForwardsProvisionalInviteResponses(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerDoesNotTrackRSeqWithoutRequire100rel(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{
+		provisionals: []voiceclient.SIPResponse{
+			{
+				StatusCode: 183,
+				Reason:     "Session Progress",
+				Headers: map[string][]string{
+					"RSeq":    {"77"},
+					"Contact": {"<sip:client@127.0.0.1:5070>"},
+				},
+				Body: []byte(sampleSDP("127.0.0.1", 4002)),
+			},
+		},
+		responses: []voiceclient.SIPResponse{
+			{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+				Body:       []byte(sampleSDP("127.0.0.1", 4004)),
+			},
+		},
+	}
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		ContactURI: "sip:vowifi@127.0.0.1:5060",
+	}
+	invite := parseWireIncoming(t, wireIMSInvite("wire-call-rseq-only", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170))))
+	responses, err := server.HandleRequest(context.Background(), invite)
+	if err != nil {
+		t.Fatalf("HandleRequest(INVITE) error = %v", err)
+	}
+	if len(responses) != 3 || responses[1].StatusCode != 183 || responses[1].Headers["RSeq"] != "77" || responses[1].Headers["Require"] != "" {
+		t.Fatalf("responses=%+v", responses)
+	}
+
+	prack := parseWireIncoming(t, wireIMSRequest("wire-call-rseq-only", "PRACK", 2, nil, "RAck: 77 1 INVITE\r\n"))
+	responses, err = server.HandleRequest(context.Background(), prack)
+	if err != nil {
+		t.Fatalf("HandleRequest(PRACK) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 481 {
+		t.Fatalf("PRACK responses=%+v, want 481", responses)
+	}
+	if len(transport.requestSnapshot()) != 1 {
+		t.Fatalf("requests after unmatched PRACK=%+v", transport.requestSnapshot())
+	}
+}
+
 func TestIMSInboundWireServerKeepsReliableProvisionalSDPOffFinal(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{
 		provisionals: []voiceclient.SIPResponse{

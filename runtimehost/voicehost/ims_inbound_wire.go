@@ -696,7 +696,7 @@ func shouldRetransmitReliableProvisional(req voiceclient.SIPIncomingRequest, res
 	if !strings.EqualFold(strings.TrimSpace(req.Method), "INVITE") || resp.NoResponse || resp.StatusCode <= 100 || resp.StatusCode >= 200 {
 		return false
 	}
-	return strings.TrimSpace(wireResponseHeader(resp, "RSeq")) != ""
+	return strings.TrimSpace(wireResponseHeader(resp, "RSeq")) != "" && wireResponseHeaderHasToken(resp, "Require", "100rel")
 }
 
 func (s *IMSInboundWireServer) startInviteFinalRetransmission(ctx context.Context, pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) {
@@ -1145,6 +1145,24 @@ func wireResponseHeader(resp IMSInboundWireResponse, name string) string {
 		}
 	}
 	return ""
+}
+
+func wireResponseHeaderHasToken(resp IMSInboundWireResponse, name string, token string) bool {
+	token = strings.ToLower(strings.TrimSpace(token))
+	if token == "" {
+		return false
+	}
+	for key, value := range resp.Headers {
+		if !strings.EqualFold(strings.TrimSpace(key), name) {
+			continue
+		}
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func wireViaBranch(via string) string {
