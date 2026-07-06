@@ -209,10 +209,10 @@ protocol layers needed by VoHive:
   protection during media transforms
 - RTP stream quality helpers for per-SSRC packet/loss/duplicate/out-of-order,
   extended-sequence, and interarrival-jitter tracking, plus RTCP Receiver
-  Report block generation from observed RTP streams, relay-side clear-RTP
-  reception snapshots, SRTP plaintext observer integration for encrypted relay
-  streams, and generated Receiver Report send paths toward IMS or client media
-  legs
+  Report block generation from observed RTP streams, Sender Report and SDES
+  packet construction, relay-side clear-RTP reception snapshots, SRTP plaintext
+  observer integration for encrypted relay streams, and generated Receiver/
+  Sender Report send paths toward IMS or client media legs
 - RTP telephone-event DTMF helpers for RFC 4733-style packet construction,
   RFC 4733-style packet-train generation with marker/sequence/timestamp/end
   repetition semantics, SDP dynamic payload discovery, relay-side event

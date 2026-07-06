@@ -192,6 +192,72 @@ func TestBuildReceiverReport(t *testing.T) {
 	}
 }
 
+func TestBuildSenderReportAndSourceDescription(t *testing.T) {
+	var tracker RTPStreamStatsTracker
+	base := time.Unix(0, 0)
+	mediaSSRC := uint32(0x66778899)
+	for _, input := range []struct {
+		sequence  uint16
+		timestamp uint32
+		arrival   time.Duration
+	}{
+		{sequence: 20, timestamp: 2000},
+		{sequence: 22, timestamp: 2320, arrival: 45 * time.Millisecond},
+	} {
+		packet := buildRTPStatsPacket(mediaSSRC, input.sequence, input.timestamp)
+		if _, err := tracker.ObserveRTPPacket(packet, base.Add(input.arrival), 8000); err != nil {
+			t.Fatalf("ObserveRTPPacket(%d) error = %v", input.sequence, err)
+		}
+	}
+
+	wallClock := time.Unix(1, int64(250*time.Millisecond))
+	report := BuildSenderReport(RTCPSenderReportConfig{
+		SSRC:           0x01020304,
+		WallClock:      wallClock,
+		RTPTime:        0x10203040,
+		PacketCount:    17,
+		OctetCount:     3200,
+		ReceptionStats: tracker.Stats(),
+	})
+	wantNTP := uint64(ntpEpochOffsetSeconds+1)<<32 | uint64(1<<30)
+	if report.SSRC != 0x01020304 || report.NTPTime != wantNTP || report.RTPTime != 0x10203040 ||
+		report.PacketCount != 17 || report.OctetCount != 3200 || len(report.Reports) != 1 {
+		t.Fatalf("sender report=%+v", report)
+	}
+	if block := report.Reports[0]; block.SSRC != mediaSSRC || block.TotalLost != 1 || block.FractionLost != 85 || block.LastSequenceNumber != 22 {
+		t.Fatalf("sender report block=%+v", block)
+	}
+
+	sdes := BuildSourceDescription(RTCPSourceDescriptionConfig{
+		SSRC:  0x01020304,
+		CNAME: "session-01020304",
+		Name:  "ims-audio",
+		Tool:  "vowifi-go",
+	})
+	raw, err := rtcp.Marshal([]rtcp.Packet{report, sdes})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal() error = %v", err)
+	}
+	packets, err := rtcp.Unmarshal(raw)
+	if err != nil {
+		t.Fatalf("rtcp.Unmarshal() error = %v", err)
+	}
+	if len(packets) != 2 {
+		t.Fatalf("packets=%d, want 2", len(packets))
+	}
+	gotSR, ok := packets[0].(*rtcp.SenderReport)
+	if !ok || gotSR.SSRC != 0x01020304 || len(gotSR.Reports) != 1 {
+		t.Fatalf("sender report packet=%+v ok=%v", packets[0], ok)
+	}
+	gotSDES, ok := packets[1].(*rtcp.SourceDescription)
+	if !ok || len(gotSDES.Chunks) != 1 || gotSDES.Chunks[0].Source != 0x01020304 || len(gotSDES.Chunks[0].Items) != 3 {
+		t.Fatalf("source description packet=%+v ok=%v", packets[1], ok)
+	}
+	if gotSDES.Chunks[0].Items[0].Type != rtcp.SDESCNAME || gotSDES.Chunks[0].Items[0].Text != "session-01020304" {
+		t.Fatalf("source description CNAME=%+v", gotSDES.Chunks[0].Items[0])
+	}
+}
+
 func buildRTPStatsPacket(ssrc uint32, sequence uint16, timestamp uint32) []byte {
 	packet := make([]byte, 13)
 	packet[0] = 0x80

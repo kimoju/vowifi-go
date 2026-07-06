@@ -604,6 +604,93 @@ func TestRTPRelaySessionTracksRTPStreamsAndSendsReceiverReport(t *testing.T) {
 	}
 }
 
+func TestRTPRelaySessionSendsSenderReportWithSourceDescription(t *testing.T) {
+	clientPeer := listenTestUDP(t)
+	defer clientPeer.Close()
+	clientRTCPPeer := listenTestUDP(t)
+	defer clientRTCPPeer.Close()
+	imsPeer := listenTestUDP(t)
+	defer imsPeer.Close()
+	imsRTCPPeer := listenTestUDP(t)
+	defer imsRTCPPeer.Close()
+
+	clientAddr := clientPeer.LocalAddr().(*net.UDPAddr)
+	clientRTCPAddr := clientRTCPPeer.LocalAddr().(*net.UDPAddr)
+	imsAddr := imsPeer.LocalAddr().(*net.UDPAddr)
+	imsRTCPAddr := imsRTCPPeer.LocalAddr().(*net.UDPAddr)
+	relay, err := NewRTPRelaySession(context.Background(), RTPRelayConfig{
+		ClientListenIP:    "127.0.0.1",
+		ClientAdvertiseIP: "127.0.0.1",
+		IMSListenIP:       "127.0.0.1",
+		IMSAdvertiseIP:    "127.0.0.1",
+		IMSRTPClockRate:   8000,
+	}, SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: clientAddr.Port, RTCPPort: clientRTCPAddr.Port})
+	if err != nil {
+		t.Fatalf("NewRTPRelaySession() error = %v", err)
+	}
+	defer relay.Close()
+	if err := relay.SetIMSRemote(SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: imsAddr.Port, RTCPPort: imsRTCPAddr.Port}); err != nil {
+		t.Fatalf("SetIMSRemote() error = %v", err)
+	}
+
+	imsEndpoint := udpAddrFromSDP(t, relay.IMSEndpoint())
+	for _, seq := range []uint16{30, 32} {
+		packet := testRTPPacket(seq, 0x51525354, []byte{byte(seq)})
+		if _, err := imsPeer.WriteToUDP(packet, imsEndpoint); err != nil {
+			t.Fatalf("ims WriteToUDP(%d) error = %v", seq, err)
+		}
+		if got, _ := readTestUDP(t, clientPeer); !bytes.Equal(got, packet) {
+			t.Fatalf("client got seq=%d packet=%x, want %x", seq, got, packet)
+		}
+	}
+	_ = waitRelayStats(t, relay, func(stats RTPRelayStats) bool {
+		return len(stats.IMSToClientRTPStreams) == 1 && stats.IMSToClientRTPStreams[0].LostPackets == 1
+	})
+
+	result, err := relay.SendSenderReportToIMS(context.Background(), RTPRelaySenderReportRequest{
+		SSRC:        0x61626364,
+		CNAME:       "session-61626364",
+		WallClock:   time.Unix(10, 0),
+		RTPTime:     0x10203040,
+		PacketCount: 4,
+		OctetCount:  640,
+	})
+	if err != nil {
+		t.Fatalf("SendSenderReportToIMS() error = %v", err)
+	}
+	if result.Datagrams != 1 || result.Feedback.SenderReports != 1 || result.Feedback.SourceDescriptions != 1 {
+		t.Fatalf("result=%+v", result)
+	}
+	got, from := readTestUDP(t, imsRTCPPeer)
+	if from.Port != relay.IMSEndpoint().RTCPPort {
+		t.Fatalf("IMS RTCP source port=%d, want relay IMS RTCP port %d", from.Port, relay.IMSEndpoint().RTCPPort)
+	}
+	packets, err := rtcp.Unmarshal(got)
+	if err != nil {
+		t.Fatalf("rtcp.Unmarshal() error = %v packet=%x", err, got)
+	}
+	if len(packets) != 2 {
+		t.Fatalf("packets=%d, want 2", len(packets))
+	}
+	sr, ok := packets[0].(*rtcp.SenderReport)
+	if !ok || sr.SSRC != 0x61626364 || sr.RTPTime != 0x10203040 || sr.PacketCount != 4 || sr.OctetCount != 640 || len(sr.Reports) != 1 {
+		t.Fatalf("sender report=%+v ok=%v", packets[0], ok)
+	}
+	if report := sr.Reports[0]; report.SSRC != 0x51525354 || report.TotalLost != 1 || report.LastSequenceNumber != 32 {
+		t.Fatalf("sender report reception block=%+v", report)
+	}
+	sdes, ok := packets[1].(*rtcp.SourceDescription)
+	if !ok || len(sdes.Chunks) != 1 || sdes.Chunks[0].Source != 0x61626364 ||
+		len(sdes.Chunks[0].Items) != 1 || sdes.Chunks[0].Items[0].Type != rtcp.SDESCNAME ||
+		sdes.Chunks[0].Items[0].Text != "session-61626364" {
+		t.Fatalf("source description=%+v ok=%v", packets[1], ok)
+	}
+	stats := relay.Stats()
+	if stats.ClientToIMSRTCPPackets != 1 || stats.RTCPSenderReports != 1 || stats.RTCPSourceDescriptions != 1 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
 func TestRTPRelaySessionReportsRTPDTMFEvents(t *testing.T) {
 	clientPeer := listenTestUDP(t)
 	defer clientPeer.Close()

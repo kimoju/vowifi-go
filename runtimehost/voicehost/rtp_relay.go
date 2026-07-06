@@ -90,6 +90,17 @@ type RTPRelayReceiverReportRequest struct {
 	SenderSSRC uint32
 }
 
+type RTPRelaySenderReportRequest struct {
+	Direction   RTCPFeedbackDirection
+	SSRC        uint32
+	CNAME       string
+	NTPTime     uint64
+	WallClock   time.Time
+	RTPTime     uint32
+	PacketCount uint32
+	OctetCount  uint32
+}
+
 type RTPRelayStats struct {
 	ClientToIMSPackets                   uint64
 	IMSToClientPackets                   uint64
@@ -675,6 +686,46 @@ func (s *RTPRelaySession) SendReceiverReport(ctx context.Context, req RTPRelayRe
 	return s.SendRTCP(ctx, RTPRelayRTCPRequest{
 		Direction: direction,
 		Packets:   []rtcp.Packet{BuildReceiverReport(req.SenderSSRC, stats)},
+	})
+}
+
+func (s *RTPRelaySession) SendSenderReportToIMS(ctx context.Context, req RTPRelaySenderReportRequest) (RTPRelayRTCPResult, error) {
+	req.Direction = RTCPFeedbackClientToIMS
+	return s.SendSenderReport(ctx, req)
+}
+
+func (s *RTPRelaySession) SendSenderReportToClient(ctx context.Context, req RTPRelaySenderReportRequest) (RTPRelayRTCPResult, error) {
+	req.Direction = RTCPFeedbackIMSToClient
+	return s.SendSenderReport(ctx, req)
+}
+
+func (s *RTPRelaySession) SendSenderReport(ctx context.Context, req RTPRelaySenderReportRequest) (RTPRelayRTCPResult, error) {
+	if s == nil {
+		return RTPRelayRTCPResult{}, ErrRTPRelayConfig
+	}
+	direction, err := normalizeRTCPFeedbackDirection(req.Direction)
+	if err != nil {
+		return RTPRelayRTCPResult{}, err
+	}
+	stats := s.IMSToClientRTPStreamStats()
+	if direction == RTCPFeedbackIMSToClient {
+		stats = s.ClientToIMSRTPStreamStats()
+	}
+	packets := []rtcp.Packet{BuildSenderReport(RTCPSenderReportConfig{
+		SSRC:           req.SSRC,
+		NTPTime:        req.NTPTime,
+		WallClock:      req.WallClock,
+		RTPTime:        req.RTPTime,
+		PacketCount:    req.PacketCount,
+		OctetCount:     req.OctetCount,
+		ReceptionStats: stats,
+	})}
+	if strings.TrimSpace(req.CNAME) != "" {
+		packets = append(packets, BuildSourceDescription(RTCPSourceDescriptionConfig{SSRC: req.SSRC, CNAME: req.CNAME}))
+	}
+	return s.SendRTCP(ctx, RTPRelayRTCPRequest{
+		Direction: direction,
+		Packets:   packets,
 	})
 }
 
