@@ -61,7 +61,9 @@ protocol layers needed by VoHive:
   Any/FullAuth/Permanent Identity selection, KDF negotiation, Notification ACK,
   and terminal Success/Failure handling, plus Client-Error handling for
   entitlement challenges and HTTP `WWW-Authenticate`/`Proxy-Authenticate`
-  challenge parsing/classification without leaking nonce material in errors
+  challenge parsing/classification without leaking nonce material in errors,
+  including HTTP Digest AKAv1-MD5/AKAv2-MD5 entitlement retry generation with
+  AUTS synchronization-failure retry handling
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
   AKA nonce extraction, Digest MD5/MD5-sess/SHA-256/SHA-512-256 plus
   AKAv1-MD5 and AKAv2-MD5 authorization material,

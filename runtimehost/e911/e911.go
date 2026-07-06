@@ -268,12 +268,12 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 	if err != nil {
 		return WebsheetRequest{}, err
 	}
-	resp, err := doEntitlement(ctx, client, req.Trace, &HTTPRequest{
+	resp, err := doEntitlementWithHTTPDigest(ctx, client, req.Trace, &HTTPRequest{
 		Method:  "POST",
 		URL:     endpoint,
 		Headers: entitlementHeaders(req),
 		Body:    payload,
-	})
+	}, req)
 	if err != nil {
 		return WebsheetRequest{}, err
 	}
@@ -319,12 +319,12 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 		if err != nil {
 			return WebsheetRequest{}, err
 		}
-		resp, err = doEntitlement(ctx, client, req.Trace, &HTTPRequest{
+		resp, err = doEntitlementWithHTTPDigest(ctx, client, req.Trace, &HTTPRequest{
 			Method:  "POST",
 			URL:     endpoint,
 			Headers: entitlementHeaders(req),
 			Body:    answer,
-		})
+		}, req)
 		if err != nil {
 			return WebsheetRequest{}, err
 		}
