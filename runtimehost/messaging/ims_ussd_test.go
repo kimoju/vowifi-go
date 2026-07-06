@@ -441,3 +441,179 @@ func TestIMSUSSDTransportHandlesInboundInfoAndBye(t *testing.T) {
 		t.Fatalf("event=%+v", dispatch.events[2])
 	}
 }
+
+func TestIMSUSSDTransportAcceptsNetworkInitiatedInfo(t *testing.T) {
+	nextXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "More?", Operation: IMSUSSDOperationRequest})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML(next) error = %v", err)
+	}
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"Content-Type": {IMSUSSDContentType}},
+		Body:       nextXML,
+	}}}
+	ussd := &IMSUSSDTransport{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+	svc.SetUSSDTransport(ussd)
+
+	menuXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "1. Balance", Operation: IMSUSSDOperationRequest})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML(menu) error = %v", err)
+	}
+	info, err := svc.HandleIMSUSSDInfo(context.Background(), IMSUSSDDialogRequest{
+		CallID: "net-ussd-call",
+		CSeq:   4,
+		Body:   menuXML,
+		Headers: map[string][]string{
+			"Content-Type": {"application/vnd.3gpp.ussd+xml;charset=UTF-8"},
+			"Info-Package": {IMSUSSDInfoPackage},
+			"From":         {"<sip:ussd-as@ims.example>;tag=as-tag"},
+			"To":           {"<sip:user@ims.example>;tag=ue-tag"},
+			"Contact":      {"<sip:ussd-as@198.51.100.7;transport=udp>"},
+			"Record-Route": {"<sip:edge1.ims.example;lr>, <sip:edge2.ims.example;lr>"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSUSSDInfo() error = %v", err)
+	}
+	sessionID := info.USSD.SessionID
+	if !info.Handled || info.StatusCode != 200 || sessionID == "" || info.USSD.Text != "1. Balance" || info.USSD.Done || !svc.hasUSSDSession(sessionID) {
+		t.Fatalf("info=%+v active=%v", info, svc.hasUSSDSession(sessionID))
+	}
+	state, ok := ussd.session(sessionID)
+	if !ok {
+		t.Fatalf("transport session %q not found", sessionID)
+	}
+	if state.cseq != 4 || state.cfg.CallID != "net-ussd-call" || state.cfg.LocalURI != "sip:user@ims.example" ||
+		state.cfg.RemoteURI != "sip:ussd-as@ims.example" || state.cfg.RemoteTargetURI != "sip:ussd-as@198.51.100.7;transport=udp" ||
+		state.cfg.LocalTag != "ue-tag" || state.cfg.RemoteTag != "as-tag" {
+		t.Fatalf("state=%+v", state)
+	}
+	if len(state.cfg.RouteSet) != 2 || state.cfg.RouteSet[0] != "<sip:edge2.ims.example;lr>" || state.cfg.RouteSet[1] != "<sip:edge1.ims.example;lr>" {
+		t.Fatalf("route set=%+v", state.cfg.RouteSet)
+	}
+
+	next, err := svc.ContinueUSSD(context.Background(), sessionID, "1")
+	if err != nil {
+		t.Fatalf("ContinueUSSD() error = %v", err)
+	}
+	if next.Done || next.Text != "More?" || !svc.hasUSSDSession(sessionID) {
+		t.Fatalf("next=%+v active=%v", next, svc.hasUSSDSession(sessionID))
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	out := transport.requests[0]
+	if out.Method != "INFO" || out.URI != "sip:ussd-as@198.51.100.7;transport=udp" || out.Headers["CSeq"] != "5 INFO" ||
+		out.Headers["Info-Package"] != IMSUSSDInfoPackage || out.Headers["Content-Disposition"] != IMSUSSDContentDisposition {
+		t.Fatalf("outbound INFO=%+v", out)
+	}
+	if !strings.Contains(out.Headers["From"], "tag=ue-tag") || !strings.Contains(out.Headers["To"], "tag=as-tag") {
+		t.Fatalf("dialog headers=%+v", out.Headers)
+	}
+	if route := out.Headers["Route"]; route != "<sip:edge2.ims.example;lr>, <sip:edge1.ims.example;lr>" {
+		t.Fatalf("Route=%q", route)
+	}
+
+	byeXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "Bye", Operation: IMSUSSDOperationNotify})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML(bye) error = %v", err)
+	}
+	bye, err := svc.HandleIMSUSSDBye(context.Background(), IMSUSSDDialogRequest{
+		CallID:      "net-ussd-call",
+		CSeq:        6,
+		ContentType: IMSUSSDContentType,
+		Body:        byeXML,
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSUSSDBye() error = %v", err)
+	}
+	if !bye.Handled || bye.StatusCode != 200 || bye.USSD.SessionID != sessionID || bye.USSD.Text != "Bye" || !bye.USSD.Done || svc.hasUSSDSession(sessionID) {
+		t.Fatalf("bye=%+v active=%v", bye, svc.hasUSSDSession(sessionID))
+	}
+	if _, ok := ussd.session(sessionID); ok {
+		t.Fatalf("transport session %q still active", sessionID)
+	}
+	if len(dispatch.events) != 3 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+}
+
+func TestIMSUSSDTransportRejectsUnknownInvalidOrNonUSSDInfo(t *testing.T) {
+	ussd := &IMSUSSDTransport{
+		Profile: voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+
+	invalid, err := ussd.HandleIMSInfo(context.Background(), IMSUSSDDialogRequest{
+		CallID:      "bad-ussd-call",
+		CSeq:        1,
+		ContentType: IMSUSSDContentType,
+		Body:        []byte("not xml"),
+	})
+	if err == nil || !invalid.Handled || invalid.StatusCode != 400 {
+		t.Fatalf("invalid=%+v err=%v", invalid, err)
+	}
+	if _, ok := ussd.session("ims-ussd-" + smsToken("bad-ussd-call")); ok {
+		t.Fatal("invalid INFO created a session")
+	}
+
+	missing, err := ussd.HandleIMSInfo(context.Background(), IMSUSSDDialogRequest{
+		CallID:      "missing-body-call",
+		CSeq:        1,
+		ContentType: "text/plain",
+		InfoPackage: IMSUSSDInfoPackage,
+		Body:        []byte("plain text"),
+	})
+	if err == nil || !missing.Handled || missing.StatusCode != 400 {
+		t.Fatalf("missing=%+v err=%v", missing, err)
+	}
+
+	plain, err := ussd.HandleIMSInfo(context.Background(), IMSUSSDDialogRequest{
+		CallID:      "plain-call",
+		CSeq:        1,
+		ContentType: "text/plain",
+		Body:        []byte("Signal=1\r\nDuration=100\r\n"),
+	})
+	if err != nil || plain.Handled || plain.StatusCode != 0 {
+		t.Fatalf("plain=%+v err=%v", plain, err)
+	}
+
+	xml, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "1. Balance", Operation: IMSUSSDOperationRequest})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML() error = %v", err)
+	}
+	implicit, err := ussd.HandleIMSInfo(context.Background(), IMSUSSDDialogRequest{
+		CallID:      "implicit-call",
+		CSeq:        1,
+		ContentType: "text/xml",
+		Body:        xml,
+	})
+	if err != nil || implicit.Handled || implicit.StatusCode != 0 {
+		t.Fatalf("implicit=%+v err=%v", implicit, err)
+	}
+	if _, ok := ussd.session("ims-ussd-" + smsToken("implicit-call")); ok {
+		t.Fatal("implicit INFO created a session")
+	}
+
+	bye, err := ussd.HandleIMSBye(context.Background(), IMSUSSDDialogRequest{
+		CallID:      "missing-call",
+		CSeq:        2,
+		ContentType: IMSUSSDContentType,
+	})
+	if err != nil || !bye.Handled || bye.StatusCode != 481 {
+		t.Fatalf("bye=%+v err=%v", bye, err)
+	}
+}

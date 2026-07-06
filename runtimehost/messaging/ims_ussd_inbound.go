@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 type IMSUSSDDialogRequest struct {
@@ -87,17 +89,28 @@ func (t *IMSUSSDTransport) HandleIMSInfo(ctx context.Context, req IMSUSSDDialogR
 	if !isIMSUSSDDialogRequest(req) {
 		return IMSUSSDDialogResult{}, nil
 	}
-	sessionID, state, ok := t.sessionByCallID(req.CallID)
-	if !ok {
-		return IMSUSSDDialogResult{Handled: true, StatusCode: 481, Reason: "USSD dialog not found"}, nil
-	}
-	payload, ok, err := DecodeIMSUSSDDocument(req.ContentType, req.Body)
+	contentType := imsUSSDDialogContentType(req)
+	payload, parsed, err := DecodeIMSUSSDDocument(contentType, req.Body)
 	if err != nil {
 		return IMSUSSDDialogResult{Handled: true, StatusCode: 400, Reason: err.Error()}, err
 	}
-	if !ok {
+	if !parsed {
 		err := errors.New("IMS USSD INFO body is missing USSD XML")
 		return IMSUSSDDialogResult{Handled: true, StatusCode: 400, Reason: err.Error()}, err
+	}
+	sessionID, state, ok := t.sessionByCallID(req.CallID)
+	if !ok {
+		if !isExplicitIMSUSSDDialogRequest(req) {
+			return IMSUSSDDialogResult{Handled: true, StatusCode: 481, Reason: "USSD dialog not found"}, nil
+		}
+		sessionID, state, err = t.inboundUSSDSession(req)
+		if err != nil {
+			status := 400
+			if errors.Is(err, ErrUSSDTransportUnavailable) {
+				status = 503
+			}
+			return IMSUSSDDialogResult{Handled: true, StatusCode: status, Reason: err.Error()}, err
+		}
 	}
 	result := ussdResultFromPayload(sessionID, payload, 200)
 	if result.Done {
@@ -119,7 +132,7 @@ func (t *IMSUSSDTransport) HandleIMSBye(ctx context.Context, req IMSUSSDDialogRe
 	}
 	result := USSDResult{SessionID: sessionID, Status: 200, Done: true}
 	if len(req.Body) > 0 {
-		payload, parsed, err := DecodeIMSUSSDDocument(req.ContentType, req.Body)
+		payload, parsed, err := DecodeIMSUSSDDocument(imsUSSDDialogContentType(req), req.Body)
 		if err != nil {
 			return IMSUSSDDialogResult{Handled: true, StatusCode: 400, Reason: err.Error()}, err
 		}
@@ -147,18 +160,84 @@ func (t *IMSUSSDTransport) sessionByCallID(callID string) (string, imsUSSDSessio
 	return "", imsUSSDSession{}, false
 }
 
+func (t *IMSUSSDTransport) inboundUSSDSession(req IMSUSSDDialogRequest) (string, imsUSSDSession, error) {
+	if t == nil {
+		return "", imsUSSDSession{}, ErrUSSDTransportUnavailable
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return "", imsUSSDSession{}, errors.New("IMS USSD Call-ID is empty")
+	}
+	from := firstNonEmpty(req.FromURI, sipHeaderURIValue(firstHeaderValue(req.Headers, "From")))
+	if from == "" {
+		return "", imsUSSDSession{}, errors.New("IMS USSD remote URI is empty")
+	}
+	to := firstNonEmpty(req.ToURI, sipHeaderURIValue(firstHeaderValue(req.Headers, "To")), t.LocalURI, t.Registration.PublicIdentity, t.Profile.IMPU)
+	if to == "" {
+		return "", imsUSSDSession{}, errors.New("IMS USSD local identity is empty")
+	}
+	cseq := req.CSeq
+	if cseq <= 0 {
+		cseq = 1
+	}
+	cfg := voiceclient.DialogRequestConfig{
+		Profile:         t.Profile,
+		Registration:    t.Registration,
+		LocalURI:        to,
+		ContactURI:      firstNonEmpty(t.ContactURI, t.Registration.ContactURI),
+		RemoteURI:       from,
+		RemoteTargetURI: firstNonEmpty(sipHeaderURIValue(firstHeaderValue(req.Headers, "Contact")), from),
+		CallID:          callID,
+		LocalTag:        firstNonEmpty(sipHeaderTagValue(firstHeaderValue(req.Headers, "To")), t.LocalTag, "ussd"),
+		RemoteTag:       sipHeaderTagValue(firstHeaderValue(req.Headers, "From")),
+		CSeq:            cseq,
+		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
+		SessionExpires:  t.SessionExpires,
+	}
+	if routeSet := ussdRecordRouteSet(req.Headers); len(routeSet) > 0 {
+		cfg.RouteSet = routeSet
+	}
+	sessionID := "ims-ussd-" + smsToken(callID)
+	return sessionID, imsUSSDSession{cfg: cfg, cseq: cseq}, nil
+}
+
 func isIMSUSSDDialogRequest(req IMSUSSDDialogRequest) bool {
-	if strings.EqualFold(strings.TrimSpace(req.InfoPackage), IMSUSSDInfoPackage) {
+	if strings.EqualFold(strings.TrimSpace(imsUSSDDialogInfoPackage(req)), IMSUSSDInfoPackage) {
 		return true
 	}
-	if normalizeUSSDContentType(req.ContentType) == IMSUSSDContentType {
+	contentType := imsUSSDDialogContentType(req)
+	if normalizeUSSDContentType(contentType) == IMSUSSDContentType {
 		return true
 	}
-	contentType := strings.ToLower(strings.TrimSpace(req.ContentType))
-	if strings.HasPrefix(contentType, "multipart/") && len(req.Body) > 0 {
-		if _, ok, _ := DecodeIMSUSSDDocument(req.ContentType, req.Body); ok {
+	normalized := strings.ToLower(strings.TrimSpace(contentType))
+	if strings.HasPrefix(normalized, "multipart/") && len(req.Body) > 0 {
+		if _, ok, _ := DecodeIMSUSSDDocument(contentType, req.Body); ok {
 			return true
 		}
 	}
 	return false
+}
+
+func isExplicitIMSUSSDDialogRequest(req IMSUSSDDialogRequest) bool {
+	if strings.EqualFold(strings.TrimSpace(imsUSSDDialogInfoPackage(req)), IMSUSSDInfoPackage) {
+		return true
+	}
+	contentType := imsUSSDDialogContentType(req)
+	normalized := normalizeUSSDContentType(contentType)
+	if normalized == IMSUSSDContentType {
+		return true
+	}
+	if strings.HasPrefix(normalized, "multipart/") && len(req.Body) > 0 {
+		_, parsed, err := DecodeIMSUSSDDocument(contentType, req.Body)
+		return parsed && err == nil
+	}
+	return false
+}
+
+func imsUSSDDialogContentType(req IMSUSSDDialogRequest) string {
+	return firstNonEmpty(req.ContentType, firstHeaderValue(req.Headers, "Content-Type"))
+}
+
+func imsUSSDDialogInfoPackage(req IMSUSSDDialogRequest) string {
+	return firstNonEmpty(req.InfoPackage, firstHeaderValue(req.Headers, "Info-Package"))
 }
