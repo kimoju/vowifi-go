@@ -141,11 +141,7 @@ func StartEmergencyAddressUpdate(ctx context.Context, req Request) (WebsheetRequ
 			return WebsheetRequest{}, err
 		}
 	}
-	return WebsheetRequest{
-		URL:         req.Carrier.E911.Websheet,
-		ContentType: "text/html",
-		Title:       "Emergency address",
-	}, nil
+	return fallbackWebsheetRequest(req), nil
 }
 
 func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req Request) (WebsheetRequest, error) {
@@ -153,7 +149,7 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 	if client == nil {
 		client = NewDefaultHTTPClient()
 	}
-	payload, err := json.Marshal([]map[string]any{{
+	requestBody := map[string]any{
 		"message-id":      1,
 		"operation":       "emergency-address-update",
 		"app-id":          "ap2003",
@@ -163,19 +159,20 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 		"mnc":             req.Identity.MNC,
 		"sip-username":    req.Identity.SIPUsername,
 		"terminal-vendor": "vowifi-go",
-	}})
+	}
+	if token := strings.TrimSpace(req.Identity.CachedToken); token != "" {
+		requestBody["entitlement-token"] = token
+		requestBody["token"] = token
+	}
+	payload, err := json.Marshal([]map[string]any{requestBody})
 	if err != nil {
 		return WebsheetRequest{}, err
 	}
 	resp, err := doEntitlement(ctx, client, req.Trace, &HTTPRequest{
-		Method: "POST",
-		URL:    endpoint,
-		Headers: []HeaderPair{
-			{Key: "Content-Type", Value: "application/json"},
-			{Key: "Accept", Value: "application/json"},
-			{Key: "x-protocol-version", Value: "2"},
-		},
-		Body: payload,
+		Method:  "POST",
+		URL:     endpoint,
+		Headers: entitlementHeaders(req),
+		Body:    payload,
 	})
 	if err != nil {
 		return WebsheetRequest{}, err
@@ -223,14 +220,10 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 			return WebsheetRequest{}, err
 		}
 		resp, err = doEntitlement(ctx, client, req.Trace, &HTTPRequest{
-			Method: "POST",
-			URL:    endpoint,
-			Headers: []HeaderPair{
-				{Key: "Content-Type", Value: "application/json"},
-				{Key: "Accept", Value: "application/json"},
-				{Key: "x-protocol-version", Value: "2"},
-			},
-			Body: answer,
+			Method:  "POST",
+			URL:     endpoint,
+			Headers: entitlementHeaders(req),
+			Body:    answer,
 		})
 		if err != nil {
 			return WebsheetRequest{}, err
@@ -260,6 +253,10 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 		"response-id":   result.ResponseID,
 		"sip-username":  req.Identity.SIPUsername,
 		"terminal-imei": req.Identity.IMEI,
+	}
+	if token := strings.TrimSpace(req.Identity.CachedToken); token != "" {
+		answerBody["entitlement-token"] = token
+		answerBody["token"] = token
 	}
 	nextIdentityTranscript := cloneByteSlices(identityTranscript)
 	if isEAPRelayTerminalPacket(result) {
@@ -366,6 +363,35 @@ func isEAPRelayTerminalPacket(result entitlementResult) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func entitlementHeaders(req Request) []HeaderPair {
+	headers := []HeaderPair{
+		{Key: "Content-Type", Value: "application/json"},
+		{Key: "Accept", Value: "application/json"},
+		{Key: "x-protocol-version", Value: "2"},
+	}
+	if token := strings.TrimSpace(req.Identity.CachedToken); token != "" {
+		headers = append(headers,
+			HeaderPair{Key: "Authorization", Value: "Bearer " + token},
+			HeaderPair{Key: "x-entitlement-token", Value: token},
+		)
+	}
+	return headers
+}
+
+func fallbackWebsheetRequest(req Request) WebsheetRequest {
+	url := strings.TrimSpace(req.Carrier.E911.Websheet)
+	token := strings.TrimSpace(req.Identity.CachedToken)
+	if token != "" {
+		url = appendUserData(url, token)
+	}
+	return WebsheetRequest{
+		URL:         url,
+		UserData:    token,
+		ContentType: "text/html",
+		Title:       "Emergency address",
 	}
 }
 

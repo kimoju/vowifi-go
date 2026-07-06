@@ -80,6 +80,51 @@ func TestStartEmergencyAddressUpdateReturnsWebsheetFromEntitlementToken(t *testi
 	}
 }
 
+func TestStartEmergencyAddressUpdateSendsCachedTokenToEntitlement(t *testing.T) {
+	client := &fakeHTTPClient{responses: []*HTTPResponse{{
+		StatusCode: 200,
+		Body:       []byte(`[{"status":1000,"websheet-url":"https://example.test/address"}]`),
+	}}}
+	_, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity: Identity{
+			IMSI:        "310280233641503",
+			IMEI:        "356306952701762",
+			MCC:         "310",
+			MNC:         "280",
+			SIPUsername: "310280233641503@private.att.net",
+			CachedToken: "cached-token-123",
+		},
+		Client: client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if len(client.requests) != 1 {
+		t.Fatalf("requests=%d", len(client.requests))
+	}
+	req := client.requests[0]
+	if got := headerValue(req.Headers, "Authorization"); got != "Bearer cached-token-123" {
+		t.Fatalf("Authorization=%q", got)
+	}
+	if got := headerValue(req.Headers, "x-entitlement-token"); got != "cached-token-123" {
+		t.Fatalf("x-entitlement-token=%q", got)
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal(req.Body, &payload); err != nil {
+		t.Fatalf("request JSON error = %v body=%s", err, req.Body)
+	}
+	if len(payload) != 1 || stringValue(payload[0]["entitlement-token"]) != "cached-token-123" || stringValue(payload[0]["token"]) != "cached-token-123" {
+		t.Fatalf("payload=%+v", payload)
+	}
+}
+
 func TestStartEmergencyAddressUpdateHandlesAKAChallenge(t *testing.T) {
 	randHex := strings.ToUpper(hex.EncodeToString(bytesFrom(0x10, 16)))
 	autnHex := strings.ToUpper(hex.EncodeToString(bytesFrom(0x40, 16)))
@@ -972,6 +1017,30 @@ func TestStartEmergencyAddressUpdateFallsBackToConfiguredWebsheet(t *testing.T) 
 	if ws.URL != "https://example.test/static" {
 		t.Fatalf("URL=%q", ws.URL)
 	}
+}
+
+func TestStartEmergencyAddressUpdateFallsBackWithCachedToken(t *testing.T) {
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{Provider: "att-ts43", Websheet: "https://example.test/static?existing=1"},
+		},
+		Identity: Identity{CachedToken: "cached-token-abc"},
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.UserData != "cached-token-abc" || !strings.Contains(ws.URL, "existing=1") || !strings.Contains(ws.URL, "token=cached-token-abc") {
+		t.Fatalf("websheet=%+v", ws)
+	}
+}
+
+func headerValue(headers []HeaderPair, name string) string {
+	for _, header := range headers {
+		if strings.EqualFold(header.Key, name) {
+			return header.Value
+		}
+	}
+	return ""
 }
 
 func bytesFrom(start byte, n int) []byte {
