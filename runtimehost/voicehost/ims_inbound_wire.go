@@ -401,8 +401,10 @@ func (s *IMSInboundWireServer) inviteResultResponse(result InboundCallResult, fa
 	if result.Accepted || (final.StatusCode > 100 && final.StatusCode < 200) {
 		final.Headers["Contact"] = "<" + s.contactURI() + ">"
 	}
-	final.Body = append([]byte(nil), result.RawSDP...)
-	if len(final.Body) == 0 && result.Accepted {
+	if !(result.Accepted && result.sdpFromProvisional) {
+		final.Body = append([]byte(nil), result.RawSDP...)
+	}
+	if len(final.Body) == 0 && result.Accepted && !result.sdpFromProvisional {
 		final.Body = BuildSDPAnswer(result.LocalSDP)
 	}
 	if len(final.Body) > 0 {

@@ -501,6 +501,52 @@ func TestIMSInboundWireServerForwardsProvisionalInviteResponses(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerKeepsReliableProvisionalSDPOffFinal(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{
+		provisionals: []voiceclient.SIPResponse{
+			{
+				StatusCode: 183,
+				Reason:     "Session Progress",
+				Headers: map[string][]string{
+					"To":      {"<sip:user@ims.example>;tag=early-tag"},
+					"Require": {"100rel"},
+					"RSeq":    {"9"},
+				},
+				Body: []byte(sampleSDP("127.0.0.1", 4090)),
+			},
+		},
+		responses: []voiceclient.SIPResponse{
+			{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+			},
+		},
+	}
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		ContactURI: "sip:vowifi@127.0.0.1:5060",
+	}
+	invite := parseWireIncoming(t, wireIMSInvite("wire-call-provisional-answer", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170))))
+	responses, err := server.HandleRequest(context.Background(), invite)
+	if err != nil {
+		t.Fatalf("HandleRequest(INVITE) error = %v", err)
+	}
+	if len(responses) != 3 || responses[0].StatusCode != 100 || responses[1].StatusCode != 183 || responses[2].StatusCode != 200 {
+		t.Fatalf("responses=%+v", responses)
+	}
+	if !strings.Contains(string(responses[1].Body), "m=audio 4090 RTP/AVP") || responses[1].Headers["Content-Type"] != "application/sdp" {
+		t.Fatalf("provisional response=%+v body=%q", responses[1], responses[1].Body)
+	}
+	if len(responses[2].Body) != 0 || responses[2].Headers["Content-Type"] != "" {
+		t.Fatalf("final response should not repeat SDP: %+v body=%q", responses[2], responses[2].Body)
+	}
+}
+
 func TestIMSInboundWireServerServesTCPInvite(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

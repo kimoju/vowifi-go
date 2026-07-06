@@ -290,6 +290,50 @@ func TestIMSInboundAgentForwardsProvisionalInviteResponses(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentUsesReliableProvisionalSDPWhenFinalHasNoBody(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{
+		provisionals: []voiceclient.SIPResponse{
+			{
+				StatusCode: 183,
+				Reason:     "Session Progress",
+				Headers: map[string][]string{
+					"To":      {"<sip:user@ims.example>;tag=early-tag"},
+					"Require": {"100rel"},
+					"RSeq":    {"9"},
+				},
+				Body: []byte(sampleSDP("192.0.2.90", 4090)),
+			},
+		},
+		responses: []voiceclient.SIPResponse{
+			{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+			},
+		},
+	}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-provisional-answer",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	if !result.sdpFromProvisional || result.LocalSDP.ConnectionIP != "192.0.2.90" || result.LocalSDP.MediaPort != 4090 {
+		t.Fatalf("result=%+v", result)
+	}
+	if !strings.Contains(string(result.RawSDP), "m=audio 4090 RTP/AVP") {
+		t.Fatalf("RawSDP=%q", result.RawSDP)
+	}
+}
+
 func TestIMSInboundAgentUsesProvisionalDialogStateForPrack(t *testing.T) {
 	transport := newReliableProvisionalInboundTransport([]voiceclient.SIPResponse{
 		{

@@ -99,12 +99,13 @@ change there.
 ## Git Rules
 
 - Preserve Git author and committer metadata, using the repository or
-  user-configured Git identity for commits.
+  user-configured Git identity for commits. Privacy cleanup applies to tracked
+  worktree content, not to Git object identities.
 - Do not hard-code personal emails, local absolute paths, or private development
   machine details into tracked repository content such as docs, examples,
   generated files, scripts, or commit messages.
-- Privacy scans should check worktree content and must not strip or rewrite
-  `.git` author/committer metadata.
+- Privacy scans should check worktree content and must not strip, anonymize, or
+  rewrite `.git` author/committer metadata.
 - Push after committing when the user explicitly asks for push.
 - Never revert unrelated local changes. If unrelated changes appear, leave them
   alone and mention them to the user.

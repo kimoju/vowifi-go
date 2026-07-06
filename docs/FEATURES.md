@@ -167,7 +167,9 @@ protocol layers needed by VoHive:
   including early-dialog CANCEL forwarding with original INVITE Via reuse and
   487 Request Terminated mapping for the canceled INVITE transaction, plus
   local 18x provisional response forwarding with early SDP/RTP relay rewriting
-  and early-dialog To-tag, Contact, and Record-Route state capture for PRACK
+  and early-dialog To-tag, Contact, and Record-Route state capture for PRACK,
+  while preserving bodyless final 2xx responses after a reliable provisional
+  SDP answer
 - wire-level inbound IMS SIP adapters for UDP/TCP listeners, SIP request
   parsing, provisional/final response construction, incoming INVITE/ACK/BYE/
   CANCEL dispatch, response To-tagging, transaction response caching for

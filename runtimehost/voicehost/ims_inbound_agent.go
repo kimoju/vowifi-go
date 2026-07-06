@@ -49,6 +49,8 @@ type InboundCallResult struct {
 	LocalSDP   SDPInfo
 	RawSDP     []byte
 	Headers    map[string]string
+
+	sdpFromProvisional bool
 }
 
 type InboundDialogRequest struct {
@@ -130,6 +132,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 	var invite voiceclient.SIPRequestMessage
 	var resp voiceclient.SIPResponse
 	retriedSessionInterval := false
+	var provisionalAnswer InboundCallResult
 	for {
 		invite, err = voiceclient.BuildInviteRequest(cfg, offerBody)
 		if err != nil {
@@ -137,7 +140,16 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		}
 		ensureInboundClientInviteVia(&invite, cfg)
 		a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay, early: true})
-		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, relay, req.onProvisional))
+		provisionalAnswer = InboundCallResult{}
+		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, relay, func(result InboundCallResult) error {
+			if len(result.RawSDP) > 0 {
+				provisionalAnswer = cloneInboundCallResult(result)
+			}
+			if req.onProvisional != nil {
+				return req.onProvisional(result)
+			}
+			return nil
+		}))
 		if err != nil {
 			a.deleteInboundDialog(callID)
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client INVITE failed"}, err
@@ -180,13 +192,21 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 			Headers:    firstValueSIPHeaders(resp.Headers),
 		}, nil
 	}
-	localSDP, err := ParseSDP(resp.Body)
-	if err != nil {
-		a.deleteInboundDialog(callID)
-		return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid client SDP answer"}, err
-	}
 	answerBody := append([]byte(nil), resp.Body...)
-	if relay != nil {
+	var localSDP SDPInfo
+	sdpFromProvisional := false
+	if len(resp.Body) == 0 && len(provisionalAnswer.RawSDP) > 0 {
+		answerBody = append([]byte(nil), provisionalAnswer.RawSDP...)
+		localSDP = provisionalAnswer.LocalSDP
+		sdpFromProvisional = true
+	} else {
+		localSDP, err = ParseSDP(resp.Body)
+		if err != nil {
+			a.deleteInboundDialog(callID)
+			return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid client SDP answer"}, err
+		}
+	}
+	if relay != nil && len(resp.Body) > 0 {
 		if err := relay.SetClientRemote(localSDP); err != nil {
 			a.deleteInboundDialog(callID)
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client setup failed"}, err
@@ -215,6 +235,8 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		LocalSDP:   localSDP,
 		RawSDP:     answerBody,
 		Headers:    firstValueSIPHeaders(resp.Headers),
+
+		sdpFromProvisional: sdpFromProvisional,
 	}, nil
 }
 
@@ -239,6 +261,7 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 	var resp voiceclient.SIPResponse
 	var err error
 	retriedSessionInterval := false
+	var provisionalAnswer InboundCallResult
 	for {
 		invite, err = voiceclient.BuildInviteRequest(cfg, body)
 		if err != nil {
@@ -247,7 +270,16 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 		ensureInboundClientInviteVia(&invite, cfg)
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		a.storeInboundDialog(callID, state)
-		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, state.relay, req.onProvisional))
+		provisionalAnswer = InboundCallResult{}
+		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, state.relay, func(result InboundCallResult) error {
+			if len(result.RawSDP) > 0 {
+				provisionalAnswer = cloneInboundCallResult(result)
+			}
+			if req.onProvisional != nil {
+				return req.onProvisional(result)
+			}
+			return nil
+		}))
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client re-INVITE failed"}, err
 		}
@@ -288,6 +320,10 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 			}
 		}
 		result.LocalSDP = localSDP
+	} else if len(provisionalAnswer.RawSDP) > 0 {
+		result.RawSDP = append([]byte(nil), provisionalAnswer.RawSDP...)
+		result.LocalSDP = provisionalAnswer.LocalSDP
+		result.sdpFromProvisional = true
 	}
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
@@ -387,6 +423,18 @@ func cloneSIPRequestMessage(msg voiceclient.SIPRequestMessage) voiceclient.SIPRe
 	if msg.Headers != nil {
 		out.Headers = make(map[string]string, len(msg.Headers))
 		for key, value := range msg.Headers {
+			out.Headers[key] = value
+		}
+	}
+	return out
+}
+
+func cloneInboundCallResult(result InboundCallResult) InboundCallResult {
+	out := result
+	out.RawSDP = append([]byte(nil), result.RawSDP...)
+	if result.Headers != nil {
+		out.Headers = make(map[string]string, len(result.Headers))
+		for key, value := range result.Headers {
 			out.Headers[key] = value
 		}
 	}
