@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/boa-z/vowifi-go/engine/sim"
@@ -422,17 +424,24 @@ func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req 
 }
 
 type entitlementResult struct {
-	Status            int
-	ResponseID        any
-	WebsheetURL       string
-	UserData          string
-	ContentType       string
-	Title             string
-	RAND              []byte
-	AUTN              []byte
-	ChallengeRequired bool
-	EAPPacket         *eapaka.Packet
-	EAPPacketRaw      []byte
+	Status                   int
+	ResponseID               any
+	WebsheetURL              string
+	UserData                 string
+	ContentType              string
+	Title                    string
+	RAND                     []byte
+	AUTN                     []byte
+	ChallengeRequired        bool
+	EAPPacket                *eapaka.Packet
+	EAPPacketRaw             []byte
+	EmergencyAddress         map[string]string
+	PDN                      string
+	PDNType                  string
+	APN                      string
+	Realm                    string
+	Endpoint                 string
+	LocationValidationStatus string
 }
 
 func (r entitlementResult) HasChallenge() bool {
@@ -440,67 +449,306 @@ func (r entitlementResult) HasChallenge() bool {
 }
 
 func parseEntitlementResponse(body []byte) (entitlementResult, error) {
+	body = bytes.TrimSpace(body)
 	var root any
-	if err := json.Unmarshal(body, &root); err != nil {
+	if err := json.Unmarshal(body, &root); err == nil {
+		var out entitlementResult
+		walkEntitlement(root, &out)
+		return finalizeEntitlementResult(out), nil
+	} else if xmlResult, xmlErr := parseXMLEntitlementResponse(body); xmlErr == nil {
+		return xmlResult, nil
+	} else if looksXMLBody(body) {
+		return entitlementResult{}, xmlErr
+	} else {
 		return entitlementResult{}, err
 	}
-	var out entitlementResult
-	walkEntitlement(root, &out)
+}
+
+func finalizeEntitlementResult(out entitlementResult) entitlementResult {
 	if out.ContentType == "" {
 		out.ContentType = "text/html"
 	}
 	if out.Title == "" {
 		out.Title = "Emergency address"
 	}
-	return out, nil
+	return out
+}
+
+type entitlementXMLNode struct {
+	XMLName  xml.Name
+	Attrs    []xml.Attr           `xml:",any,attr"`
+	Text     string               `xml:",chardata"`
+	Children []entitlementXMLNode `xml:",any"`
+}
+
+func parseXMLEntitlementResponse(body []byte) (entitlementResult, error) {
+	var root entitlementXMLNode
+	if err := xml.Unmarshal(body, &root); err != nil {
+		return entitlementResult{}, err
+	}
+	if root.XMLName.Local == "" {
+		return entitlementResult{}, errors.New("empty e911 entitlement XML response")
+	}
+	var out entitlementResult
+	walkXMLEntitlement(root, &out, false)
+	return finalizeEntitlementResult(out), nil
 }
 
 func walkEntitlement(v any, out *entitlementResult) {
+	walkEntitlementValue(v, out, false)
+}
+
+func walkEntitlementValue(v any, out *entitlementResult, inEmergencyAddress bool) {
 	switch x := v.(type) {
 	case []any:
 		for _, item := range x {
-			walkEntitlement(item, out)
+			walkEntitlementValue(item, out, inEmergencyAddress)
 		}
 	case map[string]any:
 		for key, value := range x {
-			lower := strings.ToLower(strings.TrimSpace(key))
-			switch lower {
-			case "status":
-				if n, ok := numberValue(value); ok {
-					out.Status = n
-					if n == 6004 {
-						out.ChallengeRequired = true
-					}
-				}
-			case "response-id", "response_id", "responseid":
-				out.ResponseID = value
-			case "websheet", "websheet-url", "websheet_url", "e911-websheet-url", "e911_websheet_url", "address-url", "address_url", "url":
-				if s := stringValue(value); looksHTTPURL(s) && out.WebsheetURL == "" {
-					out.WebsheetURL = s
-				}
-			case "user-data", "userdata", "user_data", "token", "entitlement-token", "entitlement_token", "auth-token", "auth_token":
-				if s := strings.TrimSpace(stringValue(value)); s != "" && out.UserData == "" {
-					out.UserData = s
-				}
-			case "content-type", "content_type":
-				out.ContentType = strings.TrimSpace(stringValue(value))
-			case "title":
-				out.Title = strings.TrimSpace(stringValue(value))
-			case "rand":
-				if decoded, ok := decodeChallengeBytes(stringValue(value)); ok {
-					out.RAND = decoded
-				}
-			case "autn":
-				if decoded, ok := decodeChallengeBytes(stringValue(value)); ok {
-					out.AUTN = decoded
-				}
-			case "challenge", "aka-challenge", "aka_challenge", "eap-aka-challenge", "eap_aka_challenge":
-				parseCombinedChallenge(value, out)
-			case "eap-relay-packet", "eap_relay_packet", "eap-relay", "eap_relay":
-				parseEAPRelayPacket(value, out)
+			consumeEntitlementField(key, value, out)
+			nextInEmergencyAddress := inEmergencyAddress || isEmergencyAddressKey(normalizeEntitlementKey(key))
+			if nextInEmergencyAddress {
+				collectEmergencyAddressField(key, value, out)
 			}
-			walkEntitlement(value, out)
+			walkEntitlementValue(value, out, nextInEmergencyAddress)
 		}
+	}
+}
+
+func walkXMLEntitlement(node entitlementXMLNode, out *entitlementResult, inEmergencyAddress bool) {
+	key := node.XMLName.Local
+	canonical := normalizeEntitlementKey(key)
+	text := strings.TrimSpace(node.Text)
+	if text != "" {
+		consumeEntitlementField(key, text, out)
+	}
+	nextInEmergencyAddress := inEmergencyAddress || isEmergencyAddressKey(canonical)
+	if nextInEmergencyAddress && text != "" && len(node.Children) == 0 {
+		collectEmergencyAddressField(key, text, out)
+	}
+	for _, attr := range node.Attrs {
+		consumeEntitlementField(attr.Name.Local, attr.Value, out)
+		if isPDNKey(canonical) {
+			consumePDNField(attr.Name.Local, attr.Value, out)
+		}
+		if nextInEmergencyAddress {
+			collectEmergencyAddressField(attr.Name.Local, attr.Value, out)
+		}
+	}
+	for _, child := range node.Children {
+		walkXMLEntitlement(child, out, nextInEmergencyAddress)
+	}
+}
+
+func consumeEntitlementField(key string, value any, out *entitlementResult) {
+	switch normalizeEntitlementKey(key) {
+	case "status", "statuscode", "entitlementstatus", "resultcode", "responsecode":
+		if n, ok := numberValue(value); ok {
+			out.Status = n
+			if n == 6004 {
+				out.ChallengeRequired = true
+			}
+		}
+	case "responseid", "responseidentifier", "requestid", "transactionid":
+		if out.ResponseID == nil {
+			out.ResponseID = value
+		}
+	case "websheet", "websheeturl", "e911websheet", "e911websheeturl", "addressurl", "addressupdateurl", "emergencyaddressurl", "emergencyaddresswebsheeturl", "emergencyaddressupdateurl", "e911addressurl", "e911addressupdateurl", "locationurl", "locationvalidationurl", "url":
+		setHTTPURL(&out.WebsheetURL, value)
+	case "endpoint", "addressendpoint", "emergencyaddressendpoint", "e911endpoint", "websheetendpoint", "locationendpoint", "locationvalidationendpoint":
+		setHTTPURL(&out.Endpoint, value)
+	case "userdata", "userdatatoken", "token", "entitlementtoken", "authtoken", "authorizationtoken", "accesstoken", "bearertoken":
+		setString(&out.UserData, value)
+	case "contenttype", "mimetype":
+		setString(&out.ContentType, value)
+	case "title", "websheettitle", "pagetitle", "displaytitle":
+		setString(&out.Title, value)
+	case "rand", "akarand", "eapakarand":
+		if decoded, ok := decodeChallengeBytes(stringValue(value)); ok {
+			out.RAND = decoded
+		}
+	case "autn", "akaautn", "eapakautn":
+		if decoded, ok := decodeChallengeBytes(stringValue(value)); ok {
+			out.AUTN = decoded
+		}
+	case "challenge", "akachallenge", "eapakachallenge", "aka":
+		parseCombinedChallenge(value, out)
+	case "eaprelaypacket", "eaprelay", "eappacket", "eapakapacket":
+		parseEAPRelayPacket(value, out)
+	case "challengerequired", "akachallengerequired", "eapchallengerequired":
+		if b, ok := boolValue(value); ok && b {
+			out.ChallengeRequired = true
+		}
+	case "pdn", "pdnname", "pdnid", "emergencypdn":
+		parsePDN(value, out)
+		setString(&out.PDN, value)
+	case "pdntype", "emergencypdntype":
+		setString(&out.PDNType, value)
+	case "apn", "accesspointname", "emergencyapn", "imsapn":
+		setString(&out.APN, value)
+	case "realm", "networkrealm", "imsrealm", "nairealm", "homerealm":
+		setString(&out.Realm, value)
+	case "locationvalidationstatus", "validationstatus", "addressvalidationstatus", "e911addressvalidationstatus", "locationstatus":
+		setString(&out.LocationValidationStatus, value)
+	default:
+		if isEmergencyAddressKey(normalizeEntitlementKey(key)) {
+			parseEmergencyAddress(value, out)
+		}
+	}
+}
+
+func normalizeEntitlementKey(key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	var b strings.Builder
+	for _, r := range key {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func looksXMLBody(body []byte) bool {
+	return strings.HasPrefix(strings.TrimSpace(string(body)), "<")
+}
+
+func setString(dst *string, value any) {
+	if dst == nil || strings.TrimSpace(*dst) != "" {
+		return
+	}
+	if s := strings.TrimSpace(stringValue(value)); s != "" {
+		*dst = s
+	}
+}
+
+func setHTTPURL(dst *string, value any) {
+	if dst == nil || strings.TrimSpace(*dst) != "" {
+		return
+	}
+	if s := strings.TrimSpace(stringValue(value)); looksHTTPURL(s) {
+		*dst = s
+	}
+}
+
+func boolValue(v any) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(x)) {
+		case "true", "yes", "1", "required":
+			return true, true
+		case "false", "no", "0", "notrequired", "none":
+			return false, true
+		}
+	case float64:
+		return x != 0, true
+	case int:
+		return x != 0, true
+	case json.Number:
+		n, err := strconv.ParseInt(string(x), 10, 64)
+		if err == nil {
+			return n != 0, true
+		}
+	}
+	return false, false
+}
+
+func isEmergencyAddressKey(canonical string) bool {
+	switch canonical {
+	case "emergencyaddress", "e911address", "address", "civicaddress", "serviceaddress", "registeredaddress":
+		return true
+	default:
+		return false
+	}
+}
+
+func isPDNKey(canonical string) bool {
+	switch canonical {
+	case "pdn", "pdninfo", "pdnconnection", "emergencypdn", "emergencybearer", "imsbearer":
+		return true
+	default:
+		return false
+	}
+}
+
+func parsePDN(value any, out *entitlementResult) {
+	switch x := value.(type) {
+	case map[string]any:
+		for key, item := range x {
+			consumePDNField(key, item, out)
+		}
+	case []any:
+		for _, item := range x {
+			parsePDN(item, out)
+		}
+	default:
+		setString(&out.PDN, value)
+	}
+}
+
+func consumePDNField(key string, value any, out *entitlementResult) {
+	if out == nil {
+		return
+	}
+	switch normalizeEntitlementKey(key) {
+	case "name", "id", "pdn", "pdnname", "pdnid", "emergencypdn":
+		setString(&out.PDN, value)
+	case "type", "pdntype", "emergencypdntype":
+		setString(&out.PDNType, value)
+	case "apn", "accesspointname", "emergencyapn", "imsapn":
+		setString(&out.APN, value)
+	case "realm", "networkrealm", "imsrealm", "nairealm", "homerealm":
+		setString(&out.Realm, value)
+	case "endpoint", "url", "uri", "addressendpoint", "e911endpoint", "locationendpoint":
+		setHTTPURL(&out.Endpoint, value)
+	}
+}
+
+func parseEmergencyAddress(value any, out *entitlementResult) {
+	switch x := value.(type) {
+	case map[string]any:
+		for key, item := range x {
+			collectEmergencyAddressField(key, item, out)
+		}
+	case []any:
+		for _, item := range x {
+			parseEmergencyAddress(item, out)
+		}
+	}
+}
+
+func collectEmergencyAddressField(key string, value any, out *entitlementResult) {
+	if out == nil {
+		return
+	}
+	canonical := normalizeEntitlementKey(key)
+	if isEmergencyAddressKey(canonical) {
+		parseEmergencyAddress(value, out)
+		return
+	}
+	switch canonical {
+	case "street", "street1", "streetaddress", "addressline1":
+		canonical = "street"
+	case "street2", "addressline2", "unit", "apartment", "suite":
+		canonical = "unit"
+	case "city", "locality":
+		canonical = "city"
+	case "state", "region", "province":
+		canonical = "state"
+	case "postalcode", "zip", "zipcode":
+		canonical = "postal_code"
+	case "country", "countrycode":
+		canonical = "country"
+	default:
+		return
+	}
+	if s := strings.TrimSpace(stringValue(value)); s != "" {
+		if out.EmergencyAddress == nil {
+			out.EmergencyAddress = make(map[string]string)
+		}
+		out.EmergencyAddress[canonical] = s
 	}
 }
 
@@ -816,7 +1064,7 @@ func parseCombinedChallenge(v any, out *entitlementResult) {
 }
 
 func websheetFromEntitlement(fallbackURL string, result entitlementResult) WebsheetRequest {
-	u := strings.TrimSpace(result.WebsheetURL)
+	u := firstNonEmpty(result.WebsheetURL, result.Endpoint)
 	userData := strings.TrimSpace(result.UserData)
 	if u == "" && userData != "" {
 		u = appendUserData(fallbackURL, userData)

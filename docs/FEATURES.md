@@ -60,7 +60,8 @@ protocol layers needed by VoHive:
   `_sip._tcp` SRV lookup, A/AAAA expansion, ordered candidate lists, and
   REGISTER/dialog transport failover before direct host:port fallback,
   including REGISTER and dialog request failover on recoverable P-CSCF final
-  responses such as 503 or other transient 5xx statuses
+  responses such as 408/503 or other transient 5xx statuses, plus retryable
+  transport failures such as timeouts and TCP connection resets
 - SWu IKE configuration payload DNS extraction, exposing negotiated internal
   DNS servers to the runtime and using them for default IMS SRV/A/AAAA lookups
 - IMS REGISTER session flow with MMTel Contact capability advertisement,

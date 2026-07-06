@@ -80,6 +80,67 @@ func TestStartEmergencyAddressUpdateReturnsWebsheetFromEntitlementToken(t *testi
 	}
 }
 
+func TestParseEntitlementResponseExtractsEmergencyPDNJSONVariants(t *testing.T) {
+	result, err := parseEntitlementResponse([]byte(`{
+		"statusCode": "1000",
+		"addressUpdateUrl": "https://example.test/address",
+		"authorizationToken": "tok-json",
+		"pdn": {"name": "sos", "type": "ipv6", "apn": "sos.att.net", "realm": "ims.example"},
+		"emergencyAddress": {
+			"streetAddress": "1 Main St",
+			"unit": "2A",
+			"city": "Seattle",
+			"state": "WA",
+			"postalCode": "98101",
+			"country": "US"
+		},
+		"locationValidationStatus": "validated"
+	}`))
+	if err != nil {
+		t.Fatalf("parseEntitlementResponse() error = %v", err)
+	}
+	if result.Status != 1000 || result.WebsheetURL != "https://example.test/address" || result.UserData != "tok-json" {
+		t.Fatalf("result basics=%+v", result)
+	}
+	if result.PDN != "sos" || result.PDNType != "ipv6" || result.APN != "sos.att.net" || result.Realm != "ims.example" {
+		t.Fatalf("PDN fields=%+v", result)
+	}
+	if result.LocationValidationStatus != "validated" || result.EmergencyAddress["street"] != "1 Main St" ||
+		result.EmergencyAddress["unit"] != "2A" || result.EmergencyAddress["postal_code"] != "98101" {
+		t.Fatalf("address/status=%+v status=%q", result.EmergencyAddress, result.LocationValidationStatus)
+	}
+}
+
+func TestParseEntitlementResponseExtractsEmergencyXMLVariants(t *testing.T) {
+	result, err := parseEntitlementResponse([]byte(`
+		<entitlement status="1000">
+			<websheetEndpoint>https://example.test/xml-address</websheetEndpoint>
+			<userDataToken>tok-xml</userDataToken>
+			<emergencyPDN name="sos" type="ipv4v6" apn="sos.example" realm="ims.example"/>
+			<emergencyAddress>
+				<street1>2 Pine St</street1>
+				<city>Portland</city>
+				<region>OR</region>
+				<zip>97035</zip>
+				<countryCode>US</countryCode>
+			</emergencyAddress>
+			<validationStatus>pending</validationStatus>
+		</entitlement>`))
+	if err != nil {
+		t.Fatalf("parseEntitlementResponse(XML) error = %v", err)
+	}
+	if result.Status != 1000 || result.Endpoint != "https://example.test/xml-address" || result.UserData != "tok-xml" {
+		t.Fatalf("xml basics=%+v", result)
+	}
+	if result.PDN != "sos" || result.PDNType != "ipv4v6" || result.APN != "sos.example" || result.Realm != "ims.example" {
+		t.Fatalf("xml PDN fields=%+v", result)
+	}
+	if result.LocationValidationStatus != "pending" || result.EmergencyAddress["street"] != "2 Pine St" ||
+		result.EmergencyAddress["state"] != "OR" || result.EmergencyAddress["postal_code"] != "97035" {
+		t.Fatalf("xml address/status=%+v status=%q", result.EmergencyAddress, result.LocationValidationStatus)
+	}
+}
+
 func TestStartEmergencyAddressUpdateSendsCachedTokenToEntitlement(t *testing.T) {
 	client := &fakeHTTPClient{responses: []*HTTPResponse{{
 		StatusCode: 200,

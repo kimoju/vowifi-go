@@ -75,7 +75,15 @@ const (
 	ClientErrorRANDNotFresh           uint16 = 3
 )
 
-const SupportedVersion uint16 = 1
+const (
+	SupportedVersion uint16 = 1
+
+	RANDLength = 16
+	AUTNLength = 16
+	AUTSLength = 14
+	RESMinBits = 32
+	RESMaxBits = 128
+)
 
 var (
 	ErrInvalidPacket    = errors.New("invalid eap-aka packet")
@@ -431,9 +439,28 @@ func (a Attribute) RESValue() ([]byte, uint16, error) {
 		return nil, 0, ErrInvalidAttribute
 	}
 	bits := binary.BigEndian.Uint16(a.Data[0:2])
+	if bits < RESMinBits || bits > RESMaxBits {
+		return nil, 0, fmt.Errorf("%w: RES bits %d outside %d..%d", ErrInvalidAttribute, bits, RESMinBits, RESMaxBits)
+	}
 	octets := int((uint32(bits) + 7) / 8)
+	baseLength := 2 + octets
+	paddedLength := baseLength + paddingFor4(2+baseLength)
+	if len(a.Data) != baseLength && len(a.Data) != paddedLength {
+		return nil, 0, fmt.Errorf("%w: RES value length %d for %d bits", ErrInvalidAttribute, len(a.Data), bits)
+	}
 	if octets > len(a.Data)-2 {
 		return nil, 0, fmt.Errorf("%w: RES bits %d exceeds %d octets", ErrInvalidAttribute, bits, len(a.Data)-2)
+	}
+	if bits%8 != 0 {
+		unusedMask := byte(1<<(8-bits%8)) - 1
+		if a.Data[1+octets]&unusedMask != 0 {
+			return nil, 0, fmt.Errorf("%w: non-zero unused RES bits", ErrInvalidAttribute)
+		}
+	}
+	for _, b := range a.Data[baseLength:] {
+		if b != 0 {
+			return nil, 0, fmt.Errorf("%w: non-zero RES padding", ErrInvalidAttribute)
+		}
 	}
 	return append([]byte(nil), a.Data[2:2+octets]...), bits, nil
 }
@@ -450,11 +477,11 @@ func (a Attribute) RANDValues() ([][]byte, error) {
 }
 
 func (a Attribute) AUTNValue() ([]byte, error) {
-	return a.FixedValue(16)
+	return a.fixedValueExact(AUTNLength)
 }
 
 func (a Attribute) AUTSValue() ([]byte, error) {
-	return a.FixedValue(14)
+	return a.fixedValueExact(AUTSLength)
 }
 
 func (a Attribute) KDFInputValue() (string, error) {
@@ -495,11 +522,11 @@ func (a Attribute) CounterTooSmallValue() error {
 }
 
 func (a Attribute) NonceSValue() ([]byte, error) {
-	return a.FixedValue(16)
+	return a.fixedValueExact(RANDLength)
 }
 
 func (a Attribute) IVValue() ([]byte, error) {
-	return a.FixedValue(16)
+	return a.fixedValueExact(RANDLength)
 }
 
 func (a Attribute) EncrDataValue() ([]byte, error) {
@@ -580,6 +607,23 @@ func (a Attribute) directUint16Value() (uint16, error) {
 		return 0, fmt.Errorf("%w: uint16 value length %d", ErrInvalidAttribute, len(a.Data))
 	}
 	return binary.BigEndian.Uint16(a.Data), nil
+}
+
+func (a Attribute) fixedValueExact(size int) ([]byte, error) {
+	if size < 0 || len(a.Data) < 2 {
+		return nil, ErrInvalidAttribute
+	}
+	baseLength := 2 + size
+	paddedLength := baseLength + paddingFor4(2+baseLength)
+	if len(a.Data) != baseLength && len(a.Data) != paddedLength {
+		return nil, fmt.Errorf("%w: fixed value length %d for %d-byte value", ErrInvalidAttribute, len(a.Data), size)
+	}
+	for _, b := range a.Data[baseLength:] {
+		if b != 0 {
+			return nil, fmt.Errorf("%w: non-zero fixed value padding", ErrInvalidAttribute)
+		}
+	}
+	return append([]byte(nil), a.Data[2:baseLength]...), nil
 }
 
 func fixed16Values(a Attribute) ([][]byte, error) {

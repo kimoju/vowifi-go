@@ -56,9 +56,9 @@ type smsConcatState struct {
 }
 
 func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {
-	contentType := strings.ToLower(strings.TrimSpace(msg.ContentType))
-	if semi := strings.IndexByte(contentType, ';'); semi >= 0 {
-		contentType = strings.TrimSpace(contentType[:semi])
+	contentType := normalizedIMSMessageContentType(msg.ContentType)
+	if contentType == IMSCPIMContentType {
+		return s.handleIMSCPIMMessage(ctx, msg)
 	}
 	switch contentType {
 	case "", "text/plain":
@@ -77,6 +77,38 @@ func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (
 		err := errors.New("unsupported IMS MESSAGE content type")
 		return IMSMessageResult{StatusCode: 415, Reason: err.Error(), UnsupportedContent: true}, err
 	}
+}
+
+func (s *Service) handleIMSCPIMMessage(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {
+	cpim, err := ParseIMSCPIMMessage(msg.Body)
+	if err != nil {
+		return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
+	}
+	nested := msg
+	nested.ContentType = cpim.ContentType
+	nested.Body = cpim.Body
+	nested.FromURI = firstNonEmpty(msg.FromURI, imsHeaderValue(cpim.Headers, "From"))
+	nested.ToURI = firstNonEmpty(msg.ToURI, imsHeaderValue(cpim.Headers, "To"))
+	result, err := s.HandleIMSMessage(ctx, nested)
+	if len(result.ReplyBody) > 0 && strings.TrimSpace(result.ReplyContentType) != "" {
+		reply, wrapErr := BuildIMSCPIMMessage(firstNonEmpty(nested.ToURI, msg.ToURI), firstNonEmpty(nested.FromURI, msg.FromURI), result.ReplyContentType, result.ReplyBody)
+		if wrapErr != nil {
+			return IMSMessageResult{StatusCode: 500, Reason: wrapErr.Error()}, wrapErr
+		}
+		result.ReplyContentType = IMSCPIMContentType
+		result.ReplyBody = reply
+	}
+	return result, err
+}
+
+func imsHeaderValue(headers map[string][]string, key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	for candidate, values := range headers {
+		if strings.ToLower(candidate) == key && len(values) > 0 {
+			return values[0]
+		}
+	}
+	return ""
 }
 
 func (s *Service) handleIMS3GPPSMS(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {

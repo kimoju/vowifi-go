@@ -55,6 +55,27 @@ func (t *UDPESPPacketTransport) SendESPPacket(ctx context.Context, packet []byte
 	return transportNetError(ctx, err)
 }
 
+func (t *UDPESPPacketTransport) SendNATTKeepalive(ctx context.Context) error {
+	if t == nil {
+		return ErrInvalidPacketTunnel
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := contextReady(ctx); err != nil {
+		return err
+	}
+	conn, err := t.getConn(ctx)
+	if err != nil {
+		return err
+	}
+	if err := conn.SetWriteDeadline(t.deadline(ctx)); err != nil {
+		return err
+	}
+	_, err = conn.Write([]byte{0xff})
+	return transportNetError(ctx, err)
+}
+
 func (t *UDPESPPacketTransport) ReadESPPacket(ctx context.Context) ([]byte, error) {
 	if t == nil {
 		return nil, ErrInvalidPacketTunnel

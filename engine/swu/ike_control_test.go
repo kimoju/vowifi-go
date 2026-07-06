@@ -102,6 +102,49 @@ func TestNewIKEMOBIKEHandlerSendsUpdateSAAddresses(t *testing.T) {
 	}
 }
 
+func TestMOBIKEUpdatePayloadsPreferRequestNewIPForNATDetection(t *testing.T) {
+	init := ikeControlInit(t)
+	payloads, err := mobikeUpdatePayloads(IKEMOBIKEConfig{
+		Init:       init,
+		LocalIP:    net.ParseIP("192.0.2.20"),
+		RemoteIP:   net.ParseIP("198.51.100.10"),
+		LocalPort:  4500,
+		RemotePort: 4500,
+	}, nil, MOBIKERequest{OldIP: "192.0.2.20", NewIP: "192.0.2.21"})
+	if err != nil {
+		t.Fatalf("mobikeUpdatePayloads() error = %v", err)
+	}
+	if _, ok, err := ikev2.FirstNotify(payloads, ikev2.NotifyUpdateSAAddresses); err != nil || !ok {
+		t.Fatalf("UPDATE_SA_ADDRESSES ok=%t err=%v", ok, err)
+	}
+	source, ok, err := ikev2.FirstNotify(payloads, ikev2.NotifyNATDetectionSourceIP)
+	if err != nil || !ok {
+		t.Fatalf("NAT_DETECTION_SOURCE_IP ok=%t err=%v", ok, err)
+	}
+	wantNew, err := ikev2.NATDetectionHash(init.InitiatorSPI, init.ResponderSPI, net.ParseIP("192.0.2.21"), 4500)
+	if err != nil {
+		t.Fatalf("NATDetectionHash(new) error = %v", err)
+	}
+	wantOld, err := ikev2.NATDetectionHash(init.InitiatorSPI, init.ResponderSPI, net.ParseIP("192.0.2.20"), 4500)
+	if err != nil {
+		t.Fatalf("NATDetectionHash(old) error = %v", err)
+	}
+	if !bytes.Equal(source.NotificationData, wantNew) || bytes.Equal(source.NotificationData, wantOld) {
+		t.Fatalf("source NAT-D=%x, want new %x not old %x", source.NotificationData, wantNew, wantOld)
+	}
+	destination, ok, err := ikev2.FirstNotify(payloads, ikev2.NotifyNATDetectionDestinationIP)
+	if err != nil || !ok {
+		t.Fatalf("NAT_DETECTION_DESTINATION_IP ok=%t err=%v", ok, err)
+	}
+	wantDestination, err := ikev2.NATDetectionHash(init.InitiatorSPI, init.ResponderSPI, net.ParseIP("198.51.100.10"), 4500)
+	if err != nil {
+		t.Fatalf("NATDetectionHash(destination) error = %v", err)
+	}
+	if !bytes.Equal(destination.NotificationData, wantDestination) {
+		t.Fatalf("destination NAT-D=%x, want %x", destination.NotificationData, wantDestination)
+	}
+}
+
 func TestNewIKEMOBIKEHandlerRejectsUnacceptableAddresses(t *testing.T) {
 	init := ikeControlInit(t)
 	control := &ikeMOBIKETransport{

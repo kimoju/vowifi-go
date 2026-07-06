@@ -393,6 +393,58 @@ func TestAKAChallengeAttributes(t *testing.T) {
 	}
 }
 
+func TestAKAAttributeBoundaryValidation(t *testing.T) {
+	resAttr := RESAttribute([]byte{0x11, 0x22, 0x33, 0x44, 0x55})
+	raw, err := resAttr.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(AT_RES) error = %v", err)
+	}
+	attrs, err := ParseAttributes(raw)
+	if err != nil {
+		t.Fatalf("ParseAttributes(AT_RES) error = %v", err)
+	}
+	res, bits, err := attrs[0].RESValue()
+	if err != nil {
+		t.Fatalf("RESValue() error = %v", err)
+	}
+	if bits != 40 || hex.EncodeToString(res) != "1122334455" {
+		t.Fatalf("RES bits=%d value=%x", bits, res)
+	}
+
+	attrs[0].Data[len(attrs[0].Data)-1] = 0x01
+	if _, _, err := attrs[0].RESValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("RESValue(non-zero padding) err=%v, want ErrInvalidAttribute", err)
+	}
+	if _, _, err := (Attribute{Type: AttributeRES, Data: []byte{0, 24, 0x11, 0x22, 0x33}}).RESValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("RESValue(short bits) err=%v, want ErrInvalidAttribute", err)
+	}
+
+	if _, err := AUTNAttribute([]byte("short")).AUTNValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("AUTNValue(short) err=%v, want ErrInvalidAttribute", err)
+	}
+
+	auts := []byte("abcdefghijklmn")
+	raw, err = AUTSAttribute(auts).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(AT_AUTS) error = %v", err)
+	}
+	attrs, err = ParseAttributes(raw)
+	if err != nil {
+		t.Fatalf("ParseAttributes(AT_AUTS) error = %v", err)
+	}
+	gotAUTS, err := attrs[0].AUTSValue()
+	if err != nil {
+		t.Fatalf("AUTSValue() error = %v", err)
+	}
+	if string(gotAUTS) != string(auts) {
+		t.Fatalf("AUTS=%q, want %q", string(gotAUTS), string(auts))
+	}
+	attrs[0].Data[len(attrs[0].Data)-1] = 0x01
+	if _, err := attrs[0].AUTSValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("AUTSValue(non-zero padding) err=%v, want ErrInvalidAttribute", err)
+	}
+}
+
 func TestParseRejectsInvalidLengths(t *testing.T) {
 	if _, err := ParsePacket([]byte{1, 2, 0, 3}); !errors.Is(err, ErrInvalidPacket) {
 		t.Fatalf("ParsePacket() err=%v, want ErrInvalidPacket", err)

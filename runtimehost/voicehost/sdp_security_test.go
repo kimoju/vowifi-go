@@ -149,3 +149,87 @@ func TestBuildSDPAnswerWithSecurityConstructsCrypto(t *testing.T) {
 		t.Fatalf("parsed security=%+v", parsed)
 	}
 }
+
+func TestSelectSDPSecurityAnswerChoosesFingerprintAndSetup(t *testing.T) {
+	offer := SDPSecurityInfo{
+		RTPProfile: "RTP/SAVPF",
+		Fingerprints: []SDPFingerprintAttribute{{
+			HashFunc:    "SHA-256",
+			Fingerprint: "AA:BB:CC",
+		}},
+		Setup: "actpass",
+	}
+	got, err := SelectSDPSecurityAnswer(offer, SDPSecurityAnswerOptions{
+		RTPProfiles: []string{"RTP/SAVPF"},
+		Fingerprints: []SDPFingerprintAttribute{{
+			HashFunc:    "sha-256",
+			Fingerprint: "11:22:33",
+		}},
+		Setup: "passive",
+	})
+	if err != nil {
+		t.Fatalf("SelectSDPSecurityAnswer() error = %v", err)
+	}
+	if got.RTPProfile != "RTP/SAVPF" || got.Setup != "passive" || len(got.Fingerprints) != 1 || got.Fingerprints[0].Fingerprint != "11:22:33" {
+		t.Fatalf("answer security=%+v", got)
+	}
+	answer := string(BuildSDPAnswerWithSecurity(SDPInfo{ConnectionIP: "192.0.2.2", MediaPort: 6000, Payloads: []int{111}}, got))
+	if !strings.Contains(answer, "a=fingerprint:sha-256 11:22:33\r\n") || !strings.Contains(answer, "a=setup:passive\r\n") || strings.Contains(answer, "AA:BB:CC") {
+		t.Fatalf("answer SDP:\n%s", answer)
+	}
+}
+
+func TestSelectSDPSecurityAnswerChoosesCryptoWithOfferTag(t *testing.T) {
+	offer := SDPSecurityInfo{
+		RTPProfile: "RTP/SAVP",
+		Crypto: []SDPCryptoAttribute{{
+			Tag:       "7",
+			Suite:     "AES_CM_128_HMAC_SHA1_80",
+			KeyParams: "inline:remote",
+		}},
+		Fingerprints: []SDPFingerprintAttribute{{
+			HashFunc:    "SHA-256",
+			Fingerprint: "AA:BB:CC",
+		}},
+		Setup: "actpass",
+	}
+	got, err := SelectSDPSecurityAnswer(offer, SDPSecurityAnswerOptions{
+		RTPProfiles:  []string{"RTP/SAVP"},
+		PreferCrypto: true,
+		Crypto: []SDPCryptoAttribute{{
+			Tag:       "1",
+			Suite:     "AES_CM_128_HMAC_SHA1_80",
+			KeyParams: "inline:local",
+		}},
+		Fingerprints: []SDPFingerprintAttribute{{
+			HashFunc:    "SHA-256",
+			Fingerprint: "11:22:33",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SelectSDPSecurityAnswer() error = %v", err)
+	}
+	if got.RTPProfile != "RTP/SAVP" || len(got.Crypto) != 1 || got.Crypto[0].Tag != "7" || got.Crypto[0].KeyParams != "inline:local" || len(got.Fingerprints) != 0 {
+		t.Fatalf("answer security=%+v", got)
+	}
+}
+
+func TestSelectSDPSecurityAnswerRejectsUnsupportedSetup(t *testing.T) {
+	_, err := SelectSDPSecurityAnswer(SDPSecurityInfo{
+		RTPProfile: "RTP/SAVPF",
+		Fingerprints: []SDPFingerprintAttribute{{
+			HashFunc:    "SHA-256",
+			Fingerprint: "AA:BB:CC",
+		}},
+		Setup: "active",
+	}, SDPSecurityAnswerOptions{
+		Fingerprints: []SDPFingerprintAttribute{{
+			HashFunc:    "SHA-256",
+			Fingerprint: "11:22:33",
+		}},
+		Setup: "active",
+	})
+	if err == nil {
+		t.Fatalf("SelectSDPSecurityAnswer() error = nil, want setup rejection")
+	}
+}

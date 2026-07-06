@@ -1,8 +1,10 @@
 package voicehost
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -27,6 +29,14 @@ type SRTPKeys struct {
 	MasterSalt []byte
 }
 
+type SDPCryptoInlineKeyParams struct {
+	MasterKey  []byte
+	MasterSalt []byte
+	Lifetime   string
+	MKIValue   string
+	MKILength  int
+}
+
 type SRTPMediaConfig struct {
 	Profile               SRTPProtectionProfile
 	ClientKeys            SRTPKeys
@@ -49,6 +59,125 @@ type SRTPMediaSession struct {
 	rtpDTMFHandler        RTPDTMFHandler
 	clientRTPDTMFPayloads map[uint8]int
 	imsRTPDTMFPayloads    map[uint8]int
+}
+
+func (p SRTPProtectionProfile) SDPCryptoSuite() string {
+	switch SRTPProtectionProfile(strings.ToUpper(strings.TrimSpace(string(p)))) {
+	case "", SRTPProfileAes128CmHmacSha1_80:
+		return string(SRTPProfileAes128CmHmacSha1_80)
+	case SRTPProfileAes128CmHmacSha1_32:
+		return string(SRTPProfileAes128CmHmacSha1_32)
+	case SRTPProfileAes256CmHmacSha1_80:
+		return string(SRTPProfileAes256CmHmacSha1_80)
+	case SRTPProfileAes256CmHmacSha1_32:
+		return string(SRTPProfileAes256CmHmacSha1_32)
+	case SRTPProfileAeadAes128Gcm:
+		return string(SRTPProfileAeadAes128Gcm)
+	case SRTPProfileAeadAes256Gcm:
+		return string(SRTPProfileAeadAes256Gcm)
+	default:
+		return ""
+	}
+}
+
+func SRTPProtectionProfileFromSDPCryptoSuite(suite string) (SRTPProtectionProfile, error) {
+	switch strings.ToUpper(strings.TrimSpace(suite)) {
+	case string(SRTPProfileAes128CmHmacSha1_80):
+		return SRTPProfileAes128CmHmacSha1_80, nil
+	case string(SRTPProfileAes128CmHmacSha1_32):
+		return SRTPProfileAes128CmHmacSha1_32, nil
+	case string(SRTPProfileAes256CmHmacSha1_80):
+		return SRTPProfileAes256CmHmacSha1_80, nil
+	case string(SRTPProfileAes256CmHmacSha1_32):
+		return SRTPProfileAes256CmHmacSha1_32, nil
+	case string(SRTPProfileAeadAes128Gcm):
+		return SRTPProfileAeadAes128Gcm, nil
+	case string(SRTPProfileAeadAes256Gcm):
+		return SRTPProfileAeadAes256Gcm, nil
+	default:
+		return "", fmt.Errorf("%w: unsupported SDP crypto suite %q", ErrSRTPMediaConfig, suite)
+	}
+}
+
+func ParseSDPCryptoInlineKeyParams(profile SRTPProtectionProfile, keyParams string) (SDPCryptoInlineKeyParams, error) {
+	srtpProfile, err := srtpProtectionProfile(profile)
+	if err != nil {
+		return SDPCryptoInlineKeyParams{}, err
+	}
+	keyLen, err := srtpProfile.KeyLen()
+	if err != nil {
+		return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: key length: %v", ErrSRTPMediaConfig, err)
+	}
+	saltLen, err := srtpProfile.SaltLen()
+	if err != nil {
+		return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: salt length: %v", ErrSRTPMediaConfig, err)
+	}
+	keyParams = strings.TrimSpace(keyParams)
+	if !strings.HasPrefix(strings.ToLower(keyParams), "inline:") {
+		return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: unsupported SDP crypto key method", ErrSRTPMediaConfig)
+	}
+	parts := strings.Split(keyParams[len("inline:"):], "|")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: empty SDP crypto inline key", ErrSRTPMediaConfig)
+	}
+	raw, err := decodeSDPInlineKey(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return SDPCryptoInlineKeyParams{}, err
+	}
+	if len(raw) != keyLen+saltLen {
+		return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: SDP crypto inline key/salt length %d != %d", ErrSRTPMediaConfig, len(raw), keyLen+saltLen)
+	}
+	out := SDPCryptoInlineKeyParams{
+		MasterKey:  append([]byte(nil), raw[:keyLen]...),
+		MasterSalt: append([]byte(nil), raw[keyLen:]...),
+	}
+	if len(parts) >= 2 {
+		out.Lifetime = strings.TrimSpace(parts[1])
+	}
+	if len(parts) >= 3 {
+		value, length, ok := strings.Cut(strings.TrimSpace(parts[2]), ":")
+		if !ok || strings.TrimSpace(value) == "" || strings.TrimSpace(length) == "" {
+			return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: malformed SDP crypto MKI", ErrSRTPMediaConfig)
+		}
+		mkiLength, err := strconv.Atoi(strings.TrimSpace(length))
+		if err != nil || mkiLength <= 0 {
+			return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: malformed SDP crypto MKI length", ErrSRTPMediaConfig)
+		}
+		out.MKIValue = strings.TrimSpace(value)
+		out.MKILength = mkiLength
+	}
+	if len(parts) > 3 {
+		return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: unsupported SDP crypto inline key params", ErrSRTPMediaConfig)
+	}
+	return out, nil
+}
+
+func BuildSDPCryptoInlineKeyParams(profile SRTPProtectionProfile, params SDPCryptoInlineKeyParams) (string, error) {
+	srtpProfile, err := srtpProtectionProfile(profile)
+	if err != nil {
+		return "", err
+	}
+	keys := SRTPKeys{
+		MasterKey:  append([]byte(nil), params.MasterKey...),
+		MasterSalt: append([]byte(nil), params.MasterSalt...),
+	}
+	if err := validateSRTPKeys(srtpProfile, keys, "SDP crypto"); err != nil {
+		return "", err
+	}
+	raw := make([]byte, 0, len(params.MasterKey)+len(params.MasterSalt))
+	raw = append(raw, params.MasterKey...)
+	raw = append(raw, params.MasterSalt...)
+	value := "inline:" + base64.StdEncoding.EncodeToString(raw)
+	if lifetime := strings.TrimSpace(params.Lifetime); lifetime != "" || strings.TrimSpace(params.MKIValue) != "" || params.MKILength > 0 {
+		value += "|" + lifetime
+	}
+	if strings.TrimSpace(params.MKIValue) != "" || params.MKILength > 0 {
+		if strings.TrimSpace(params.MKIValue) == "" || params.MKILength <= 0 {
+			return "", fmt.Errorf("%w: incomplete SDP crypto MKI", ErrSRTPMediaConfig)
+		}
+		value += "|" + strings.TrimSpace(params.MKIValue) + ":" + strconv.Itoa(params.MKILength)
+	}
+	return value, nil
 }
 
 func NewSRTPMediaSession(cfg SRTPMediaConfig) (*SRTPMediaSession, error) {
@@ -316,4 +445,16 @@ func validateSRTPKeys(profile srtp.ProtectionProfile, keys SRTPKeys, label strin
 		return fmt.Errorf("%w: %s master salt length %d != %d", ErrSRTPMediaConfig, label, len(keys.MasterSalt), saltLen)
 	}
 	return nil
+}
+
+func decodeSDPInlineKey(value string) ([]byte, error) {
+	raw, err := base64.StdEncoding.DecodeString(value)
+	if err == nil {
+		return raw, nil
+	}
+	raw, rawErr := base64.RawStdEncoding.DecodeString(value)
+	if rawErr == nil {
+		return raw, nil
+	}
+	return nil, fmt.Errorf("%w: malformed SDP crypto inline key: %v", ErrSRTPMediaConfig, err)
 }

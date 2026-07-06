@@ -526,6 +526,62 @@ func TestHandleIMSMessageDispatchesRPDataAndReturnsAck(t *testing.T) {
 	}
 }
 
+func TestHandleIMSMessageUnwrapsCPIM3GPPSMSAndWrapsAck(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+	tpdu := mustHex(t, "0005810180F600006270502143650005E8329BFD06")
+	rpdu := imsRPDataBody(0x33, tpdu)
+	cpimBody, err := BuildIMSCPIMMessage("<sip:smsc@ims.example>", "<sip:user@ims.example>", IMS3GPPSMSContentType, rpdu)
+	if err != nil {
+		t.Fatalf("BuildIMSCPIMMessage() error = %v", err)
+	}
+	cpimBody = append(cpimBody, '\r', '\n')
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		CallID:      "sms-downlink-cpim",
+		ContentType: "message/cpim; charset=utf-8",
+		Body:        cpimBody,
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.StatusCode != 200 || result.ReplyContentType != IMSCPIMContentType || result.Incoming == nil || result.Incoming.Content != "hello" {
+		t.Fatalf("result=%+v", result)
+	}
+	reply, err := ParseIMSCPIMMessage(result.ReplyBody)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage(reply) error = %v body=%x", err, result.ReplyBody)
+	}
+	if reply.ContentType != IMS3GPPSMSContentType || string(reply.Body) != string(BuildSMSRPAck(0x33)) {
+		t.Fatalf("reply=%+v body=%x", reply, reply.Body)
+	}
+	if got := imsHeaderValue(reply.Headers, "From"); got != "<sip:user@ims.example>" {
+		t.Fatalf("reply From=%q", got)
+	}
+	if got := imsHeaderValue(reply.Headers, "To"); got != "<sip:smsc@ims.example>" {
+		t.Fatalf("reply To=%q", got)
+	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	got, ok := dispatch.events[0].(eventhost.SMSReceived)
+	if !ok || got.Sender != "10086" || got.Content != "hello" {
+		t.Fatalf("event=%+v", dispatch.events[0])
+	}
+}
+
+func TestHandleIMSMessageRejectsMalformedCPIM(t *testing.T) {
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		ContentType: IMSCPIMContentType,
+		Body:        []byte("From: <sip:smsc@ims.example>\r\nContent-Type: application/vnd.3gpp.sms\r\n"),
+	})
+	if err == nil || result.StatusCode != 400 {
+		t.Fatalf("result=%+v err=%v, want malformed CPIM rejection", result, err)
+	}
+}
+
 func TestHandleIMSMessageAcceptsAlphanumericSender(t *testing.T) {
 	dispatch := &fakeDispatcher{}
 	svc := NewService("dev-1", "310280233641503", nil, dispatch)

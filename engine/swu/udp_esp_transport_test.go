@@ -34,6 +34,30 @@ func TestUDPESPPacketTransportSendsRawESP(t *testing.T) {
 	}
 }
 
+func TestUDPESPPacketTransportSendsNATTKeepalive(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer server.Close()
+	transport := &UDPESPPacketTransport{
+		RemoteAddr: server.LocalAddr().String(),
+		Timeout:    time.Second,
+	}
+	if err := transport.SendNATTKeepalive(context.Background()); err != nil {
+		t.Fatalf("SendNATTKeepalive() error = %v", err)
+	}
+	_ = server.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 64)
+	n, _, err := server.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("server ReadFrom() error = %v", err)
+	}
+	if !bytes.Equal(buf[:n], []byte{0xff}) {
+		t.Fatalf("server packet=%x, want ff", buf[:n])
+	}
+}
+
 func TestUDPESPPacketTransportReadFiltersNATTControlPackets(t *testing.T) {
 	server, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

@@ -128,7 +128,10 @@ func cloneIKEPayloads(in []ikev2.Payload) []ikev2.Payload {
 
 func mobikeUpdatePayloads(cfg IKEMOBIKEConfig, additional []net.IP, req MOBIKERequest) ([]ikev2.Payload, error) {
 	payloads := []ikev2.Payload{ikev2.UpdateSAAddressesNotify()}
-	localIP := normalizedMOBIKEIP(cfg.LocalIP, req.NewIP, req.OldIP)
+	localIP := normalizedMOBIKEIP(nil, req.NewIP, req.OldIP)
+	if localIP == nil {
+		localIP = normalizedMOBIKEIP(cfg.LocalIP)
+	}
 	remoteIP := normalizedMOBIKEIP(cfg.RemoteIP)
 	if localIP != nil && remoteIP != nil {
 		localPort := cfg.LocalPort

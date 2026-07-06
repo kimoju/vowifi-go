@@ -12,6 +12,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -413,22 +414,58 @@ func SIPResponseRetryAfter(resp RegisterResponse) time.Duration {
 	return SIPRetryAfterDelay(resp.Headers)
 }
 
-func sipRegisterTargetFailoverStatus(code int) bool {
+type sipFailureKind int
+
+const (
+	sipFailureNone sipFailureKind = iota
+	sipFailureSIPStatus
+	sipFailureTransport
+)
+
+type sipRecoveryScope int
+
+const (
+	sipRecoveryRegister sipRecoveryScope = iota
+	sipRecoveryDialog
+)
+
+type sipFailureRecovery struct {
+	Kind           sipFailureKind
+	StatusCode     int
+	Err            error
+	Recoverable    bool
+	TargetFailover bool
+}
+
+func sipResponseFailureRecovery(scope sipRecoveryScope, code int) sipFailureRecovery {
+	if !sipRecoverableResponseStatus(scope, code) {
+		return sipFailureRecovery{Kind: sipFailureSIPStatus, StatusCode: code}
+	}
+	return sipFailureRecovery{
+		Kind:           sipFailureSIPStatus,
+		StatusCode:     code,
+		Recoverable:    true,
+		TargetFailover: true,
+	}
+}
+
+func sipRecoverableResponseStatus(scope sipRecoveryScope, code int) bool {
 	switch code {
-	case 408, 430, 480, 500, 502, 503, 504, 580:
+	case 408, 430, 500, 502, 503, 504, 580:
 		return true
+	case 480:
+		return scope == sipRecoveryRegister
 	default:
 		return code >= 500 && code < 600
 	}
 }
 
+func sipRegisterTargetFailoverStatus(code int) bool {
+	return sipResponseFailureRecovery(sipRecoveryRegister, code).TargetFailover
+}
+
 func sipDialogTargetFailoverStatus(code int) bool {
-	switch code {
-	case 408, 430, 500, 502, 503, 504, 580:
-		return true
-	default:
-		return code >= 500 && code < 600
-	}
+	return sipResponseFailureRecovery(sipRecoveryDialog, code).TargetFailover
 }
 
 const maxSIPRedirectTargets = 4
@@ -997,17 +1034,26 @@ func isSIPTimeout(err error) bool {
 }
 
 func isSIPRetryableTransportError(err error) bool {
+	return sipTransportFailureRecovery(err).TargetFailover
+}
+
+func sipTransportFailureRecovery(err error) sipFailureRecovery {
 	if err == nil {
-		return false
+		return sipFailureRecovery{Kind: sipFailureTransport}
 	}
-	if errors.Is(err, context.Canceled) {
-		return false
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return sipFailureRecovery{Kind: sipFailureTransport, Err: err}
 	}
-	if isSIPTimeout(err) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-		return true
+	if isSIPTimeout(err) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EPIPE) {
+		return sipFailureRecovery{Kind: sipFailureTransport, Err: err, Recoverable: true, TargetFailover: true}
 	}
 	var opErr *net.OpError
-	return errors.As(err, &opErr)
+	if errors.As(err, &opErr) {
+		return sipFailureRecovery{Kind: sipFailureTransport, Err: err, Recoverable: true, TargetFailover: true}
+	}
+	return sipFailureRecovery{Kind: sipFailureTransport, Err: err}
 }
 
 func sipURIAddr(uri string) (string, error) {

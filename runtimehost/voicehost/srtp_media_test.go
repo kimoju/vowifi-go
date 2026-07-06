@@ -2,6 +2,7 @@ package voicehost
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"testing"
 
@@ -124,6 +125,43 @@ func TestSRTPMediaSessionRejectsInvalidConfig(t *testing.T) {
 	cfg.Profile = "bogus"
 	if _, err := NewSRTPMediaSession(cfg); !errors.Is(err, ErrSRTPMediaConfig) {
 		t.Fatalf("NewSRTPMediaSession(profile) err=%v, want ErrSRTPMediaConfig", err)
+	}
+}
+
+func TestSRTPProtectionProfileFromSDPCryptoSuite(t *testing.T) {
+	profile, err := SRTPProtectionProfileFromSDPCryptoSuite("aes_cm_128_hmac_sha1_80")
+	if err != nil {
+		t.Fatalf("SRTPProtectionProfileFromSDPCryptoSuite() error = %v", err)
+	}
+	if profile != SRTPProfileAes128CmHmacSha1_80 || profile.SDPCryptoSuite() != "AES_CM_128_HMAC_SHA1_80" {
+		t.Fatalf("profile=%q suite=%q", profile, profile.SDPCryptoSuite())
+	}
+	if _, err := SRTPProtectionProfileFromSDPCryptoSuite("bogus"); !errors.Is(err, ErrSRTPMediaConfig) {
+		t.Fatalf("SRTPProtectionProfileFromSDPCryptoSuite(bogus) err=%v, want ErrSRTPMediaConfig", err)
+	}
+}
+
+func TestSDPCryptoInlineKeyParamsRoundTrip(t *testing.T) {
+	key := bytes.Repeat([]byte{0x10}, 16)
+	salt := bytes.Repeat([]byte{0x20}, 14)
+	raw := append(append([]byte(nil), key...), salt...)
+	params, err := ParseSDPCryptoInlineKeyParams(SRTPProfileAes128CmHmacSha1_80, "inline:"+base64.StdEncoding.EncodeToString(raw)+"|2^20|1:32")
+	if err != nil {
+		t.Fatalf("ParseSDPCryptoInlineKeyParams() error = %v", err)
+	}
+	if !bytes.Equal(params.MasterKey, key) || !bytes.Equal(params.MasterSalt, salt) || params.Lifetime != "2^20" || params.MKIValue != "1" || params.MKILength != 32 {
+		t.Fatalf("params=%+v", params)
+	}
+	built, err := BuildSDPCryptoInlineKeyParams(SRTPProfileAes128CmHmacSha1_80, params)
+	if err != nil {
+		t.Fatalf("BuildSDPCryptoInlineKeyParams() error = %v", err)
+	}
+	reparsed, err := ParseSDPCryptoInlineKeyParams(SRTPProfileAes128CmHmacSha1_80, built)
+	if err != nil {
+		t.Fatalf("ParseSDPCryptoInlineKeyParams(built) error = %v", err)
+	}
+	if !bytes.Equal(reparsed.MasterKey, key) || !bytes.Equal(reparsed.MasterSalt, salt) || reparsed.Lifetime != "2^20" || reparsed.MKILength != 32 {
+		t.Fatalf("reparsed=%+v built=%q", reparsed, built)
 	}
 }
 

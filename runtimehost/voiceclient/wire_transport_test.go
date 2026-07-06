@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -102,6 +103,45 @@ func TestParseSIPResponseRejectsInvalidStatusCode(t *testing.T) {
 		}, "\r\n")))
 		if !errors.Is(err, ErrInvalidSIPMessage) {
 			t.Fatalf("ParseSIPResponse(%s) error=%v, want ErrInvalidSIPMessage", status, err)
+		}
+	}
+}
+
+func TestSIPFailureRecoveryClassifiesRecoverableFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		got  sipFailureRecovery
+		want bool
+	}{
+		{
+			name: "register request timeout",
+			got:  sipResponseFailureRecovery(sipRecoveryRegister, 408),
+			want: true,
+		},
+		{
+			name: "dialog service unavailable",
+			got:  sipResponseFailureRecovery(sipRecoveryDialog, 503),
+			want: true,
+		},
+		{
+			name: "dialog temporarily unavailable stays terminal",
+			got:  sipResponseFailureRecovery(sipRecoveryDialog, 480),
+			want: false,
+		},
+		{
+			name: "connection reset",
+			got:  sipTransportFailureRecovery(&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}),
+			want: true,
+		},
+		{
+			name: "caller canceled",
+			got:  sipTransportFailureRecovery(context.Canceled),
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		if tc.got.Recoverable != tc.want || tc.got.TargetFailover != tc.want {
+			t.Fatalf("%s recovery=%+v, want recoverable/failover=%t", tc.name, tc.got, tc.want)
 		}
 	}
 }
@@ -984,6 +1024,84 @@ func TestWireSIPTransportFailsOverRecoverableDialogResponse(t *testing.T) {
 			"From":         "<sip:user@example>;tag=t",
 			"Contact":      "<sip:user@192.0.2.10:5060>",
 			"Call-ID":      "failover-dialog-message",
+			"CSeq":         "1 MESSAGE",
+			"Max-Forwards": "70",
+		},
+		Body: []byte("hello"),
+	})
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequest() response=%+v err=%v", resp, err)
+	}
+	if wire := <-firstSeen; !strings.Contains(wire, "MESSAGE sip:+18005551212@example") {
+		t.Fatalf("first target wire=%q", wire)
+	}
+	if wire := <-secondSeen; !strings.Contains(wire, "MESSAGE sip:+18005551212@example") {
+		t.Fatalf("second target wire=%q", wire)
+	}
+}
+
+func TestWireSIPTransportFailsOverTCPConnectionReset(t *testing.T) {
+	first, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(first) error = %v", err)
+	}
+	defer first.Close()
+	second, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(second) error = %v", err)
+	}
+	defer second.Close()
+
+	firstSeen := make(chan string, 1)
+	go func() {
+		conn, err := first.Accept()
+		if err != nil {
+			firstSeen <- "accept error: " + err.Error()
+			return
+		}
+		raw, err := readSIPStreamMessage(bufio.NewReader(conn))
+		if err != nil {
+			firstSeen <- "read error: " + err.Error()
+			_ = conn.Close()
+			return
+		}
+		firstSeen <- string(raw)
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = conn.Close()
+	}()
+	secondSeen := make(chan string, 1)
+	go func() {
+		conn, err := second.Accept()
+		if err != nil {
+			secondSeen <- "accept error: " + err.Error()
+			return
+		}
+		defer conn.Close()
+		raw, err := readSIPStreamMessage(bufio.NewReader(conn))
+		if err != nil {
+			secondSeen <- "read error: " + err.Error()
+			return
+		}
+		secondSeen <- string(raw)
+		_, _ = conn.Write([]byte("SIP/2.0 202 Accepted\r\nContent-Length: 0\r\n\r\n"))
+	}()
+
+	resp, err := WireSIPTransport{
+		Network: "tcp",
+		Resolver: SIPServerCandidateResolverFunc(func(ctx context.Context, network, uri string) ([]string, error) {
+			return []string{first.Addr().String(), second.Addr().String()}, nil
+		}),
+		Timeout: time.Second,
+	}.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sip:+18005551212@example",
+		Headers: map[string]string{
+			"To":           "<sip:+18005551212@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "failover-tcp-reset-message",
 			"CSeq":         "1 MESSAGE",
 			"Max-Forwards": "70",
 		},

@@ -13,6 +13,12 @@ const (
 	AKAAppPreferenceAuto       = "auto"
 	AKAAppPreferenceISIM       = "isim"
 	AKAAppPreferenceISIMStrict = "isim_strict"
+
+	AKARESMinLength = 4
+	AKARESMaxLength = 16
+	AKACKLength     = 16
+	AKAIKLength     = 16
+	AKAAUTSLength   = 14
 )
 
 type AKAResult = swusim.AKAResult
@@ -134,6 +140,9 @@ func ParseUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAResult, error) {
 		if err != nil {
 			return AKAResult{}, err
 		}
+		if len(data) != AKAAUTSLength {
+			return AKAResult{}, fmt.Errorf("AKA AUTS length must be %d bytes: %d", AKAAUTSLength, len(data))
+		}
 		return AKAResult{AUTS: append([]byte(nil), data...)}, swusim.ErrSyncFailure
 	case 0xDD:
 		return AKAResult{}, swusim.ErrAuthFailure
@@ -147,7 +156,7 @@ func parseSimpleTLVData(body []byte) ([]byte, error) {
 		return nil, errors.New("response body too short")
 	}
 	l := int(body[1])
-	if len(body) < 2+l {
+	if len(body) != 2+l {
 		return nil, fmt.Errorf("response length mismatch: need=%d have=%d", 2+l, len(body))
 	}
 	return append([]byte(nil), body[2:2+l]...), nil
@@ -164,6 +173,9 @@ func parseUSIMAuthDB(body []byte) (AKAResult, bool) {
 		return AKAResult{}, false
 	}
 	res := append([]byte(nil), body[pos:pos+resLen]...)
+	if resLen < AKARESMinLength || resLen > AKARESMaxLength {
+		return AKAResult{}, false
+	}
 	pos += resLen
 
 	remain := len(body) - pos
@@ -177,7 +189,7 @@ func parseUSIMAuthDB(body []byte) (AKAResult, bool) {
 
 	ckLen := int(body[pos])
 	pos++
-	if ckLen <= 0 || len(body) < pos+ckLen+1 {
+	if ckLen != AKACKLength || len(body) < pos+ckLen+1 {
 		return AKAResult{}, false
 	}
 	ck := append([]byte(nil), body[pos:pos+ckLen]...)
@@ -185,7 +197,7 @@ func parseUSIMAuthDB(body []byte) (AKAResult, bool) {
 
 	ikLen := int(body[pos])
 	pos++
-	if ikLen <= 0 || len(body) < pos+ikLen {
+	if ikLen != AKAIKLength || len(body) != pos+ikLen {
 		return AKAResult{}, false
 	}
 	ik := append([]byte(nil), body[pos:pos+ikLen]...)

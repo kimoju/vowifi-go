@@ -260,6 +260,13 @@ func TestEncryptDecryptAttributes(t *testing.T) {
 	}
 }
 
+func TestEncryptAttributesRejectsInvalidKEncrLength(t *testing.T) {
+	_, err := EncryptAttributes(bytes.Repeat([]byte{0x11}, 15), bytes.Repeat([]byte{0x22}, 16), []Attribute{ResultIndAttribute()})
+	if !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("EncryptAttributes(short K_encr) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+}
+
 func TestDecryptChallengeEncryptedAttributes(t *testing.T) {
 	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
 	aka := sim.AKAResult{
@@ -342,7 +349,8 @@ func TestParseReauthenticationRequestRejectsMethodMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeriveAKAPrimeKeys() error = %v", err)
 	}
-	request := signedReauthenticationRequestWithOptions(t, TypeAKA, keys, 1, []byte("0123456789abcdef"), nil, nil)
+	request := signedReauthenticationRequestWithOptions(t, TypeAKAPrime, keys, 1, []byte("0123456789abcdef"), nil, nil)
+	request.Type = TypeAKA
 	_, err = ParseReauthenticationRequest(request, keys)
 	if !errors.Is(err, ErrInvalidReauth) {
 		t.Fatalf("ParseReauthenticationRequest() err=%v, want ErrInvalidReauth", err)
@@ -380,6 +388,31 @@ func TestDeriveReauthenticationKeys(t *testing.T) {
 	}
 	if !bytes.Equal(again.MSK, next.MSK) || !bytes.Equal(again.EMSK, next.EMSK) {
 		t.Fatal("reauth derivation is not deterministic")
+	}
+}
+
+func TestDeriveReauthenticationKeysRejectsInvalidTEKs(t *testing.T) {
+	nonceS := []byte("0123456789abcdef")
+	keys := Keys{
+		MK:    bytes.Repeat([]byte{0xaa}, 20),
+		KEncr: bytes.Repeat([]byte{0x11}, 16),
+		KAut:  bytes.Repeat([]byte{0x22}, 16),
+	}
+	keys.KEncr = keys.KEncr[:15]
+	if _, err := DeriveReauthenticationKeys("identity", keys, 1, nonceS); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("DeriveReauthenticationKeys(short K_encr) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+
+	keys.KEncr = bytes.Repeat([]byte{0x11}, 16)
+	keys.KAut = keys.KAut[:15]
+	if _, err := DeriveReauthenticationKeys("identity", keys, 1, nonceS); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("DeriveReauthenticationKeys(short K_aut) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+
+	keys.KAut = bytes.Repeat([]byte{0x22}, 16)
+	keys.KRe = bytes.Repeat([]byte{0x33}, 32)
+	if _, err := DeriveReauthenticationKeys("identity", keys, 1, nonceS); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("DeriveReauthenticationKeys(AKA' short K_aut) err=%v, want ErrInvalidKeyMaterial", err)
 	}
 }
 
@@ -859,12 +892,61 @@ func TestBuildClientErrorResponse(t *testing.T) {
 
 func TestBuildChallengeResponseRejectsBadRequestMAC(t *testing.T) {
 	identity := "user@example.com"
-	aka := sim.AKAResult{RES: []byte{1}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}
+	aka := sim.AKAResult{RES: []byte{1, 2, 3, 4}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}
 	req := signedChallengeRequest(t, identity, aka)
 	req.Attributes[len(req.Attributes)-1] = MACAttribute(bytes.Repeat([]byte{0xff}, 16))
 	_, _, err := BuildChallengeResponse(identity, req, aka)
 	if !errors.Is(err, ErrInvalidMAC) {
 		t.Fatalf("BuildChallengeResponse() err=%v, want ErrInvalidMAC", err)
+	}
+}
+
+func TestDeriveKeysRejectsInvalidAKAInputLengths(t *testing.T) {
+	valid := sim.AKAResult{
+		RES: []byte{1, 2, 3, 4},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	if _, err := DeriveKeys("identity", sim.AKAResult{CK: bytes.Repeat([]byte{0xc1}, 15), IK: valid.IK}); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("DeriveKeys(short CK) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+	if _, err := DeriveKeys("identity", sim.AKAResult{CK: valid.CK, IK: bytes.Repeat([]byte{0xd2}, 15)}); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("DeriveKeys(short IK) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+	if _, err := DeriveAKAPrimeKeys("identity", "WLAN", bytes.Repeat([]byte{0xb2}, 15), valid); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("DeriveAKAPrimeKeys(short AUTN) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+	if _, err := DeriveAKAPrimeKeys("identity", "WLAN", bytes.Repeat([]byte{0xb2}, 16), sim.AKAResult{CK: valid.CK, IK: bytes.Repeat([]byte{0xd2}, 17)}); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("DeriveAKAPrimeKeys(long IK) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+}
+
+func TestBuildChallengeResponseRejectsInvalidRESLength(t *testing.T) {
+	identity := "user@example.com"
+	aka := sim.AKAResult{RES: []byte{1, 2, 3}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}
+	req := signedChallengeRequest(t, identity, aka)
+	_, _, err := BuildChallengeResponse(identity, req, aka)
+	if !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("BuildChallengeResponse(short RES) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+}
+
+func TestMACRejectsInvalidKAutLength(t *testing.T) {
+	raw, err := (Packet{
+		Code:       CodeResponse,
+		Identifier: 1,
+		Type:       TypeAKA,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{MACAttribute(nil)},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	if _, err := CalculateMAC(bytes.Repeat([]byte{0x01}, 15), raw, nil); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("CalculateMAC(short K_aut) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+	if _, err := CalculateAKAPrimeMAC(bytes.Repeat([]byte{0x01}, 16), raw, nil); !errors.Is(err, ErrInvalidKeyMaterial) {
+		t.Fatalf("CalculateAKAPrimeMAC(short K_aut) err=%v, want ErrInvalidKeyMaterial", err)
 	}
 }
 
@@ -888,6 +970,17 @@ func TestBuildSynchronizationFailureResponse(t *testing.T) {
 	}
 	if !bytes.Equal(auts, wantAUTS) {
 		t.Fatalf("AUTS=%x", auts)
+	}
+}
+
+func TestBuildSynchronizationFailureResponseRejectsInvalidAUTS(t *testing.T) {
+	req := Packet{Code: CodeRequest, Identifier: 3, Type: TypeAKA, Subtype: SubtypeChallenge}
+	if _, err := BuildSynchronizationFailureResponse(req, bytes.Repeat([]byte{0xaa}, 13)); !errors.Is(err, ErrInvalidAKAChallenge) {
+		t.Fatalf("BuildSynchronizationFailureResponse(short AUTS) err=%v, want ErrInvalidAKAChallenge", err)
+	}
+	req.Type = 99
+	if _, err := BuildSynchronizationFailureResponse(req, bytes.Repeat([]byte{0xaa}, 14)); !errors.Is(err, ErrInvalidAKAChallenge) {
+		t.Fatalf("BuildSynchronizationFailureResponse(bad type) err=%v, want ErrInvalidAKAChallenge", err)
 	}
 }
 
@@ -932,6 +1025,34 @@ func TestBuildSynchronizationFailureResponseCopiesAKAPrimeKDF(t *testing.T) {
 	}
 	if _, ok := FindAttribute(resp.Attributes, AttributeKDFInput); ok {
 		t.Fatal("AKA' sync failure must copy AT_KDF, not AT_KDF_INPUT")
+	}
+}
+
+func TestChallengeRANDAndAUTNRejectsInvalidAttributes(t *testing.T) {
+	req := Packet{
+		Code:    CodeRequest,
+		Type:    TypeAKA,
+		Subtype: SubtypeChallenge,
+		Attributes: []Attribute{
+			RANDAttribute(bytes.Repeat([]byte{0xa1}, 16), bytes.Repeat([]byte{0xa2}, 16)),
+			AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
+		},
+	}
+	if _, _, err := ChallengeRANDAndAUTN(req); !errors.Is(err, ErrInvalidAKAChallenge) {
+		t.Fatalf("ChallengeRANDAndAUTN(two RANDs) err=%v, want ErrInvalidAKAChallenge", err)
+	}
+
+	req.Attributes = []Attribute{
+		RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
+		AUTNAttribute(bytes.Repeat([]byte{0xb2}, 15)),
+	}
+	if _, _, err := ChallengeRANDAndAUTN(req); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ChallengeRANDAndAUTN(short AUTN) err=%v, want ErrInvalidAttribute", err)
+	}
+
+	req.Subtype = SubtypeIdentity
+	if _, _, err := ChallengeRANDAndAUTN(req); !errors.Is(err, ErrInvalidAKAChallenge) {
+		t.Fatalf("ChallengeRANDAndAUTN(non-challenge) err=%v, want ErrInvalidAKAChallenge", err)
 	}
 }
 

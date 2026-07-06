@@ -16,6 +16,8 @@ import (
 )
 
 const (
+	KeyLengthCK           = 16
+	KeyLengthIK           = 16
 	KeyLengthKEncr        = 16
 	KeyLengthKAut         = 16
 	KeyLengthAKAPrimeKAut = 32
@@ -48,8 +50,8 @@ type Keys struct {
 }
 
 func DeriveKeys(identity string, aka sim.AKAResult) (Keys, error) {
-	if len(aka.IK) == 0 || len(aka.CK) == 0 {
-		return Keys{}, fmt.Errorf("%w: IK/CK is empty", ErrInvalidKeyMaterial)
+	if err := validateCKIK(aka); err != nil {
+		return Keys{}, err
 	}
 	mkInput := make([]byte, 0, len(identity)+len(aka.IK)+len(aka.CK))
 	mkInput = append(mkInput, []byte(identity)...)
@@ -73,11 +75,11 @@ func DeriveAKAPrimeKeys(identity, networkName string, autn16 []byte, aka sim.AKA
 	if networkName == "" {
 		return Keys{}, fmt.Errorf("%w: network name is empty", ErrInvalidKeyMaterial)
 	}
-	if len(autn16) < 6 {
+	if len(autn16) != AUTNLength {
 		return Keys{}, fmt.Errorf("%w: AUTN length %d", ErrInvalidKeyMaterial, len(autn16))
 	}
-	if len(aka.IK) == 0 || len(aka.CK) == 0 {
-		return Keys{}, fmt.Errorf("%w: IK/CK is empty", ErrInvalidKeyMaterial)
+	if err := validateCKIK(aka); err != nil {
+		return Keys{}, err
 	}
 	if len(networkName) > 0xffff {
 		return Keys{}, fmt.Errorf("%w: network name too long", ErrInvalidKeyMaterial)
@@ -110,6 +112,24 @@ func DeriveAKAPrimeKeys(identity, networkName string, autn16 []byte, aka sim.AKA
 	return out, nil
 }
 
+func validateCKIK(aka sim.AKAResult) error {
+	if len(aka.CK) != KeyLengthCK {
+		return fmt.Errorf("%w: CK length %d", ErrInvalidKeyMaterial, len(aka.CK))
+	}
+	if len(aka.IK) != KeyLengthIK {
+		return fmt.Errorf("%w: IK length %d", ErrInvalidKeyMaterial, len(aka.IK))
+	}
+	return nil
+}
+
+func validateRES(res []byte) error {
+	bits := len(res) * 8
+	if bits < RESMinBits || bits > RESMaxBits {
+		return fmt.Errorf("%w: RES bits %d outside %d..%d", ErrInvalidKeyMaterial, bits, RESMinBits, RESMaxBits)
+	}
+	return nil
+}
+
 func BuildChallengeResponse(identity string, request Packet, aka sim.AKAResult) (Packet, Keys, error) {
 	return BuildChallengeResponseWithCheckcode(identity, request, aka, nil)
 }
@@ -118,8 +138,11 @@ func BuildChallengeResponseWithCheckcode(identity string, request Packet, aka si
 	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
 		return Packet{}, Keys{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
 	}
-	if len(aka.RES) == 0 {
-		return Packet{}, Keys{}, fmt.Errorf("%w: RES is empty", ErrInvalidKeyMaterial)
+	if !isAKAType(request.Type) {
+		return Packet{}, Keys{}, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+	}
+	if err := validateRES(aka.RES); err != nil {
+		return Packet{}, Keys{}, err
 	}
 	keys, selectedKDF, err := deriveChallengeKeys(identity, request, aka)
 	if err != nil {
@@ -319,8 +342,11 @@ func BuildSynchronizationFailureResponse(request Packet, auts []byte) (Packet, e
 	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
 		return Packet{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
 	}
-	if len(auts) == 0 {
-		return Packet{}, fmt.Errorf("%w: AUTS is empty", ErrInvalidAKAChallenge)
+	if !isAKAType(request.Type) {
+		return Packet{}, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+	}
+	if len(auts) != AUTSLength {
+		return Packet{}, fmt.Errorf("%w: AUTS length %d", ErrInvalidAKAChallenge, len(auts))
 	}
 	attrs := []Attribute{AUTSAttribute(auts)}
 	if request.Type == TypeAKAPrime {
@@ -372,7 +398,7 @@ func DecryptAttributes(kEncr, iv []byte, encrypted Attribute) ([]Attribute, erro
 	if err != nil {
 		return nil, err
 	}
-	if len(ciphertext)%aes.BlockSize != 0 {
+	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
 		return nil, fmt.Errorf("%w: ciphertext length %d", ErrInvalidEncryptedData, len(ciphertext))
 	}
 	plaintext := make([]byte, len(ciphertext))
@@ -468,8 +494,8 @@ func DeriveReauthenticationKeys(identity string, previous Keys, counter uint16, 
 	if identity == "" {
 		return Keys{}, fmt.Errorf("%w: identity is empty", ErrInvalidKeyMaterial)
 	}
-	if len(previous.KEncr) == 0 || len(previous.KAut) == 0 {
-		return Keys{}, fmt.Errorf("%w: TEKs are empty", ErrInvalidKeyMaterial)
+	if len(previous.KEncr) != KeyLengthKEncr {
+		return Keys{}, fmt.Errorf("%w: K_encr length %d", ErrInvalidKeyMaterial, len(previous.KEncr))
 	}
 	if len(nonceS) != 16 {
 		return Keys{}, fmt.Errorf("%w: NONCE_S length %d", ErrInvalidReauth, len(nonceS))
@@ -481,6 +507,9 @@ func DeriveReauthenticationKeys(identity string, previous Keys, counter uint16, 
 		if len(previous.KRe) != KeyLengthKRe {
 			return Keys{}, fmt.Errorf("%w: K_re length %d", ErrInvalidKeyMaterial, len(previous.KRe))
 		}
+		if len(previous.KAut) != KeyLengthAKAPrimeKAut {
+			return Keys{}, fmt.Errorf("%w: AKA' K_aut length %d", ErrInvalidKeyMaterial, len(previous.KAut))
+		}
 		seed := make([]byte, 0, len("EAP-AKA' re-auth")+len(identity)+2+len(nonceS))
 		seed = append(seed, []byte("EAP-AKA' re-auth")...)
 		seed = append(seed, []byte(identity)...)
@@ -490,6 +519,9 @@ func DeriveReauthenticationKeys(identity string, previous Keys, counter uint16, 
 		return reauthenticationKeys(previous, stream, stream), nil
 	}
 
+	if len(previous.KAut) != KeyLengthKAut {
+		return Keys{}, fmt.Errorf("%w: K_aut length %d", ErrInvalidKeyMaterial, len(previous.KAut))
+	}
 	if len(previous.MK) == 0 {
 		return Keys{}, fmt.Errorf("%w: MK is empty", ErrInvalidKeyMaterial)
 	}
@@ -566,6 +598,12 @@ func buildReauthenticationResponsePacket(request Packet, keys Keys, iv []byte, p
 }
 
 func ChallengeRANDAndAUTN(request Packet) (rand16, autn16 []byte, err error) {
+	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
+		return nil, nil, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
+	}
+	if !isAKAType(request.Type) {
+		return nil, nil, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+	}
 	randAttr, ok := FindAttribute(request.Attributes, AttributeRAND)
 	if !ok {
 		return nil, nil, fmt.Errorf("%w: missing AT_RAND", ErrInvalidAKAChallenge)
@@ -653,10 +691,16 @@ func MACAttribute(mac []byte) Attribute {
 }
 
 func CalculateMAC(kAut, packet, extra []byte) ([]byte, error) {
+	if len(kAut) != KeyLengthKAut {
+		return nil, fmt.Errorf("%w: K_aut length %d", ErrInvalidKeyMaterial, len(kAut))
+	}
 	return calculateMAC(kAut, packet, extra, sha1.New)
 }
 
 func CalculateAKAPrimeMAC(kAut, packet, extra []byte) ([]byte, error) {
+	if len(kAut) != KeyLengthAKAPrimeKAut {
+		return nil, fmt.Errorf("%w: AKA' K_aut length %d", ErrInvalidKeyMaterial, len(kAut))
+	}
 	return calculateMAC(kAut, packet, extra, sha256.New)
 }
 
@@ -844,6 +888,9 @@ func cloneAttributes(attrs []Attribute) []Attribute {
 }
 
 func validateReauthenticationMethod(eapType uint8, keys Keys) error {
+	if len(keys.KEncr) != KeyLengthKEncr {
+		return fmt.Errorf("%w: K_encr length %d", ErrInvalidKeyMaterial, len(keys.KEncr))
+	}
 	switch eapType {
 	case TypeAKAPrime:
 		if len(keys.KRe) != KeyLengthKRe {

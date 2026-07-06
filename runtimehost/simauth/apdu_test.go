@@ -113,25 +113,52 @@ func TestBuildAndParseUSIMAuth(t *testing.T) {
 		t.Fatalf("APDU Le = 0x%02X, want 0", apdu[len(apdu)-1])
 	}
 
-	body := append([]byte{0xDB, 0x02, 0x11, 0x22, 0x10}, bytesFrom(0x01, 16)...)
+	body := append([]byte{0xDB, 0x04, 0x11, 0x22, 0x33, 0x44, 0x10}, bytesFrom(0x01, 16)...)
 	body = append(body, 0x10)
 	body = append(body, bytesFrom(0x21, 16)...)
 	res, err := ParseUSIMAuthResponse(body, 0x90, 0x00)
 	if err != nil {
 		t.Fatalf("ParseUSIMAuthResponse() error = %v", err)
 	}
-	if len(res.RES) != 2 || len(res.CK) != 16 || len(res.IK) != 16 {
+	if len(res.RES) != 4 || len(res.CK) != 16 || len(res.IK) != 16 {
 		t.Fatalf("AKA lengths = RES %d CK %d IK %d", len(res.RES), len(res.CK), len(res.IK))
 	}
 
-	res, err = ParseUSIMAuthResponse([]byte{0xDC, 0x02, 0xAA, 0xBB}, 0x90, 0x00)
-	if !errors.Is(err, swusim.ErrSyncFailure) || hex.EncodeToString(res.AUTS) != "aabb" {
+	res, err = ParseUSIMAuthResponse(append([]byte{0xDC, 0x0E}, bytesFrom(0xAA, 14)...), 0x90, 0x00)
+	if !errors.Is(err, swusim.ErrSyncFailure) || len(res.AUTS) != AKAAUTSLength {
 		t.Fatalf("sync failure = %+v err=%v, want AUTS and ErrSyncFailure", res, err)
 	}
 
 	_, err = ParseUSIMAuthResponse([]byte{0xDD, 0x00}, 0x90, 0x00)
 	if !errors.Is(err, swusim.ErrAuthFailure) {
 		t.Fatalf("auth failure err=%v, want ErrAuthFailure", err)
+	}
+}
+
+func TestParseUSIMAuthRejectsInvalidLengths(t *testing.T) {
+	shortRES := append([]byte{0xDB, 0x02, 0x11, 0x22, 0x10}, bytesFrom(0x01, 16)...)
+	shortRES = append(shortRES, 0x10)
+	shortRES = append(shortRES, bytesFrom(0x21, 16)...)
+	if _, err := ParseUSIMAuthResponse(shortRES, 0x90, 0x00); err == nil {
+		t.Fatal("ParseUSIMAuthResponse(short RES) err=nil, want error")
+	}
+
+	shortCK := append([]byte{0xDB, 0x04, 0x11, 0x22, 0x33, 0x44, 0x0F}, bytesFrom(0x01, 15)...)
+	shortCK = append(shortCK, 0x10)
+	shortCK = append(shortCK, bytesFrom(0x21, 16)...)
+	if _, err := ParseUSIMAuthResponse(shortCK, 0x90, 0x00); err == nil {
+		t.Fatal("ParseUSIMAuthResponse(short CK) err=nil, want error")
+	}
+
+	wrongAUTS := append([]byte{0xDC, 0x02}, 0xAA, 0xBB)
+	if _, err := ParseUSIMAuthResponse(wrongAUTS, 0x90, 0x00); err == nil {
+		t.Fatal("ParseUSIMAuthResponse(short AUTS) err=nil, want error")
+	}
+
+	trailing := append([]byte{0xDC, 0x0E}, bytesFrom(0xA0, 14)...)
+	trailing = append(trailing, 0x00)
+	if _, err := ParseUSIMAuthResponse(trailing, 0x90, 0x00); err == nil {
+		t.Fatal("ParseUSIMAuthResponse(trailing TLV bytes) err=nil, want error")
 	}
 }
 

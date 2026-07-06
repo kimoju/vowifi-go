@@ -1,6 +1,7 @@
 package voiceclient
 
 import (
+	"bufio"
 	"context"
 	"net"
 	"strings"
@@ -445,6 +446,117 @@ func TestWireSIPFlowDialogFailsOverRecoverableResponse(t *testing.T) {
 	}
 	if wire := <-secondSeen; !strings.Contains(wire, "MESSAGE sip:+18005551212@example") {
 		t.Fatalf("second target wire=%q", wire)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("resolver calls=%d, want 1", resolverCalls)
+	}
+}
+
+func TestWireSIPFlowFailsOverTCPResetAndReusesResolvedTarget(t *testing.T) {
+	first, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(first) error = %v", err)
+	}
+	defer first.Close()
+	second, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen(second) error = %v", err)
+	}
+	defer second.Close()
+
+	firstSeen := make(chan string, 1)
+	go func() {
+		conn, err := first.Accept()
+		if err != nil {
+			firstSeen <- "accept error: " + err.Error()
+			return
+		}
+		raw, err := readSIPStreamMessage(bufio.NewReader(conn))
+		if err != nil {
+			firstSeen <- "read error: " + err.Error()
+			_ = conn.Close()
+			return
+		}
+		firstSeen <- string(raw)
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = conn.Close()
+	}()
+	secondSeen := make(chan []string, 1)
+	go func() {
+		conn, err := second.Accept()
+		if err != nil {
+			secondSeen <- []string{"accept error: " + err.Error()}
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		var requests []string
+		for i := 0; i < 2; i++ {
+			raw, err := readSIPStreamMessage(reader)
+			if err != nil {
+				secondSeen <- append(requests, "read error: "+err.Error())
+				return
+			}
+			requests = append(requests, string(raw))
+			status := "SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"
+			if i == 1 {
+				status = "SIP/2.0 202 Accepted\r\nContent-Length: 0\r\n\r\n"
+			}
+			_, _ = conn.Write([]byte(status))
+		}
+		secondSeen <- requests
+	}()
+
+	resolverCalls := 0
+	flow := &WireSIPFlow{
+		Network: "tcp",
+		Resolver: SIPServerCandidateResolverFunc(func(ctx context.Context, network, uri string) ([]string, error) {
+			resolverCalls++
+			return []string{first.Addr().String(), second.Addr().String()}, nil
+		}),
+		Timeout: time.Second,
+	}
+	defer flow.Close()
+	resp, err := flow.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-tcp-reset-register",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("RoundTripRegister() response=%+v err=%v", resp, err)
+	}
+	resp, err = flow.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sip:+18005551212@example",
+		Headers: map[string]string{
+			"To":           "<sip:+18005551212@example>",
+			"From":         "<sip:user@example>;tag=sms",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-tcp-reset-message",
+			"CSeq":         "1 MESSAGE",
+			"Max-Forwards": "70",
+		},
+		Body: []byte("hello"),
+	})
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequest() response=%+v err=%v", resp, err)
+	}
+	if wire := <-firstSeen; !strings.Contains(wire, "REGISTER sip:ims.example") {
+		t.Fatalf("first target wire=%q", wire)
+	}
+	requests := <-secondSeen
+	if len(requests) != 2 ||
+		!strings.Contains(requests[0], "REGISTER sip:ims.example") ||
+		!strings.Contains(requests[1], "MESSAGE sip:+18005551212@example") {
+		t.Fatalf("second target requests=%+v", requests)
 	}
 	if resolverCalls != 1 {
 		t.Fatalf("resolver calls=%d, want 1", resolverCalls)

@@ -8,6 +8,8 @@ import (
 
 var ErrInvalidSDPSecurity = errors.New("invalid SDP security")
 
+var ErrSDPSecurityNegotiation = errors.New("SDP security negotiation failed")
+
 type SDPCryptoAttribute struct {
 	Tag           string
 	Suite         string
@@ -25,6 +27,14 @@ type SDPSecurityInfo struct {
 	Crypto       []SDPCryptoAttribute
 	Fingerprints []SDPFingerprintAttribute
 	Setup        string
+}
+
+type SDPSecurityAnswerOptions struct {
+	RTPProfiles  []string
+	Crypto       []SDPCryptoAttribute
+	Fingerprints []SDPFingerprintAttribute
+	Setup        string
+	PreferCrypto bool
 }
 
 func ParseSDPWithSecurity(body []byte) (SDPInfo, SDPSecurityInfo, error) {
@@ -116,6 +126,30 @@ func ParseSDPSecurity(body []byte) (SDPSecurityInfo, error) {
 		out.Setup = session.Setup
 	}
 	return out, nil
+}
+
+func SelectSDPSecurityAnswer(offer SDPSecurityInfo, options SDPSecurityAnswerOptions) (SDPSecurityInfo, error) {
+	profile, ok := selectSDPRTPProfile(offer.RTPProfile, options.RTPProfiles)
+	if !ok {
+		return SDPSecurityInfo{}, fmt.Errorf("%w: unsupported RTP profile %q", ErrSDPSecurityNegotiation, offer.RTPProfile)
+	}
+	if !options.PreferCrypto {
+		if answer, ok, err := selectSDPFingerprintAnswer(offer, options, profile); ok || err != nil {
+			return answer, err
+		}
+	}
+	if answer, ok := selectSDPCryptoAnswer(offer, options, profile); ok {
+		return answer, nil
+	}
+	if options.PreferCrypto {
+		if answer, ok, err := selectSDPFingerprintAnswer(offer, options, profile); ok || err != nil {
+			return answer, err
+		}
+	}
+	if offer.HasSecurityAttributes() {
+		return SDPSecurityInfo{}, fmt.Errorf("%w: no compatible SDP security attributes", ErrSDPSecurityNegotiation)
+	}
+	return SDPSecurityInfo{RTPProfile: profile}, nil
 }
 
 func BuildSDPAnswerWithSecurity(info SDPInfo, security SDPSecurityInfo) []byte {
@@ -283,4 +317,110 @@ func sdpSecurityLines(body []byte) []string {
 		lines = append(lines, strings.TrimSpace(line))
 	}
 	return lines
+}
+
+func selectSDPRTPProfile(offerProfile string, allowed []string) (string, bool) {
+	offerProfile = strings.TrimSpace(offerProfile)
+	if offerProfile == "" {
+		offerProfile = "RTP/AVP"
+	}
+	if len(allowed) == 0 {
+		return offerProfile, true
+	}
+	for _, profile := range allowed {
+		profile = strings.TrimSpace(profile)
+		if profile == "" {
+			continue
+		}
+		if strings.EqualFold(profile, offerProfile) {
+			return offerProfile, true
+		}
+	}
+	return "", false
+}
+
+func selectSDPFingerprintAnswer(offer SDPSecurityInfo, options SDPSecurityAnswerOptions, profile string) (SDPSecurityInfo, bool, error) {
+	if len(offer.Fingerprints) == 0 || len(options.Fingerprints) == 0 {
+		return SDPSecurityInfo{}, false, nil
+	}
+	for _, local := range options.Fingerprints {
+		for _, remote := range offer.Fingerprints {
+			if !strings.EqualFold(strings.TrimSpace(local.HashFunc), strings.TrimSpace(remote.HashFunc)) {
+				continue
+			}
+			setup, err := SelectSDPSetupAnswer(offer.Setup, options.Setup)
+			if err != nil {
+				return SDPSecurityInfo{}, true, err
+			}
+			local.HashFunc = strings.TrimSpace(local.HashFunc)
+			local.Fingerprint = strings.TrimSpace(local.Fingerprint)
+			if local.SDPValue() == "" {
+				continue
+			}
+			return SDPSecurityInfo{
+				RTPProfile:   profile,
+				Fingerprints: []SDPFingerprintAttribute{local},
+				Setup:        setup,
+			}, true, nil
+		}
+	}
+	return SDPSecurityInfo{}, false, nil
+}
+
+func selectSDPCryptoAnswer(offer SDPSecurityInfo, options SDPSecurityAnswerOptions, profile string) (SDPSecurityInfo, bool) {
+	if len(offer.Crypto) == 0 || len(options.Crypto) == 0 {
+		return SDPSecurityInfo{}, false
+	}
+	for _, local := range options.Crypto {
+		for _, remote := range offer.Crypto {
+			if !strings.EqualFold(strings.TrimSpace(local.Suite), strings.TrimSpace(remote.Suite)) {
+				continue
+			}
+			answer := local
+			answer.Tag = strings.TrimSpace(remote.Tag)
+			answer.Suite = strings.TrimSpace(local.Suite)
+			answer.KeyParams = strings.TrimSpace(local.KeyParams)
+			answer.SessionParams = strings.TrimSpace(local.SessionParams)
+			if answer.SDPValue() == "" {
+				continue
+			}
+			return SDPSecurityInfo{
+				RTPProfile: profile,
+				Crypto:     []SDPCryptoAttribute{answer},
+			}, true
+		}
+	}
+	return SDPSecurityInfo{}, false
+}
+
+func SelectSDPSetupAnswer(offerSetup, preferred string) (string, error) {
+	offerSetup = strings.ToLower(strings.TrimSpace(offerSetup))
+	preferred = strings.ToLower(strings.TrimSpace(preferred))
+	if offerSetup == "" {
+		offerSetup = "actpass"
+	}
+	switch offerSetup {
+	case "actpass":
+		if preferred == "" {
+			return "active", nil
+		}
+		if preferred == "active" || preferred == "passive" {
+			return preferred, nil
+		}
+	case "active":
+		if preferred == "" || preferred == "passive" {
+			return "passive", nil
+		}
+	case "passive":
+		if preferred == "" || preferred == "active" {
+			return "active", nil
+		}
+	case "holdconn":
+		if preferred == "" || preferred == "holdconn" {
+			return "holdconn", nil
+		}
+	default:
+		return "", fmt.Errorf("%w: unsupported setup role %q", ErrSDPSecurityNegotiation, offerSetup)
+	}
+	return "", fmt.Errorf("%w: setup role %q cannot answer offer role %q", ErrSDPSecurityNegotiation, preferred, offerSetup)
 }

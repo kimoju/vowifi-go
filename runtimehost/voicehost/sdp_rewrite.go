@@ -9,6 +9,35 @@ import (
 
 var ErrInvalidSDPDirection = errors.New("invalid SDP media direction")
 
+var ErrSDPMediaNegotiation = errors.New("invalid SDP media negotiation")
+
+type SDPCodec struct {
+	Payload      int
+	EncodingName string
+	ClockRate    int
+	Channels     int
+	FMTP         string
+}
+
+type SDPMediaDescription struct {
+	Info         SDPInfo
+	RTPProfile   string
+	RTCPMux      bool
+	ExplicitRTCP bool
+	Codecs       []SDPCodec
+}
+
+type SDPAnswerOptions struct {
+	RTPProfile string
+	RTCPMux    bool
+	Codecs     []SDPCodec
+	Security   SDPSecurityInfo
+}
+
+type SDPMediaRewriteOptions struct {
+	RTCPMux bool
+}
+
 func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 	if len(body) == 0 || strings.TrimSpace(endpoint.ConnectionIP) == "" || endpoint.MediaPort <= 0 {
 		return BuildSDPAnswer(endpoint)
@@ -95,6 +124,215 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 	return []byte(strings.Join(out, "\r\n") + "\r\n")
 }
 
+func RewriteSDPMediaEndpointWithOptions(body []byte, endpoint SDPInfo, options SDPMediaRewriteOptions) []byte {
+	if !options.RTCPMux {
+		return RewriteSDPMediaEndpoint(body, endpoint)
+	}
+	endpoint.RTCPPort = 0
+	return rewriteSDPRTCPMux(RewriteSDPMediaEndpoint(body, endpoint))
+}
+
+func ParseSDPMediaDescription(body []byte) (SDPMediaDescription, error) {
+	info, err := ParseSDP(body)
+	if err != nil {
+		return SDPMediaDescription{}, err
+	}
+	out := SDPMediaDescription{Info: info}
+	lines := sdpSecurityLines(body)
+	inAudio := false
+	sawAudio := false
+	codecsByPayload := make(map[int]SDPCodec)
+	payloadOrder := append([]int(nil), info.Payloads...)
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "m=") {
+			if inAudio {
+				break
+			}
+			inAudio = false
+			fields := strings.Fields(line)
+			if len(fields) >= 3 && strings.EqualFold(fields[0], "m=audio") {
+				out.RTPProfile = fields[2]
+				inAudio = true
+				sawAudio = true
+			}
+			continue
+		}
+		if !inAudio {
+			continue
+		}
+		switch {
+		case strings.EqualFold(strings.TrimSpace(line), "a=rtcp-mux"):
+			out.RTCPMux = true
+		case strings.HasPrefix(lower, "a=rtcp:"):
+			out.ExplicitRTCP = true
+		case strings.HasPrefix(lower, "a=rtpmap:"):
+			codec, ok, err := parseSDPRTPMapCodec(line)
+			if err != nil {
+				return SDPMediaDescription{}, err
+			}
+			if ok {
+				if existing, exists := codecsByPayload[codec.Payload]; exists {
+					codec.FMTP = existing.FMTP
+				}
+				codecsByPayload[codec.Payload] = codec
+			}
+		case strings.HasPrefix(lower, "a=fmtp:"):
+			payload, fmtp, ok, err := parseSDPFmtpLine(line)
+			if err != nil {
+				return SDPMediaDescription{}, err
+			}
+			if ok {
+				codec := codecsByPayload[payload]
+				codec.Payload = payload
+				codec.FMTP = fmtp
+				codecsByPayload[payload] = codec
+			}
+		}
+	}
+	if !sawAudio {
+		return SDPMediaDescription{}, errors.New("missing SDP audio port")
+	}
+	out.Codecs = make([]SDPCodec, 0, len(payloadOrder))
+	for _, payload := range payloadOrder {
+		codec, ok := codecsByPayload[payload]
+		if !ok {
+			codec, _ = staticSDPCodec(payload)
+		}
+		codec.Payload = payload
+		out.Codecs = append(out.Codecs, codec)
+	}
+	if out.RTCPMux && out.Info.MediaPort > 0 {
+		out.Info.RTCPPort = out.Info.MediaPort
+		out.Info.RTCPIP = out.Info.ConnectionIP
+	}
+	return out, nil
+}
+
+func SelectSDPAnswerCodecs(offer, local []SDPCodec) []SDPCodec {
+	if len(offer) == 0 {
+		return nil
+	}
+	if len(local) == 0 {
+		return cloneSDPCodecs(offer)
+	}
+	selected := make([]SDPCodec, 0, len(local))
+	used := make(map[int]bool, len(offer))
+	for _, want := range local {
+		want = normalizeSDPCodec(want)
+		for i, offered := range offer {
+			if used[i] || !sdpCodecMatches(offered, want) {
+				continue
+			}
+			answer := normalizeSDPCodec(offered)
+			if strings.TrimSpace(want.FMTP) != "" {
+				answer.FMTP = strings.TrimSpace(want.FMTP)
+			}
+			selected = append(selected, answer)
+			used[i] = true
+			break
+		}
+	}
+	return selected
+}
+
+func SDPInfoWithCodecs(info SDPInfo, codecs []SDPCodec) SDPInfo {
+	if len(codecs) == 0 {
+		return info
+	}
+	out := info
+	out.Payloads = nil
+	out.TelephoneEventPayloads = nil
+	for _, codec := range codecs {
+		if codec.Payload < 0 || codec.Payload > 127 || sdpPayloadsContain(out.Payloads, codec.Payload) {
+			continue
+		}
+		out.Payloads = append(out.Payloads, codec.Payload)
+		if strings.EqualFold(strings.TrimSpace(codec.EncodingName), "telephone-event") {
+			clockRate := codec.ClockRate
+			if clockRate <= 0 {
+				clockRate = DefaultRTPDTMFClockRate
+			}
+			if out.TelephoneEventPayloads == nil {
+				out.TelephoneEventPayloads = make(map[uint8]int)
+			}
+			out.TelephoneEventPayloads[uint8(codec.Payload)] = clockRate
+		}
+	}
+	return out
+}
+
+func BuildSDPAnswerWithOptions(info SDPInfo, options SDPAnswerOptions) []byte {
+	if options.RTPProfile == "" && !options.RTCPMux && len(options.Codecs) == 0 && options.Security.IsZero() {
+		return BuildSDPAnswer(info)
+	}
+	if len(options.Codecs) > 0 {
+		info = SDPInfoWithCodecs(info, options.Codecs)
+	}
+	ip := strings.TrimSpace(info.ConnectionIP)
+	if ip == "" {
+		ip = "127.0.0.1"
+	}
+	ipVersion := "IP4"
+	if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
+		ipVersion = "IP6"
+	}
+	port := info.MediaPort
+	if port <= 0 && normalizeSDPDirection(info.Direction) != "inactive" {
+		port = 4000
+	}
+	payloads := info.Payloads
+	if len(payloads) == 0 {
+		payloads = []int{0, 8, 101}
+	}
+	profile := strings.TrimSpace(options.RTPProfile)
+	if profile == "" {
+		profile = strings.TrimSpace(options.Security.RTPProfile)
+	}
+	if profile == "" {
+		profile = "RTP/AVP"
+	}
+	direction := strings.TrimSpace(info.Direction)
+	if direction == "" {
+		direction = "sendrecv"
+	}
+	var b strings.Builder
+	b.WriteString("v=0\r\n")
+	b.WriteString("o=vowifi-go 0 0 IN " + ipVersion + " " + ip + "\r\n")
+	b.WriteString("s=VoWiFi\r\n")
+	b.WriteString("c=IN " + ipVersion + " " + ip + "\r\n")
+	b.WriteString("t=0 0\r\n")
+	b.WriteString("m=audio " + strconv.Itoa(port) + " " + profile)
+	for _, payload := range payloads {
+		b.WriteString(" " + strconv.Itoa(payload))
+	}
+	b.WriteString("\r\n")
+	for _, line := range options.Security.sdpAttributeLines() {
+		b.WriteString(line + "\r\n")
+	}
+	if options.RTCPMux {
+		b.WriteString("a=rtcp-mux\r\n")
+	} else if info.RTCPPort > 0 {
+		rtcpIP := strings.TrimSpace(info.RTCPIP)
+		if rtcpIP == "" {
+			rtcpIP = ip
+		}
+		rtcpIPVersion := "IP4"
+		if parsed := net.ParseIP(rtcpIP); parsed != nil && parsed.To4() == nil {
+			rtcpIPVersion = "IP6"
+		}
+		b.WriteString("a=rtcp:" + strconv.Itoa(info.RTCPPort) + " IN " + rtcpIPVersion + " " + rtcpIP + "\r\n")
+	}
+	b.WriteString("a=" + direction + "\r\n")
+	for _, line := range sdpCodecAttributeLines(payloads, options.Codecs, info.TelephoneEventPayloads) {
+		b.WriteString(line + "\r\n")
+	}
+	return []byte(b.String())
+}
+
 func RewriteSDPMediaDirection(body []byte, direction string) ([]byte, error) {
 	direction, err := normalizeExplicitSDPDirection(direction)
 	if err != nil {
@@ -158,4 +396,199 @@ func sdpAudioPortDisabled(lines []string) bool {
 		return len(fields) >= 2 && strings.TrimSpace(fields[1]) == "0"
 	}
 	return false
+}
+
+func rewriteSDPRTCPMux(body []byte) []byte {
+	text := strings.ReplaceAll(string(body), "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines)+1)
+	inAudio := false
+	inserted := false
+	audioDisabled := false
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(lower, "m=") {
+			inAudio = strings.HasPrefix(lower, "m=audio ")
+			inserted = false
+			audioDisabled = false
+			if inAudio {
+				fields := strings.Fields(line)
+				audioDisabled = len(fields) >= 2 && fields[1] == "0"
+			}
+			out = append(out, line)
+			if inAudio && !audioDisabled {
+				out = append(out, "a=rtcp-mux")
+				inserted = true
+			}
+			continue
+		}
+		if inAudio {
+			if strings.HasPrefix(lower, "a=rtcp:") {
+				continue
+			}
+			if lower == "a=rtcp-mux" {
+				if inserted || audioDisabled {
+					continue
+				}
+				inserted = true
+			}
+		}
+		out = append(out, line)
+	}
+	return []byte(strings.Join(out, "\r\n") + "\r\n")
+}
+
+func parseSDPRTPMapCodec(line string) (SDPCodec, bool, error) {
+	value, ok := cutSDPAttributeValue(line, "a=rtpmap:")
+	if !ok {
+		return SDPCodec{}, false, nil
+	}
+	payloadText, encoding, ok := cutSDPField(value)
+	if !ok || strings.TrimSpace(encoding) == "" {
+		return SDPCodec{}, true, ErrSDPMediaNegotiation
+	}
+	payload, err := strconv.Atoi(payloadText)
+	if err != nil || payload < 0 || payload > 127 {
+		return SDPCodec{}, true, ErrSDPMediaNegotiation
+	}
+	parts := strings.Split(strings.Fields(encoding)[0], "/")
+	if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" {
+		return SDPCodec{}, true, ErrSDPMediaNegotiation
+	}
+	clockRate, err := strconv.Atoi(parts[1])
+	if err != nil || clockRate <= 0 {
+		return SDPCodec{}, true, ErrSDPMediaNegotiation
+	}
+	channels := 1
+	if len(parts) >= 3 && strings.TrimSpace(parts[2]) != "" {
+		channels, err = strconv.Atoi(parts[2])
+		if err != nil || channels <= 0 {
+			return SDPCodec{}, true, ErrSDPMediaNegotiation
+		}
+	}
+	return SDPCodec{
+		Payload:      payload,
+		EncodingName: strings.TrimSpace(parts[0]),
+		ClockRate:    clockRate,
+		Channels:     channels,
+	}, true, nil
+}
+
+func parseSDPFmtpLine(line string) (int, string, bool, error) {
+	value, ok := cutSDPAttributeValue(line, "a=fmtp:")
+	if !ok {
+		return 0, "", false, nil
+	}
+	payloadText, fmtp, ok := cutSDPField(value)
+	if !ok {
+		return 0, "", true, ErrSDPMediaNegotiation
+	}
+	payload, err := strconv.Atoi(payloadText)
+	if err != nil || payload < 0 || payload > 127 {
+		return 0, "", true, ErrSDPMediaNegotiation
+	}
+	return payload, strings.TrimSpace(fmtp), true, nil
+}
+
+func cloneSDPCodecs(in []SDPCodec) []SDPCodec {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]SDPCodec, len(in))
+	copy(out, in)
+	return out
+}
+
+func normalizeSDPCodec(codec SDPCodec) SDPCodec {
+	if codec.Channels <= 0 {
+		codec.Channels = 1
+	}
+	codec.EncodingName = strings.TrimSpace(codec.EncodingName)
+	codec.FMTP = strings.TrimSpace(codec.FMTP)
+	if codec.EncodingName == "" {
+		if static, ok := staticSDPCodec(codec.Payload); ok {
+			if codec.ClockRate <= 0 {
+				codec.ClockRate = static.ClockRate
+			}
+			codec.EncodingName = static.EncodingName
+		}
+	}
+	return codec
+}
+
+func sdpCodecMatches(offered, want SDPCodec) bool {
+	offered = normalizeSDPCodec(offered)
+	want = normalizeSDPCodec(want)
+	if want.EncodingName == "" {
+		return want.Payload >= 0 && offered.Payload == want.Payload
+	}
+	if !strings.EqualFold(offered.EncodingName, want.EncodingName) {
+		return false
+	}
+	if want.ClockRate > 0 && offered.ClockRate > 0 && want.ClockRate != offered.ClockRate {
+		return false
+	}
+	if want.Channels > 0 && offered.Channels > 0 && want.Channels != offered.Channels {
+		return false
+	}
+	return true
+}
+
+func staticSDPCodec(payload int) (SDPCodec, bool) {
+	switch payload {
+	case 0:
+		return SDPCodec{Payload: payload, EncodingName: "PCMU", ClockRate: 8000, Channels: 1}, true
+	case 8:
+		return SDPCodec{Payload: payload, EncodingName: "PCMA", ClockRate: 8000, Channels: 1}, true
+	default:
+		return SDPCodec{Payload: payload}, false
+	}
+}
+
+func sdpCodecAttributeLines(payloads []int, codecs []SDPCodec, telephoneEventPayloads map[uint8]int) []string {
+	if telephoneEventPayloads == nil && sdpPayloadsContain(payloads, DefaultRTPDTMFPayloadType) {
+		telephoneEventPayloads = map[uint8]int{DefaultRTPDTMFPayloadType: DefaultRTPDTMFClockRate}
+	}
+	if len(codecs) == 0 {
+		codecs = make([]SDPCodec, 0, len(payloads))
+		for _, payload := range payloads {
+			codec, _ := staticSDPCodec(payload)
+			if payload >= 0 && payload <= 127 {
+				if clockRate, ok := telephoneEventPayloads[uint8(payload)]; ok {
+					if clockRate <= 0 {
+						clockRate = DefaultRTPDTMFClockRate
+					}
+					codec = SDPCodec{Payload: payload, EncodingName: "telephone-event", ClockRate: clockRate, Channels: 1, FMTP: "0-16"}
+				}
+			}
+			codecs = append(codecs, codec)
+		}
+	}
+	byPayload := make(map[int]SDPCodec, len(codecs))
+	for _, codec := range codecs {
+		codec = normalizeSDPCodec(codec)
+		byPayload[codec.Payload] = codec
+	}
+	out := make([]string, 0, len(payloads)*2)
+	for _, payload := range payloads {
+		codec := byPayload[payload]
+		if codec.EncodingName == "" && codec.ClockRate == 0 {
+			codec, _ = staticSDPCodec(payload)
+		}
+		codec = normalizeSDPCodec(codec)
+		if codec.EncodingName != "" && codec.ClockRate > 0 {
+			rtpmap := "a=rtpmap:" + strconv.Itoa(payload) + " " + codec.EncodingName + "/" + strconv.Itoa(codec.ClockRate)
+			if codec.Channels > 1 {
+				rtpmap += "/" + strconv.Itoa(codec.Channels)
+			}
+			out = append(out, rtpmap)
+		}
+		if fmtp := strings.TrimSpace(codec.FMTP); fmtp != "" {
+			out = append(out, "a=fmtp:"+strconv.Itoa(payload)+" "+fmtp)
+		}
+	}
+	return out
 }
