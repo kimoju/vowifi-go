@@ -343,8 +343,9 @@ func ParseSIPResponse(raw []byte) (RegisterResponse, error) {
 	if err != nil {
 		return RegisterResponse{}, err
 	}
-	if n, ok := contentLength(headers); ok && n <= len(body) {
-		body = body[:n]
+	body, err = sipBodyByContentLength(headers, body)
+	if err != nil {
+		return RegisterResponse{}, err
 	}
 	return RegisterResponse{
 		StatusCode: code,
@@ -433,8 +434,9 @@ func ParseSIPRequest(raw []byte) (SIPIncomingRequest, error) {
 	if err != nil {
 		return SIPIncomingRequest{}, err
 	}
-	if n, ok := contentLength(headers); ok && n <= len(body) {
-		body = body[:n]
+	body, err = sipBodyByContentLength(headers, body)
+	if err != nil {
+		return SIPIncomingRequest{}, err
 	}
 	return SIPIncomingRequest{
 		Method:  method,
@@ -659,6 +661,36 @@ func contentLength(headers map[string][]string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func sipBodyByContentLength(headers map[string][]string, body []byte) ([]byte, error) {
+	n, ok, err := strictContentLength(headers)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return body, nil
+	}
+	if n > len(body) {
+		return nil, fmt.Errorf("%w: content length %d exceeds body length %d", ErrInvalidSIPMessage, n, len(body))
+	}
+	return body[:n], nil
+}
+
+func strictContentLength(headers map[string][]string) (int, bool, error) {
+	for key, values := range headers {
+		if !strings.EqualFold(key, "Content-Length") && !strings.EqualFold(key, "l") {
+			continue
+		}
+		for _, value := range values {
+			n, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || n < 0 {
+				return 0, false, fmt.Errorf("%w: invalid content length", ErrInvalidSIPMessage)
+			}
+			return n, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 func sipRetransmitInterval(timeout, configured time.Duration) time.Duration {

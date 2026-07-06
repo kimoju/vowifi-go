@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -131,6 +132,77 @@ func TestParseSIPRequestAndBuildResponseWire(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("response wire missing %q in %q", want, text)
+		}
+	}
+}
+
+func TestParseSIPMessageRejectsInvalidContentLength(t *testing.T) {
+	tests := []struct {
+		name  string
+		raw   string
+		parse func([]byte) error
+	}{
+		{
+			name: "request_short_body",
+			raw: strings.Join([]string{
+				"MESSAGE sip:user@example SIP/2.0",
+				"Call-ID: short-request",
+				"CSeq: 1 MESSAGE",
+				"Content-Length: 5",
+				"",
+				"abc",
+			}, "\r\n"),
+			parse: func(raw []byte) error {
+				_, err := ParseSIPRequest(raw)
+				return err
+			},
+		},
+		{
+			name: "response_short_body",
+			raw: strings.Join([]string{
+				"SIP/2.0 200 OK",
+				"Content-Length: 5",
+				"",
+				"abc",
+			}, "\r\n"),
+			parse: func(raw []byte) error {
+				_, err := ParseSIPResponse(raw)
+				return err
+			},
+		},
+		{
+			name: "request_negative_length",
+			raw: strings.Join([]string{
+				"OPTIONS sip:user@example SIP/2.0",
+				"Call-ID: bad-length",
+				"CSeq: 1 OPTIONS",
+				"Content-Length: -1",
+				"",
+				"",
+			}, "\r\n"),
+			parse: func(raw []byte) error {
+				_, err := ParseSIPRequest(raw)
+				return err
+			},
+		},
+		{
+			name: "response_nonnumeric_length",
+			raw: strings.Join([]string{
+				"SIP/2.0 200 OK",
+				"Content-Length: many",
+				"",
+				"",
+			}, "\r\n"),
+			parse: func(raw []byte) error {
+				_, err := ParseSIPResponse(raw)
+				return err
+			},
+		},
+	}
+	for _, tc := range tests {
+		err := tc.parse([]byte(tc.raw))
+		if !errors.Is(err, ErrInvalidSIPMessage) {
+			t.Fatalf("%s error=%v, want ErrInvalidSIPMessage", tc.name, err)
 		}
 	}
 }
