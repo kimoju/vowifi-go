@@ -34,6 +34,29 @@ func TestBuildSMSSubmitTPDURelativeValidityPeriod(t *testing.T) {
 	}
 }
 
+func TestBuildSMSSubmitTPDUAbsoluteValidityDeadline(t *testing.T) {
+	deadline := time.Date(2026, 7, 5, 12, 34, 56, 0, time.FixedZone("CST", 8*3600))
+	tpdu, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", Encoding: "gsm7", ValidityDeadline: deadline}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU() error = %v", err)
+	}
+	got := strings.ToUpper(hex.EncodeToString(tpdu))
+	want := "19010B918100551512F200006270502143652305E8329BFD06"
+	if got != want {
+		t.Fatalf("TPDU=%s want %s", got, want)
+	}
+	if tpdu[0]&0x18 != 0x18 || tpdu[19] != 5 {
+		t.Fatalf("first=0x%02x UDL=%d TPDU=%x", tpdu[0], tpdu[19], tpdu)
+	}
+	decoded, err := decodeSMSTimestamp(tpdu[12:19])
+	if err != nil {
+		t.Fatalf("decodeSMSTimestamp() error = %v", err)
+	}
+	if !decoded.Equal(deadline) {
+		t.Fatalf("decoded deadline=%s want %s", decoded, deadline)
+	}
+}
+
 func TestBuildSMSSubmitTPDUCustomProtocolIDAndDCS(t *testing.T) {
 	tpdu, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "flash", ProtocolID: 0x7f, DataCodingScheme: 0x10}, 1)
 	if err != nil {
@@ -72,6 +95,25 @@ func TestBuildSMSSubmitTPDURejectsConflictingDCS(t *testing.T) {
 	_, err = BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", DataCodingScheme: 0x20}, 1)
 	if err == nil || !strings.Contains(err.Error(), "compressed") {
 		t.Fatalf("BuildSMSSubmitTPDU() err=%v, want compressed DCS rejection", err)
+	}
+}
+
+func TestEncodeSMSSubmitValidityPeriodRejectsConflicts(t *testing.T) {
+	deadline := time.Date(2026, 7, 5, 12, 34, 56, 0, time.UTC)
+	_, _, err := encodeSMSSubmitValidityPeriod(time.Hour, deadline)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("encodeSMSSubmitValidityPeriod() err=%v, want mutual exclusion", err)
+	}
+}
+
+func TestEncodeSMSTimestampRejectsUnsupportedValues(t *testing.T) {
+	_, err := encodeSMSTimestamp(time.Date(2090, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err == nil || !strings.Contains(err.Error(), "encodable range") {
+		t.Fatalf("encodeSMSTimestamp(year) err=%v, want encodable range", err)
+	}
+	_, err = encodeSMSTimestamp(time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("odd", 61)))
+	if err == nil || !strings.Contains(err.Error(), "15-minute") {
+		t.Fatalf("encodeSMSTimestamp(offset) err=%v, want 15-minute error", err)
 	}
 }
 

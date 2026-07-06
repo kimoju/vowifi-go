@@ -79,13 +79,11 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 	if len(udh) > 0 {
 		firstOctet |= 0x40
 	}
-	vp, hasValidityPeriod, err := encodeSMSRelativeValidityPeriod(part.ValidityPeriod)
+	vpf, vp, err := encodeSMSSubmitValidityPeriod(part.ValidityPeriod, part.ValidityDeadline)
 	if err != nil {
 		return nil, err
 	}
-	if hasValidityPeriod {
-		firstOctet |= 0x10
-	}
+	firstOctet |= vpf
 	userData, udl, dcs, err := encodeSMSUserData(part.Text, encoding, udh)
 	if err != nil {
 		return nil, err
@@ -93,13 +91,11 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 	if hasDCSOverride {
 		dcs = dcsOverride
 	}
-	out := make([]byte, 0, 8+len(bcd)+len(userData))
+	out := make([]byte, 0, 7+len(bcd)+len(vp)+len(userData))
 	out = append(out, firstOctet, mr, byte(digits), toa)
 	out = append(out, bcd...)
 	out = append(out, smsSubmitProtocolID(part), dcs)
-	if hasValidityPeriod {
-		out = append(out, vp)
-	}
+	out = append(out, vp...)
 	out = append(out, byte(udl))
 	out = append(out, userData...)
 	return out, nil
@@ -161,6 +157,24 @@ func validateSMSSubmitDataCodingScheme(dcs byte, encoding string) error {
 		return fmt.Errorf("sms data coding scheme 0x%02x expects %s user data, got %s", dcs, want, got)
 	}
 	return nil
+}
+
+func encodeSMSSubmitValidityPeriod(relative time.Duration, absolute time.Time) (byte, []byte, error) {
+	if relative != 0 && !absolute.IsZero() {
+		return 0, nil, errors.New("sms validity period and deadline are mutually exclusive")
+	}
+	if !absolute.IsZero() {
+		encoded, err := encodeSMSTimestamp(absolute)
+		if err != nil {
+			return 0, nil, err
+		}
+		return 0x18, encoded, nil
+	}
+	vp, ok, err := encodeSMSRelativeValidityPeriod(relative)
+	if err != nil || !ok {
+		return 0, nil, err
+	}
+	return 0x10, []byte{vp}, nil
 }
 
 func encodeSMSRelativeValidityPeriod(validity time.Duration) (byte, bool, error) {
@@ -978,6 +992,48 @@ func decodeSMSTimestamp(raw []byte) (time.Time, error) {
 		offset = -offset
 	}
 	return time.Date(fullYear, time.Month(month), day, hour, minute, second, 0, time.FixedZone("", offset)), nil
+}
+
+func encodeSMSTimestamp(ts time.Time) ([]byte, error) {
+	if ts.IsZero() {
+		return nil, errors.New("SMS timestamp is zero")
+	}
+	year := ts.Year()
+	if year < 1990 || year > 2089 {
+		return nil, fmt.Errorf("SMS timestamp year %d is outside encodable range 1990-2089", year)
+	}
+	_, offset := ts.Zone()
+	if offset%900 != 0 {
+		return nil, fmt.Errorf("SMS timestamp timezone offset %d is not a 15-minute multiple", offset)
+	}
+	tzQuarterHours := offset / 900
+	negative := tzQuarterHours < 0
+	if negative {
+		tzQuarterHours = -tzQuarterHours
+	}
+	if tzQuarterHours > 79 {
+		return nil, fmt.Errorf("SMS timestamp timezone quarter-hours out of range: %d", tzQuarterHours)
+	}
+	tz := encodeSemiOctetDecimal(tzQuarterHours)
+	if negative {
+		tz |= 0x08
+	}
+	return []byte{
+		encodeSemiOctetDecimal(year % 100),
+		encodeSemiOctetDecimal(int(ts.Month())),
+		encodeSemiOctetDecimal(ts.Day()),
+		encodeSemiOctetDecimal(ts.Hour()),
+		encodeSemiOctetDecimal(ts.Minute()),
+		encodeSemiOctetDecimal(ts.Second()),
+		tz,
+	}, nil
+}
+
+func encodeSemiOctetDecimal(value int) byte {
+	if value < 0 {
+		return 0
+	}
+	return byte((value%10)<<4 | (value/10)%10)
 }
 
 func decodeSemiOctetDecimal(value byte) int {

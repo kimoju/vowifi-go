@@ -135,6 +135,26 @@ func TestSendSMSWithOptionsPropagatesValidityPeriod(t *testing.T) {
 	}
 }
 
+func TestSendSMSWithOptionsPropagatesValidityDeadline(t *testing.T) {
+	transport := &fakeSMSTransport{}
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	svc.SetSMSTransport(transport)
+	deadline := time.Date(2026, 7, 5, 12, 34, 56, 0, time.FixedZone("CST", 8*3600))
+
+	out, err := svc.SendSMSWithOptions(context.Background(), "+18005551212", "hello", SendOptions{
+		ValidityDeadline: deadline,
+	})
+	if err != nil {
+		t.Fatalf("SendSMSWithOptions() error = %v", err)
+	}
+	if out.PartsTotal != 1 || len(transport.requests) != 1 {
+		t.Fatalf("out=%+v requests=%+v", out, transport.requests)
+	}
+	if !transport.requests[0].Part.ValidityDeadline.Equal(deadline) {
+		t.Fatalf("deadline=%s want %s part=%+v", transport.requests[0].Part.ValidityDeadline, deadline, transport.requests[0].Part)
+	}
+}
+
 func TestSendSMSWithOptionsPropagatesSubmitProtocolFields(t *testing.T) {
 	transport := &fakeSMSTransport{}
 	svc := NewService("dev-1", "310280233641503", nil, nil)
@@ -192,6 +212,14 @@ func TestSendSMSWithOptionsRejectsInvalidValidityPeriod(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "validity period") {
 		t.Fatalf("SendSMSWithOptions() err=%v, want validity period error", err)
+	}
+
+	_, err = svc.SendSMSWithOptions(context.Background(), "+18005551212", "hello", SendOptions{
+		ValidityPeriod:   time.Hour,
+		ValidityDeadline: time.Date(2026, 7, 5, 12, 34, 56, 0, time.UTC),
+	})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("SendSMSWithOptions() err=%v, want mutual exclusion", err)
 	}
 }
 

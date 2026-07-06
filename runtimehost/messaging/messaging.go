@@ -30,6 +30,7 @@ func WithSuppressSendTGSuccess(ctx context.Context) context.Context {
 type SendOptions struct {
 	Encoding            string
 	ValidityPeriod      time.Duration
+	ValidityDeadline    time.Time
 	ProtocolID          byte
 	DataCodingScheme    byte
 	UseProtocolID       bool
@@ -82,6 +83,7 @@ type SMSPart struct {
 	Encoding            string
 	UDH                 []byte
 	ValidityPeriod      time.Duration
+	ValidityDeadline    time.Time
 	ProtocolID          byte
 	DataCodingScheme    byte
 	UseProtocolID       bool
@@ -462,7 +464,7 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	if text == "" {
 		return nil, nil
 	}
-	if _, _, err := encodeSMSRelativeValidityPeriod(opts.ValidityPeriod); err != nil {
+	if _, _, err := encodeSMSSubmitValidityPeriod(opts.ValidityPeriod, opts.ValidityDeadline); err != nil {
 		return nil, err
 	}
 	enc, err := normalizeSMSSubmitEncoding(text, opts.Encoding, opts.DataCodingScheme, opts.UseDataCodingScheme || opts.DataCodingScheme != 0)
@@ -471,7 +473,7 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	}
 	single, concat := smsPartLimitsForUDH(enc, concatUDHLength(normalizeSMSConcatRefBits(opts.ConcatRef, opts.ConcatRefBits)))
 	if messageLen(text, enc) <= single {
-		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc, ValidityPeriod: opts.ValidityPeriod, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme}}, nil
+		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme}}, nil
 	}
 	refBits, err := validateSMSConcatOptions(opts.ConcatRef, opts.ConcatRefBits)
 	if err != nil {
@@ -497,7 +499,7 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ConcatRef: ref, ConcatRefBits: refBits})
+		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ConcatRef: ref, ConcatRefBits: refBits})
 		remaining = rest
 	}
 	for i := range out {
