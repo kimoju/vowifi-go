@@ -41,6 +41,10 @@ type DialogInfoSender interface {
 	SendDialogInfo(context.Context, DialogInfoRequest) (DialogInfoResult, error)
 }
 
+type DialogOptionsSender interface {
+	SendDialogOptions(context.Context, DialogOptionsRequest) (DialogOptionsResult, error)
+}
+
 type DialogUpdater interface {
 	SendDialogUpdate(context.Context, DialogUpdateRequest) (DialogUpdateResult, error)
 }
@@ -107,6 +111,14 @@ type DialogInfoResult struct {
 	Body                       []byte
 	Headers                    map[string]string
 }
+
+type DialogOptionsRequest struct {
+	DeviceID string
+	CallID   string
+	Headers  map[string]string
+}
+
+type DialogOptionsResult = DialogInfoResult
 
 type DialogUpdateRequest struct {
 	DeviceID    string

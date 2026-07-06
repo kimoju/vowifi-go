@@ -208,6 +208,60 @@ func TestIMSOutboundAgentSendsDialogDTMF(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentSendsDialogOptions(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"Content-Type": {"application/sdp"}, "Allow": {"INVITE, UPDATE"}, "X-IMS": {"options-ok"}}, Body: []byte(sampleSDP("203.0.113.20", 49180))},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-options",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogOptions(context.Background(), DialogOptionsRequest{
+		CallID:  "call-options",
+		Headers: map[string]string{"X-Test": "options"},
+	})
+	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "options-ok" || result.ContentType != "application/sdp" || !strings.Contains(string(result.Body), "m=audio 49180") {
+		t.Fatalf("SendDialogOptions() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "OPTIONS" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	options := transport.requests[1]
+	if options.URI != "sip:carrier@198.51.100.1:5060" || options.Headers["CSeq"] != "2 OPTIONS" ||
+		options.Headers["Accept"] != "application/sdp" || options.Headers["Supported"] == "" ||
+		options.Headers["X-Test"] != "options" || options.Headers["Contact"] != "" || len(options.Body) != 0 {
+		t.Fatalf("OPTIONS=%+v body=%q", options, options.Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-options"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after OPTIONS=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentSendsDialogHoldAndResume(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
