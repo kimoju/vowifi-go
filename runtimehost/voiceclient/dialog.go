@@ -9,6 +9,12 @@ import (
 
 var ErrInvalidDialogConfig = errors.New("invalid IMS dialog config")
 
+const (
+	imsMMTelService        = "urn:urn-7:3gpp-service.ims.icsi.mmtel"
+	imsMMTelContactFeature = `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
+	imsMMTelAcceptContact  = "*;" + imsMMTelContactFeature
+)
+
 type SIPRequestMessage struct {
 	Method  string
 	URI     string
@@ -50,6 +56,8 @@ func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage,
 		msg.Headers["Content-Type"] = "application/sdp"
 		msg.Headers["Accept"] = "application/sdp"
 	}
+	msg.Headers["P-Preferred-Service"] = imsMMTelService
+	msg.Headers["Accept-Contact"] = imsMMTelAcceptContact
 	msg.Headers["Supported"] = "100rel, timer, replaces, outbound"
 	applySessionIntervalHeaders(msg.Headers, cfg)
 	if cfg.MinSE > 0 {

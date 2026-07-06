@@ -61,10 +61,10 @@ protocol layers needed by VoHive:
   503 or other transient 5xx statuses
 - SWu IKE configuration payload DNS extraction, exposing negotiated internal
   DNS servers to the runtime and using them for default IMS SRV/A/AAAA lookups
-- IMS REGISTER session flow with 401/407 authentication retry, 423
-  `Min-Expires` retry handling, associated URI, Service-Route, Path,
-  Security-Server, and Contact expiry capture, plus a runtime `IMSRegistrar`
-  adapter for the wire transport
+- IMS REGISTER session flow with MMTel Contact capability advertisement,
+  401/407 authentication retry, 423 `Min-Expires` retry handling, associated
+  URI, Service-Route, Path, Security-Server, and Contact expiry capture, plus a
+  runtime `IMSRegistrar` adapter for the wire transport
 - IMS REGISTER refresh maintenance on the reusable SIP flow, including
   expiry-based renewal, 423 `Min-Expires` retry handling, retry scheduling,
   binding/auth/CSeq state updates, full re-registration after recoverable
@@ -86,10 +86,10 @@ protocol layers needed by VoHive:
   registration/route failure signals for MESSAGE, USSD INVITE/INFO, and USSD
   BYE failures
 - outbound voice dialog bridging helpers, SDP parsing/building, IMS INVITE/ACK/
-  BYE/CANCEL request construction, route-set application, UDP/TCP SIP request
-  transport, outbound IMS voice agent, ACK/BYE dialog handling, RTP/RTCP media
-  relay endpoint allocation, SDP media/RTCP rewriting, packet forwarding, and
-  dialog termination hooks
+  BYE/CANCEL request construction with MMTel service identification headers,
+  route-set application, UDP/TCP SIP request transport, outbound IMS voice
+  agent, ACK/BYE dialog handling, RTP/RTCP media relay endpoint allocation, SDP
+  media/RTCP rewriting, packet forwarding, and dialog termination hooks
 - SWu tunnel manager/session contracts with startup validation, tunnel readiness
   state integration, shutdown cleanup, and MOBIKE delegation
 - IKEv2 binary header/payload framing, Notify/KE/Nonce/EAP helpers, NAT

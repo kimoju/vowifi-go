@@ -280,6 +280,7 @@ func writeOrderedHeaders(out *bytes.Buffer, headers map[string]string) {
 	order := []string{
 		"Via", "Route", "Max-Forwards", "To", "From", "Call-ID", "CSeq", "Contact",
 		"Expires", "P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
+		"P-Preferred-Service", "Accept-Contact",
 		"P-Access-Network-Info", "Security-Client", "Security-Verify", "Authorization",
 		"Proxy-Authorization", "Session-Expires", "Min-SE", "Content-Type", "Accept",
 	}

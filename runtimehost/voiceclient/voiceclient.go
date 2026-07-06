@@ -371,7 +371,7 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 	headers := map[string]string{
 		"To":                   "<" + impu + ">",
 		"From":                 "<" + impu + ">;tag=vowifi-go",
-		"Contact":              "<" + strings.TrimSpace(contactURI) + ">;+sip.instance=\"<urn:uuid:vowifi-go>\"",
+		"Contact":              buildRegisterContactHeader(contactURI),
 		"Call-ID":              strings.TrimSpace(callID),
 		"CSeq":                 strings.TrimSpace(cseq) + " REGISTER",
 		"Max-Forwards":         "70",
@@ -383,6 +383,14 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 		"Security-Client":      BuildSecurityClientHeader(DefaultSecurityClientAgreement(nil)),
 	}
 	return headers
+}
+
+func buildRegisterContactHeader(contactURI string) string {
+	contact := "<" + strings.TrimSpace(contactURI) + ">;+sip.instance=\"<urn:uuid:vowifi-go>\""
+	if imsMMTelContactFeature != "" {
+		contact += ";" + imsMMTelContactFeature
+	}
+	return contact
 }
 
 func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {

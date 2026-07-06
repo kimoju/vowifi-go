@@ -60,6 +60,10 @@ func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {
 	if invite.URI != "sip:+18005551212@ims.example" || invite.Headers["Route"] != "<sip:pcscf.ims.example;lr>" {
 		t.Fatalf("INVITE=%+v", invite)
 	}
+	if invite.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.mmtel" ||
+		!strings.Contains(invite.Headers["Accept-Contact"], "g.3gpp.icsi-ref") {
+		t.Fatalf("INVITE service headers=%+v", invite.Headers)
+	}
 	if !strings.Contains(string(invite.Body), "m=audio 4002 RTP/AVP") {
 		t.Fatalf("INVITE body=%q", invite.Body)
 	}

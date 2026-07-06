@@ -150,6 +150,10 @@ func TestBuildRegisterHeaders(t *testing.T) {
 	if headers["To"] != "<sip:310280233641503@one.att.net>" || headers["CSeq"] != "1 REGISTER" {
 		t.Fatalf("headers=%+v", headers)
 	}
+	if !strings.Contains(headers["Contact"], `+sip.instance="<urn:uuid:vowifi-go>"`) ||
+		!strings.Contains(headers["Contact"], imsMMTelContactFeature) {
+		t.Fatalf("Contact=%q", headers["Contact"])
+	}
 	if !strings.Contains(headers["Security-Client"], "ipsec-3gpp") {
 		t.Fatalf("Security-Client=%q", headers["Security-Client"])
 	}
@@ -1192,6 +1196,9 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	}
 	if invite.Headers["Content-Type"] != "application/sdp" || invite.Headers["Session-Expires"] != "1800" || invite.Headers["Min-SE"] != "90" {
 		t.Fatalf("invite headers=%+v", invite.Headers)
+	}
+	if invite.Headers["P-Preferred-Service"] != imsMMTelService || invite.Headers["Accept-Contact"] != imsMMTelAcceptContact {
+		t.Fatalf("invite service headers=%+v", invite.Headers)
 	}
 	bye, err := BuildByeRequest(cfg)
 	if err != nil {
