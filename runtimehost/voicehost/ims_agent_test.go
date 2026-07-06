@@ -805,6 +805,117 @@ func TestIMSOutboundAgentSendsDialogSubscribe(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentFollowsSupplementaryDialogRedirectContacts(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers:    map[string][]string{"Contact": {"<sip:refer-redirect@198.51.100.20:5060>"}},
+		},
+		{
+			StatusCode: 202,
+			Reason:     "Accepted",
+			Headers:    map[string][]string{"Contact": {"<sip:refer-final@198.51.100.21:5060>"}, "X-IMS": {"refer-redirect-ok"}},
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers:    map[string][]string{"Contact": {"<sip:notify-redirect@198.51.100.30:5060>"}},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"Contact": {"<sip:notify-final@198.51.100.31:5060>"}, "X-IMS": {"notify-redirect-ok"}},
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers:    map[string][]string{"Contact": {"<sip:subscribe-redirect@198.51.100.40:5060>"}},
+		},
+		{
+			StatusCode: 202,
+			Reason:     "Accepted",
+			Headers:    map[string][]string{"Contact": {"<sip:subscribe-final@198.51.100.41:5060>"}, "X-IMS": {"subscribe-redirect-ok"}},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-supplementary-redirect",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	referResult, err := agent.SendDialogRefer(context.Background(), DialogReferRequest{
+		CallID:     "call-supplementary-redirect",
+		ReferTo:    "sip:+18005551313@ims.example",
+		ReferredBy: "sip:user@ims.example",
+	})
+	if err != nil || !referResult.Accepted || referResult.Headers["X-IMS"] != "refer-redirect-ok" {
+		t.Fatalf("SendDialogRefer() result=%+v err=%v", referResult, err)
+	}
+	notifyResult, err := agent.SendDialogNotify(context.Background(), DialogNotifyRequest{
+		CallID:            "call-supplementary-redirect",
+		Event:             "refer",
+		SubscriptionState: "terminated;reason=noresource",
+		ContentType:       "message/sipfrag",
+		Body:              []byte("SIP/2.0 200 OK\r\n"),
+	})
+	if err != nil || !notifyResult.Accepted || notifyResult.Headers["X-IMS"] != "notify-redirect-ok" {
+		t.Fatalf("SendDialogNotify() result=%+v err=%v", notifyResult, err)
+	}
+	subscribeResult, err := agent.SendDialogSubscribe(context.Background(), DialogSubscribeRequest{
+		CallID:      "call-supplementary-redirect",
+		Event:       "refer",
+		Expires:     "300",
+		ContentType: "application/resource-lists+xml",
+		Body:        []byte("<resource-lists/>"),
+	})
+	if err != nil || !subscribeResult.Accepted || subscribeResult.Headers["X-IMS"] != "subscribe-redirect-ok" {
+		t.Fatalf("SendDialogSubscribe() result=%+v err=%v", subscribeResult, err)
+	}
+	if len(transport.requests) != 7 {
+		t.Fatalf("dialog requests=%+v", transport.requests)
+	}
+	check := func(index int, method, uri, cseq string) {
+		t.Helper()
+		if transport.requests[index].Method != method || transport.requests[index].URI != uri || transport.requests[index].Headers["CSeq"] != cseq {
+			t.Fatalf("request[%d]=%+v", index, transport.requests[index])
+		}
+	}
+	check(1, "REFER", "sip:carrier@198.51.100.1:5060", "2 REFER")
+	check(2, "REFER", "sip:refer-redirect@198.51.100.20:5060", "3 REFER")
+	check(3, "NOTIFY", "sip:refer-final@198.51.100.21:5060", "4 NOTIFY")
+	check(4, "NOTIFY", "sip:notify-redirect@198.51.100.30:5060", "5 NOTIFY")
+	check(5, "SUBSCRIBE", "sip:notify-final@198.51.100.31:5060", "6 SUBSCRIBE")
+	check(6, "SUBSCRIBE", "sip:subscribe-redirect@198.51.100.40:5060", "7 SUBSCRIBE")
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-supplementary-redirect"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 8 || transport.requests[7].Method != "BYE" ||
+		transport.requests[7].URI != "sip:subscribe-final@198.51.100.41:5060" ||
+		transport.requests[7].Headers["CSeq"] != "8 BYE" {
+		t.Fatalf("BYE after redirects=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentSendsDialogHoldAndResume(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

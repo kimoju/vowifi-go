@@ -702,16 +702,31 @@ func (a *IMSInboundAgent) HandleInboundRefer(ctx context.Context, req InboundDia
 	cfg := state.clientCfg
 	referCSeq := inboundCSeq(req.CSeq)
 	cfg.CSeq = referCSeq
-	refer, err := voiceclient.BuildReferRequest(cfg, referTo, firstVoiceNonEmpty(req.ReferredBy, firstVoiceHeader(req.Headers, "Referred-By")))
-	if err != nil {
-		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client REFER failed"}, err
-	}
-	applyIncomingInfoHeaders(refer.Headers, "", req.Headers)
-	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, referCSeq)
-	a.storeInboundDialog(callID, state)
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, refer)
-	if err != nil {
-		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client REFER failed"}, err
+	var resp voiceclient.SIPResponse
+	var refer voiceclient.SIPRequestMessage
+	var err error
+	redirectRetries := 0
+	for {
+		refer, err = voiceclient.BuildReferRequest(cfg, referTo, firstVoiceNonEmpty(req.ReferredBy, firstVoiceHeader(req.Headers, "Referred-By")))
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client REFER failed"}, err
+		}
+		applyIncomingInfoHeaders(refer.Headers, "", req.Headers)
+		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
+		a.storeInboundDialog(callID, state)
+		resp, err = a.ClientTransport.RoundTripRequest(ctx, refer)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client REFER failed"}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextInboundClientCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
@@ -751,16 +766,31 @@ func (a *IMSInboundAgent) HandleInboundNotify(ctx context.Context, req InboundDi
 	cfg := state.clientCfg
 	notifyCSeq := inboundCSeq(req.CSeq)
 	cfg.CSeq = notifyCSeq
-	notify, err := voiceclient.BuildNotifyRequest(cfg, event, subscriptionState, req.ContentType, req.Body)
-	if err != nil {
-		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client NOTIFY failed"}, err
-	}
-	applyIncomingInfoHeaders(notify.Headers, "", req.Headers)
-	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, notifyCSeq)
-	a.storeInboundDialog(callID, state)
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, notify)
-	if err != nil {
-		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client NOTIFY failed"}, err
+	var resp voiceclient.SIPResponse
+	var notify voiceclient.SIPRequestMessage
+	var err error
+	redirectRetries := 0
+	for {
+		notify, err = voiceclient.BuildNotifyRequest(cfg, event, subscriptionState, req.ContentType, req.Body)
+		if err != nil {
+			return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client NOTIFY failed"}, err
+		}
+		applyIncomingInfoHeaders(notify.Headers, "", req.Headers)
+		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
+		a.storeInboundDialog(callID, state)
+		resp, err = a.ClientTransport.RoundTripRequest(ctx, notify)
+		if err != nil {
+			return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client NOTIFY failed"}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextInboundClientCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
@@ -801,20 +831,35 @@ func (a *IMSInboundAgent) HandleInboundSubscribe(ctx context.Context, req Inboun
 	cfg := state.clientCfg
 	subscribeCSeq := inboundCSeq(req.CSeq)
 	cfg.CSeq = subscribeCSeq
-	subscribe, err := voiceclient.BuildSubscribeRequest(cfg, event, expires, req.ContentType, req.Body)
-	if err != nil {
-		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client SUBSCRIBE failed"}, err
-	}
-	applyIncomingInfoHeaders(subscribe.Headers, "", req.Headers)
-	subscribe.Headers["Event"] = event
-	if strings.TrimSpace(expires) != "" {
-		subscribe.Headers["Expires"] = strings.TrimSpace(expires)
-	}
-	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, subscribeCSeq)
-	a.storeInboundDialog(callID, state)
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, subscribe)
-	if err != nil {
-		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client SUBSCRIBE failed"}, err
+	var resp voiceclient.SIPResponse
+	var subscribe voiceclient.SIPRequestMessage
+	var err error
+	redirectRetries := 0
+	for {
+		subscribe, err = voiceclient.BuildSubscribeRequest(cfg, event, expires, req.ContentType, req.Body)
+		if err != nil {
+			return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client SUBSCRIBE failed"}, err
+		}
+		applyIncomingInfoHeaders(subscribe.Headers, "", req.Headers)
+		subscribe.Headers["Event"] = event
+		if strings.TrimSpace(expires) != "" {
+			subscribe.Headers["Expires"] = strings.TrimSpace(expires)
+		}
+		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
+		a.storeInboundDialog(callID, state)
+		resp, err = a.ClientTransport.RoundTripRequest(ctx, subscribe)
+		if err != nil {
+			return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client SUBSCRIBE failed"}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextInboundClientCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
@@ -861,6 +906,7 @@ func (a *IMSInboundAgent) HandleInboundMessage(ctx context.Context, req IMSMessa
 		}
 		applyIncomingInfoHeaders(msg.Headers, "", req.Headers)
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
 		a.storeInboundDialog(callID, state)
 		resp, err = a.ClientTransport.RoundTripRequest(ctx, msg)
 		if err != nil {
@@ -920,6 +966,7 @@ func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequ
 		}
 		applyIncomingInfoHeaders(info.Headers, req.InfoPackage, req.Headers)
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
 		a.storeInboundDialog(callID, state)
 		resp, err = a.ClientTransport.RoundTripRequest(ctx, info)
 		if err != nil {

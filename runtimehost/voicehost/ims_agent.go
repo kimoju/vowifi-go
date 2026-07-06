@@ -660,29 +660,33 @@ func (a *IMSOutboundAgent) SendDialogRefer(ctx context.Context, req DialogReferR
 		return DialogReferResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
 	cfg := state.cfg
-	refer, err := voiceclient.BuildReferRequest(cfg, referTo, req.ReferredBy)
-	if err != nil {
-		a.mu.Unlock()
-		return DialogReferResult{Accepted: false, StatusCode: 500, Reason: "build IMS REFER failed"}, err
-	}
-	applyDialogUpdateHeaders(refer.Headers, req.Headers)
-	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
-	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.roundTripRequest(ctx, refer)
-	if err != nil {
-		return DialogReferResult{Accepted: false, Reason: "IMS REFER failed", RegistrationRecoveryNeeded: true}, err
+
+	var resp voiceclient.SIPResponse
+	redirectRetries := 0
+	for {
+		refer, err := voiceclient.BuildReferRequest(cfg, referTo, req.ReferredBy)
+		if err != nil {
+			return DialogReferResult{Accepted: false, StatusCode: 500, Reason: "build IMS REFER failed"}, err
+		}
+		applyDialogUpdateHeaders(refer.Headers, req.Headers)
+		a.storeOutboundDialogAttempt(callID, cfg)
+		resp, err = a.roundTripRequest(ctx, refer)
+		if err != nil {
+			return DialogReferResult{Accepted: false, Reason: "IMS REFER failed", RegistrationRecoveryNeeded: true}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
 	if accepted {
-		a.mu.Lock()
-		if latest, ok := a.dialogs[callID]; ok {
-			if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
-				latest.cfg.RemoteTargetURI = contact
-			}
-			a.dialogs[callID] = latest
-		}
-		a.mu.Unlock()
+		a.updateOutboundDialogContact(callID, resp.Headers)
 	}
 	return DialogReferResult{
 		Accepted:                   accepted,
@@ -722,29 +726,33 @@ func (a *IMSOutboundAgent) SendDialogNotify(ctx context.Context, req DialogNotif
 		return DialogNotifyResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
 	cfg := state.cfg
-	notify, err := voiceclient.BuildNotifyRequest(cfg, event, subscriptionState, req.ContentType, req.Body)
-	if err != nil {
-		a.mu.Unlock()
-		return DialogNotifyResult{Accepted: false, StatusCode: 500, Reason: "build IMS NOTIFY failed"}, err
-	}
-	applyDialogUpdateHeaders(notify.Headers, req.Headers)
-	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
-	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.roundTripRequest(ctx, notify)
-	if err != nil {
-		return DialogNotifyResult{Accepted: false, Reason: "IMS NOTIFY failed", RegistrationRecoveryNeeded: true}, err
+
+	var resp voiceclient.SIPResponse
+	redirectRetries := 0
+	for {
+		notify, err := voiceclient.BuildNotifyRequest(cfg, event, subscriptionState, req.ContentType, req.Body)
+		if err != nil {
+			return DialogNotifyResult{Accepted: false, StatusCode: 500, Reason: "build IMS NOTIFY failed"}, err
+		}
+		applyDialogUpdateHeaders(notify.Headers, req.Headers)
+		a.storeOutboundDialogAttempt(callID, cfg)
+		resp, err = a.roundTripRequest(ctx, notify)
+		if err != nil {
+			return DialogNotifyResult{Accepted: false, Reason: "IMS NOTIFY failed", RegistrationRecoveryNeeded: true}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
 	if accepted {
-		a.mu.Lock()
-		if latest, ok := a.dialogs[callID]; ok {
-			if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
-				latest.cfg.RemoteTargetURI = contact
-			}
-			a.dialogs[callID] = latest
-		}
-		a.mu.Unlock()
+		a.updateOutboundDialogContact(callID, resp.Headers)
 	}
 	return DialogNotifyResult{
 		Accepted:                   accepted,
@@ -780,33 +788,37 @@ func (a *IMSOutboundAgent) SendDialogSubscribe(ctx context.Context, req DialogSu
 		return DialogSubscribeResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
 	cfg := state.cfg
-	subscribe, err := voiceclient.BuildSubscribeRequest(cfg, event, req.Expires, req.ContentType, req.Body)
-	if err != nil {
-		a.mu.Unlock()
-		return DialogSubscribeResult{Accepted: false, StatusCode: 500, Reason: "build IMS SUBSCRIBE failed"}, err
-	}
-	applyDialogUpdateHeaders(subscribe.Headers, req.Headers)
-	subscribe.Headers["Event"] = event
-	if expires := strings.TrimSpace(req.Expires); expires != "" {
-		subscribe.Headers["Expires"] = expires
-	}
-	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
-	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.roundTripRequest(ctx, subscribe)
-	if err != nil {
-		return DialogSubscribeResult{Accepted: false, Reason: "IMS SUBSCRIBE failed", RegistrationRecoveryNeeded: true}, err
+
+	var resp voiceclient.SIPResponse
+	redirectRetries := 0
+	for {
+		subscribe, err := voiceclient.BuildSubscribeRequest(cfg, event, req.Expires, req.ContentType, req.Body)
+		if err != nil {
+			return DialogSubscribeResult{Accepted: false, StatusCode: 500, Reason: "build IMS SUBSCRIBE failed"}, err
+		}
+		applyDialogUpdateHeaders(subscribe.Headers, req.Headers)
+		subscribe.Headers["Event"] = event
+		if expires := strings.TrimSpace(req.Expires); expires != "" {
+			subscribe.Headers["Expires"] = expires
+		}
+		a.storeOutboundDialogAttempt(callID, cfg)
+		resp, err = a.roundTripRequest(ctx, subscribe)
+		if err != nil {
+			return DialogSubscribeResult{Accepted: false, Reason: "IMS SUBSCRIBE failed", RegistrationRecoveryNeeded: true}, err
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
 	if accepted {
-		a.mu.Lock()
-		if latest, ok := a.dialogs[callID]; ok {
-			if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
-				latest.cfg.RemoteTargetURI = contact
-			}
-			a.dialogs[callID] = latest
-		}
-		a.mu.Unlock()
+		a.updateOutboundDialogContact(callID, resp.Headers)
 	}
 	return DialogSubscribeResult{
 		Accepted:                   accepted,
