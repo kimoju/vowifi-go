@@ -56,6 +56,13 @@ type EmergencyPIDFLOConfig struct {
 	Address   EmergencyAddress
 }
 
+type EmergencyPIDFLOUsageRules struct {
+	RetransmissionAllowed *bool
+	RetentionExpiry       time.Time
+	RulesetReference      string
+	NoteWell              string
+}
+
 type EmergencySIPHeaderConfig struct {
 	ServiceURN         string
 	AccessNetworkInfo  EmergencyAccessNetworkInfo
@@ -206,6 +213,10 @@ func ParseGeolocationRoutingHeader(header string) (allowed bool, present bool, e
 }
 
 func BuildEmergencyPIDFLO(cfg EmergencyPIDFLOConfig) ([]byte, error) {
+	return BuildEmergencyPIDFLOWithUsageRules(cfg, EmergencyPIDFLOUsageRules{})
+}
+
+func BuildEmergencyPIDFLOWithUsageRules(cfg EmergencyPIDFLOConfig, rules EmergencyPIDFLOUsageRules) ([]byte, error) {
 	if !emergencyAddressHasPIDFLOLocation(cfg.Address) {
 		return nil, errors.New("e911 pidf-lo requires emergency location")
 	}
@@ -267,10 +278,7 @@ func BuildEmergencyPIDFLO(cfg EmergencyPIDFLOConfig) ([]byte, error) {
 	if err := encodePIDFLOEnd(enc, "gp:location-info"); err != nil {
 		return nil, err
 	}
-	if err := encodePIDFLOStart(enc, "gp:usage-rules"); err != nil {
-		return nil, err
-	}
-	if err := encodePIDFLOEnd(enc, "gp:usage-rules"); err != nil {
+	if err := encodePIDFLOUsageRules(enc, rules); err != nil {
 		return nil, err
 	}
 	if err := encodePIDFLOTextElement(enc, "gp:method", method); err != nil {
@@ -693,6 +701,37 @@ func encodePIDFLOTextElement(enc *xml.Encoder, local, value string) error {
 		return err
 	}
 	return encodePIDFLOEnd(enc, local)
+}
+
+func encodePIDFLOUsageRules(enc *xml.Encoder, rules EmergencyPIDFLOUsageRules) error {
+	if err := encodePIDFLOStart(enc, "gp:usage-rules"); err != nil {
+		return err
+	}
+	if rules.RetransmissionAllowed != nil {
+		value := "false"
+		if *rules.RetransmissionAllowed {
+			value = "true"
+		}
+		if err := encodePIDFLOTextElement(enc, "gp:retransmission-allowed", value); err != nil {
+			return err
+		}
+	}
+	if !rules.RetentionExpiry.IsZero() {
+		if err := encodePIDFLOTextElement(enc, "gp:retention-expiry", rules.RetentionExpiry.UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+	}
+	if ref := strings.TrimSpace(rules.RulesetReference); ref != "" {
+		if err := encodePIDFLOTextElement(enc, "gp:ruleset-reference", ref); err != nil {
+			return err
+		}
+	}
+	if note := strings.TrimSpace(rules.NoteWell); note != "" {
+		if err := encodePIDFLOTextElement(enc, "gp:note-well", note); err != nil {
+			return err
+		}
+	}
+	return encodePIDFLOEnd(enc, "gp:usage-rules")
 }
 
 func emergencyAddressHasPIDFLOLocation(address EmergencyAddress) bool {

@@ -15,6 +15,7 @@ type InformationalHandling struct {
 	NoAdditionalAddresses bool
 	AdditionalAddresses   []net.IP
 	Cookie2               []byte
+	InvalidSelectors      []InvalidSelectorReport
 	NotifyError           error
 	Notifies              []Notify
 	Deletes               []Delete
@@ -75,6 +76,12 @@ func handleInformationalNotify(handling *InformationalHandling, notify Notify) e
 			return fmt.Errorf("%w: %w: COOKIE2 length %d", ErrInvalidInformational, ErrInvalidNotify, len(notify.NotificationData))
 		}
 		handling.Cookie2 = append([]byte(nil), notify.NotificationData...)
+	case NotifyInvalidSelectors:
+		report, _, err := notify.InvalidSelectorReport()
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidInformational, err)
+		}
+		handling.InvalidSelectors = append(handling.InvalidSelectors, report)
 	}
 	return nil
 }

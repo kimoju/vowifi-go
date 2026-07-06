@@ -75,6 +75,50 @@ func TestHandleInformationalContentPreservesNotifyError(t *testing.T) {
 	}
 }
 
+func TestHandleInformationalContentReportsInvalidSelectors(t *testing.T) {
+	payload, err := NotifyPayload(Notify{
+		ProtocolID:       ProtocolESP,
+		NotifyType:       NotifyInvalidSelectors,
+		SPI:              []byte{0xca, 0xfe, 0xba, 0xbe},
+		NotificationData: []byte{0x45, 0x00, 0x00, 0x54, 0xaa, 0xbb, 0xcc, 0xdd},
+	})
+	if err != nil {
+		t.Fatalf("NotifyPayload() error = %v", err)
+	}
+	handling, err := HandleInformationalPayloads([]Payload{payload})
+	if err != nil {
+		t.Fatalf("HandleInformationalPayloads() error = %v", err)
+	}
+	if !errors.Is(handling.NotifyError, ErrNotifyInvalidSelectors) {
+		t.Fatalf("NotifyError=%v, want ErrNotifyInvalidSelectors", handling.NotifyError)
+	}
+	if len(handling.InvalidSelectors) != 1 {
+		t.Fatalf("InvalidSelectors=%+v, want one report", handling.InvalidSelectors)
+	}
+	report := handling.InvalidSelectors[0]
+	if report.ProtocolID != ProtocolESP ||
+		!bytes.Equal(report.SPI, []byte{0xca, 0xfe, 0xba, 0xbe}) ||
+		!bytes.Equal(report.PacketPrefix, []byte{0x45, 0x00, 0x00, 0x54, 0xaa, 0xbb, 0xcc, 0xdd}) {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
+func TestHandleInformationalContentRejectsMalformedInvalidSelectors(t *testing.T) {
+	payload, err := NotifyPayload(Notify{
+		ProtocolID:       ProtocolIKE,
+		NotifyType:       NotifyInvalidSelectors,
+		SPI:              []byte{0x01, 0x02, 0x03, 0x04},
+		NotificationData: []byte{0x45},
+	})
+	if err != nil {
+		t.Fatalf("NotifyPayload() error = %v", err)
+	}
+	_, err = HandleInformationalPayloads([]Payload{payload})
+	if !errors.Is(err, ErrInvalidInformational) || !errors.Is(err, ErrInvalidNotify) {
+		t.Fatalf("HandleInformationalPayloads(malformed invalid selectors) err=%v, want ErrInvalidInformational and ErrInvalidNotify", err)
+	}
+}
+
 func TestHandleInformationalContentRejectsMalformedMOBIKENotify(t *testing.T) {
 	payload := NotifyWithZeroSPI(NotifyAdditionalIPv4Address, []byte{1, 2, 3})
 	_, err := HandleInformationalPayloads([]Payload{payload})

@@ -185,6 +185,50 @@ func TestBuildAndParseEmergencyPIDFLO(t *testing.T) {
 	}
 }
 
+func TestBuildEmergencyPIDFLOUsageRules(t *testing.T) {
+	allowRetransmission := true
+	body, err := BuildEmergencyPIDFLOWithUsageRules(EmergencyPIDFLOConfig{
+		Entity: "pres:device@example.test",
+		Address: EmergencyAddress{
+			Latitude:  "47.6205",
+			Longitude: "-122.3493",
+		},
+	}, EmergencyPIDFLOUsageRules{
+		RetransmissionAllowed: &allowRetransmission,
+		RetentionExpiry:       time.Date(2026, 7, 7, 17, 30, 0, 123456789, time.FixedZone("PDT", -7*60*60)),
+		RulesetReference:      "https://example.test/location-policy/e911",
+		NoteWell:              "Emergency location for PSAP handling only",
+	})
+	if err != nil {
+		t.Fatalf("BuildEmergencyPIDFLO() error = %v", err)
+	}
+	xmlBody := string(body)
+	for _, want := range []string{
+		`<gp:usage-rules>`,
+		`<gp:retransmission-allowed>true</gp:retransmission-allowed>`,
+		`<gp:retention-expiry>2026-07-08T00:30:00.123456789Z</gp:retention-expiry>`,
+		`<gp:ruleset-reference>https://example.test/location-policy/e911</gp:ruleset-reference>`,
+		`<gp:note-well>Emergency location for PSAP handling only</gp:note-well>`,
+	} {
+		if !strings.Contains(xmlBody, want) {
+			t.Fatalf("PIDF-LO body missing usage rule %q:\n%s", want, xmlBody)
+		}
+	}
+
+	allowRetransmission = false
+	body, err = BuildEmergencyPIDFLOWithUsageRules(EmergencyPIDFLOConfig{
+		Address: EmergencyAddress{Country: "US", State: "WA", City: "Seattle"},
+	}, EmergencyPIDFLOUsageRules{
+		RetransmissionAllowed: &allowRetransmission,
+	})
+	if err != nil {
+		t.Fatalf("BuildEmergencyPIDFLO(false retransmission) error = %v", err)
+	}
+	if !strings.Contains(string(body), `<gp:retransmission-allowed>false</gp:retransmission-allowed>`) {
+		t.Fatalf("PIDF-LO body missing explicit false retransmission rule:\n%s", body)
+	}
+}
+
 func TestBuildUsableEmergencySIPRequestInfoUsesEntitlementSnapshot(t *testing.T) {
 	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
 	cache := NewEntitlementCache(EntitlementCachePolicy{RefreshBefore: time.Minute})

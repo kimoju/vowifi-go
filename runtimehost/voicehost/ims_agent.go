@@ -950,6 +950,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 	retriedSessionInterval := false
 	forceSessionHeaders := false
 	redirectRetries := 0
+	glareRetries := 0
 	for {
 		update, err = buildUpdate(cfg, forceSessionHeaders)
 		if err != nil {
@@ -965,6 +966,25 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 				cfg = retryCfg
 				retriedSessionInterval = true
 				forceSessionHeaders = true
+				continue
+			}
+		}
+		if glareRetries < maxIMSDialogGlareRetries {
+			if retryCfg, delay, ok := retryDialogConfigForGlare(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
+				if err := waitForIMSDialogRetry(ctx, delay); err != nil {
+					return DialogUpdateResult{
+						Accepted:                   false,
+						StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
+						Reason:                     firstVoiceNonEmpty(resp.Reason, "IMS UPDATE retry canceled"),
+						RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+						RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+						ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
+						Body:                       append([]byte(nil), resp.Body...),
+						Headers:                    firstValueSIPHeaders(resp.Headers),
+					}, err
+				}
+				cfg = retryCfg
+				glareRetries++
 				continue
 			}
 		}
@@ -1106,6 +1126,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 	allowDigestChallengeRetry := true
 	retriedSessionInterval := false
 	redirectRetries := 0
+	glareRetries := 0
 	for {
 		if isInviteDigestChallenge(resp) && invite.AuthSession != nil && allowDigestChallengeRetry && digestChallengeRetries < 2 {
 			retryCfg, retryInvite, retryResult, ok, err := a.buildInviteDigestChallengeRetry(ctx, cfg, invite, resp, nextCSeq, body)
@@ -1176,6 +1197,51 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 				return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE retry failed", RegistrationRecoveryNeeded: true}, err
 			}
 			continue
+		}
+		if glareRetries < maxIMSDialogGlareRetries {
+			retryCfg, delay, ok := retryDialogConfigForGlare(cfg, resp, nextCSeq)
+			if ok {
+				if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
+					return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "IMS re-INVITE glare ACK failed"}, err
+				}
+				if err := waitForIMSDialogRetry(ctx, delay); err != nil {
+					return DialogReinviteResult{
+						Accepted:                   false,
+						StatusCode:                 outboundStatusCode(resp.StatusCode, 488),
+						Reason:                     firstVoiceNonEmpty(resp.Reason, "IMS re-INVITE retry canceled"),
+						RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+						RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+						ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
+						Body:                       append([]byte(nil), resp.Body...),
+						Headers:                    firstValueSIPHeaders(resp.Headers),
+					}, err
+				}
+				retryInvite, err := voiceclient.BuildInviteRequest(retryCfg, body)
+				if err != nil {
+					return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "build IMS re-INVITE glare retry failed"}, err
+				}
+				if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
+					retryInvite.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
+				}
+				applyDialogUpdateHeaders(retryInvite.Headers, req.Headers)
+				cfg = retryCfg
+				invite = retryInvite
+				activeCfg = retryCfg
+				activeInvite = retryInvite
+				nextCSeq = outboundNextCSeq(retryCfg.CSeq)
+				glareRetries++
+				a.mu.Lock()
+				if latest, ok := a.dialogs[callID]; ok {
+					latest.cfg.CSeq = nextCSeq
+					a.dialogs[callID] = latest
+				}
+				a.mu.Unlock()
+				resp, err = sendReinvite(retryCfg, retryInvite, "IMS re-INVITE glare retry")
+				if err != nil {
+					return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE glare retry failed", RegistrationRecoveryNeeded: true}, err
+				}
+				continue
+			}
 		}
 		if redirectRetries < maxIMSInviteRedirects {
 			retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextCSeq)
@@ -1353,6 +1419,8 @@ func (a *IMSOutboundAgent) buildInviteDigestChallengeRetry(ctx context.Context, 
 }
 
 const maxIMSInviteRedirects = 4
+const maxIMSDialogGlareRetries = 1
+const defaultIMSDialogGlareRetryDelay = 500 * time.Millisecond
 
 func retryDialogConfigForRedirect(cfg voiceclient.DialogRequestConfig, resp voiceclient.SIPResponse, cseq int) (voiceclient.DialogRequestConfig, bool) {
 	target := firstIMSRedirectContactURI(resp)
@@ -1363,6 +1431,68 @@ func retryDialogConfigForRedirect(cfg voiceclient.DialogRequestConfig, resp voic
 	retryCfg.RemoteTargetURI = target
 	retryCfg.CSeq = cseq
 	return retryCfg, true
+}
+
+func retryDialogConfigForGlare(cfg voiceclient.DialogRequestConfig, resp voiceclient.SIPResponse, cseq int) (voiceclient.DialogRequestConfig, time.Duration, bool) {
+	if !isDialogGlareRetryResponse(resp) {
+		return voiceclient.DialogRequestConfig{}, 0, false
+	}
+	retryCfg := cfg
+	retryCfg.CSeq = cseq
+	return retryCfg, imsDialogGlareRetryDelay(resp), true
+}
+
+func isDialogGlareRetryResponse(resp voiceclient.SIPResponse) bool {
+	switch resp.StatusCode {
+	case 491:
+		return true
+	case 500:
+		return hasVoiceHeader(resp.Headers, "Retry-After")
+	default:
+		return false
+	}
+}
+
+func imsDialogGlareRetryDelay(resp voiceclient.SIPResponse) time.Duration {
+	delay := voiceclient.SIPResponseRetryAfter(resp)
+	if delay > 0 {
+		return delay
+	}
+	if resp.StatusCode == 491 && !hasVoiceHeader(resp.Headers, "Retry-After") {
+		return defaultIMSDialogGlareRetryDelay
+	}
+	return 0
+}
+
+func waitForIMSDialogRetry(ctx context.Context, delay time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func hasVoiceHeader(headers map[string][]string, name string) bool {
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, value := range values {
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func firstIMSRedirectContactURI(resp voiceclient.SIPResponse) string {

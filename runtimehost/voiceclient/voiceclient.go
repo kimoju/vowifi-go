@@ -300,6 +300,9 @@ func ParseDigestAuthorization(header string) (DigestAuthorization, error) {
 	if auth.QOP != "" && (auth.NC <= 0 || auth.CNonce == "") {
 		return DigestAuthorization{}, ErrInvalidAuthorization
 	}
+	if auth.QOP == "" && digestAlgorithmNeedsCNonce(auth.Algorithm) && auth.CNonce == "" {
+		return DigestAuthorization{}, ErrInvalidAuthorization
+	}
 	return auth, nil
 }
 
@@ -336,6 +339,13 @@ func VerifyDigestAuthorization(header string, ch DigestChallenge, in DigestAuthI
 			return auth, false, nil
 		}
 		if in.NC > 0 && in.NC != auth.NC {
+			return auth, false, nil
+		}
+	} else if digestAlgorithmNeedsCNonce(algorithm) {
+		if auth.CNonce == "" {
+			return auth, false, nil
+		}
+		if expected := strings.TrimSpace(in.CNonce); expected != "" && expected != auth.CNonce {
 			return auth, false, nil
 		}
 	}
@@ -381,7 +391,7 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 	if algorithm == "" {
 		algorithm = "MD5"
 	}
-	if !strings.EqualFold(algorithm, "MD5") && !strings.EqualFold(algorithm, "AKAv1-MD5") && !strings.EqualFold(algorithm, "AKAv2-MD5") {
+	if !digestAlgorithmBuildSupported(algorithm) {
 		return "", fmt.Errorf("unsupported digest algorithm %q", algorithm)
 	}
 
@@ -389,8 +399,12 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 	if len(in.AUTS) > 0 {
 		password = ""
 	}
-	ha1 := md5Hex(username + ":" + ch.Realm + ":" + password)
 	qop := firstQOP(ch.QOP)
+	cnonce := strings.TrimSpace(in.CNonce)
+	ha1, err := digestHA1(algorithm, username, ch.Realm, password, ch.Nonce, cnonce)
+	if err != nil {
+		return "", err
+	}
 	ha2 := ""
 	switch qop {
 	case "":
@@ -408,7 +422,6 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 		nc = 1
 	}
 	ncText := fmt.Sprintf("%08x", nc)
-	cnonce := strings.TrimSpace(in.CNonce)
 	if qop != "" {
 		if cnonce == "" {
 			return "", errors.New("cnonce required when qop is present")
@@ -431,6 +444,8 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 	}
 	if qop != "" {
 		parts = append(parts, `qop=`+qop, `nc=`+ncText, `cnonce="`+quote(cnonce)+`"`)
+	} else if digestAlgorithmNeedsCNonce(algorithm) {
+		parts = append(parts, `cnonce="`+quote(cnonce)+`"`)
 	}
 	if len(in.AUTS) > 0 {
 		parts = append(parts, `auts="`+base64.StdEncoding.EncodeToString(in.AUTS)+`"`)
@@ -1186,7 +1201,11 @@ func digestInfoHeaderNames(authHeaderName string) []string {
 func digestRspauth(state DigestAuthState, qop string, body []byte) (string, error) {
 	input := state.input
 	qop = firstQOP(qop)
-	ha1 := md5Hex(input.Username + ":" + state.challenge.Realm + ":" + input.Password)
+	cnonce := strings.TrimSpace(input.CNonce)
+	ha1, err := digestHA1(state.challenge.Algorithm, input.Username, state.challenge.Realm, input.Password, state.challenge.Nonce, cnonce)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalidAuthenticationInfo, err)
+	}
 	ha2 := ""
 	switch qop {
 	case "":
@@ -1205,7 +1224,6 @@ func digestRspauth(state DigestAuthState, qop string, body []byte) (string, erro
 	if qop == "" {
 		return md5Hex(ha1 + ":" + state.challenge.Nonce + ":" + ha2), nil
 	}
-	cnonce := strings.TrimSpace(input.CNonce)
 	if cnonce == "" {
 		return "", fmt.Errorf("%w: cnonce required", ErrInvalidAuthenticationInfo)
 	}
@@ -1575,12 +1593,46 @@ func isAKADigestAlgorithm(algorithm string) bool {
 	return alg == "AKAV1-MD5" || alg == "AKAV2-MD5"
 }
 
+func digestAlgorithmBuildSupported(algorithm string) bool {
+	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
+	case "MD5", "MD5-SESS", "AKAV1-MD5", "AKAV2-MD5":
+		return true
+	default:
+		return false
+	}
+}
+
+func digestAlgorithmNeedsCNonce(algorithm string) bool {
+	return strings.EqualFold(strings.TrimSpace(algorithm), "MD5-sess")
+}
+
+func digestHA1(algorithm, username, realm, password, nonce, cnonce string) (string, error) {
+	algorithm = strings.TrimSpace(algorithm)
+	if algorithm == "" {
+		algorithm = "MD5"
+	}
+	base := md5Hex(username + ":" + realm + ":" + password)
+	if !digestAlgorithmNeedsCNonce(algorithm) {
+		if digestAlgorithmBuildSupported(algorithm) {
+			return base, nil
+		}
+		return "", fmt.Errorf("unsupported digest algorithm %q", algorithm)
+	}
+	cnonce = strings.TrimSpace(cnonce)
+	if cnonce == "" {
+		return "", errors.New("cnonce required for MD5-sess")
+	}
+	return md5Hex(base + ":" + nonce + ":" + cnonce), nil
+}
+
 func digestAlgorithmScore(algorithm string) int {
 	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
 	case "AKAV2-MD5":
 		return 30
 	case "AKAV1-MD5":
 		return 20
+	case "MD5-SESS":
+		return 11
 	case "MD5":
 		return 10
 	default:

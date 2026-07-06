@@ -130,6 +130,55 @@ func TestInvalidKEPayloadAlternativeGroup(t *testing.T) {
 	}
 }
 
+func TestInvalidSelectorReport(t *testing.T) {
+	notify := Notify{
+		ProtocolID:       ProtocolESP,
+		NotifyType:       NotifyInvalidSelectors,
+		SPI:              []byte{0xde, 0xad, 0xbe, 0xef},
+		NotificationData: []byte{0x45, 0x00, 0x00, 0x54},
+	}
+	report, ok, err := notify.InvalidSelectorReport()
+	if err != nil || !ok {
+		t.Fatalf("InvalidSelectorReport() ok=%t err=%v", ok, err)
+	}
+	if report.ProtocolID != ProtocolESP ||
+		hex.EncodeToString(report.SPI) != "deadbeef" ||
+		hex.EncodeToString(report.PacketPrefix) != "45000054" {
+		t.Fatalf("report=%+v", report)
+	}
+	report.SPI[0] = 0
+	report.PacketPrefix[0] = 0
+	if hex.EncodeToString(notify.SPI) != "deadbeef" ||
+		hex.EncodeToString(notify.NotificationData) != "45000054" {
+		t.Fatalf("InvalidSelectorReport() did not clone notify data: notify=%+v", notify)
+	}
+
+	notifyErr := NotifyErrorFor(notify)
+	report, ok, err = InvalidSelectorReportFromError(notifyErr)
+	if err != nil || !ok || report.ProtocolID != ProtocolESP || hex.EncodeToString(report.SPI) != "deadbeef" {
+		t.Fatalf("InvalidSelectorReportFromError() report=%+v ok=%t err=%v", report, ok, err)
+	}
+	report, ok, err = (Notify{NotifyType: NotifyMOBIKESupported}).InvalidSelectorReport()
+	if err != nil || ok || report.ProtocolID != 0 {
+		t.Fatalf("non-INVALID_SELECTORS report=%+v ok=%t err=%v", report, ok, err)
+	}
+	report, ok, err = InvalidSelectorReportFromError(errors.New("other"))
+	if err != nil || ok || report.ProtocolID != 0 {
+		t.Fatalf("non-notify error report=%+v ok=%t err=%v", report, ok, err)
+	}
+
+	for _, tc := range []Notify{
+		{ProtocolID: ProtocolIKE, NotifyType: NotifyInvalidSelectors, SPI: []byte{1, 2, 3, 4}, NotificationData: []byte{0x45}},
+		{ProtocolID: ProtocolESP, NotifyType: NotifyInvalidSelectors, SPI: []byte{1, 2, 3}, NotificationData: []byte{0x45}},
+		{ProtocolID: ProtocolESP, NotifyType: NotifyInvalidSelectors, SPI: []byte{1, 2, 3, 4}},
+	} {
+		report, ok, err = tc.InvalidSelectorReport()
+		if !ok || !errors.Is(err, ErrInvalidNotify) || report.ProtocolID != 0 {
+			t.Fatalf("malformed notify=%+v report=%+v ok=%t err=%v, want ErrInvalidNotify", tc, report, ok, err)
+		}
+	}
+}
+
 func TestDeletePayloadMarshalParseESP(t *testing.T) {
 	payload, err := ESPDeletePayload(mustHex("01020304"), mustHex("aabbccdd"))
 	if err != nil {

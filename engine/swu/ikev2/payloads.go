@@ -83,6 +83,12 @@ type Notify struct {
 	NotificationData []byte
 }
 
+type InvalidSelectorReport struct {
+	ProtocolID   uint8
+	SPI          []byte
+	PacketPrefix []byte
+}
+
 type NotifyError struct {
 	Notify Notify
 	Err    error
@@ -138,6 +144,44 @@ func InvalidKEPayloadAlternativeGroupFromError(err error) (uint16, bool, error) 
 		return 0, false, nil
 	}
 	return notifyErr.InvalidKEPayloadAlternativeGroup()
+}
+
+func (n Notify) InvalidSelectorReport() (InvalidSelectorReport, bool, error) {
+	if n.NotifyType != NotifyInvalidSelectors {
+		return InvalidSelectorReport{}, false, nil
+	}
+	if n.ProtocolID != ProtocolAH && n.ProtocolID != ProtocolESP {
+		return InvalidSelectorReport{}, true, fmt.Errorf("%w: INVALID_SELECTORS protocol %d", ErrInvalidNotify, n.ProtocolID)
+	}
+	if len(n.SPI) != 4 {
+		return InvalidSelectorReport{}, true, fmt.Errorf("%w: INVALID_SELECTORS spi length %d", ErrInvalidNotify, len(n.SPI))
+	}
+	if len(n.NotificationData) == 0 {
+		return InvalidSelectorReport{}, true, fmt.Errorf("%w: INVALID_SELECTORS missing packet prefix", ErrInvalidNotify)
+	}
+	return InvalidSelectorReport{
+		ProtocolID:   n.ProtocolID,
+		SPI:          append([]byte(nil), n.SPI...),
+		PacketPrefix: append([]byte(nil), n.NotificationData...),
+	}, true, nil
+}
+
+func (e *NotifyError) InvalidSelectorReport() (InvalidSelectorReport, bool, error) {
+	if e == nil {
+		return InvalidSelectorReport{}, false, nil
+	}
+	return e.Notify.InvalidSelectorReport()
+}
+
+func InvalidSelectorReportFromError(err error) (InvalidSelectorReport, bool, error) {
+	if err == nil {
+		return InvalidSelectorReport{}, false, nil
+	}
+	var notifyErr *NotifyError
+	if !errors.As(err, &notifyErr) {
+		return InvalidSelectorReport{}, false, nil
+	}
+	return notifyErr.InvalidSelectorReport()
 }
 
 func (n Notify) MarshalBinary() ([]byte, error) {

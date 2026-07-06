@@ -1400,6 +1400,79 @@ func TestIMSOutboundAgentDialogUpdate503RequestsRegistrationRecovery(t *testing.
 	}
 }
 
+func TestIMSOutboundAgentRetriesDialogUpdateOnGlare(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 491,
+			Reason:     "Request Pending",
+			Headers:    map[string][]string{"Retry-After": {"0"}},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact": {"<sip:updated@198.51.100.8:5060>"},
+				"X-IMS":   {"update-glare-ok"},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-update-glare",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogUpdate(context.Background(), DialogUpdateRequest{
+		CallID:      "call-update-glare",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("192.0.2.60", 4010)),
+	})
+	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "update-glare-ok" {
+		t.Fatalf("SendDialogUpdate() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 3 || transport.requests[1].Method != "UPDATE" || transport.requests[2].Method != "UPDATE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	firstUpdate := transport.requests[1]
+	retryUpdate := transport.requests[2]
+	if firstUpdate.URI != "sip:carrier@198.51.100.1:5060" || firstUpdate.Headers["CSeq"] != "2 UPDATE" {
+		t.Fatalf("first UPDATE=%+v", firstUpdate)
+	}
+	if retryUpdate.URI != "sip:carrier@198.51.100.1:5060" ||
+		retryUpdate.Headers["CSeq"] != "3 UPDATE" ||
+		retryUpdate.Headers["Content-Type"] != "application/sdp" ||
+		!strings.Contains(string(retryUpdate.Body), "m=audio 4010 RTP/AVP") {
+		t.Fatalf("retry UPDATE=%+v body=%q", retryUpdate, retryUpdate.Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-update-glare"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 4 || transport.requests[3].Method != "BYE" ||
+		transport.requests[3].URI != "sip:updated@198.51.100.8:5060" ||
+		transport.requests[3].Headers["CSeq"] != "4 BYE" {
+		t.Fatalf("BYE after UPDATE glare retry=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentRetriesDialogUpdateWithMinSE(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
@@ -2004,6 +2077,96 @@ func TestIMSOutboundAgentDialogReinvite481RequestsRegistrationRecovery(t *testin
 		transport.writes[1].Headers["CSeq"] != "2 ACK" ||
 		!strings.Contains(transport.writes[1].Headers["To"], "gone-tag") {
 		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+}
+
+func TestIMSOutboundAgentRetriesDialogReinviteOnRetryAfterGlare(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 500,
+			Reason:     "Server Internal Error",
+			Headers: map[string][]string{
+				"To":          {"<sip:+18005551212@ims.example>;tag=glare-tag"},
+				"Retry-After": {"0"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:updated@198.51.100.9:5060>"},
+				"X-IMS":   {"reinvite-glare-ok"},
+			},
+			Body: []byte(sampleSDP("203.0.113.20", 49180)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-reinvite-glare",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogReinvite(context.Background(), DialogReinviteRequest{
+		CallID:      "call-reinvite-glare",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("192.0.2.60", 4010)),
+	})
+	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "reinvite-glare-ok" ||
+		!strings.Contains(string(result.Body), "m=audio 49180") {
+		t.Fatalf("SendDialogReinvite() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 3 ||
+		transport.requests[1].Method != "INVITE" ||
+		transport.requests[2].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	firstReinvite := transport.requests[1]
+	retryReinvite := transport.requests[2]
+	if firstReinvite.URI != "sip:carrier@198.51.100.1:5060" || firstReinvite.Headers["CSeq"] != "2 INVITE" {
+		t.Fatalf("first re-INVITE=%+v", firstReinvite)
+	}
+	if retryReinvite.URI != "sip:carrier@198.51.100.1:5060" ||
+		retryReinvite.Headers["CSeq"] != "3 INVITE" ||
+		retryReinvite.Headers["Content-Type"] != "application/sdp" ||
+		!strings.Contains(string(retryReinvite.Body), "m=audio 4010 RTP/AVP") {
+		t.Fatalf("retry re-INVITE=%+v body=%q", retryReinvite, retryReinvite.Body)
+	}
+	if len(transport.writes) != 3 ||
+		transport.writes[1].Method != "ACK" ||
+		transport.writes[1].Headers["CSeq"] != "2 ACK" ||
+		!strings.Contains(transport.writes[1].Headers["To"], "glare-tag") ||
+		transport.writes[1].Headers["Via"] != firstReinvite.Headers["Via"] ||
+		transport.writes[2].Method != "ACK" ||
+		transport.writes[2].Headers["CSeq"] != "3 ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-reinvite-glare"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 4 || transport.requests[3].Method != "BYE" ||
+		transport.requests[3].URI != "sip:updated@198.51.100.9:5060" ||
+		transport.requests[3].Headers["CSeq"] != "4 BYE" {
+		t.Fatalf("BYE after re-INVITE glare retry=%+v", transport.requests)
 	}
 }
 

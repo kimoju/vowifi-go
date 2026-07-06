@@ -93,6 +93,84 @@ func TestBuildDigestAuthorizationAuthInt(t *testing.T) {
 	}
 }
 
+func TestBuildDigestAuthorizationMD5Sess(t *testing.T) {
+	ch := DigestChallenge{
+		Realm:     "ims.example",
+		Nonce:     "nonce-md5-sess",
+		Algorithm: "MD5-sess",
+		QOP:       "auth",
+		Opaque:    "opaque-md5-sess",
+	}
+	input := DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce-md5-sess",
+		NC:       3,
+	}
+	got, err := BuildDigestAuthorization(ch, input)
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization(MD5-sess) error = %v", err)
+	}
+	ha1Base := md5Hex("impi@example:ims.example:secret")
+	ha1 := md5Hex(ha1Base + ":nonce-md5-sess:cnonce-md5-sess")
+	ha2 := md5Hex("REGISTER:sip:ims.example")
+	wantResponse := md5Hex(ha1 + ":nonce-md5-sess:00000003:cnonce-md5-sess:auth:" + ha2)
+	for _, want := range []string{
+		`algorithm=MD5-sess`,
+		`cnonce="cnonce-md5-sess"`,
+		`qop=auth`,
+		`response="` + wantResponse + `"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Authorization missing %q: %s", want, got)
+		}
+	}
+	parsed, ok, err := VerifyDigestAuthorization(got, ch, input)
+	if err != nil || !ok || parsed.Response != wantResponse {
+		t.Fatalf("VerifyDigestAuthorization(MD5-sess) parsed=%+v ok=%v err=%v header=%s", parsed, ok, err, got)
+	}
+}
+
+func TestBuildDigestAuthorizationMD5SessWithoutQOPCarriesCNonce(t *testing.T) {
+	ch := DigestChallenge{Realm: "ims.example", Nonce: "nonce-md5-sess-no-qop", Algorithm: "MD5-sess"}
+	input := DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce-no-qop",
+	}
+	got, err := BuildDigestAuthorization(ch, input)
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization(MD5-sess no qop) error = %v", err)
+	}
+	if strings.Contains(got, `qop=`) || strings.Contains(got, `nc=`) || !strings.Contains(got, `cnonce="cnonce-no-qop"`) {
+		t.Fatalf("Authorization no-qop fields wrong: %s", got)
+	}
+	if _, ok, err := VerifyDigestAuthorization(got, ch, input); err != nil || !ok {
+		t.Fatalf("VerifyDigestAuthorization(MD5-sess no qop) ok=%v err=%v header=%s", ok, err, got)
+	}
+}
+
+func TestBuildDigestAuthorizationMD5SessRequiresCNonce(t *testing.T) {
+	_, err := BuildDigestAuthorization(DigestChallenge{
+		Realm:     "ims.example",
+		Nonce:     "nonce-md5-sess",
+		Algorithm: "MD5-sess",
+		QOP:       "auth",
+	}, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cnonce") {
+		t.Fatalf("BuildDigestAuthorization(MD5-sess no cnonce) error=%v, want cnonce error", err)
+	}
+}
+
 func TestBuildAKADigestPasswordAKAv2(t *testing.T) {
 	aka := sim.AKAResult{
 		RES: []byte{0x01, 0x02, 0x03, 0x04},
@@ -1675,6 +1753,21 @@ func TestSelectDigestChallengeSupportsAuthInt(t *testing.T) {
 	}
 	if ch.Algorithm != "AKAv2-MD5" || ch.QOP != "auth-int" {
 		t.Fatalf("challenge=%+v, want AKAv2-MD5 auth-int", ch)
+	}
+}
+
+func TestSelectDigestChallengeSupportsMD5Sess(t *testing.T) {
+	ch, err := SelectDigestChallenge(map[string][]string{
+		"WWW-Authenticate": {
+			`Digest realm="ims.example", nonce="nonce-md5", algorithm=MD5, qop="auth"`,
+			`Digest realm="ims.example", nonce="nonce-md5-sess", algorithm=MD5-sess, qop="auth"`,
+		},
+	}, "WWW-Authenticate")
+	if err != nil {
+		t.Fatalf("SelectDigestChallenge() error = %v", err)
+	}
+	if ch.Algorithm != "MD5-sess" || ch.Nonce != "nonce-md5-sess" {
+		t.Fatalf("challenge=%+v, want MD5-sess", ch)
 	}
 }
 
