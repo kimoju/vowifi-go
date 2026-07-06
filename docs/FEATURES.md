@@ -176,7 +176,9 @@ protocol layers needed by VoHive:
   retransmitted requests, immediate `100 Trying` emission for socket-served
   INVITEs, forwarding of reliable provisional headers such as `Require: 100rel`
   and `RSeq`, in-progress INVITE transaction caching while local client final
-  responses are pending, and loopback-tested socket handling
+  responses are pending, UDP final INVITE response retransmission until the
+  matching ACK arrives or the transaction expires, and loopback-tested socket
+  handling
 - IMS in-dialog interworking for UPDATE, PRACK, and OPTIONS, including SDP
   session refresh forwarding, RAck propagation, RTP relay endpoint rewriting
   for UPDATE offers/answers, and local OPTIONS capability responses

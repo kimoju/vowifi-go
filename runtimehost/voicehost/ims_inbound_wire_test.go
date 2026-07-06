@@ -686,6 +686,92 @@ func TestIMSInboundWireServerReplaysCachedInviteTransaction(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerRetransmitsInviteFinalUntilAck(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+	client, err := net.Dial("udp", pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	transport := newWireInboundTransport([]voiceclient.SIPResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+		Body:       []byte(sampleSDP("127.0.0.1", 4002)),
+	}})
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		LocalTag:       "ue-tag",
+		ContactURI:     "sip:vowifi@127.0.0.1:5060",
+		ReadTimeout:    50 * time.Millisecond,
+		TransactionTTL: 400 * time.Millisecond,
+		InviteFinalT1:  20 * time.Millisecond,
+		InviteFinalT2:  80 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.ServePacket(ctx, pc)
+	}()
+
+	invite := wireIMSInvite("wire-call-final-retransmit", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170)))
+	if _, err := client.Write(invite); err != nil {
+		t.Fatalf("client INVITE Write() error = %v", err)
+	}
+	trying := readUDPWireResponse(t, client)
+	ok := readUDPWireResponse(t, client)
+	if trying.StatusCode != 100 || ok.StatusCode != 200 {
+		t.Fatalf("first responses=%+v/%+v", trying, ok)
+	}
+	_ = transport.readRequest(t)
+
+	retransmitted := readUDPWireResponse(t, client)
+	if retransmitted.StatusCode != 200 ||
+		firstVoiceHeader(retransmitted.Headers, "CSeq") != "1 INVITE" ||
+		string(retransmitted.Body) != string(ok.Body) {
+		t.Fatalf("retransmitted final=%+v body=%q first=%+v", retransmitted, retransmitted.Body, ok)
+	}
+
+	if _, err := client.Write(wireIMSInvite("wire-call-final-retransmit", "ACK", 1, nil)); err != nil {
+		t.Fatalf("client ACK Write() error = %v", err)
+	}
+	clientACK := transport.readWrite(t)
+	if clientACK.Method != "ACK" || clientACK.Headers["CSeq"] != "1 ACK" {
+		t.Fatalf("client ACK=%+v", clientACK)
+	}
+	assertNoUDPWireResponse(t, client, 120*time.Millisecond)
+
+	if _, err := client.Write(invite); err != nil {
+		t.Fatalf("retransmitted INVITE after ACK Write() error = %v", err)
+	}
+	replayedTrying := readUDPWireResponse(t, client)
+	replayedOK := readUDPWireResponse(t, client)
+	if replayedTrying.StatusCode != 100 || replayedOK.StatusCode != 200 {
+		t.Fatalf("cached replay after ACK=%+v/%+v", replayedTrying, replayedOK)
+	}
+	assertNoUDPWireResponse(t, client, 120*time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ServePacket() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("ServePacket() did not stop")
+	}
+}
+
 func TestIMSInboundWireServerDispatchesPrackUpdateAndOptions(t *testing.T) {
 	transport := newWireInboundTransport([]voiceclient.SIPResponse{
 		{
@@ -1382,4 +1468,23 @@ func readUDPWireResponse(t *testing.T, conn net.Conn) voiceclient.SIPResponse {
 		t.Fatalf("ParseSIPResponse() error = %v", err)
 	}
 	return resp
+}
+
+func assertNoUDPWireResponse(t *testing.T, conn net.Conn, wait time.Duration) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(wait)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	buf := make([]byte, 65535)
+	n, err := conn.Read(buf)
+	if err == nil {
+		resp, parseErr := voiceclient.ParseSIPResponse(buf[:n])
+		if parseErr != nil {
+			t.Fatalf("unexpected UDP response raw=%q", buf[:n])
+		}
+		t.Fatalf("unexpected UDP response=%+v", resp)
+	}
+	if !isTimeout(err) {
+		t.Fatalf("UDP Read() error = %v", err)
+	}
 }
