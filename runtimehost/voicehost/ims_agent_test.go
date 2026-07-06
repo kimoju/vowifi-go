@@ -1752,6 +1752,64 @@ func TestIMSOutboundAgentKeepsDialogWhenByeFails(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentEndVoiceCallWithResultReturnsIMSResponse(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 503,
+			Reason:     "Service Unavailable",
+			Headers: map[string][]string{
+				"Content-Type": {"message/sipfrag"},
+				"Retry-After":  {"7"},
+				"X-IMS":        {"bye-failed"},
+			},
+			Body: []byte("SIP/2.0 503 Service Unavailable\r\n"),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{Transport: transport}
+	agent.storeDialog("call-bye-result", imsDialogState{
+		cfg: voiceclient.DialogRequestConfig{
+			Profile:         voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+			LocalURI:        "sip:user@ims.example",
+			ContactURI:      "sip:user@192.0.2.10:5060",
+			RemoteURI:       "sip:+18005551212@ims.example",
+			RemoteTargetURI: "sip:+18005551212@ims.example",
+			CallID:          "call-bye-result",
+			LocalTag:        "local-tag",
+			RemoteTag:       "remote-tag",
+			CSeq:            2,
+		},
+	})
+
+	result, err := agent.EndVoiceCallWithResult(context.Background(), DialogInfo{CallID: "call-bye-result"})
+	if err == nil || !strings.Contains(err.Error(), "IMS BYE rejected") {
+		t.Fatalf("EndVoiceCallWithResult() err=%v, want IMS BYE rejection", err)
+	}
+	if result.Accepted || result.StatusCode != 503 || result.Reason != "Service Unavailable" ||
+		result.ContentType != "message/sipfrag" ||
+		string(result.Body) != "SIP/2.0 503 Service Unavailable\r\n" ||
+		result.Headers["X-IMS"] != "bye-failed" ||
+		result.RetryAfter != 7*time.Second ||
+		!result.RegistrationRecoveryNeeded {
+		t.Fatalf("result=%+v body=%q", result, result.Body)
+	}
+	if _, ok := agent.dialogs["call-bye-result"]; !ok {
+		t.Fatal("dialog should remain after rejected IMS BYE")
+	}
+	if len(transport.requests) != 1 || transport.requests[0].Method != "BYE" || transport.requests[0].Headers["CSeq"] != "2 BYE" {
+		t.Fatalf("BYE requests=%+v", transport.requests)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-bye-result"}); err != nil {
+		t.Fatalf("EndVoiceCall() retry error = %v", err)
+	}
+	if _, ok := agent.dialogs["call-bye-result"]; ok {
+		t.Fatal("dialog should close after accepted IMS BYE")
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE retry requests=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentUsesRTPRelayWhenConfigured(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

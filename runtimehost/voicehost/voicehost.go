@@ -33,6 +33,10 @@ type DialogTerminator interface {
 	EndVoiceCall(context.Context, DialogInfo) error
 }
 
+type DialogTerminatorWithResult interface {
+	EndVoiceCallWithResult(context.Context, DialogInfo) (DialogInfoResult, error)
+}
+
 type DialogCanceller interface {
 	CancelVoiceCall(context.Context, DialogInfo) error
 }

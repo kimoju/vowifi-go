@@ -285,17 +285,41 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	if callID == "" {
 		return nil
 	}
+	if _, ok := a.dialog(callID); !ok {
+		return nil
+	}
+	result, err := a.EndVoiceCallWithResult(ctx, info)
+	if err != nil {
+		return err
+	}
+	if result.StatusCode > 0 && (result.StatusCode < 200 || result.StatusCode >= 300) {
+		return fmt.Errorf("IMS BYE rejected: %d %s", result.StatusCode, strings.TrimSpace(result.Reason))
+	}
+	return nil
+}
+
+func (a *IMSOutboundAgent) EndVoiceCallWithResult(ctx context.Context, info DialogInfo) (DialogInfoResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.Transport == nil {
+		return DialogInfoResult{Accepted: false, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(info.CallID)
+	if callID == "" {
+		return DialogInfoResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
 	a.mu.Lock()
 	state, ok := a.dialogs[callID]
 	if !ok {
 		a.mu.Unlock()
-		return nil
+		return DialogInfoResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
 	cfg := state.cfg
 	bye, err := voiceclient.BuildByeRequestWithBody(cfg, info.ContentType, info.Body)
 	if err != nil {
 		a.mu.Unlock()
-		return err
+		return DialogInfoResult{Accepted: false, StatusCode: 500, Reason: "build IMS BYE failed"}, err
 	}
 	applyDialogUpdateHeaders(bye.Headers, info.Headers)
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
@@ -303,10 +327,24 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	a.mu.Unlock()
 	resp, err := a.Transport.RoundTripRequest(ctx, bye)
 	if err != nil {
-		return err
+		return DialogInfoResult{Accepted: false, Reason: "IMS BYE failed", RegistrationRecoveryNeeded: true}, err
+	}
+	defaultReason := "OK"
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defaultReason = "IMS BYE rejected"
+	}
+	result := DialogInfoResult{
+		Accepted:                   resp.StatusCode >= 200 && resp.StatusCode < 300,
+		StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
+		Reason:                     firstVoiceNonEmpty(resp.Reason, defaultReason),
+		RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+		RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+		ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:                       append([]byte(nil), resp.Body...),
+		Headers:                    firstValueSIPHeaders(resp.Headers),
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("IMS BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
+		return result, fmt.Errorf("IMS BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
 	if state.relay != nil {
 		_ = state.relay.Close()
@@ -314,7 +352,7 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 	a.mu.Lock()
 	delete(a.dialogs, callID)
 	a.mu.Unlock()
-	return nil
+	return result, nil
 }
 
 func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoRequest) (DialogInfoResult, error) {
@@ -1167,6 +1205,16 @@ func (a *IMSOutboundAgent) storeDialog(callID string, state imsDialogState) {
 	}
 	a.dialogs[callID] = state
 	a.mu.Unlock()
+}
+
+func (a *IMSOutboundAgent) dialog(callID string) (imsDialogState, bool) {
+	if a == nil || strings.TrimSpace(callID) == "" {
+		return imsDialogState{}, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state, ok := a.dialogs[strings.TrimSpace(callID)]
+	return state, ok
 }
 
 func (a *IMSOutboundAgent) deleteDialog(callID string) {

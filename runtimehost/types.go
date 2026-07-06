@@ -574,6 +574,21 @@ func (i *Instance) EndVoiceCall(ctx context.Context, info voicehost.DialogInfo) 
 	return agent.EndVoiceCall(ctx, info)
 }
 
+func (i *Instance) EndVoiceCallWithResult(ctx context.Context, info voicehost.DialogInfo) (voicehost.DialogInfoResult, error) {
+	agent := i.dialogTerminatorWithResult()
+	if agent != nil {
+		return agent.EndVoiceCallWithResult(ctx, info)
+	}
+	terminator := i.dialogTerminator()
+	if terminator == nil {
+		return voicehost.DialogInfoResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
+	}
+	if err := terminator.EndVoiceCall(ctx, info); err != nil {
+		return voicehost.DialogInfoResult{Accepted: false, Reason: err.Error()}, err
+	}
+	return voicehost.DialogInfoResult{Accepted: true, StatusCode: 200, Reason: "OK"}, nil
+}
+
 func (i *Instance) CancelVoiceCall(ctx context.Context, info voicehost.DialogInfo) error {
 	agent := i.dialogCanceller()
 	if agent == nil {
@@ -1008,6 +1023,20 @@ func (i *Instance) dialogTerminator() voicehost.DialogTerminator {
 	}
 	i.mu.RLock()
 	agent, _ := i.voice.(voicehost.DialogTerminator)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogTerminatorWithResult() voicehost.DialogTerminatorWithResult {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogTerminatorWithResult)
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {
