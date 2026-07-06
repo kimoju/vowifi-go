@@ -51,7 +51,8 @@ protocol layers needed by VoHive:
   and terminal Success/Failure handling, plus Client-Error handling for
   entitlement challenges
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
-  AKA nonce extraction, Digest/AKAv1-MD5 and AKAv2-MD5 authorization material,
+  AKA nonce extraction, Digest MD5/MD5-sess/SHA-256/SHA-512-256 plus
+  AKAv1-MD5 and AKAv2-MD5 authorization material,
   IMS `Security-Client` proposal generation, `Security-Server` parsing/
   selection, direction-aware IMS IPsec SA plan extraction, Security-Verify
   echoing, folded/compact SIP header parsing, strict

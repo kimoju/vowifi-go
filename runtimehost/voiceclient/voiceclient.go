@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -308,11 +310,11 @@ func ParseDigestAuthorization(header string) (DigestAuthorization, error) {
 	if auth.Username == "" || auth.Realm == "" || auth.Nonce == "" || auth.URI == "" || auth.Response == "" {
 		return DigestAuthorization{}, ErrInvalidAuthorization
 	}
-	if !validDigestHex(auth.Response, 32) {
-		return DigestAuthorization{}, fmt.Errorf("%w: invalid response", ErrInvalidAuthorization)
-	}
 	if auth.Algorithm == "" {
 		auth.Algorithm = "MD5"
+	}
+	if !validDigestHex(auth.Response, digestResponseHexLength(auth.Algorithm)) {
+		return DigestAuthorization{}, fmt.Errorf("%w: invalid response", ErrInvalidAuthorization)
 	}
 	if auth.QOP != "" && (auth.NC <= 0 || auth.CNonce == "") {
 		return DigestAuthorization{}, ErrInvalidAuthorization
@@ -425,11 +427,11 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 	ha2 := ""
 	switch qop {
 	case "":
-		ha2 = md5Hex(method + ":" + uri)
+		ha2 = digestHashHex(algorithm, method+":"+uri)
 	case "auth":
-		ha2 = md5Hex(method + ":" + uri)
+		ha2 = digestHashHex(algorithm, method+":"+uri)
 	case "auth-int":
-		ha2 = md5Hex(method + ":" + uri + ":" + md5HexBytes(in.Body))
+		ha2 = digestHashHex(algorithm, method+":"+uri+":"+digestHashBytesHex(algorithm, in.Body))
 	default:
 		return "", fmt.Errorf("unsupported digest qop %q", qop)
 	}
@@ -443,9 +445,9 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 		if cnonce == "" {
 			return "", errors.New("cnonce required when qop is present")
 		}
-		response = md5Hex(ha1 + ":" + ch.Nonce + ":" + ncText + ":" + cnonce + ":" + qop + ":" + ha2)
+		response = digestHashHex(algorithm, ha1+":"+ch.Nonce+":"+ncText+":"+cnonce+":"+qop+":"+ha2)
 	} else {
-		response = md5Hex(ha1 + ":" + ch.Nonce + ":" + ha2)
+		response = digestHashHex(algorithm, ha1+":"+ch.Nonce+":"+ha2)
 	}
 
 	parts := []string{
@@ -1223,14 +1225,15 @@ func digestRspauth(state DigestAuthState, qop string, body []byte) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrInvalidAuthenticationInfo, err)
 	}
+	algorithm := state.challenge.Algorithm
 	ha2 := ""
 	switch qop {
 	case "":
-		ha2 = md5Hex(":" + input.URI)
+		ha2 = digestHashHex(algorithm, ":"+input.URI)
 	case "auth":
-		ha2 = md5Hex(":" + input.URI)
+		ha2 = digestHashHex(algorithm, ":"+input.URI)
 	case "auth-int":
-		ha2 = md5Hex(":" + input.URI + ":" + md5HexBytes(body))
+		ha2 = digestHashHex(algorithm, ":"+input.URI+":"+digestHashBytesHex(algorithm, body))
 	default:
 		return "", fmt.Errorf("%w: unsupported rspauth qop %q", ErrInvalidAuthenticationInfo, qop)
 	}
@@ -1239,12 +1242,12 @@ func digestRspauth(state DigestAuthState, qop string, body []byte) (string, erro
 		nc = 1
 	}
 	if qop == "" {
-		return md5Hex(ha1 + ":" + state.challenge.Nonce + ":" + ha2), nil
+		return digestHashHex(algorithm, ha1+":"+state.challenge.Nonce+":"+ha2), nil
 	}
 	if cnonce == "" {
 		return "", fmt.Errorf("%w: cnonce required", ErrInvalidAuthenticationInfo)
 	}
-	return md5Hex(ha1 + ":" + state.challenge.Nonce + ":" + fmt.Sprintf("%08x", nc) + ":" + cnonce + ":" + qop + ":" + ha2), nil
+	return digestHashHex(algorithm, ha1+":"+state.challenge.Nonce+":"+fmt.Sprintf("%08x", nc)+":"+cnonce+":"+qop+":"+ha2), nil
 }
 
 func securityClientFromBinding(binding RegistrationBinding) SecurityAgreement {
@@ -1710,7 +1713,7 @@ func isAKADigestAlgorithm(algorithm string) bool {
 
 func digestAlgorithmBuildSupported(algorithm string) bool {
 	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
-	case "MD5", "MD5-SESS", "AKAV1-MD5", "AKAV2-MD5":
+	case "MD5", "MD5-SESS", "AKAV1-MD5", "AKAV2-MD5", "SHA-256", "SHA-256-SESS", "SHA-512-256", "SHA-512-256-SESS":
 		return true
 	default:
 		return false
@@ -1718,7 +1721,7 @@ func digestAlgorithmBuildSupported(algorithm string) bool {
 }
 
 func digestAlgorithmNeedsCNonce(algorithm string) bool {
-	return strings.EqualFold(strings.TrimSpace(algorithm), "MD5-sess")
+	return strings.HasSuffix(strings.ToUpper(strings.TrimSpace(algorithm)), "-SESS")
 }
 
 func digestHA1(algorithm, username, realm, password, nonce, cnonce string) (string, error) {
@@ -1726,18 +1729,18 @@ func digestHA1(algorithm, username, realm, password, nonce, cnonce string) (stri
 	if algorithm == "" {
 		algorithm = "MD5"
 	}
-	base := md5Hex(username + ":" + realm + ":" + password)
-	if !digestAlgorithmNeedsCNonce(algorithm) {
-		if digestAlgorithmBuildSupported(algorithm) {
-			return base, nil
-		}
+	if !digestAlgorithmBuildSupported(algorithm) {
 		return "", fmt.Errorf("unsupported digest algorithm %q", algorithm)
+	}
+	base := digestHashHex(algorithm, username+":"+realm+":"+password)
+	if !digestAlgorithmNeedsCNonce(algorithm) {
+		return base, nil
 	}
 	cnonce = strings.TrimSpace(cnonce)
 	if cnonce == "" {
-		return "", errors.New("cnonce required for MD5-sess")
+		return "", fmt.Errorf("cnonce required for %s", algorithm)
 	}
-	return md5Hex(base + ":" + nonce + ":" + cnonce), nil
+	return digestHashHex(algorithm, base+":"+nonce+":"+cnonce), nil
 }
 
 func digestAlgorithmScore(algorithm string) int {
@@ -1746,12 +1749,60 @@ func digestAlgorithmScore(algorithm string) int {
 		return 30
 	case "AKAV1-MD5":
 		return 20
+	case "SHA-512-256-SESS":
+		return 15
+	case "SHA-512-256":
+		return 14
+	case "SHA-256-SESS":
+		return 13
+	case "SHA-256":
+		return 12
 	case "MD5-SESS":
 		return 11
 	case "MD5":
 		return 10
 	default:
 		return 0
+	}
+}
+
+func digestResponseHexLength(algorithm string) int {
+	switch digestBaseAlgorithm(algorithm) {
+	case "SHA-256", "SHA-512-256":
+		return 64
+	default:
+		return 32
+	}
+}
+
+func digestHashHex(algorithm, value string) string {
+	return digestHashBytesHex(algorithm, []byte(value))
+}
+
+func digestHashBytesHex(algorithm string, value []byte) string {
+	switch digestBaseAlgorithm(algorithm) {
+	case "SHA-256":
+		sum := sha256.Sum256(value)
+		return hex.EncodeToString(sum[:])
+	case "SHA-512-256":
+		sum := sha512.Sum512_256(value)
+		return hex.EncodeToString(sum[:])
+	default:
+		sum := md5.Sum(value)
+		return hex.EncodeToString(sum[:])
+	}
+}
+
+func digestBaseAlgorithm(algorithm string) string {
+	algorithm = strings.ToUpper(strings.TrimSpace(algorithm))
+	if strings.HasSuffix(algorithm, "-SESS") {
+		algorithm = strings.TrimSuffix(algorithm, "-SESS")
+	}
+	switch algorithm {
+	case "SHA-256", "SHA-512-256":
+		return algorithm
+	default:
+		return "MD5"
 	}
 }
 

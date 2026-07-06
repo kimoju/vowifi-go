@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -178,6 +180,93 @@ func TestBuildDigestAuthorizationMD5SessRequiresCNonce(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "cnonce") {
 		t.Fatalf("BuildDigestAuthorization(MD5-sess no cnonce) error=%v, want cnonce error", err)
+	}
+}
+
+func TestBuildDigestAuthorizationSHA256AuthInt(t *testing.T) {
+	ch := DigestChallenge{
+		Realm:     "ims.example",
+		Nonce:     "nonce-sha256",
+		Algorithm: "SHA-256",
+		QOP:       "auth-int",
+	}
+	body := []byte("v=0\r\n")
+	input := DigestAuthInput{
+		Method:   "MESSAGE",
+		URI:      "sip:user@example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce-sha256",
+		NC:       4,
+		Body:     body,
+	}
+	got, err := BuildDigestAuthorization(ch, input)
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization(SHA-256) error = %v", err)
+	}
+	ha1 := sha256Hex("impi@example:ims.example:secret")
+	ha2 := sha256Hex("MESSAGE:sip:user@example:" + sha256HexBytes(body))
+	wantResponse := sha256Hex(ha1 + ":nonce-sha256:00000004:cnonce-sha256:auth-int:" + ha2)
+	if !strings.Contains(got, `algorithm=SHA-256`) || !strings.Contains(got, `qop=auth-int`) || !strings.Contains(got, `response="`+wantResponse+`"`) {
+		t.Fatalf("Authorization=%s", got)
+	}
+	parsed, ok, err := VerifyDigestAuthorization(got, ch, input)
+	if err != nil || !ok || parsed.Response != wantResponse {
+		t.Fatalf("VerifyDigestAuthorization(SHA-256) parsed=%+v ok=%v err=%v header=%s", parsed, ok, err, got)
+	}
+}
+
+func TestBuildDigestAuthorizationSHA256Sess(t *testing.T) {
+	ch := DigestChallenge{
+		Realm:     "ims.example",
+		Nonce:     "nonce-sha256-sess",
+		Algorithm: "SHA-256-sess",
+		QOP:       "auth",
+	}
+	input := DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce-sha256-sess",
+		NC:       2,
+	}
+	got, err := BuildDigestAuthorization(ch, input)
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization(SHA-256-sess) error = %v", err)
+	}
+	ha1Base := sha256Hex("impi@example:ims.example:secret")
+	ha1 := sha256Hex(ha1Base + ":nonce-sha256-sess:cnonce-sha256-sess")
+	ha2 := sha256Hex("REGISTER:sip:ims.example")
+	wantResponse := sha256Hex(ha1 + ":nonce-sha256-sess:00000002:cnonce-sha256-sess:auth:" + ha2)
+	if !strings.Contains(got, `algorithm=SHA-256-sess`) || !strings.Contains(got, `response="`+wantResponse+`"`) {
+		t.Fatalf("Authorization=%s", got)
+	}
+	if _, ok, err := VerifyDigestAuthorization(got, ch, input); err != nil || !ok {
+		t.Fatalf("VerifyDigestAuthorization(SHA-256-sess) ok=%v err=%v header=%s", ok, err, got)
+	}
+}
+
+func TestDigestRspauthSHA512256(t *testing.T) {
+	ch := DigestChallenge{
+		Realm:     "ims.example",
+		Nonce:     "nonce-sha512-256",
+		Algorithm: "SHA-512-256",
+		QOP:       "auth",
+	}
+	input := DigestAuthInput{
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce-sha512-256",
+		NC:       5,
+	}
+	got := mustTestDigestRspauth(t, ch, input, nil)
+	ha1 := sha512256Hex("impi@example:ims.example:secret")
+	ha2 := sha512256Hex(":sip:ims.example")
+	want := sha512256Hex(ha1 + ":nonce-sha512-256:00000005:cnonce-sha512-256:auth:" + ha2)
+	if got != want {
+		t.Fatalf("rspauth=%q, want %q", got, want)
 	}
 }
 
@@ -1837,6 +1926,22 @@ func TestSelectDigestChallengeSupportsMD5Sess(t *testing.T) {
 	}
 }
 
+func TestSelectDigestChallengeSupportsSHAAlgorithms(t *testing.T) {
+	ch, err := SelectDigestChallenge(map[string][]string{
+		"WWW-Authenticate": {
+			`Digest realm="ims.example", nonce="nonce-md5-sess", algorithm=MD5-sess, qop="auth"`,
+			`Digest realm="ims.example", nonce="nonce-sha256", algorithm=SHA-256, qop="auth"`,
+			`Digest realm="ims.example", nonce="nonce-sha512-256-sess", algorithm=SHA-512-256-sess, qop="auth"`,
+		},
+	}, "WWW-Authenticate")
+	if err != nil {
+		t.Fatalf("SelectDigestChallenge() error = %v", err)
+	}
+	if ch.Algorithm != "SHA-512-256-sess" || ch.Nonce != "nonce-sha512-256-sess" {
+		t.Fatalf("challenge=%+v, want SHA-512-256-sess", ch)
+	}
+}
+
 func TestSelectDigestChallengeSkipsUnsupportedQOP(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	ch, err := SelectDigestChallenge(map[string][]string{
@@ -3276,4 +3381,18 @@ func mustTestDigestRspauth(t *testing.T, ch DigestChallenge, input DigestAuthInp
 		t.Fatalf("digestRspauth() error = %v", err)
 	}
 	return got
+}
+
+func sha256Hex(value string) string {
+	return sha256HexBytes([]byte(value))
+}
+
+func sha256HexBytes(value []byte) string {
+	sum := sha256.Sum256(value)
+	return hex.EncodeToString(sum[:])
+}
+
+func sha512256Hex(value string) string {
+	sum := sha512.Sum512_256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
