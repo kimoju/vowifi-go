@@ -236,6 +236,12 @@ func TestSelectSecurityAgreementPrefersHigherQValue(t *testing.T) {
 		plan.Mode != "trans" || plan.QValue != "0.8" {
 		t.Fatalf("plan=%+v", plan)
 	}
+	if plan.Inbound.Direction != "inbound" || plan.Inbound.LocalPort != 5064 || plan.Inbound.RemotePort != 5065 || plan.Inbound.SPI != 333 {
+		t.Fatalf("inbound plan=%+v", plan.Inbound)
+	}
+	if plan.Outbound.Direction != "outbound" || plan.Outbound.LocalPort != 5064 || plan.Outbound.RemotePort != 5065 || plan.Outbound.SPI != 444 {
+		t.Fatalf("outbound plan=%+v", plan.Outbound)
+	}
 }
 
 func TestBuildIMSSecurityAssociationPlanRequiresPortsAndSPIs(t *testing.T) {
@@ -341,6 +347,10 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 		result.Binding.SecurityPlan.SPIServer != 222 ||
 		result.Binding.SecurityPlan.PortClient != 5062 ||
 		result.Binding.SecurityPlan.PortServer != 5063 ||
+		result.Binding.SecurityPlan.Inbound.SPI != 111 ||
+		result.Binding.SecurityPlan.Inbound.LocalPort != 5062 ||
+		result.Binding.SecurityPlan.Outbound.SPI != 222 ||
+		result.Binding.SecurityPlan.Outbound.RemotePort != 5063 ||
 		result.Binding.SecurityPlan.Mode != "trans" ||
 		result.Binding.SecurityPlan.Protocol != "ipsec-3gpp" {
 		t.Fatalf("security binding=%+v", result.Binding)

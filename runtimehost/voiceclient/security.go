@@ -38,8 +38,17 @@ type IMSSecurityAssociationPlan struct {
 	SPIServer           uint32
 	PortClient          int
 	PortServer          int
+	Inbound             IMSSecurityAssociationDirection
+	Outbound            IMSSecurityAssociationDirection
 	QValue              string
 	Source              string
+}
+
+type IMSSecurityAssociationDirection struct {
+	Direction  string
+	LocalPort  int
+	RemotePort int
+	SPI        uint32
 }
 
 func DefaultSecurityClientAgreement(random io.Reader) SecurityAgreement {
@@ -120,8 +129,20 @@ func BuildIMSSecurityAssociationPlan(agreement SecurityAgreement) (IMSSecurityAs
 		SPIServer:           agreement.SPIServer,
 		PortClient:          agreement.PortClient,
 		PortServer:          agreement.PortServer,
-		QValue:              strings.TrimSpace(agreement.Parameters["q"]),
-		Source:              agreement.Raw,
+		Inbound: IMSSecurityAssociationDirection{
+			Direction:  "inbound",
+			LocalPort:  agreement.PortClient,
+			RemotePort: agreement.PortServer,
+			SPI:        agreement.SPIClient,
+		},
+		Outbound: IMSSecurityAssociationDirection{
+			Direction:  "outbound",
+			LocalPort:  agreement.PortClient,
+			RemotePort: agreement.PortServer,
+			SPI:        agreement.SPIServer,
+		},
+		QValue: strings.TrimSpace(agreement.Parameters["q"]),
+		Source: agreement.Raw,
 	}, true
 }
 
