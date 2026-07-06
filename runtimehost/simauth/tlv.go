@@ -2,6 +2,7 @@ package simauth
 
 import (
 	"fmt"
+	"math"
 )
 
 type TLV struct {
@@ -118,7 +119,10 @@ func readLength(data []byte) (int, []byte, error) {
 		return int(b), data, nil
 	}
 	n := int(b & 0x7F)
-	if n == 0 || n > 3 {
+	if n == 0 {
+		return 0, nil, fmt.Errorf("unsupported indefinite TLV length form 0x%02X", b)
+	}
+	if n > 4 {
 		return 0, nil, fmt.Errorf("unsupported TLV length form 0x%02X", b)
 	}
 	if len(data) < n {
@@ -126,6 +130,9 @@ func readLength(data []byte) (int, []byte, error) {
 	}
 	length := 0
 	for _, part := range data[:n] {
+		if length > (math.MaxInt-int(part))/256 {
+			return 0, nil, fmt.Errorf("TLV length overflows int")
+		}
 		length = (length << 8) | int(part)
 	}
 	return length, data[n:], nil

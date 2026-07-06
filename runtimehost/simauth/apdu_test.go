@@ -44,6 +44,21 @@ func TestParseTLVListAndFCP(t *testing.T) {
 	if v, ok := FindTLV(highTag, 0x5F20); !ok || string(v) != "boa" {
 		t.Fatalf("FindTLV(high tag) = %q/%v, want boa/true", string(v), ok)
 	}
+
+	longLength := append([]byte{0x62, 0x84, 0x00, 0x00, 0x00, 0x05}, []byte{0x80, 0x03, 0x01, 0x02, 0x03}...)
+	items, err := ParseTLVList(longLength)
+	if err != nil {
+		t.Fatalf("ParseTLVList(0x84 length) error = %v", err)
+	}
+	if len(items) != 1 || items[0].Tag != 0x62 || !reflect.DeepEqual(items[0].Value, []byte{0x80, 0x03, 0x01, 0x02, 0x03}) {
+		t.Fatalf("0x84 length items=%+v", items)
+	}
+	if _, err := ParseTLVList([]byte{0x62, 0x80, 0x00, 0x00}); err == nil {
+		t.Fatal("ParseTLVList(indefinite length) err=nil, want error")
+	}
+	if _, err := ParseTLVList([]byte{0x62, 0x85, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00}); err == nil {
+		t.Fatal("ParseTLVList(0x85 length) err=nil, want error")
+	}
 }
 
 func TestTransmitHandlesRetryLengthAndGetResponse(t *testing.T) {
@@ -261,6 +276,15 @@ func TestParseUSIMAuthResponseNestedTLVAndPadding(t *testing.T) {
 	}
 	if hex.EncodeToString(res.RES) != "11223344" || len(res.CK) != 16 || len(res.IK) != 16 {
 		t.Fatalf("wrapped AKA result=%+v", res)
+	}
+
+	longWrapped := append([]byte{0xA0, 0x84, 0x00, 0x00, 0x00, byte(len(success))}, success...)
+	res, err = ParseUSIMAuthResponse(longWrapped, 0x90, 0x00)
+	if err != nil {
+		t.Fatalf("ParseUSIMAuthResponse(long wrapped success) error = %v", err)
+	}
+	if hex.EncodeToString(res.RES) != "11223344" || len(res.CK) != 16 || len(res.IK) != 16 {
+		t.Fatalf("long wrapped AKA result=%+v", res)
 	}
 
 	auts := bytesFrom(0xA0, AKAAUTSLength)

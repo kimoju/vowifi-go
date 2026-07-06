@@ -30,7 +30,8 @@ The current implementation includes the runtime boundary plus the first real
 protocol layers needed by VoHive:
 
 - logical-channel SIM/ISIM APDU helpers, AT `CCHO`/`CGLA`/`CCHC` and basic
-  `CSIM`/`CRSM` transport helpers, FCP/TLV parsing, ISIM identity EF reading
+  `CSIM`/`CRSM` transport helpers, FCP/BER-TLV parsing with multi-byte
+  definite length support, ISIM identity EF reading
   over logical-channel APDUs or CRSM, runtime modem-access fallback from
   explicit identity readers to APDU/CRSM/AT+CRSM identity reads, SIM/ISIM
   recovery error classification with opt-in non-destructive retry hooks, and USIM/ISIM
