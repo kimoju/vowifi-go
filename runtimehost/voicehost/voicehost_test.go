@@ -10,32 +10,35 @@ import (
 )
 
 type fakeOutboundAgent struct {
-	requests       []OutboundCallRequest
-	infos          []DialogInfoRequest
-	pracks         []DialogPrackRequest
-	options        []DialogOptionsRequest
-	refers         []DialogReferRequest
-	notifies       []DialogNotifyRequest
-	updates        []DialogUpdateRequest
-	reinvites      []DialogReinviteRequest
-	terminated     []DialogInfo
-	canceled       []DialogInfo
-	result         OutboundCallResult
-	infoResult     DialogInfoResult
-	prackResult    DialogPrackResult
-	optionsResult  DialogOptionsResult
-	referResult    DialogReferResult
-	notifyResult   DialogNotifyResult
-	updateResult   DialogUpdateResult
-	reinviteResult DialogReinviteResult
-	err            error
-	infoErr        error
-	prackErr       error
-	optionsErr     error
-	referErr       error
-	notifyErr      error
-	updateErr      error
-	reinviteErr    error
+	requests        []OutboundCallRequest
+	infos           []DialogInfoRequest
+	pracks          []DialogPrackRequest
+	options         []DialogOptionsRequest
+	refers          []DialogReferRequest
+	notifies        []DialogNotifyRequest
+	subscribes      []DialogSubscribeRequest
+	updates         []DialogUpdateRequest
+	reinvites       []DialogReinviteRequest
+	terminated      []DialogInfo
+	canceled        []DialogInfo
+	result          OutboundCallResult
+	infoResult      DialogInfoResult
+	prackResult     DialogPrackResult
+	optionsResult   DialogOptionsResult
+	referResult     DialogReferResult
+	notifyResult    DialogNotifyResult
+	subscribeResult DialogSubscribeResult
+	updateResult    DialogUpdateResult
+	reinviteResult  DialogReinviteResult
+	err             error
+	infoErr         error
+	prackErr        error
+	optionsErr      error
+	referErr        error
+	notifyErr       error
+	subscribeErr    error
+	updateErr       error
+	reinviteErr     error
 }
 
 func (a *fakeOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCallRequest) (OutboundCallResult, error) {
@@ -97,6 +100,14 @@ func (a *fakeOutboundAgent) SendDialogNotify(ctx context.Context, req DialogNoti
 		return DialogNotifyResult{}, a.notifyErr
 	}
 	return a.notifyResult, nil
+}
+
+func (a *fakeOutboundAgent) SendDialogSubscribe(ctx context.Context, req DialogSubscribeRequest) (DialogSubscribeResult, error) {
+	a.subscribes = append(a.subscribes, req)
+	if a.subscribeErr != nil {
+		return DialogSubscribeResult{}, a.subscribeErr
+	}
+	return a.subscribeResult, nil
 }
 
 func (a *fakeOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdateRequest) (DialogUpdateResult, error) {
@@ -501,6 +512,52 @@ func TestGatewayHandleClientNotifyRequiresEventAndSubscriptionState(t *testing.T
 	}
 }
 
+func TestGatewayHandleClientSubscribeSendsDialogSubscribe(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{subscribeResult: DialogSubscribeResult{
+		Accepted:   true,
+		StatusCode: 202,
+		Reason:     "Accepted",
+		Headers:    map[string]string{"Expires": "300", "X-IMS": "subscribe-ok"},
+	}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newSubscribeRequest("call-subscribe", "refer", "300", "application/resource-lists+xml", "<resource-lists/>")
+	req.AppendHeader(sip.NewHeader("X-Client", "subscribe"))
+
+	g.HandleClientSubscribe("dev-1", req, tx)
+
+	if len(agent.subscribes) != 1 {
+		t.Fatalf("subscribes=%d", len(agent.subscribes))
+	}
+	got := agent.subscribes[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-subscribe" ||
+		got.Event != "refer" || got.Expires != "300" ||
+		got.ContentType != "application/resource-lists+xml" ||
+		got.Headers["X-Client"] != "subscribe" ||
+		got.Headers["Event"] != "" || got.Headers["Expires"] != "" ||
+		string(got.Body) != "<resource-lists/>" {
+		t.Fatalf("DialogSubscribeRequest=%+v body=%q", got, got.Body)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 202 ||
+		tx.responses[0].GetHeader("Expires").Value() != "300" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "subscribe-ok" {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
+func TestGatewayHandleClientSubscribeRequiresEvent(t *testing.T) {
+	g := NewGateway()
+	g.RegisterAgent("dev-1", &fakeOutboundAgent{})
+	tx := &fakeServerTransaction{}
+
+	g.HandleClientSubscribe("dev-1", newSubscribeRequest("call-subscribe", "", "", "", ""), tx)
+
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 400 {
+		t.Fatalf("SUBSCRIBE responses=%v", responseCodes(tx.responses))
+	}
+}
+
 func TestGatewayHandleClientUpdateSendsDialogUpdate(t *testing.T) {
 	g := NewGateway()
 	agent := &fakeOutboundAgent{updateResult: DialogUpdateResult{
@@ -654,6 +711,24 @@ func newNotifyRequest(callID, event, subscriptionState, contentType, body string
 	}
 	if strings.TrimSpace(subscriptionState) != "" {
 		req.AppendHeader(sip.NewHeader("Subscription-State", subscriptionState))
+	}
+	if strings.TrimSpace(body) != "" {
+		req.SetBody([]byte(body))
+	}
+	if strings.TrimSpace(contentType) != "" {
+		req.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	}
+	return req
+}
+
+func newSubscribeRequest(callID, event, expires, contentType, body string) *sip.Request {
+	req := sip.NewRequest(sip.SUBSCRIBE, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
+	appendCommonHeaders(req, callID, "18005551212")
+	if strings.TrimSpace(event) != "" {
+		req.AppendHeader(sip.NewHeader("Event", event))
+	}
+	if strings.TrimSpace(expires) != "" {
+		req.AppendHeader(sip.NewHeader("Expires", expires))
 	}
 	if strings.TrimSpace(body) != "" {
 		req.SetBody([]byte(body))

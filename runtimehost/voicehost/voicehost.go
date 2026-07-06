@@ -57,6 +57,10 @@ type DialogNotifySender interface {
 	SendDialogNotify(context.Context, DialogNotifyRequest) (DialogNotifyResult, error)
 }
 
+type DialogSubscribeSender interface {
+	SendDialogSubscribe(context.Context, DialogSubscribeRequest) (DialogSubscribeResult, error)
+}
+
 type DialogUpdater interface {
 	SendDialogUpdate(context.Context, DialogUpdateRequest) (DialogUpdateResult, error)
 }
@@ -164,6 +168,18 @@ type DialogNotifyRequest struct {
 }
 
 type DialogNotifyResult = DialogInfoResult
+
+type DialogSubscribeRequest struct {
+	DeviceID    string
+	CallID      string
+	Event       string
+	Expires     string
+	ContentType string
+	Body        []byte
+	Headers     map[string]string
+}
+
+type DialogSubscribeResult = DialogInfoResult
 
 type DialogUpdateRequest struct {
 	DeviceID    string
@@ -684,6 +700,58 @@ func (g *Gateway) HandleClientNotify(deviceID string, req *sip.Request, tx sip.S
 	_ = tx.Respond(res)
 }
 
+func (g *Gateway) HandleClientSubscribe(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
+	if tx == nil || req == nil {
+		return
+	}
+	sender, _ := g.GetAgent(deviceID).(DialogSubscribeSender)
+	if sender == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
+		return
+	}
+	callID := sipCallID(req)
+	if callID == "" {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
+		return
+	}
+	event := sipHeaderValue(req, "Event")
+	if strings.TrimSpace(event) == "" {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Event", nil))
+		return
+	}
+	headers := sipRequestHeaderMap(req)
+	deleteSIPHeaderValue(headers, "Expires")
+	result, err := sender.SendDialogSubscribe(context.Background(), DialogSubscribeRequest{
+		DeviceID:    strings.TrimSpace(deviceID),
+		CallID:      callID,
+		Event:       event,
+		Expires:     sipHeaderValue(req, "Expires"),
+		ContentType: sipHeaderValue(req, "Content-Type"),
+		Body:        append([]byte(nil), req.Body()...),
+		Headers:     headers,
+	})
+	if err != nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi SUBSCRIBE failed", nil))
+		return
+	}
+	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)
+	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	body := append([]byte(nil), result.Body...)
+	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
+	if strings.TrimSpace(result.ContentType) != "" && len(body) > 0 {
+		res.AppendHeader(sip.NewHeader("Content-Type", strings.TrimSpace(result.ContentType)))
+	}
+	for key, value := range result.Headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
+	_ = tx.Respond(res)
+}
+
 func (g *Gateway) HandleClientInfo(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
 	if tx == nil || req == nil {
 		return
@@ -978,6 +1046,14 @@ func sipHeaderValue(req *sip.Request, name string) string {
 		return ""
 	}
 	return strings.TrimSpace(header.Value())
+}
+
+func deleteSIPHeaderValue(headers map[string]string, name string) {
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			delete(headers, key)
+		}
+	}
 }
 
 func sipRequestHeaderMap(req *sip.Request) map[string]string {

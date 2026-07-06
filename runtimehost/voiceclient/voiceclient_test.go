@@ -161,7 +161,7 @@ func TestBuildRegisterHeaders(t *testing.T) {
 		!strings.Contains(headers["Security-Client"], "port-c=5062") || !strings.Contains(headers["Security-Client"], "port-s=5063") {
 		t.Fatalf("Security-Client has invalid default proposal: %q", headers["Security-Client"])
 	}
-	if !strings.Contains(headers["Allow"], "INFO") || !strings.Contains(headers["Allow"], "NOTIFY") {
+	if !strings.Contains(headers["Allow"], "INFO") || !strings.Contains(headers["Allow"], "NOTIFY") || !strings.Contains(headers["Allow"], "SUBSCRIBE") {
 		t.Fatalf("Allow=%q", headers["Allow"])
 	}
 }
@@ -1287,6 +1287,23 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	}
 	if !strings.Contains(notify.Headers["Security-Verify"], "spi-c=111") {
 		t.Fatalf("notify Security-Verify=%q", notify.Headers["Security-Verify"])
+	}
+	subscribe, err := BuildSubscribeRequest(cfg, "refer", "300", "application/resource-lists+xml", []byte("<resource-lists/>"))
+	if err != nil {
+		t.Fatalf("BuildSubscribeRequest() error = %v", err)
+	}
+	if subscribe.Method != "SUBSCRIBE" || subscribe.Headers["CSeq"] != "3 SUBSCRIBE" ||
+		subscribe.Headers["Event"] != "refer" ||
+		subscribe.Headers["Expires"] != "300" ||
+		subscribe.Headers["Accept"] != "message/sipfrag" ||
+		subscribe.Headers["Allow-Events"] != "refer" ||
+		subscribe.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" ||
+		subscribe.Headers["Content-Type"] != "application/resource-lists+xml" ||
+		string(subscribe.Body) != "<resource-lists/>" {
+		t.Fatalf("subscribe=%+v body=%q", subscribe, subscribe.Body)
+	}
+	if !strings.Contains(subscribe.Headers["Security-Verify"], "spi-c=111") {
+		t.Fatalf("subscribe Security-Verify=%q", subscribe.Headers["Security-Verify"])
 	}
 	options, err := BuildOptionsRequest(cfg)
 	if err != nil {

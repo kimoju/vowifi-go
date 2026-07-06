@@ -452,6 +452,83 @@ func TestIMSOutboundAgentSendsDialogNotify(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentSendsDialogSubscribe(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 202,
+			Reason:     "Accepted",
+			Headers: map[string][]string{
+				"Contact": {"<sip:carrier@198.51.100.3:5060>"},
+				"Expires": {"300"},
+				"X-IMS":   {"subscribe-ok"},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-subscribe",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogSubscribe(context.Background(), DialogSubscribeRequest{
+		CallID:      "call-subscribe",
+		Event:       "refer",
+		Expires:     "300",
+		ContentType: "application/resource-lists+xml",
+		Body:        []byte("<resource-lists/>"),
+		Headers: map[string]string{
+			"Event":   "presence",
+			"Expires": "0",
+			"X-Test":  "subscribe",
+		},
+	})
+	if err != nil || !result.Accepted || result.StatusCode != 202 || result.Headers["X-IMS"] != "subscribe-ok" || result.Headers["Expires"] != "300" {
+		t.Fatalf("SendDialogSubscribe() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "SUBSCRIBE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	subscribe := transport.requests[1]
+	if subscribe.URI != "sip:carrier@198.51.100.1:5060" || subscribe.Headers["CSeq"] != "2 SUBSCRIBE" ||
+		subscribe.Headers["Event"] != "refer" ||
+		subscribe.Headers["Expires"] != "300" ||
+		subscribe.Headers["Accept"] != "message/sipfrag" ||
+		subscribe.Headers["Allow-Events"] != "refer" ||
+		subscribe.Headers["Content-Type"] != "application/resource-lists+xml" ||
+		subscribe.Headers["X-Test"] != "subscribe" ||
+		string(subscribe.Body) != "<resource-lists/>" {
+		t.Fatalf("SUBSCRIBE=%+v body=%q", subscribe, subscribe.Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-subscribe"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
+		transport.requests[2].URI != "sip:carrier@198.51.100.3:5060" ||
+		transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after SUBSCRIBE=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentSendsDialogHoldAndResume(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

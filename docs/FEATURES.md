@@ -217,6 +217,10 @@ protocol layers needed by VoHive:
   including `Event` and `Subscription-State` preservation, `message/sipfrag`
   body forwarding, `Allow-Events: refer` capability exposure, response mapping,
   remote Contact refresh, and dialog CSeq tracking
+- local softphone in-dialog SIP SUBSCRIBE forwarding to IMS dialogs for
+  supplementary service event packages, including structured `Event` and
+  `Expires` handling, `Allow-Events: refer` capability exposure, response
+  header/body mapping, remote Contact refresh, and dialog CSeq advancement
 - runtime voice operations consume recoverable registration or route failures
   such as 481, 503, transport errors, and other transient IMS 5xx responses to
   trigger IMS re-registration, refresh voice/SMS/USSD transports, and retry an

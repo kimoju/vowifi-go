@@ -195,6 +195,27 @@ func BuildNotifyRequest(cfg DialogRequestConfig, event, subscriptionState, conte
 	return msg, nil
 }
 
+func BuildSubscribeRequest(cfg DialogRequestConfig, event, expires, contentType string, body []byte) (SIPRequestMessage, error) {
+	event = strings.TrimSpace(event)
+	if event == "" {
+		return SIPRequestMessage{}, fmt.Errorf("%w: Event is empty", ErrInvalidDialogConfig)
+	}
+	msg, err := buildDialogRequest("SUBSCRIBE", cfg, body)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	msg.Headers["Event"] = event
+	msg.Headers["Accept"] = "message/sipfrag"
+	msg.Headers["Allow-Events"] = "refer"
+	if expires = strings.TrimSpace(expires); expires != "" {
+		msg.Headers["Expires"] = expires
+	}
+	if len(body) > 0 {
+		msg.Headers["Content-Type"] = firstNonEmpty(contentType, "application/octet-stream")
+	}
+	return msg, nil
+}
+
 func BuildOptionsRequest(cfg DialogRequestConfig) (SIPRequestMessage, error) {
 	msg, err := buildDialogRequest("OPTIONS", cfg, nil)
 	if err != nil {
@@ -242,11 +263,11 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 		"CSeq":                  strconv.Itoa(cseq) + " " + method,
 		"Max-Forwards":          "70",
 		"User-Agent":            firstNonEmpty(cfg.UserAgent, cfg.Profile.UserAgent, "vowifi-go"),
-		"Allow":                 "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, NOTIFY, OPTIONS",
+		"Allow":                 "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, NOTIFY, SUBSCRIBE, OPTIONS",
 		"P-Preferred-Identity":  "<" + localURI + ">",
 		"P-Access-Network-Info": "IEEE-802.11",
 	}
-	if contactURI != "" && (method == "INVITE" || method == "UPDATE" || method == "INFO" || method == "NOTIFY") {
+	if contactURI != "" && (method == "INVITE" || method == "UPDATE" || method == "INFO" || method == "NOTIFY" || method == "SUBSCRIBE") {
 		headers["Contact"] = "<" + contactURI + ">"
 	}
 	if route := routeHeader(firstNonEmptySlice(cfg.RouteSet, cfg.Registration.ServiceRoutes)); route != "" {

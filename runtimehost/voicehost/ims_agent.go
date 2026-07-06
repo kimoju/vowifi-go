@@ -608,6 +608,68 @@ func (a *IMSOutboundAgent) SendDialogNotify(ctx context.Context, req DialogNotif
 	}, nil
 }
 
+func (a *IMSOutboundAgent) SendDialogSubscribe(ctx context.Context, req DialogSubscribeRequest) (DialogSubscribeResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.Transport == nil {
+		return DialogSubscribeResult{Accepted: false, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return DialogSubscribeResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	event := strings.TrimSpace(req.Event)
+	if event == "" {
+		return DialogSubscribeResult{Accepted: false, StatusCode: 400, Reason: "Event empty"}, errors.New("Event is empty")
+	}
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		a.mu.Unlock()
+		return DialogSubscribeResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.cfg
+	subscribe, err := voiceclient.BuildSubscribeRequest(cfg, event, req.Expires, req.ContentType, req.Body)
+	if err != nil {
+		a.mu.Unlock()
+		return DialogSubscribeResult{Accepted: false, StatusCode: 500, Reason: "build IMS SUBSCRIBE failed"}, err
+	}
+	applyDialogUpdateHeaders(subscribe.Headers, req.Headers)
+	subscribe.Headers["Event"] = event
+	if expires := strings.TrimSpace(req.Expires); expires != "" {
+		subscribe.Headers["Expires"] = expires
+	}
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+	resp, err := a.Transport.RoundTripRequest(ctx, subscribe)
+	if err != nil {
+		return DialogSubscribeResult{Accepted: false, Reason: "IMS SUBSCRIBE failed", RegistrationRecoveryNeeded: true}, err
+	}
+	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if accepted {
+		a.mu.Lock()
+		if latest, ok := a.dialogs[callID]; ok {
+			if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+				latest.cfg.RemoteTargetURI = contact
+			}
+			a.dialogs[callID] = latest
+		}
+		a.mu.Unlock()
+	}
+	return DialogSubscribeResult{
+		Accepted:                   accepted,
+		StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
+		Reason:                     firstVoiceNonEmpty(resp.Reason, "OK"),
+		RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+		RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+		ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:                       append([]byte(nil), resp.Body...),
+		Headers:                    firstValueSIPHeaders(resp.Headers),
+	}, nil
+}
+
 func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdateRequest) (DialogUpdateResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
