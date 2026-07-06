@@ -23,6 +23,40 @@ func TestSegmentSMSGSM7(t *testing.T) {
 	}
 }
 
+func TestSegmentSMSUsesFreshConcatReferences(t *testing.T) {
+	first := SegmentSMS(strings.Repeat("a", 161), "")
+	second := SegmentSMS(strings.Repeat("b", 161), "")
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("parts first=%d second=%d", len(first), len(second))
+	}
+	if first[0].ConcatRefBits != 8 || second[0].ConcatRefBits != 8 {
+		t.Fatalf("concat bits first=%+v second=%+v", first[0], second[0])
+	}
+	if first[0].ConcatRef == 0 || second[0].ConcatRef == 0 || first[0].ConcatRef == second[0].ConcatRef {
+		t.Fatalf("concat refs first=%d second=%d", first[0].ConcatRef, second[0].ConcatRef)
+	}
+	if first[0].UDH[3] != byte(first[0].ConcatRef) || second[0].UDH[3] != byte(second[0].ConcatRef) {
+		t.Fatalf("UDH refs first=%x second=%x", first[0].UDH, second[0].UDH)
+	}
+}
+
+func TestSegmentSMSWithExplicit16BitConcatReference(t *testing.T) {
+	parts := SegmentSMSWithOptions(strings.Repeat("a", 306), SendOptions{ConcatRef: 0x1234, ConcatRefBits: 16})
+	if len(parts) != 3 {
+		t.Fatalf("parts=%d, want 3", len(parts))
+	}
+	if parts[0].ConcatRef != 0x1234 || parts[0].ConcatRefBits != 16 {
+		t.Fatalf("first part=%+v", parts[0])
+	}
+	wantUDH := []byte{0x06, 0x08, 0x04, 0x12, 0x34, 0x03, 0x01}
+	if string(parts[0].UDH) != string(wantUDH) {
+		t.Fatalf("UDH=%x want %x", parts[0].UDH, wantUDH)
+	}
+	if messageLen(parts[0].Text, "gsm7") != 152 {
+		t.Fatalf("first part septets=%d want 152", messageLen(parts[0].Text, "gsm7"))
+	}
+}
+
 func TestSegmentSMSGSM7ExtendedCharacters(t *testing.T) {
 	single := SegmentSMS(strings.Repeat("^", 80), "")
 	if len(single) != 1 || single[0].Encoding != "gsm7" || single[0].UDH != nil || messageLen(single[0].Text, single[0].Encoding) != 160 {
@@ -95,6 +129,17 @@ func TestSendSMSWithTransportFailureMarksDeliveryFailed(t *testing.T) {
 	}
 	if !strings.Contains(store.lastError, "part failed") {
 		t.Fatalf("lastError=%q", store.lastError)
+	}
+}
+
+func TestSendSMSWithOptionsRejectsInvalidConcatReference(t *testing.T) {
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	_, err := svc.SendSMSWithOptions(context.Background(), "+18005551212", strings.Repeat("a", 161), SendOptions{
+		ConcatRef:     0x1ff,
+		ConcatRefBits: 8,
+	})
+	if err == nil || !strings.Contains(err.Error(), "8-bit concat reference") {
+		t.Fatalf("SendSMSWithOptions() err=%v, want 8-bit concat reference error", err)
 	}
 }
 

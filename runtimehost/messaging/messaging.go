@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -27,7 +28,9 @@ func WithSuppressSendTGSuccess(ctx context.Context) context.Context {
 }
 
 type SendOptions struct {
-	Encoding string
+	Encoding      string
+	ConcatRef     int
+	ConcatRefBits int
 }
 
 type SendOutcome struct {
@@ -73,6 +76,8 @@ type SMSPart struct {
 	Text                string
 	Encoding            string
 	UDH                 []byte
+	ConcatRef           int
+	ConcatRefBits       int
 	RequestStatusReport bool
 }
 
@@ -180,6 +185,8 @@ type Service struct {
 	smsConcat     map[smsConcatKey]*smsConcatState
 }
 
+var smsConcatRefCounter atomic.Uint32
+
 func NewService(deviceID, imsi string, store DeliveryStore, dispatch eventhost.Dispatcher) *Service {
 	return &Service{deviceID: deviceID, imsi: imsi, store: store, dispatch: dispatch}
 }
@@ -225,7 +232,10 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 	if to == "" {
 		return SendOutcome{}, errors.New("sms target is empty")
 	}
-	parts := SegmentSMS(text, opts.Encoding)
+	parts, err := segmentSMS(text, opts)
+	if err != nil {
+		return SendOutcome{}, err
+	}
 	if len(parts) == 0 {
 		return SendOutcome{}, errors.New("sms content is empty")
 	}
@@ -430,30 +440,59 @@ func (s *Service) HandleSMSDeliveryReport(ctx context.Context, report SMSDeliver
 }
 
 func SegmentSMS(text, encoding string) []SMSPart {
+	return SegmentSMSWithOptions(text, SendOptions{Encoding: encoding})
+}
+
+func SegmentSMSWithOptions(text string, opts SendOptions) []SMSPart {
+	parts, _ := segmentSMS(text, opts)
+	return parts
+}
+
+func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	if text == "" {
-		return nil
+		return nil, nil
 	}
-	enc := normalizeEncoding(text, encoding)
-	single, concat := smsPartLimits(enc)
+	enc := normalizeEncoding(text, opts.Encoding)
+	single, concat := smsPartLimitsForUDH(enc, concatUDHLength(normalizeSMSConcatRefBits(opts.ConcatRef, opts.ConcatRefBits)))
 	if messageLen(text, enc) <= single {
-		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc}}
+		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc}}, nil
 	}
+	refBits, err := validateSMSConcatOptions(opts.ConcatRef, opts.ConcatRefBits)
+	if err != nil {
+		return nil, err
+	}
+	ref := opts.ConcatRef
+	if ref == 0 {
+		ref = nextSMSConcatRef(refBits)
+	}
+	_, concat = smsPartLimitsForUDH(enc, concatUDHLength(refBits))
 	total := int(math.Ceil(float64(messageLen(text, enc)) / float64(concat)))
 	if total <= 0 {
 		total = 1
+	}
+	if total > 255 {
+		return nil, fmt.Errorf("sms message requires %d parts; maximum is 255", total)
 	}
 	out := make([]SMSPart, 0, total)
 	remaining := text
 	for partNo := 1; remaining != ""; partNo++ {
 		chunk, rest := takeSMSChunk(remaining, enc, concat)
-		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: concatUDH(total, partNo)})
+		udh, err := concatUDHWithRef(ref, refBits, total, partNo)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: udh, ConcatRef: ref, ConcatRefBits: refBits})
 		remaining = rest
 	}
 	for i := range out {
 		out[i].TotalParts = len(out)
-		out[i].UDH = concatUDH(len(out), out[i].PartNo)
+		udh, err := concatUDHWithRef(ref, refBits, len(out), out[i].PartNo)
+		if err != nil {
+			return nil, err
+		}
+		out[i].UDH = udh
 	}
-	return out
+	return out, nil
 }
 
 func normalizeEncoding(text, requested string) string {
@@ -473,13 +512,21 @@ func normalizeEncoding(text, requested string) string {
 }
 
 func smsPartLimits(encoding string) (single int, concat int) {
+	return smsPartLimitsForUDH(encoding, 6)
+}
+
+func smsPartLimitsForUDH(encoding string, udhBytes int) (single int, concat int) {
+	if udhBytes <= 0 {
+		udhBytes = 6
+	}
 	switch encoding {
 	case "gsm7":
-		return 160, 153
+		headerSeptets := (udhBytes*8 + 6) / 7
+		return 160, 160 - headerSeptets
 	case "utf8":
-		return 140, 134
+		return 140, 140 - udhBytes
 	default:
-		return 70, 67
+		return 70, (140 - udhBytes) / 2
 	}
 }
 
@@ -525,10 +572,83 @@ func takeSMSChunk(text, encoding string, limit int) (string, string) {
 }
 
 func concatUDH(total, partNo int) []byte {
+	udh, _ := concatUDHWithRef(1, 8, total, partNo)
+	return udh
+}
+
+func concatUDHWithRef(ref, refBits, total, partNo int) ([]byte, error) {
 	if total <= 1 {
-		return nil
+		return nil, nil
 	}
-	return []byte{0x05, 0x00, 0x03, 0x01, byte(total), byte(partNo)}
+	if total > 255 {
+		return nil, fmt.Errorf("sms concat total parts out of range: %d", total)
+	}
+	if partNo <= 0 || partNo > total {
+		return nil, fmt.Errorf("sms concat part number %d out of range for %d parts", partNo, total)
+	}
+	switch refBits {
+	case 8:
+		if ref < 0 || ref > 0xff {
+			return nil, fmt.Errorf("sms 8-bit concat reference out of range: %d", ref)
+		}
+		return []byte{0x05, 0x00, 0x03, byte(ref), byte(total), byte(partNo)}, nil
+	case 16:
+		if ref < 0 || ref > 0xffff {
+			return nil, fmt.Errorf("sms 16-bit concat reference out of range: %d", ref)
+		}
+		return []byte{0x06, 0x08, 0x04, byte(ref >> 8), byte(ref), byte(total), byte(partNo)}, nil
+	default:
+		return nil, fmt.Errorf("unsupported sms concat reference size: %d", refBits)
+	}
+}
+
+func concatUDHLength(refBits int) int {
+	if refBits == 16 {
+		return 7
+	}
+	return 6
+}
+
+func validateSMSConcatOptions(ref, refBits int) (int, error) {
+	if ref < 0 {
+		return 0, fmt.Errorf("sms concat reference out of range: %d", ref)
+	}
+	bits := normalizeSMSConcatRefBits(ref, refBits)
+	switch bits {
+	case 8:
+		if ref > 0xff {
+			return 0, fmt.Errorf("sms 8-bit concat reference out of range: %d", ref)
+		}
+	case 16:
+		if ref > 0xffff {
+			return 0, fmt.Errorf("sms 16-bit concat reference out of range: %d", ref)
+		}
+	default:
+		return 0, fmt.Errorf("unsupported sms concat reference size: %d", refBits)
+	}
+	return bits, nil
+}
+
+func normalizeSMSConcatRefBits(ref, refBits int) int {
+	switch refBits {
+	case 8, 16:
+		return refBits
+	case 0:
+		if ref > 0xff {
+			return 16
+		}
+		return 8
+	default:
+		return refBits
+	}
+}
+
+func nextSMSConcatRef(refBits int) int {
+	n := smsConcatRefCounter.Add(1)
+	if refBits == 16 {
+		return int(n%0xffff) + 1
+	}
+	return int(n%0xff) + 1
 }
 
 func isGSM7Text(text string) bool {

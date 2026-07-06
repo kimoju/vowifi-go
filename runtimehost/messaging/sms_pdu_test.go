@@ -163,6 +163,17 @@ func TestParseSMSDeliverTPDUUCS2WithConcatUDH(t *testing.T) {
 	}
 }
 
+func TestParseSMSDeliverTPDUUCS2With16BitConcatUDH(t *testing.T) {
+	tpdu := mustHex(t, "4005810180F600086270502143650009060804123402014F60")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	if deliver.Text != "你" || !deliver.Concat.IsConcat || deliver.Concat.Ref != 0x1234 || deliver.Concat.RefBits != 16 || deliver.Concat.Total != 2 || deliver.Concat.Seq != 1 {
+		t.Fatalf("deliver=%+v", deliver)
+	}
+}
+
 func TestParseSMSStatusReportTPDU(t *testing.T) {
 	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000000")
 	report, err := ParseSMSStatusReportTPDU(tpdu)
