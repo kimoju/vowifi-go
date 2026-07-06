@@ -47,6 +47,7 @@ type smsConcatState struct {
 	protocolID             byte
 	dataCodingScheme       byte
 	userDataHeader         bool
+	userDataHeaderInfo     SMSUserDataHeaderInfo
 	moreMessagesToSend     bool
 	statusReportIndication bool
 	replyPath              bool
@@ -173,6 +174,7 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 			DataCodingScheme:       deliver.DataCodingScheme,
 			DataCoding:             deliver.DataCoding,
 			UserDataHeader:         deliver.UserDataHeader,
+			UserDataHeaderInfo:     deliver.UserDataHeaderInfo,
 			MoreMessagesToSend:     deliver.MoreMessagesToSend,
 			StatusReportIndication: deliver.StatusReportIndication,
 			ReplyPath:              deliver.ReplyPath,
@@ -242,6 +244,7 @@ func (s *Service) handleIMSSMSStatusReport(ctx context.Context, msg IMSMessageRe
 		MoreMessagesToSend:    reportTPDU.MoreMessagesToSend,
 		StatusReportQualifier: reportTPDU.StatusReportQualifier,
 		UserDataHeader:        reportTPDU.UserDataHeader,
+		UserDataHeaderInfo:    reportTPDU.UserDataHeaderInfo,
 		ParameterIndicator:    reportTPDU.ParameterIndicator,
 		ProtocolID:            reportTPDU.ProtocolID,
 		DataCodingScheme:      reportTPDU.DataCodingScheme,
@@ -293,6 +296,7 @@ func (s *Service) collectSMSConcatPart(incoming IncomingSMS, concat SMSConcatInf
 		state.protocolID = incoming.ProtocolID
 		state.dataCodingScheme = incoming.DataCodingScheme
 		state.userDataHeader = incoming.UserDataHeader
+		state.userDataHeaderInfo = incoming.UserDataHeaderInfo
 		state.moreMessagesToSend = incoming.MoreMessagesToSend
 		state.statusReportIndication = incoming.StatusReportIndication
 		state.replyPath = incoming.ReplyPath
@@ -321,6 +325,7 @@ func (s *Service) collectSMSConcatPart(incoming IncomingSMS, concat SMSConcatInf
 	incoming.ProtocolID = state.protocolID
 	incoming.DataCodingScheme = state.dataCodingScheme
 	incoming.UserDataHeader = state.userDataHeader
+	incoming.UserDataHeaderInfo = state.userDataHeaderInfo
 	incoming.MoreMessagesToSend = state.moreMessagesToSend
 	incoming.StatusReportIndication = state.statusReportIndication
 	incoming.ReplyPath = state.replyPath

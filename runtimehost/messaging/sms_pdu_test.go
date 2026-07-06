@@ -421,6 +421,9 @@ func TestParseSMSDeliverTPDUUCS2WithConcatUDH(t *testing.T) {
 	if deliver.Text != "你" || !deliver.Concat.IsConcat || deliver.Concat.Ref != 0x7a || deliver.Concat.Total != 2 || deliver.Concat.Seq != 1 {
 		t.Fatalf("deliver=%+v", deliver)
 	}
+	if string(deliver.UserDataHeaderInfo.Raw) != string([]byte{0x05, 0x00, 0x03, 0x7a, 0x02, 0x01}) || len(deliver.UserDataHeaderInfo.Elements) != 1 {
+		t.Fatalf("UDH=%+v", deliver.UserDataHeaderInfo)
+	}
 }
 
 func TestParseSMSDeliverTPDUPreservesProtocolMetadata(t *testing.T) {
@@ -440,6 +443,42 @@ func TestParseSMSDeliverTPDUPreservesProtocolMetadata(t *testing.T) {
 	}
 	if deliver.Text != "你" || !deliver.Concat.IsConcat {
 		t.Fatalf("deliver content=%+v", deliver)
+	}
+}
+
+func TestParseSMSDeliverTPDUWith16BitPortUDH(t *testing.T) {
+	tpdu := mustHex(t, "4005810180F6000462705021436500090605040B8423F06869")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	header := deliver.UserDataHeaderInfo
+	if deliver.Text != "hi" || !deliver.UserDataHeader || deliver.UserDataLength != 9 {
+		t.Fatalf("deliver=%+v", deliver)
+	}
+	if !header.HasPorts || header.PortBits != 16 || header.DestinationPort != 2948 || header.SourcePort != 9200 {
+		t.Fatalf("UDH ports=%+v", header)
+	}
+	if len(header.Elements) != 1 || header.Elements[0].Identifier != 0x05 || string(header.Elements[0].Data) != string([]byte{0x0b, 0x84, 0x23, 0xf0}) {
+		t.Fatalf("UDH elements=%+v", header.Elements)
+	}
+}
+
+func TestParseSMSDeliverTPDUWith8BitPortAndUnknownUDH(t *testing.T) {
+	tpdu := mustHex(t, "4005810180F60004627050214365000B0804027F009902AABB6F6B")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	header := deliver.UserDataHeaderInfo
+	if deliver.Text != "ok" {
+		t.Fatalf("deliver=%+v", deliver)
+	}
+	if !header.HasPorts || header.PortBits != 8 || header.DestinationPort != 0x7f || header.SourcePort != 0 {
+		t.Fatalf("UDH ports=%+v", header)
+	}
+	if len(header.Elements) != 2 || header.Elements[0].Identifier != 0x04 || header.Elements[1].Identifier != 0x99 {
+		t.Fatalf("UDH elements=%+v", header.Elements)
 	}
 }
 

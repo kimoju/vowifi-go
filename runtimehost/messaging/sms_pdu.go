@@ -40,6 +40,21 @@ type SMSConcatInfo struct {
 	Seq      int
 }
 
+type SMSUDHElement struct {
+	Identifier byte
+	Data       []byte
+}
+
+type SMSUserDataHeaderInfo struct {
+	Raw             []byte
+	Elements        []SMSUDHElement
+	Concat          SMSConcatInfo
+	HasPorts        bool
+	DestinationPort int
+	SourcePort      int
+	PortBits        int
+}
+
 type SMSDataCodingInfo struct {
 	Raw                   byte
 	Alphabet              string
@@ -66,6 +81,7 @@ type SMSDeliver struct {
 	DataCoding             SMSDataCodingInfo
 	UserDataLength         int
 	UserDataHeader         bool
+	UserDataHeaderInfo     SMSUserDataHeaderInfo
 	MoreMessagesToSend     bool
 	StatusReportIndication bool
 	ReplyPath              bool
@@ -91,6 +107,7 @@ type SMSStatusReport struct {
 	HasDataCodingScheme   bool
 	DataCoding            SMSDataCodingInfo
 	UserDataLength        int
+	UserDataHeaderInfo    SMSUserDataHeaderInfo
 	UserData              string
 	HasUserData           bool
 	RawTPDU               []byte
@@ -538,7 +555,7 @@ func ParseSMSDeliverTPDU(tpdu []byte) (SMSDeliver, error) {
 	if i > len(tpdu) {
 		return SMSDeliver{}, errors.New("SMS-DELIVER user data missing")
 	}
-	text, concat, err := decodeSMSUserData(tpdu[i:], udl, dcs, firstOctet&0x40 != 0)
+	text, headerInfo, err := decodeSMSUserDataWithHeader(tpdu[i:], udl, dcs, firstOctet&0x40 != 0)
 	if err != nil {
 		return SMSDeliver{}, err
 	}
@@ -546,13 +563,14 @@ func ParseSMSDeliverTPDU(tpdu []byte) (SMSDeliver, error) {
 		Sender:                 sender,
 		Text:                   text,
 		Timestamp:              ts,
-		Concat:                 concat,
+		Concat:                 headerInfo.Concat,
 		FirstOctet:             firstOctet,
 		ProtocolID:             pid,
 		DataCodingScheme:       dcs,
 		DataCoding:             ParseSMSDataCodingScheme(dcs),
 		UserDataLength:         udl,
 		UserDataHeader:         firstOctet&0x40 != 0,
+		UserDataHeaderInfo:     headerInfo,
 		MoreMessagesToSend:     firstOctet&0x04 == 0,
 		StatusReportIndication: firstOctet&0x20 != 0,
 		ReplyPath:              firstOctet&0x80 != 0,
@@ -657,11 +675,12 @@ func parseSMSStatusReportOptionalParameters(data []byte, report *SMSStatusReport
 			return errors.New("SMS-STATUS-REPORT user data missing")
 		}
 		dcs := report.DataCodingScheme
-		text, _, err := decodeSMSUserData(data[i:], udl, dcs, report.UserDataHeader)
+		text, headerInfo, err := decodeSMSUserDataWithHeader(data[i:], udl, dcs, report.UserDataHeader)
 		if err != nil {
 			return err
 		}
 		report.UserDataLength = udl
+		report.UserDataHeaderInfo = headerInfo
 		report.UserData = text
 		report.HasUserData = true
 	}
@@ -1034,12 +1053,17 @@ func normalizeSMSNumber(value string) string {
 }
 
 func decodeSMSUserData(data []byte, udl int, dcs byte, hasUDH bool) (string, SMSConcatInfo, error) {
+	text, headerInfo, err := decodeSMSUserDataWithHeader(data, udl, dcs, hasUDH)
+	return text, headerInfo.Concat, err
+}
+
+func decodeSMSUserDataWithHeader(data []byte, udl int, dcs byte, hasUDH bool) (string, SMSUserDataHeaderInfo, error) {
 	if udl < 0 {
-		return "", SMSConcatInfo{}, errors.New("SMS user data length is invalid")
+		return "", SMSUserDataHeaderInfo{}, errors.New("SMS user data length is invalid")
 	}
-	udh, payload, headerSeptets, concat, err := splitSMSUDH(data, hasUDH)
+	udh, payload, headerSeptets, headerInfo, err := splitSMSUDH(data, hasUDH)
 	if err != nil {
-		return "", SMSConcatInfo{}, err
+		return "", SMSUserDataHeaderInfo{}, err
 	}
 	switch smsDCSAlphabet(dcs) {
 	case "ucs2":
@@ -1051,7 +1075,7 @@ func decodeSMSUserData(data []byte, udl int, dcs byte, hasUDH bool) (string, SMS
 			payloadOctets = len(payload)
 		}
 		text, err := decodeUCS2(payload[:payloadOctets])
-		return text, concat, err
+		return text, headerInfo, err
 	case "8bit":
 		payloadOctets := udl
 		if hasUDH {
@@ -1060,7 +1084,7 @@ func decodeSMSUserData(data []byte, udl int, dcs byte, hasUDH bool) (string, SMS
 		if payloadOctets < 0 || payloadOctets > len(payload) {
 			payloadOctets = len(payload)
 		}
-		return strings.ToValidUTF8(string(payload[:payloadOctets]), ""), concat, nil
+		return strings.ToValidUTF8(string(payload[:payloadOctets]), ""), headerInfo, nil
 	default:
 		septets := udl
 		if hasUDH {
@@ -1073,48 +1097,72 @@ func decodeSMSUserData(data []byte, udl int, dcs byte, hasUDH bool) (string, SMS
 		if hasUDH {
 			fillBits = (7 - ((len(udh) * 8) % 7)) % 7
 		}
-		return decodeGSM7(unpackSeptets(payload, septets, fillBits)), concat, nil
+		return decodeGSM7(unpackSeptets(payload, septets, fillBits)), headerInfo, nil
 	}
 }
 
-func splitSMSUDH(data []byte, hasUDH bool) (udh []byte, payload []byte, headerSeptets int, concat SMSConcatInfo, err error) {
+func splitSMSUDH(data []byte, hasUDH bool) (udh []byte, payload []byte, headerSeptets int, headerInfo SMSUserDataHeaderInfo, err error) {
 	if !hasUDH {
-		return nil, data, 0, SMSConcatInfo{}, nil
+		return nil, data, 0, SMSUserDataHeaderInfo{}, nil
 	}
 	if len(data) == 0 {
-		return nil, nil, 0, SMSConcatInfo{}, errors.New("SMS UDH length missing")
+		return nil, nil, 0, SMSUserDataHeaderInfo{}, errors.New("SMS UDH length missing")
 	}
 	headerLen := int(data[0]) + 1
 	if headerLen > len(data) {
-		return nil, nil, 0, SMSConcatInfo{}, errors.New("SMS UDH truncated")
+		return nil, nil, 0, SMSUserDataHeaderInfo{}, errors.New("SMS UDH truncated")
 	}
 	udh = append([]byte(nil), data[:headerLen]...)
-	concat = parseSMSConcatUDH(udh)
+	headerInfo = parseSMSUDHInfo(udh)
 	headerSeptets = (headerLen*8 + 6) / 7
-	return udh, data[headerLen:], headerSeptets, concat, nil
+	return udh, data[headerLen:], headerSeptets, headerInfo, nil
 }
 
 func parseSMSConcatUDH(udh []byte) SMSConcatInfo {
+	return parseSMSUDHInfo(udh).Concat
+}
+
+func parseSMSUDHInfo(udh []byte) SMSUserDataHeaderInfo {
+	info := SMSUserDataHeaderInfo{Raw: append([]byte(nil), udh...)}
 	if len(udh) < 2 {
-		return SMSConcatInfo{}
+		return info
 	}
 	for i := 1; i+1 < len(udh); {
 		iei := udh[i]
 		iedl := int(udh[i+1])
 		i += 2
 		if i+iedl > len(udh) {
-			return SMSConcatInfo{}
+			return info
 		}
 		ie := udh[i : i+iedl]
-		switch {
-		case iei == 0x00 && len(ie) == 3 && ie[1] > 1:
-			return SMSConcatInfo{IsConcat: true, Ref: int(ie[0]), RefBits: 8, Total: int(ie[1]), Seq: int(ie[2])}
-		case iei == 0x08 && len(ie) == 4 && ie[2] > 1:
-			return SMSConcatInfo{IsConcat: true, Ref: int(ie[0])<<8 | int(ie[1]), RefBits: 16, Total: int(ie[2]), Seq: int(ie[3])}
+		info.Elements = append(info.Elements, SMSUDHElement{Identifier: iei, Data: append([]byte(nil), ie...)})
+		switch iei {
+		case 0x00:
+			if len(ie) == 3 && ie[1] > 1 {
+				info.Concat = SMSConcatInfo{IsConcat: true, Ref: int(ie[0]), RefBits: 8, Total: int(ie[1]), Seq: int(ie[2])}
+			}
+		case 0x04:
+			if len(ie) == 2 {
+				info.HasPorts = true
+				info.DestinationPort = int(ie[0])
+				info.SourcePort = int(ie[1])
+				info.PortBits = 8
+			}
+		case 0x05:
+			if len(ie) == 4 {
+				info.HasPorts = true
+				info.DestinationPort = int(ie[0])<<8 | int(ie[1])
+				info.SourcePort = int(ie[2])<<8 | int(ie[3])
+				info.PortBits = 16
+			}
+		case 0x08:
+			if len(ie) == 4 && ie[2] > 1 {
+				info.Concat = SMSConcatInfo{IsConcat: true, Ref: int(ie[0])<<8 | int(ie[1]), RefBits: 16, Total: int(ie[2]), Seq: int(ie[3])}
+			}
 		}
 		i += iedl
 	}
-	return SMSConcatInfo{}
+	return info
 }
 
 func smsDCSAlphabet(dcs byte) string {

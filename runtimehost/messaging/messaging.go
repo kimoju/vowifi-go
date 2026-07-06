@@ -69,6 +69,7 @@ type IncomingSMS struct {
 	DataCodingScheme       byte
 	DataCoding             SMSDataCodingInfo
 	UserDataHeader         bool
+	UserDataHeaderInfo     SMSUserDataHeaderInfo
 	MoreMessagesToSend     bool
 	StatusReportIndication bool
 	ReplyPath              bool
@@ -89,6 +90,7 @@ type SMSDeliveryReport struct {
 	MoreMessagesToSend    bool
 	StatusReportQualifier bool
 	UserDataHeader        bool
+	UserDataHeaderInfo    SMSUserDataHeaderInfo
 	ParameterIndicator    byte
 	ProtocolID            byte
 	DataCodingScheme      byte

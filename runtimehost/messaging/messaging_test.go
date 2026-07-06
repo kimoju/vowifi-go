@@ -467,6 +467,28 @@ func TestHandleIMSMessagePreservesDeliverProtocolMetadata(t *testing.T) {
 	}
 }
 
+func TestHandleIMSMessagePreservesUDHPortMetadata(t *testing.T) {
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	tpdu := mustHex(t, "4005810180F6000462705021436500090605040B8423F06869")
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x38, tpdu),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.Incoming == nil || result.Incoming.Content != "hi" || string(result.ReplyBody) != string(BuildSMSRPAck(0x38)) {
+		t.Fatalf("result=%+v", result)
+	}
+	header := result.Incoming.UserDataHeaderInfo
+	if !result.Incoming.UserDataHeader || !header.HasPorts || header.PortBits != 16 || header.DestinationPort != 2948 || header.SourcePort != 9200 {
+		t.Fatalf("incoming UDH=%+v incoming=%+v", header, result.Incoming)
+	}
+}
+
 func TestHandleIMSMessageReassemblesConcatSMSBeforeDispatch(t *testing.T) {
 	dispatch := &fakeDispatcher{}
 	svc := NewService("dev-1", "310280233641503", nil, dispatch)
