@@ -39,6 +39,8 @@ type SDPAnswerOptions struct {
 	RTCPMux    bool
 	Codecs     []SDPCodec
 	Security   SDPSecurityInfo
+	PTimeMS    int
+	MaxPTimeMS int
 }
 
 type SDPMediaRewriteOptions struct {
@@ -282,6 +284,25 @@ func SelectSDPAnswerCodecs(offer, local []SDPCodec) []SDPCodec {
 	return selected
 }
 
+func SelectSDPAnswerPacketizationTime(offer, local SDPInfo) (int, int) {
+	maxptime := local.MaxPTimeMS
+	if maxptime > 0 && offer.MaxPTimeMS > 0 && offer.MaxPTimeMS < maxptime {
+		maxptime = offer.MaxPTimeMS
+	}
+	limit := maxptime
+	if limit <= 0 {
+		limit = offer.MaxPTimeMS
+	}
+	ptime := local.PTimeMS
+	if ptime <= 0 {
+		ptime = offer.PTimeMS
+	}
+	if ptime > 0 && limit > 0 && ptime > limit {
+		ptime = limit
+	}
+	return ptime, maxptime
+}
+
 func SDPInfoWithCodecs(info SDPInfo, codecs []SDPCodec) SDPInfo {
 	if len(codecs) == 0 {
 		return info
@@ -309,7 +330,7 @@ func SDPInfoWithCodecs(info SDPInfo, codecs []SDPCodec) SDPInfo {
 }
 
 func BuildSDPAnswerWithOptions(info SDPInfo, options SDPAnswerOptions) []byte {
-	if options.RTPProfile == "" && !options.RTCPMux && len(options.Codecs) == 0 && options.Security.IsZero() {
+	if options.RTPProfile == "" && !options.RTCPMux && len(options.Codecs) == 0 && options.Security.IsZero() && options.PTimeMS <= 0 && options.MaxPTimeMS <= 0 {
 		return BuildSDPAnswer(info)
 	}
 	if len(options.Codecs) > 0 {
@@ -342,6 +363,15 @@ func BuildSDPAnswerWithOptions(info SDPInfo, options SDPAnswerOptions) []byte {
 	if direction == "" {
 		direction = "sendrecv"
 	}
+	ptime := info.PTimeMS
+	if options.PTimeMS > 0 {
+		ptime = options.PTimeMS
+	}
+	maxptime := info.MaxPTimeMS
+	if options.MaxPTimeMS > 0 {
+		maxptime = options.MaxPTimeMS
+	}
+	timingLines := sdpPacketizationTimeAttributeLines(ptime, maxptime)
 	var b strings.Builder
 	b.WriteString("v=0\r\n")
 	b.WriteString("o=vowifi-go 0 0 IN " + ipVersion + " " + ip + "\r\n")
@@ -370,6 +400,9 @@ func BuildSDPAnswerWithOptions(info SDPInfo, options SDPAnswerOptions) []byte {
 		b.WriteString("a=rtcp:" + strconv.Itoa(info.RTCPPort) + " IN " + rtcpIPVersion + " " + rtcpIP + "\r\n")
 	}
 	b.WriteString("a=" + direction + "\r\n")
+	for _, line := range timingLines {
+		b.WriteString(line + "\r\n")
+	}
 	for _, line := range sdpCodecAttributeLines(payloads, options.Codecs, info.TelephoneEventPayloads) {
 		b.WriteString(line + "\r\n")
 	}
@@ -482,6 +515,62 @@ func rewriteSDPRTCPMux(body []byte) []byte {
 		out = append(out, line)
 	}
 	return []byte(strings.Join(out, "\r\n") + "\r\n")
+}
+
+func parseSDPAudioPacketizationTime(body []byte) (int, int) {
+	lines := sdpSecurityLines(body)
+	inAudio := false
+	var ptime int
+	var maxptime int
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "m=") {
+			fields := strings.Fields(line)
+			inAudio = len(fields) > 0 && strings.EqualFold(fields[0], "m=audio")
+			continue
+		}
+		if !inAudio {
+			continue
+		}
+		if value, ok := parseSDPPacketizationTimeAttribute(line, "a=ptime:"); ok {
+			ptime = value
+			continue
+		}
+		if value, ok := parseSDPPacketizationTimeAttribute(line, "a=maxptime:"); ok {
+			maxptime = value
+		}
+	}
+	return ptime, maxptime
+}
+
+func parseSDPPacketizationTimeAttribute(line, prefix string) (int, bool) {
+	value, ok := cutSDPAttributeValue(line, prefix)
+	if !ok {
+		return 0, false
+	}
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return 0, true
+	}
+	ms, err := strconv.Atoi(fields[0])
+	if err != nil || ms <= 0 {
+		return 0, true
+	}
+	return ms, true
+}
+
+func sdpPacketizationTimeAttributeLines(ptime, maxptime int) []string {
+	out := make([]string, 0, 2)
+	if ptime > 0 {
+		out = append(out, "a=ptime:"+strconv.Itoa(ptime))
+	}
+	if maxptime > 0 {
+		out = append(out, "a=maxptime:"+strconv.Itoa(maxptime))
+	}
+	return out
 }
 
 func parseSDPRTPMapCodec(line string) (SDPCodec, bool, error) {

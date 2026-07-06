@@ -89,6 +89,7 @@ func TestStatusStringRecoveryClass(t *testing.T) {
 		{status: "6400", want: RecoveryClassSIMBusy},
 		{status: "6F00", want: RecoveryClassSIMBusy},
 		{status: "6102", want: RecoveryClassMalformedReply},
+		{status: "9F02", want: RecoveryClassMalformedReply},
 		{status: "6C10", want: RecoveryClassMalformedReply},
 		{status: "6A86", want: RecoveryClassMalformedReply},
 		{status: "not-status", want: RecoveryClassNone},
@@ -129,6 +130,11 @@ func TestAPDUStatusRecoveryPlan(t *testing.T) {
 	plan = PlanAPDUStatusRecovery(0x61, 0x02)
 	if plan.Action != APDURecoveryGetResponse || plan.Le != 2 {
 		t.Fatalf("6102 plan=%+v", plan)
+	}
+
+	plan = PlanAPDUStatusRecovery(0x9F, 0x02)
+	if plan.Action != APDURecoveryGetResponse || plan.Le != 2 {
+		t.Fatalf("9F02 plan=%+v", plan)
 	}
 
 	plan = PlanAPDUStatusRecovery(0x90, 0x00)
@@ -254,6 +260,13 @@ func TestAPDURecoveryCommands(t *testing.T) {
 	}
 	if !reflect.DeepEqual(getResponse, []byte{0x00, 0xC0, 0x00, 0x00, 0x02}) {
 		t.Fatalf("GET RESPONSE APDU=% X", getResponse)
+	}
+	simGetResponse, err := GetResponseAPDUWithCLA(0xA0, 2)
+	if err != nil {
+		t.Fatalf("GetResponseAPDUWithCLA() error = %v", err)
+	}
+	if !reflect.DeepEqual(simGetResponse, []byte{0xA0, 0xC0, 0x00, 0x00, 0x02}) {
+		t.Fatalf("SIM GET RESPONSE APDU=% X", simGetResponse)
 	}
 	if _, err := GetResponseAPDU(0); err == nil {
 		t.Fatal("GetResponseAPDU(0) err=nil, want error")

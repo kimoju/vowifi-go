@@ -1010,6 +1010,8 @@ type SDPInfo struct {
 	Payloads               []int
 	TelephoneEventPayloads map[uint8]int
 	Direction              string
+	PTimeMS                int
+	MaxPTimeMS             int
 }
 
 var (
@@ -1069,6 +1071,7 @@ func ParseSDP(body []byte) (SDPInfo, error) {
 	if out.TelephoneEventPayloads == nil && sdpPayloadsContain(out.Payloads, DefaultRTPDTMFPayloadType) {
 		out.TelephoneEventPayloads = map[uint8]int{DefaultRTPDTMFPayloadType: DefaultRTPDTMFClockRate}
 	}
+	out.PTimeMS, out.MaxPTimeMS = parseSDPAudioPacketizationTime(body)
 	if m := sdpDirectionRE.FindStringSubmatch(text); len(m) == 2 {
 		out.Direction = strings.TrimSpace(m[1])
 	}
@@ -1105,6 +1108,7 @@ func BuildSDPAnswer(info SDPInfo) []byte {
 	if direction == "" {
 		direction = "sendrecv"
 	}
+	timingLines := sdpPacketizationTimeAttributeLines(info.PTimeMS, info.MaxPTimeMS)
 	var b strings.Builder
 	b.WriteString("v=0\r\n")
 	b.WriteString("o=vowifi-go 0 0 IN " + ipVersion + " " + ip + "\r\n")
@@ -1128,6 +1132,9 @@ func BuildSDPAnswer(info SDPInfo) []byte {
 		b.WriteString("a=rtcp:" + strconv.Itoa(info.RTCPPort) + " IN " + rtcpIPVersion + " " + rtcpIP + "\r\n")
 	}
 	b.WriteString("a=" + direction + "\r\n")
+	for _, line := range timingLines {
+		b.WriteString(line + "\r\n")
+	}
 	telephoneEventPayloads := info.TelephoneEventPayloads
 	if telephoneEventPayloads == nil && sdpPayloadsContain(payloads, DefaultRTPDTMFPayloadType) {
 		telephoneEventPayloads = map[uint8]int{DefaultRTPDTMFPayloadType: DefaultRTPDTMFClockRate}

@@ -190,6 +190,23 @@ type RefreshResult struct {
 }
 
 func ParseWWWAuthenticate(header string) (DigestChallenge, error) {
+	var firstErr error
+	for _, header := range digestChallengeHeaderValues(header) {
+		ch, err := parseDigestChallenge(header)
+		if err == nil {
+			return ch, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return DigestChallenge{}, firstErr
+	}
+	return DigestChallenge{}, ErrInvalidChallenge
+}
+
+func parseDigestChallenge(header string) (DigestChallenge, error) {
 	header = strings.TrimSpace(header)
 	if header == "" {
 		return DigestChallenge{}, ErrInvalidChallenge
@@ -1345,23 +1362,29 @@ func SelectDigestChallenge(headers map[string][]string, name string) (DigestChal
 	bestScore := -1
 	var firstErr error
 	for _, header := range rawHeaderValues(headers, name) {
-		ch, err := ParseWWWAuthenticate(header)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
+		challenges := digestChallengeHeaderValues(header)
+		if len(challenges) == 0 && firstErr == nil {
+			firstErr = ErrInvalidChallenge
 		}
-		if !digestChallengeSupported(ch) {
-			if firstErr == nil {
-				firstErr = unsupportedDigestChallengeError(ch)
+		for _, challenge := range challenges {
+			ch, err := parseDigestChallenge(challenge)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
 			}
-			continue
-		}
-		score := digestAlgorithmScore(ch.Algorithm)
-		if score > bestScore {
-			best = ch
-			bestScore = score
+			if !digestChallengeSupported(ch) {
+				if firstErr == nil {
+					firstErr = unsupportedDigestChallengeError(ch)
+				}
+				continue
+			}
+			score := digestAlgorithmScore(ch.Algorithm)
+			if score > bestScore {
+				best = ch
+				bestScore = score
+			}
 		}
 	}
 	if bestScore >= 0 {
@@ -1466,6 +1489,98 @@ func splitAuthParams(s string) []string {
 		out = append(out, part)
 	}
 	return out
+}
+
+func digestChallengeHeaderValues(header string) []string {
+	var out []string
+	for _, challenge := range splitAuthenticateChallenges(header) {
+		if strings.EqualFold(authChallengeScheme(challenge), "Digest") {
+			out = append(out, challenge)
+		}
+	}
+	return out
+}
+
+func splitAuthenticateChallenges(header string) []string {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return nil
+	}
+	var out []string
+	start := 0
+	inQuote := false
+	escaped := false
+	for i := 0; i < len(header); i++ {
+		switch header[i] {
+		case '\\':
+			if inQuote && !escaped {
+				escaped = true
+				continue
+			}
+			escaped = false
+		case '"':
+			if !escaped {
+				inQuote = !inQuote
+			}
+			escaped = false
+		case ',':
+			if !inQuote && authChallengeStarts(header[i+1:]) {
+				if part := strings.TrimSpace(header[start:i]); part != "" {
+					out = append(out, part)
+				}
+				start = i + 1
+			}
+			escaped = false
+		default:
+			escaped = false
+		}
+	}
+	if part := strings.TrimSpace(header[start:]); part != "" {
+		out = append(out, part)
+	}
+	return out
+}
+
+func authChallengeScheme(challenge string) string {
+	challenge = strings.TrimSpace(challenge)
+	end := 0
+	for end < len(challenge) && isAuthTokenChar(challenge[end]) {
+		end++
+	}
+	return challenge[:end]
+}
+
+func authChallengeStarts(s string) bool {
+	s = strings.TrimLeft(s, " \t")
+	end := 0
+	for end < len(s) && isAuthTokenChar(s[end]) {
+		end++
+	}
+	if end == 0 || end >= len(s) {
+		return false
+	}
+	if s[end] != ' ' && s[end] != '\t' {
+		return false
+	}
+	rest := strings.TrimLeft(s[end:], " \t")
+	return rest != "" && rest[0] != '='
+}
+
+func isAuthTokenChar(c byte) bool {
+	switch {
+	case c >= '0' && c <= '9':
+		return true
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= 'a' && c <= 'z':
+		return true
+	}
+	switch c {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
 }
 
 func parseDigestNonceCount(value string) (int, error) {

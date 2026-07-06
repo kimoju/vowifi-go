@@ -177,7 +177,7 @@ func (a *Adapter) recoverAPDUStatus(channel int, apdu string, resp APDUResult) (
 				return mergeAPDUResult(bodyPrefix, resp), nil
 			}
 			bodyPrefix += resp.Body
-			getResponse, err := GetResponseAPDU(plan.Le)
+			getResponse, err := GetResponseAPDUWithCLA(apduCLA(apdu), plan.Le)
 			if err != nil {
 				return mergeAPDUResult(bodyPrefix, resp), nil
 			}
@@ -359,6 +359,17 @@ func correctAPDUHexLe(apdu string, le int) (string, error) {
 		return "", err
 	}
 	return strings.ToUpper(hex.EncodeToString(corrected)), nil
+}
+
+func apduCLA(apdu string) byte {
+	if len(apdu) < 2 {
+		return 0x00
+	}
+	cla, err := strconv.ParseUint(apdu[:2], 16, 8)
+	if err != nil {
+		return 0x00
+	}
+	return byte(cla)
 }
 
 func mergeAPDUResult(bodyPrefix string, resp APDUResult) APDUResult {

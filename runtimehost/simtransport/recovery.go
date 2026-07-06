@@ -113,7 +113,7 @@ func PlanAPDUStatusRecovery(sw1, sw2 byte) APDURecoveryPlan {
 	switch sw1 {
 	case 0x6C:
 		return APDURecoveryPlan{Action: APDURecoveryCorrectLe, Le: apduLeFromSW2(sw2)}
-	case 0x61:
+	case 0x61, 0x9F:
 		return APDURecoveryPlan{Action: APDURecoveryGetResponse, Le: apduLeFromSW2(sw2)}
 	default:
 		return APDURecoveryPlan{}
@@ -176,11 +176,15 @@ func CorrectAPDULe(apdu []byte, le int) ([]byte, error) {
 }
 
 func GetResponseAPDU(le int) ([]byte, error) {
+	return GetResponseAPDUWithCLA(0x00, le)
+}
+
+func GetResponseAPDUWithCLA(cla byte, le int) ([]byte, error) {
 	leByte, err := apduLeByte(le)
 	if err != nil {
 		return nil, err
 	}
-	return []byte{0x00, 0xC0, 0x00, 0x00, leByte}, nil
+	return []byte{cla, 0xC0, 0x00, 0x00, leByte}, nil
 }
 
 func ClassifyError(err error) RecoveryClass {

@@ -1,6 +1,7 @@
 package ikev2
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"net"
@@ -338,6 +339,37 @@ func TestMOBIKENotifyHelpers(t *testing.T) {
 	}
 	if _, err := Cookie2Notify([]byte("short")); !errors.Is(err, ErrInvalidNotify) {
 		t.Fatalf("Cookie2Notify(short) err=%v, want ErrInvalidNotify", err)
+	}
+	ikeCookie, err := CookieNotify([]byte("cookie-1"))
+	if err != nil {
+		t.Fatalf("CookieNotify() error = %v", err)
+	}
+	parsedIKECookie, err := ParseNotify(ikeCookie.Body)
+	if err != nil {
+		t.Fatalf("ParseNotify(IKE cookie) error = %v", err)
+	}
+	cookieData, ok, err := parsedIKECookie.Cookie()
+	if err != nil || !ok || string(cookieData) != "cookie-1" {
+		t.Fatalf("Cookie() data=%q ok=%t err=%v", string(cookieData), ok, err)
+	}
+	cookieData[0] = 0
+	if string(parsedIKECookie.NotificationData) != "cookie-1" {
+		t.Fatalf("Cookie() did not clone notification data")
+	}
+	if parsedIKECookie.ProtocolID != 0 || parsedIKECookie.NotifyType != NotifyCookie || len(parsedIKECookie.SPI) != 0 {
+		t.Fatalf("parsed IKE cookie=%+v", parsedIKECookie)
+	}
+	if got, want := NotifyTypeName(NotifyCookie), "COOKIE"; got != want {
+		t.Fatalf("NotifyTypeName(COOKIE)=%q, want %q", got, want)
+	}
+	if _, err := CookieNotify(nil); !errors.Is(err, ErrInvalidNotify) {
+		t.Fatalf("CookieNotify(empty) err=%v, want ErrInvalidNotify", err)
+	}
+	if _, err := CookieNotify(bytes.Repeat([]byte{0xaa}, MaxIKECookieLength+1)); !errors.Is(err, ErrInvalidNotify) {
+		t.Fatalf("CookieNotify(long) err=%v, want ErrInvalidNotify", err)
+	}
+	if _, _, err := (Notify{NotifyType: NotifyCookie, SPI: []byte{1}, NotificationData: []byte{1}}).Cookie(); !errors.Is(err, ErrInvalidNotify) {
+		t.Fatalf("Notify.Cookie(with SPI) err=%v, want ErrInvalidNotify", err)
 	}
 	ipv4, err := AdditionalIPAddressNotify(net.ParseIP("192.0.2.44"))
 	if err != nil {

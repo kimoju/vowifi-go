@@ -134,6 +134,105 @@ func TestRunIKESAInitDerivesKeys(t *testing.T) {
 	}
 }
 
+func TestRunIKESAInitRetriesWithCookieNotify(t *testing.T) {
+	initiatorKey := bytes.Repeat([]byte{0x11}, 32)
+	responderKey := bytes.Repeat([]byte{0x22}, 32)
+	nonceI := bytes.Repeat([]byte{0xa1}, 32)
+	nonceR := bytes.Repeat([]byte{0xb2}, 32)
+	cookie := []byte("ike-cookie-1")
+	responderSPI := uint64(0x1112131415161718)
+	calls := 0
+	var secondRequest Message
+
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		req, err := ParseMessage(request)
+		if err != nil {
+			return nil, err
+		}
+		calls++
+		switch calls {
+		case 1:
+			if len(req.Payloads) < 3 || req.Payloads[0].Type != PayloadSA {
+				t.Fatalf("first request payloads=%+v", req.Payloads)
+			}
+			cookiePayload, err := CookieNotify(cookie)
+			if err != nil {
+				return nil, err
+			}
+			resp := Message{
+				Header: Header{
+					InitiatorSPI: req.Header.InitiatorSPI,
+					ExchangeType: ExchangeIKE_SA_INIT,
+					Flags:        FlagResponse,
+				},
+				Payloads: []Payload{cookiePayload},
+			}
+			return resp.MarshalBinary()
+		case 2:
+			secondRequest = req
+			if len(req.Payloads) < 4 ||
+				req.Payloads[0].Type != PayloadNotify ||
+				req.Payloads[1].Type != PayloadSA ||
+				req.Payloads[2].Type != PayloadKE ||
+				req.Payloads[3].Type != PayloadNonce {
+				t.Fatalf("second request payloads=%+v", req.Payloads)
+			}
+			notify, err := ParseNotify(req.Payloads[0].Body)
+			if err != nil {
+				return nil, err
+			}
+			gotCookie, ok, err := notify.Cookie()
+			if err != nil {
+				return nil, err
+			}
+			if !ok || !bytes.Equal(gotCookie, cookie) {
+				t.Fatalf("second request COOKIE=%x ok=%t, want %x", gotCookie, ok, cookie)
+			}
+			privR, err := ecdh.X25519().NewPrivateKey(responderKey)
+			if err != nil {
+				return nil, err
+			}
+			resp := Message{
+				Header: Header{
+					InitiatorSPI: req.Header.InitiatorSPI,
+					ResponderSPI: responderSPI,
+					ExchangeType: ExchangeIKE_SA_INIT,
+					Flags:        FlagResponse,
+				},
+				Payloads: []Payload{
+					req.Payloads[1],
+					KeyExchangePayload(DHGroupCurve25519, privR.PublicKey().Bytes()),
+					NoncePayload(nonceR),
+					MOBIKESupportedNotify(),
+				},
+			}
+			return resp.MarshalBinary()
+		default:
+			return nil, errors.New("unexpected extra IKE_SA_INIT request")
+		}
+	})
+
+	res, err := RunIKE_SA_INIT(context.Background(), InitConfig{
+		Transport:        transport,
+		InitiatorSPI:     0x0102030405060708,
+		NonceI:           nonceI,
+		X25519PrivateKey: initiatorKey,
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_SA_INIT() error = %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("IKE_SA_INIT requests=%d, want 2", calls)
+	}
+	if res.ResponderSPI != responderSPI || !res.MOBIKESupported {
+		t.Fatalf("responder SPI=%x mobike=%t", res.ResponderSPI, res.MOBIKESupported)
+	}
+	if len(res.Request.Payloads) == 0 || res.Request.Payloads[0].Type != PayloadNotify ||
+		!bytes.Equal(res.Request.Payloads[0].Body, secondRequest.Payloads[0].Body) {
+		t.Fatalf("result request payloads=%+v second=%+v", res.Request.Payloads, secondRequest.Payloads)
+	}
+}
+
 func TestRunIKESAInitRejectsMissingNonce(t *testing.T) {
 	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
 		req, err := ParseMessage(request)

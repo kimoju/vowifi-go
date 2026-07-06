@@ -168,6 +168,9 @@ func TestBuildAndParseEmergencyPIDFLO(t *testing.T) {
 			t.Fatalf("PIDF-LO body missing %q:\n%s", want, xmlBody)
 		}
 	}
+	if strings.Contains(xmlBody, "<gp:usage-rules>") {
+		t.Fatalf("PIDF-LO body should omit empty usage-rules:\n%s", xmlBody)
+	}
 
 	address, err := ParseEmergencyPIDFLO(body)
 	if err != nil {
@@ -226,6 +229,21 @@ func TestBuildEmergencyPIDFLOUsageRules(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `<gp:retransmission-allowed>false</gp:retransmission-allowed>`) {
 		t.Fatalf("PIDF-LO body missing explicit false retransmission rule:\n%s", body)
+	}
+}
+
+func TestBuildEmergencyPIDFLORejectsExpiredRetentionExpiry(t *testing.T) {
+	_, err := BuildEmergencyPIDFLOWithUsageRules(EmergencyPIDFLOConfig{
+		Timestamp: time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC),
+		Address: EmergencyAddress{
+			Latitude:  "47.6205",
+			Longitude: "-122.3493",
+		},
+	}, EmergencyPIDFLOUsageRules{
+		RetentionExpiry: time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC),
+	})
+	if err == nil || !strings.Contains(err.Error(), "retention-expiry") {
+		t.Fatalf("BuildEmergencyPIDFLOWithUsageRules() error = %v, want retention-expiry boundary", err)
 	}
 }
 

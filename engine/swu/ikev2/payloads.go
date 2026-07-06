@@ -34,6 +34,7 @@ const (
 	NotifyUnexpectedNATDetected      uint16 = 41
 	NotifyNATDetectionSourceIP       uint16 = 16388
 	NotifyNATDetectionDestinationIP  uint16 = 16389
+	NotifyCookie                     uint16 = 16390
 	NotifyRekeySA                    uint16 = 16393
 	NotifyMOBIKESupported            uint16 = 16396
 	NotifyAdditionalIPv4Address      uint16 = 16397
@@ -45,6 +46,7 @@ const (
 )
 
 const (
+	MaxIKECookieLength        = 64
 	DHGroup2048BitMODP uint16 = 14
 	DHGroup256BitECP   uint16 = 19
 	DHGroup384BitECP   uint16 = 20
@@ -184,6 +186,19 @@ func InvalidSelectorReportFromError(err error) (InvalidSelectorReport, bool, err
 	return notifyErr.InvalidSelectorReport()
 }
 
+func (n Notify) Cookie() ([]byte, bool, error) {
+	if n.NotifyType != NotifyCookie {
+		return nil, false, nil
+	}
+	if len(n.SPI) != 0 {
+		return nil, true, fmt.Errorf("%w: COOKIE spi length %d", ErrInvalidNotify, len(n.SPI))
+	}
+	if len(n.NotificationData) == 0 || len(n.NotificationData) > MaxIKECookieLength {
+		return nil, true, fmt.Errorf("%w: COOKIE length %d", ErrInvalidNotify, len(n.NotificationData))
+	}
+	return append([]byte(nil), n.NotificationData...), true, nil
+}
+
 func (n Notify) MarshalBinary() ([]byte, error) {
 	if len(n.SPI) > 0xff {
 		return nil, fmt.Errorf("%w: spi too long", ErrInvalidNotify)
@@ -285,6 +300,8 @@ func NotifyTypeName(notifyType uint16) string {
 		return "NAT_DETECTION_SOURCE_IP"
 	case NotifyNATDetectionDestinationIP:
 		return "NAT_DETECTION_DESTINATION_IP"
+	case NotifyCookie:
+		return "COOKIE"
 	case NotifyRekeySA:
 		return "REKEY_SA"
 	case NotifyMOBIKESupported:
@@ -568,6 +585,18 @@ func Cookie2Notify(cookie []byte) (Payload, error) {
 		return Payload{}, fmt.Errorf("%w: COOKIE2 length %d", ErrInvalidNotify, len(cookie))
 	}
 	body, err := (Notify{NotifyType: NotifyCookie2, NotificationData: append([]byte(nil), cookie...)}).MarshalBinary()
+	if err != nil {
+		return Payload{}, err
+	}
+	return Payload{Type: PayloadNotify, Body: body}, nil
+}
+
+func CookieNotify(cookie []byte) (Payload, error) {
+	notify := Notify{NotifyType: NotifyCookie, NotificationData: append([]byte(nil), cookie...)}
+	if _, _, err := notify.Cookie(); err != nil {
+		return Payload{}, err
+	}
+	body, err := notify.MarshalBinary()
 	if err != nil {
 		return Payload{}, err
 	}

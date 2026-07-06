@@ -10,6 +10,8 @@ import (
 const (
 	USIMAIDPrefix = "A0000000871002"
 	ISIMAIDPrefix = "A0000000871004"
+
+	maxGetResponseAPDUs = 4
 )
 
 type LogicalChannelTransport interface {
@@ -145,19 +147,40 @@ func Transmit(t LogicalChannelTransport, channel int, cmd []byte) (Response, err
 			return Response{}, err
 		}
 	}
-	if resp.SW1 == 0x61 {
-		le := int(resp.SW2)
-		if le == 0 {
-			le = 256
-		}
-		getResp, err := transmitOnce(t, channel, []byte{0x00, 0xC0, 0x00, 0x00, byte(le)})
+	return chaseGetResponse(t, channel, commandCLA(cmd), resp)
+}
+
+func chaseGetResponse(t LogicalChannelTransport, channel int, cla byte, resp Response) (Response, error) {
+	if !requestsGetResponse(resp.SW1) {
+		return resp, nil
+	}
+	body := append([]byte(nil), resp.Body...)
+	for count := 0; requestsGetResponse(resp.SW1) && count < maxGetResponseAPDUs; count++ {
+		le := apduLeFromSW2(resp.SW2)
+		leByte, err := apduLeByte(le)
 		if err != nil {
 			return Response{}, err
 		}
-		getResp.Body = append(append([]byte(nil), resp.Body...), getResp.Body...)
-		return getResp, nil
+		getResp, err := transmitOnce(t, channel, []byte{cla, 0xC0, 0x00, 0x00, leByte})
+		if err != nil {
+			return Response{}, err
+		}
+		resp = getResp
+		body = append(body, resp.Body...)
 	}
+	resp.Body = body
 	return resp, nil
+}
+
+func requestsGetResponse(sw1 byte) bool {
+	return sw1 == 0x61 || sw1 == 0x9F
+}
+
+func commandCLA(cmd []byte) byte {
+	if len(cmd) == 0 {
+		return 0x00
+	}
+	return cmd[0]
 }
 
 func correctAPDULe(apdu []byte, le int) ([]byte, error) {

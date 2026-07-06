@@ -103,6 +103,89 @@ func TestParseSDPMediaDescriptionCapturesRTCPMuxAndCodecs(t *testing.T) {
 	}
 }
 
+func TestParseSDPMediaDescriptionCapturesAudioPacketizationTime(t *testing.T) {
+	raw := []byte("v=0\r\n" +
+		"o=user 0 0 IN IP4 203.0.113.8\r\n" +
+		"s=-\r\n" +
+		"c=IN IP4 203.0.113.8\r\n" +
+		"t=0 0\r\n" +
+		"m=audio 49170 RTP/AVP 96 101\r\n" +
+		"a=ptime:20\r\n" +
+		"a=maxptime:60\r\n" +
+		"a=rtpmap:96 AMR/8000\r\n" +
+		"a=rtpmap:101 telephone-event/8000\r\n" +
+		"m=video 9 RTP/AVP 99\r\n" +
+		"a=ptime:100\r\n")
+	info, err := ParseSDP(raw)
+	if err != nil {
+		t.Fatalf("ParseSDP() error = %v", err)
+	}
+	if info.PTimeMS != 20 || info.MaxPTimeMS != 60 {
+		t.Fatalf("packetization info=%+v", info)
+	}
+	got, err := ParseSDPMediaDescription(raw)
+	if err != nil {
+		t.Fatalf("ParseSDPMediaDescription() error = %v", err)
+	}
+	if got.Info.PTimeMS != 20 || got.Info.MaxPTimeMS != 60 {
+		t.Fatalf("media packetization=%+v", got.Info)
+	}
+	answer := string(BuildSDPAnswer(SDPInfo{
+		ConnectionIP: "192.0.2.2",
+		MediaPort:    6000,
+		Payloads:     []int{96, 101},
+		Direction:    "sendrecv",
+		PTimeMS:      20,
+		MaxPTimeMS:   60,
+	}))
+	if !strings.Contains(answer, "a=ptime:20\r\n") || !strings.Contains(answer, "a=maxptime:60\r\n") {
+		t.Fatalf("answer packetization:\n%s", answer)
+	}
+}
+
+func TestSelectSDPAnswerPacketizationTimeBuildsAnswerAttributes(t *testing.T) {
+	offer, err := ParseSDP([]byte("v=0\r\n" +
+		"c=IN IP4 203.0.113.8\r\n" +
+		"m=audio 49170 RTP/AVP 96 101\r\n" +
+		"a=ptime:40\r\n" +
+		"a=maxptime:30\r\n" +
+		"a=rtpmap:96 AMR/8000\r\n" +
+		"a=rtpmap:101 telephone-event/8000\r\n"))
+	if err != nil {
+		t.Fatalf("ParseSDP() error = %v", err)
+	}
+	ptime, maxptime := SelectSDPAnswerPacketizationTime(offer, SDPInfo{PTimeMS: 40, MaxPTimeMS: 60})
+	if ptime != 30 || maxptime != 30 {
+		t.Fatalf("packetization=%d/%d, want 30/30", ptime, maxptime)
+	}
+	answer := string(BuildSDPAnswerWithOptions(SDPInfo{
+		ConnectionIP: "192.0.2.2",
+		MediaPort:    6000,
+		RTCPPort:     6001,
+		Payloads:     []int{96, 101},
+		Direction:    "sendrecv",
+	}, SDPAnswerOptions{
+		PTimeMS:    ptime,
+		MaxPTimeMS: maxptime,
+		Codecs: []SDPCodec{
+			NewSDPAMRCodec(96, "octet-align=1"),
+			NewSDPTelephoneEventCodec(101, 8000),
+		},
+	}))
+	for _, want := range []string{
+		"a=sendrecv\r\n",
+		"a=ptime:30\r\n",
+		"a=maxptime:30\r\n",
+		"a=rtpmap:96 AMR/8000\r\n",
+		"a=fmtp:96 octet-align=1\r\n",
+		"a=rtpmap:101 telephone-event/8000\r\n",
+	} {
+		if !strings.Contains(answer, want) {
+			t.Fatalf("answer missing %q:\n%s", want, answer)
+		}
+	}
+}
+
 func TestSelectSDPAnswerCodecsAndBuildMuxedAnswer(t *testing.T) {
 	offer, err := ParseSDPMediaDescription([]byte("v=0\r\n" +
 		"c=IN IP4 203.0.113.8\r\n" +

@@ -220,6 +220,9 @@ func BuildEmergencyPIDFLOWithUsageRules(cfg EmergencyPIDFLOConfig, rules Emergen
 	if !emergencyAddressHasPIDFLOLocation(cfg.Address) {
 		return nil, errors.New("e911 pidf-lo requires emergency location")
 	}
+	if err := validateEmergencyPIDFLOUsageRules(cfg, rules); err != nil {
+		return nil, err
+	}
 	entity := firstNonEmpty(cfg.Entity, defaultEmergencyPIDFLOEntity)
 	tupleID := firstNonEmpty(cfg.TupleID, defaultEmergencyPIDFLOTuple)
 	method := firstNonEmpty(cfg.Method, defaultEmergencyPIDFLOMethod)
@@ -704,6 +707,9 @@ func encodePIDFLOTextElement(enc *xml.Encoder, local, value string) error {
 }
 
 func encodePIDFLOUsageRules(enc *xml.Encoder, rules EmergencyPIDFLOUsageRules) error {
+	if !emergencyPIDFLOUsageRulesPresent(rules) {
+		return nil
+	}
 	if err := encodePIDFLOStart(enc, "gp:usage-rules"); err != nil {
 		return err
 	}
@@ -732,6 +738,23 @@ func encodePIDFLOUsageRules(enc *xml.Encoder, rules EmergencyPIDFLOUsageRules) e
 		}
 	}
 	return encodePIDFLOEnd(enc, "gp:usage-rules")
+}
+
+func validateEmergencyPIDFLOUsageRules(cfg EmergencyPIDFLOConfig, rules EmergencyPIDFLOUsageRules) error {
+	if rules.RetentionExpiry.IsZero() || cfg.Timestamp.IsZero() {
+		return nil
+	}
+	if !rules.RetentionExpiry.After(cfg.Timestamp) {
+		return errors.New("e911 pidf-lo retention-expiry must be after location timestamp")
+	}
+	return nil
+}
+
+func emergencyPIDFLOUsageRulesPresent(rules EmergencyPIDFLOUsageRules) bool {
+	return rules.RetransmissionAllowed != nil ||
+		!rules.RetentionExpiry.IsZero() ||
+		strings.TrimSpace(rules.RulesetReference) != "" ||
+		strings.TrimSpace(rules.NoteWell) != ""
 }
 
 func emergencyAddressHasPIDFLOLocation(address EmergencyAddress) bool {

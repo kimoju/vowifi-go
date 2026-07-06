@@ -175,6 +175,29 @@ func TestAdapterTransmitAPDUSendsGetResponseFor61(t *testing.T) {
 	}
 }
 
+func TestAdapterTransmitAPDUSendsGetResponseFor9F(t *testing.T) {
+	at := &fakeAT{responses: []string{
+		`+CGLA: 8,"11229F02"`,
+		`+CGLA: 8,"33449000"`,
+	}}
+	adapter := NewAdapter(at)
+
+	resp, err := adapter.TransmitAPDU(3, "A0A4000002AABB")
+	if err != nil {
+		t.Fatalf("TransmitAPDU() error = %v", err)
+	}
+	if resp != "112233449000" {
+		t.Fatalf("response = %s, want 112233449000", resp)
+	}
+	want := []string{
+		`AT+CGLA=3,14,"A0A4000002AABB"`,
+		`AT+CGLA=3,10,"A0C0000002"`,
+	}
+	if !reflect.DeepEqual(at.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", at.calls, want)
+	}
+}
+
 func TestAdapterTransmitAPDUKeeps6CWhenLeCannotBeCorrected(t *testing.T) {
 	at := &fakeAT{responses: []string{`+CSIM: 4,"6C10"`}}
 	adapter := NewAdapter(at)

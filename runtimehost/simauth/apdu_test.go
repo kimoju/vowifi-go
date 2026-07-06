@@ -94,6 +94,48 @@ func TestTransmitHandlesRetryLengthAndGetResponse(t *testing.T) {
 	if !reflect.DeepEqual(getResponse.calls, []string{"00A40004026F02", "00C0000002"}) {
 		t.Fatalf("get-response calls = %#v", getResponse.calls)
 	}
+
+	chainedGetResponse := &fakeTransport{responses: []string{"AA6102", "BB6101", "CC9000"}}
+	resp, err = Transmit(chainedGetResponse, 1, []byte{0x00, 0xA4, 0x04, 0x04, 0x02, 0x6F, 0x02})
+	if err != nil {
+		t.Fatalf("Transmit(chained 61) error = %v", err)
+	}
+	if !reflect.DeepEqual(resp.Body, []byte{0xAA, 0xBB, 0xCC}) {
+		t.Fatalf("chained get-response body = % X", resp.Body)
+	}
+	if !reflect.DeepEqual(chainedGetResponse.calls, []string{"00A40404026F02", "00C0000002", "00C0000001"}) {
+		t.Fatalf("chained get-response calls = %#v", chainedGetResponse.calls)
+	}
+
+	simGetResponse := &fakeTransport{responses: []string{"AA9F02", "BBCC9000"}}
+	resp, err = Transmit(simGetResponse, 1, []byte{0xA0, 0xA4, 0x00, 0x00, 0x02, 0x6F, 0x02})
+	if err != nil {
+		t.Fatalf("Transmit(9F) error = %v", err)
+	}
+	if !reflect.DeepEqual(resp.Body, []byte{0xAA, 0xBB, 0xCC}) {
+		t.Fatalf("9F get-response body = % X", resp.Body)
+	}
+	if !reflect.DeepEqual(simGetResponse.calls, []string{"A0A40000026F02", "A0C0000002"}) {
+		t.Fatalf("9F get-response calls = %#v", simGetResponse.calls)
+	}
+}
+
+func TestTransmitLimitsGetResponseChain(t *testing.T) {
+	ft := &fakeTransport{responses: []string{"AA6101", "BB6101", "CC6101", "DD6101", "EE6101"}}
+	resp, err := Transmit(ft, 1, []byte{0x00, 0xCA, 0x00, 0x00, 0x00})
+	if err != nil {
+		t.Fatalf("Transmit(long 61 chain) error = %v", err)
+	}
+	if resp.StatusString() != "6101" {
+		t.Fatalf("long 61 chain status = %s, want 6101", resp.StatusString())
+	}
+	if !reflect.DeepEqual(resp.Body, []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE}) {
+		t.Fatalf("long 61 chain body = % X", resp.Body)
+	}
+	wantCalls := []string{"00CA000000", "00C0000001", "00C0000001", "00C0000001", "00C0000001"}
+	if !reflect.DeepEqual(ft.calls, wantCalls) {
+		t.Fatalf("long 61 chain calls = %#v, want %#v", ft.calls, wantCalls)
+	}
 }
 
 func TestAPDUStatusErrorsCarryRecoveryStatus(t *testing.T) {

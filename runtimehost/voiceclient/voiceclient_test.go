@@ -24,6 +24,16 @@ func TestParseWWWAuthenticate(t *testing.T) {
 	}
 }
 
+func TestParseWWWAuthenticateUsesDigestFromCombinedChallenges(t *testing.T) {
+	ch, err := ParseWWWAuthenticate(`Basic realm="legacy", Digest realm = "ims.example", nonce = "nonce-combined", algorithm = MD5, qop = "auth"`)
+	if err != nil {
+		t.Fatalf("ParseWWWAuthenticate() error = %v", err)
+	}
+	if ch.Realm != "ims.example" || ch.Nonce != "nonce-combined" || ch.Algorithm != "MD5" || ch.QOP != "auth" {
+		t.Fatalf("challenge=%+v", ch)
+	}
+}
+
 func TestExtractAKAChallengeNonce(t *testing.T) {
 	raw := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	rand16, autn16, ok := ExtractAKAChallengeNonce(base64.StdEncoding.EncodeToString(raw))
@@ -568,6 +578,47 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 	}
 	if got := strings.ToUpper(hex.EncodeToString(aka.rand)); got != strings.ToUpper(hex.EncodeToString(bytesFrom(0x10, 16))) {
 		t.Fatalf("RAND=%s", got)
+	}
+}
+
+func TestRegisterSessionUsesDigestFromCombinedWWWAuthenticate(t *testing.T) {
+	rawNonce := append(bytesFrom(0x21, 16), bytesFrom(0x51, 16)...)
+	challenge := `Basic realm="legacy", Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {challenge},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	aka := &registerAKAProvider{}
+	result, err := RegisterSession{
+		Transport:    transport,
+		AKAProvider:  aka,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-combined-auth",
+		CNonce:       "cnonce",
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || result.Challenge.Algorithm != "AKAv1-MD5" || result.Attempts != 2 {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("requests=%d, want 2", len(transport.requests))
+	}
+	auth := transport.requests[1].Headers["Authorization"]
+	if !strings.Contains(auth, `algorithm=AKAv1-MD5`) || !strings.Contains(auth, `nonce="`+base64.StdEncoding.EncodeToString(rawNonce)+`"`) {
+		t.Fatalf("Authorization=%s", auth)
+	}
+	if !bytesEqual(aka.rand, bytesFrom(0x21, 16)) {
+		t.Fatalf("AKA RAND=%x", aka.rand)
 	}
 }
 
@@ -1737,6 +1788,21 @@ func TestSelectDigestChallengePrefersAKAv2(t *testing.T) {
 	}
 	if ch.Algorithm != "AKAv2-MD5" {
 		t.Fatalf("challenge=%+v, want AKAv2-MD5", ch)
+	}
+}
+
+func TestSelectDigestChallengeParsesMultipleChallengesInSingleHeader(t *testing.T) {
+	rawNonce := append(bytesFrom(0x22, 16), bytesFrom(0x52, 16)...)
+	ch, err := SelectDigestChallenge(map[string][]string{
+		"WWW-Authenticate": {
+			`Basic realm="legacy", Digest realm="ims.example", nonce="md5nonce", algorithm=MD5, qop="auth", Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth"`,
+		},
+	}, "WWW-Authenticate")
+	if err != nil {
+		t.Fatalf("SelectDigestChallenge() error = %v", err)
+	}
+	if ch.Algorithm != "AKAv2-MD5" || ch.Nonce != base64.StdEncoding.EncodeToString(rawNonce) {
+		t.Fatalf("challenge=%+v, want AKAv2-MD5 from combined header", ch)
 	}
 }
 

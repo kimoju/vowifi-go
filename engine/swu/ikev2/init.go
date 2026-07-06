@@ -161,23 +161,7 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 	}
 	payloads = append(payloads, initNATPayloads(cfg, spiI, 0)...)
 	payloads = append(payloads, MOBIKESupportedNotify())
-	req := Message{
-		Header: Header{
-			InitiatorSPI: spiI,
-			ExchangeType: ExchangeIKE_SA_INIT,
-			Flags:        FlagInitiator,
-		},
-		Payloads: payloads,
-	}
-	reqBytes, err := req.MarshalBinary()
-	if err != nil {
-		return InitResult{}, err
-	}
-	respBytes, err := cfg.Transport.ExchangeIKE(ctx, reqBytes)
-	if err != nil {
-		return InitResult{}, err
-	}
-	resp, err := ParseMessage(respBytes)
+	req, reqBytes, resp, respBytes, err := runIKESAInitRequest(ctx, cfg.Transport, spiI, payloads)
 	if err != nil {
 		return InitResult{}, err
 	}
@@ -240,6 +224,83 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 		MOBIKESupported: parsed.mobikeSupported,
 		NATDetected:     detectNAT(parsed.notifies, spiI, resp.Header.ResponderSPI, cfg),
 	}, nil
+}
+
+func runIKESAInitRequest(ctx context.Context, transport InitTransport, spiI uint64, payloads []Payload) (Message, []byte, Message, []byte, error) {
+	var cookie []byte
+	var retriedCookie bool
+	for {
+		reqPayloads := clonePayloads(payloads)
+		if len(cookie) > 0 {
+			cookiePayload, err := CookieNotify(cookie)
+			if err != nil {
+				return Message{}, nil, Message{}, nil, err
+			}
+			reqPayloads = append([]Payload{cookiePayload}, reqPayloads...)
+		}
+		req := Message{
+			Header: Header{
+				InitiatorSPI: spiI,
+				ExchangeType: ExchangeIKE_SA_INIT,
+				Flags:        FlagInitiator,
+			},
+			Payloads: reqPayloads,
+		}
+		reqBytes, err := req.MarshalBinary()
+		if err != nil {
+			return Message{}, nil, Message{}, nil, err
+		}
+		respBytes, err := transport.ExchangeIKE(ctx, reqBytes)
+		if err != nil {
+			return Message{}, nil, Message{}, nil, err
+		}
+		resp, err := ParseMessage(respBytes)
+		if err != nil {
+			return Message{}, nil, Message{}, nil, err
+		}
+		nextCookie, ok, err := initResponseCookie(resp, spiI)
+		if err != nil {
+			return Message{}, nil, Message{}, nil, err
+		}
+		if !ok {
+			return req, reqBytes, resp, respBytes, nil
+		}
+		if retriedCookie {
+			return Message{}, nil, Message{}, nil, fmt.Errorf("%w: repeated COOKIE notify", ErrInvalidInitResponse)
+		}
+		cookie = nextCookie
+		retriedCookie = true
+	}
+}
+
+func initResponseCookie(resp Message, spiI uint64) ([]byte, bool, error) {
+	h := resp.Header
+	if h.InitiatorSPI != spiI {
+		return nil, false, fmt.Errorf("%w: initiator SPI mismatch", ErrInvalidInitResponse)
+	}
+	if h.ExchangeType != ExchangeIKE_SA_INIT || h.MessageID != 0 || h.Flags&FlagResponse == 0 {
+		return nil, false, fmt.Errorf("%w: unexpected header", ErrInvalidInitResponse)
+	}
+	if err := FirstNotifyError(resp.Payloads); err != nil {
+		return nil, false, fmt.Errorf("%w: %w", ErrInvalidInitResponse, err)
+	}
+	for _, payload := range resp.Payloads {
+		if payload.Type != PayloadNotify {
+			continue
+		}
+		notify, err := ParseNotify(payload.Body)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %w", ErrInvalidInitResponse, err)
+		}
+		cookie, ok, err := notify.Cookie()
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %w", ErrInvalidInitResponse, err)
+		}
+		if ok {
+			return cookie, true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 type parsedInitResponse struct {
