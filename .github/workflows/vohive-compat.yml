@@ -10,6 +10,18 @@ on:
         description: Optional branch, tag, or SHA for the VoHive checkout.
         required: false
         default: ""
+      compat-packages:
+        description: Optional package list for VoHive go test; blank uses the script default.
+        required: false
+        default: ""
+      compat-run:
+        description: Optional go test -run pattern; blank uses the script default.
+        required: false
+        default: ""
+      compat-build-packages:
+        description: Optional package list for an added VoHive go build check.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -52,6 +64,9 @@ jobs:
         env:
           VOHIVE_DIR: ${{ github.workspace }}/vohive
           GO_BIN: go
+          VOHIVE_COMPAT_PACKAGES: ${{ inputs.compat-packages }}
+          VOHIVE_COMPAT_RUN: ${{ inputs.compat-run }}
+          VOHIVE_COMPAT_BUILD_PACKAGES: ${{ inputs.compat-build-packages }}
         run: |
           cd vowifi-go
           make compat-vohive

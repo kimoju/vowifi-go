@@ -49,6 +49,7 @@ type DialogRequestConfig struct {
 	SessionExpires   int
 	SessionRefresher string
 	MinSE            int
+	InviteHeaders    map[string]string
 	AuthHeader       string
 	AuthHeaderName   string
 	AuthSession      *DigestAuthSession
@@ -101,6 +102,7 @@ func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage,
 	if cfg.MinSE > 0 {
 		msg.Headers["Min-SE"] = strconv.Itoa(cfg.MinSE)
 	}
+	applyDialogRequestHeaders(msg.Headers, cfg.InviteHeaders)
 	return msg, nil
 }
 
@@ -509,6 +511,39 @@ func applySessionIntervalHeaders(headers map[string]string, cfg DialogRequestCon
 		value += ";refresher=" + refresher
 	}
 	headers["Session-Expires"] = value
+}
+
+func applyDialogRequestHeaders(dst map[string]string, headers map[string]string) {
+	if dst == nil {
+		return
+	}
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogRequestHeader(key) {
+			continue
+		}
+		setDialogRequestHeader(dst, key, value)
+	}
+}
+
+func setDialogRequestHeader(headers map[string]string, name, value string) {
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			headers[key] = value
+			return
+		}
+	}
+	headers[name] = value
+}
+
+func isProtectedDialogRequestHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "to", "from", "call-id", "cseq", "max-forwards", "route", "record-route", "via", "contact", "content-length", "content-type", "authorization", "proxy-authorization", "p-preferred-identity", "security-verify", "rack", "refer-to", "referred-by", "event", "subscription-state":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeSessionRefresher(value string) string {

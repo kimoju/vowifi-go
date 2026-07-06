@@ -22,6 +22,13 @@ type XFRMInterfaceConfig struct {
 	SkipCreateLink bool
 }
 
+type XFRMNATTraversalConfig struct {
+	Enabled         bool
+	LocalPort       uint16
+	RemotePort      uint16
+	OriginalAddress string
+}
+
 type KernelXFRMConfig struct {
 	ChildSA              ikev2.ChildSAResult
 	OuterLocalIP         string
@@ -33,6 +40,7 @@ type KernelXFRMConfig struct {
 	InterfaceID          uint32
 	IncludeForwardPolicy bool
 	XFRMInterface        XFRMInterfaceConfig
+	NATTraversal         XFRMNATTraversalConfig
 }
 
 type KernelXFRMState struct {
@@ -126,6 +134,14 @@ type kernelXFRMParams struct {
 	xfrmiName      string
 	xfrmiOuterDev  string
 	xfrmiMTU       int
+	natt           kernelXFRMNATTraversal
+}
+
+type kernelXFRMNATTraversal struct {
+	enabled         bool
+	localPort       string
+	remotePort      string
+	originalAddress string
 }
 
 func normalizeKernelXFRMConfig(cfg KernelXFRMConfig) (kernelXFRMParams, error) {
@@ -185,6 +201,10 @@ func normalizeKernelXFRMConfig(cfg KernelXFRMConfig) (kernelXFRMParams, error) {
 			return kernelXFRMParams{}, fmt.Errorf("%w: xfrm interface mtu must be positive", ErrInvalidXFRMConfig)
 		}
 	}
+	natt, err := normalizeXFRMNATTraversal(cfg.NATTraversal)
+	if err != nil {
+		return kernelXFRMParams{}, err
+	}
 	return kernelXFRMParams{
 		child:          cfg.ChildSA,
 		outerLocal:     outerLocal,
@@ -198,6 +218,38 @@ func normalizeKernelXFRMConfig(cfg KernelXFRMConfig) (kernelXFRMParams, error) {
 		xfrmiName:      xfrmiName,
 		xfrmiOuterDev:  xfrmiOuterDev,
 		xfrmiMTU:       cfg.XFRMInterface.MTU,
+		natt:           natt,
+	}, nil
+}
+
+func normalizeXFRMNATTraversal(cfg XFRMNATTraversalConfig) (kernelXFRMNATTraversal, error) {
+	if !cfg.Enabled {
+		if cfg.LocalPort != 0 || cfg.RemotePort != 0 || strings.TrimSpace(cfg.OriginalAddress) != "" {
+			return kernelXFRMNATTraversal{}, fmt.Errorf("%w: nat traversal parameters require nat traversal enabled", ErrInvalidXFRMConfig)
+		}
+		return kernelXFRMNATTraversal{}, nil
+	}
+	localPort := cfg.LocalPort
+	if localPort == 0 {
+		localPort = 4500
+	}
+	remotePort := cfg.RemotePort
+	if remotePort == 0 {
+		remotePort = 4500
+	}
+	originalAddress := "0.0.0.0"
+	if strings.TrimSpace(cfg.OriginalAddress) != "" {
+		addr, err := normalizeIPAddress(cfg.OriginalAddress, "xfrm nat original address")
+		if err != nil {
+			return kernelXFRMNATTraversal{}, wrapXFRMError(err)
+		}
+		originalAddress = addr
+	}
+	return kernelXFRMNATTraversal{
+		enabled:         true,
+		localPort:       strconv.Itoa(int(localPort)),
+		remotePort:      strconv.Itoa(int(remotePort)),
+		originalAddress: originalAddress,
 	}, nil
 }
 
@@ -254,6 +306,7 @@ func xfrmStateAddArgs(params kernelXFRMParams, outbound bool) []string {
 		"enc", "cbc(aes)", xfrmHexKey(keys.EncryptionKey),
 	}
 	args = appendXFRMCommonSelectors(args, params)
+	args = appendXFRMNATTraversal(args, params, outbound)
 	return args
 }
 
@@ -320,6 +373,17 @@ func appendXFRMCommonSelectors(args []string, params kernelXFRMParams) []string 
 		args = append(args, "if_id", params.ifID)
 	}
 	return args
+}
+
+func appendXFRMNATTraversal(args []string, params kernelXFRMParams, outbound bool) []string {
+	if !params.natt.enabled {
+		return args
+	}
+	sourcePort, destPort := params.natt.localPort, params.natt.remotePort
+	if !outbound {
+		sourcePort, destPort = destPort, sourcePort
+	}
+	return append(args, "encap", "espinudp", sourcePort, destPort, params.natt.originalAddress)
 }
 
 func xfrmSPI(spi []byte) (string, error) {

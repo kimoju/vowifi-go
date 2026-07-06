@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/boa-z/vowifi-go/runtimehost/e911"
 	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
@@ -98,6 +99,65 @@ func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {
 	}
 	if route := bye.Headers["Route"]; route != "<sip:pcscf-dialog2.ims.example;lr>, <sip:pcscf-dialog1.ims.example;lr>" {
 		t.Fatalf("BYE Route=%q", route)
+	}
+}
+
+func TestIMSOutboundAgentEmergencyINVITEUsesRequestURIAndHeaders(t *testing.T) {
+	info := e911.BuildEmergencySIPRequestInfo(e911.EmergencySIPHeaderConfig{
+		ServiceURN: "fire",
+		AccessNetworkInfo: e911.EmergencyAccessNetworkInfo{
+			Raw: "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=3102600abcdef",
+		},
+		GeolocationURI:     "cid:location-1",
+		GeolocationRouting: true,
+	})
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:911@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:emergency-carrier@198.51.100.9:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+
+	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID:     "call-emergency",
+		Callee:     "911",
+		RequestURI: info.RequestURI,
+		RawSDP:     []byte(sampleSDP("192.0.2.50", 4002)),
+		Headers:    info.Headers,
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("StartOutboundCall() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 1 || transport.requests[0].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	invite := transport.requests[0]
+	if invite.URI != "urn:service:sos.fire" || invite.Headers["To"] != "<sip:911@ims.example>" {
+		t.Fatalf("emergency INVITE target=%q headers=%+v", invite.URI, invite.Headers)
+	}
+	if invite.Headers["Accept-Contact"] != e911.IMSEmergencyAcceptContact ||
+		invite.Headers["P-Access-Network-Info"] != "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=3102600abcdef" ||
+		invite.Headers["Geolocation"] != "<cid:location-1>;inserted-by=endpoint" ||
+		invite.Headers["Geolocation-Routing"] != "yes" {
+		t.Fatalf("emergency INVITE headers=%+v", invite.Headers)
+	}
+	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" ||
+		transport.writes[0].URI != "sip:emergency-carrier@198.51.100.9:5060" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
 	}
 }
 

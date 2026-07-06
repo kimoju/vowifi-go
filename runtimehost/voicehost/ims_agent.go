@@ -112,13 +112,14 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		LocalURI:         firstVoiceNonEmpty(a.Registration.PublicIdentity, a.Profile.IMPU),
 		ContactURI:       a.Registration.ContactURI,
 		RemoteURI:        remoteURI,
-		RemoteTargetURI:  firstVoiceNonEmpty(a.RemoteTargetURI, remoteURI),
+		RemoteTargetURI:  firstVoiceNonEmpty(req.RequestURI, a.RemoteTargetURI, remoteURI),
 		CallID:           strings.TrimSpace(req.CallID),
 		LocalTag:         firstVoiceNonEmpty(a.LocalTag, "vowifi-go"),
 		CSeq:             1,
 		UserAgent:        firstVoiceNonEmpty(a.UserAgent, a.Profile.UserAgent, "vowifi-go"),
 		SessionExpires:   a.SessionExpires,
 		SessionRefresher: normalizeSessionRefresher(a.SessionRefresher),
+		InviteHeaders:    copyVoiceHeaderMap(req.Headers),
 	}
 	inviteBody := append([]byte(nil), req.RawSDP...)
 	localSDPBody := dialogLocalSDPBody(req.RawSDP, req.RemoteSDP)
@@ -257,6 +258,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		cfg.RemoteTargetURI = contact
 	}
 	applyNegotiatedSessionInterval(&cfg, resp.Headers)
+	cfg.InviteHeaders = nil
 	ack, err := voiceclient.BuildAckRequest(cfg)
 	if err != nil {
 		return OutboundCallResult{Accepted: false, Reason: "build IMS ACK failed"}, err
@@ -2051,6 +2053,21 @@ func firstValueSIPHeaders(headers map[string][]string) map[string]string {
 				out[strings.TrimSpace(key)] = strings.TrimSpace(value)
 				break
 			}
+		}
+	}
+	return out
+}
+
+func copyVoiceHeaderMap(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key != "" && value != "" {
+			out[key] = value
 		}
 	}
 	return out

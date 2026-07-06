@@ -17,6 +17,7 @@ make ci
 Useful focused targets are:
 
 - `make go-version`
+- `make module-path`
 - `make fmt-check`
 - `make tidy-check`
 - `make vet`
@@ -28,9 +29,10 @@ Useful focused targets are:
 - `make compat-vohive`
 
 The default `make ci` path stays lightweight: it checks the Go version required
-by `go.mod`, downloads modules, verifies formatting and module tidiness, runs
-`go vet`, compiles packages/tests with a zero-test smoke pass, then runs the
-unit suite. Race and coverage runs are opt-in:
+by `go.mod`, verifies the canonical module path and Go import roots, downloads
+modules, verifies formatting and module tidiness, runs `go vet`, compiles
+packages/tests with a zero-test smoke pass, then runs the unit suite. Race and
+coverage runs are opt-in:
 
 ```sh
 make race
@@ -47,12 +49,16 @@ GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt make ci
 
 GitHub Actions runs `.github/workflows/ci.yml` on Ubuntu with the Go version
 pinned by `go.mod`, calling `make ci` so local validation and the default CI
-job share the same entry point. The workflow can also be started manually with
-optional race and coverage inputs, matching `make race` and `make coverage`.
+job share the same entry point, including the canonical
+`github.com/boa-z/vowifi-go` module-path guard. The workflow can also be
+started manually with optional race and coverage inputs, matching `make race`
+and `make coverage`.
 
 The manual `.github/workflows/vohive-compat.yml` workflow checks this module
 against an older VoHive consumer checkout. It asks for the VoHive repository
 and an optional ref, then runs the same compatibility script used locally.
+Optional inputs can override the VoHive test package list, `go test -run`
+pattern, and added `go build` package list for broader compatibility coverage.
 
 The current test suite uses loopback networking and mock command boundaries. It
 does not require a modem, root privileges, or a real TUN device in CI.
@@ -74,9 +80,11 @@ VOHIVE_DIR=/path/to/vohive GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt
 ```
 
 The script clones or copies the VoHive checkout into a temporary directory,
-rewrites legacy `vowifi-go` module references there to
-`github.com/boa-z/vowifi-go` when needed, verifies no legacy module references
-remain, confirms the temporary VoHive module resolves
+first verifies this checkout still declares `github.com/boa-z/vowifi-go` and
+does not use the legacy module path in Go module/source files, rewrites legacy
+`vowifi-go` module references there to `github.com/boa-z/vowifi-go` when
+needed, verifies no legacy module references remain, confirms the temporary
+VoHive module resolves
 `github.com/boa-z/vowifi-go` through a `replace` pointing at this repository,
 then runs the focused VoHive test set. The source VoHive checkout is not
 modified.

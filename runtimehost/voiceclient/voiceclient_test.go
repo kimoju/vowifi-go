@@ -536,6 +536,58 @@ func TestRegisterSessionInstallsSecurityPlanBeforeAuthenticatedRegister(t *testi
 	}
 }
 
+func TestRegisterSessionInstallsRichSecurityPlanRequestWithAKAMaterial(t *testing.T) {
+	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	ck := bytesFrom(0xA0, 16)
+	ik := bytesFrom(0xB0, 16)
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063;q=0.8;mode=trans`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	installer := &fakeRichSecurityPlanInstaller{transport: transport}
+	result, err := RegisterSession{
+		Transport:             transport,
+		AKAProvider:           &sequenceAKAProvider{results: []sim.AKAResult{{RES: []byte{0xAA, 0xBB, 0xCC, 0xDD}, CK: ck, IK: ik}}},
+		Profile:               IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:          "sip:ims.example",
+		ContactURI:            "sip:user@192.0.2.10:5060",
+		CNonce:                "cnonce",
+		SecurityPlanInstaller: installer,
+		SecurityLocalAddr:     "192.0.2.20:45000",
+		SecurityRemoteAddr:    "198.51.100.10:5060",
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", result, len(transport.requests))
+	}
+	if len(installer.requests) != 1 || len(installer.requestsAtCall) != 1 || installer.requestsAtCall[0] != 1 || len(installer.legacyCalls) != 0 {
+		t.Fatalf("rich requests=%+v legacy=%+v requestsAtCall=%+v", installer.requests, installer.legacyCalls, installer.requestsAtCall)
+	}
+	req := installer.requests[0]
+	if !bytesEqual(req.AKA.CK, ck) || !bytesEqual(req.AKA.IK, ik) {
+		t.Fatalf("AKA keys CK=%x IK=%x", req.AKA.CK, req.AKA.IK)
+	}
+	if req.LocalEndpoint.Address != "192.0.2.20" || req.LocalEndpoint.Port != 5062 ||
+		req.RemoteEndpoint.Address != "198.51.100.10" || req.RemoteEndpoint.Port != 5063 {
+		t.Fatalf("endpoints local=%+v remote=%+v", req.LocalEndpoint, req.RemoteEndpoint)
+	}
+	if req.Plan.SPIClient != 111 || req.Plan.SPIServer != 222 || req.Plan.Inbound.LocalPort != 5062 || req.Plan.Outbound.RemotePort != 5063 {
+		t.Fatalf("plan=%+v", req.Plan)
+	}
+	if req.Agreement.SPIClient != 111 || req.SelectedParameters["q"] != "0.8" || req.SelectedParameters["mode"] != "trans" {
+		t.Fatalf("agreement=%+v selected=%+v", req.Agreement, req.SelectedParameters)
+	}
+}
+
 func TestRegisterSessionPropagatesSecurityPlanInstallerError(t *testing.T) {
 	installErr := errors.New("security plan install failed")
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
@@ -1912,6 +1964,53 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	}
 }
 
+func TestBuildIMSDialogINVITEAppliesEmergencyHeaders(t *testing.T) {
+	cfg := DialogRequestConfig{
+		Profile: IMSProfile{UserAgent: "VoHive"},
+		Registration: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@example",
+		},
+		RemoteURI:       "sip:911@ims.example",
+		RemoteTargetURI: "urn:service:sos.fire",
+		CallID:          "call-emergency",
+		LocalTag:        "ltag",
+		InviteHeaders: map[string]string{
+			"P-Preferred-Service":   "urn:urn-7:3gpp-service.ims.icsi.mmtel",
+			"Accept-Contact":        `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";require;explicit`,
+			"P-Access-Network-Info": "IEEE-802.11;i-wlan-node-id=\"aa:bb\"",
+			"Geolocation":           "<geo:47.6205,-122.3493>;inserted-by=endpoint",
+			"Geolocation-Routing":   "yes",
+			"To":                    "<sip:changed@example>",
+			"Content-Type":          "text/plain",
+		},
+	}
+	invite, err := BuildInviteRequest(cfg, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatalf("BuildInviteRequest() error = %v", err)
+	}
+	if invite.URI != "urn:service:sos.fire" || invite.Headers["To"] != "<sip:911@ims.example>" {
+		t.Fatalf("emergency INVITE target headers=%+v uri=%q", invite.Headers, invite.URI)
+	}
+	if invite.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.mmtel" ||
+		invite.Headers["Accept-Contact"] != `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";require;explicit` ||
+		invite.Headers["P-Access-Network-Info"] != "IEEE-802.11;i-wlan-node-id=\"aa:bb\"" ||
+		invite.Headers["Geolocation"] != "<geo:47.6205,-122.3493>;inserted-by=endpoint" ||
+		invite.Headers["Geolocation-Routing"] != "yes" {
+		t.Fatalf("emergency INVITE headers=%+v", invite.Headers)
+	}
+	if invite.Headers["Content-Type"] != "application/sdp" {
+		t.Fatalf("protected Content-Type=%q", invite.Headers["Content-Type"])
+	}
+	bye, err := BuildByeRequest(cfg)
+	if err != nil {
+		t.Fatalf("BuildByeRequest() error = %v", err)
+	}
+	if bye.URI != "urn:service:sos.fire" || bye.Headers["Geolocation"] != "" || bye.Headers["Accept-Contact"] != "" {
+		t.Fatalf("BYE should not inherit INVITE-only emergency headers: %+v", bye)
+	}
+}
+
 func TestBuildIMSDialogRequestsIncludeSessionRefresher(t *testing.T) {
 	cfg := DialogRequestConfig{
 		Profile:          IMSProfile{IMPU: "sip:user@example"},
@@ -2539,6 +2638,27 @@ type fakeSecurityPlanInstaller struct {
 
 func (f *fakeSecurityPlanInstaller) InstallSecurityPlan(ctx context.Context, plan IMSSecurityAssociationPlan) error {
 	f.calls = append(f.calls, plan)
+	if f.transport != nil {
+		f.requestsAtCall = append(f.requestsAtCall, len(f.transport.requests))
+	}
+	return f.err
+}
+
+type fakeRichSecurityPlanInstaller struct {
+	transport      *fakeRegisterTransport
+	requests       []IMSSecurityAssociationInstallRequest
+	requestsAtCall []int
+	legacyCalls    []IMSSecurityAssociationPlan
+	err            error
+}
+
+func (f *fakeRichSecurityPlanInstaller) InstallSecurityPlan(ctx context.Context, plan IMSSecurityAssociationPlan) error {
+	f.legacyCalls = append(f.legacyCalls, plan)
+	return f.err
+}
+
+func (f *fakeRichSecurityPlanInstaller) InstallSecurityPlanRequest(ctx context.Context, req IMSSecurityAssociationInstallRequest) error {
+	f.requests = append(f.requests, cloneIMSSecurityAssociationInstallRequest(req))
 	if f.transport != nil {
 		f.requestsAtCall = append(f.requestsAtCall, len(f.transport.requests))
 	}

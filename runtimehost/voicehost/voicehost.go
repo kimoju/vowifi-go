@@ -87,11 +87,13 @@ type DialogHoldController interface {
 }
 
 type OutboundCallRequest struct {
-	DeviceID  string
-	CallID    string
-	Callee    string
-	RemoteSDP SDPInfo
-	RawSDP    []byte
+	DeviceID   string
+	CallID     string
+	Callee     string
+	RequestURI string
+	RemoteSDP  SDPInfo
+	RawSDP     []byte
+	Headers    map[string]string
 }
 
 type OutboundCallResult struct {

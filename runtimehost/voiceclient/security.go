@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -49,6 +50,25 @@ type IMSSecurityAssociationDirection struct {
 	LocalPort  int
 	RemotePort int
 	SPI        uint32
+}
+
+type IMSSecurityAKAKeys struct {
+	CK []byte
+	IK []byte
+}
+
+type IMSSecurityAssociationEndpoint struct {
+	Address string
+	Port    int
+}
+
+type IMSSecurityAssociationInstallRequest struct {
+	Plan               IMSSecurityAssociationPlan
+	Agreement          SecurityAgreement
+	AKA                IMSSecurityAKAKeys
+	LocalEndpoint      IMSSecurityAssociationEndpoint
+	RemoteEndpoint     IMSSecurityAssociationEndpoint
+	SelectedParameters map[string]string
 }
 
 func DefaultSecurityClientAgreement(random io.Reader) SecurityAgreement {
@@ -209,6 +229,127 @@ func isZeroSecurityAgreement(a SecurityAgreement) bool {
 
 func isZeroIMSSecurityAssociationPlan(plan IMSSecurityAssociationPlan) bool {
 	return plan == IMSSecurityAssociationPlan{}
+}
+
+func buildIMSSecurityAssociationInstallRequest(plan IMSSecurityAssociationPlan, agreement SecurityAgreement, aka IMSSecurityAKAKeys, localAddr, remoteAddr, contactURI, registrarURI string) IMSSecurityAssociationInstallRequest {
+	agreement = cloneSecurityAgreement(agreement)
+	return IMSSecurityAssociationInstallRequest{
+		Plan:               plan,
+		Agreement:          agreement,
+		AKA:                cloneIMSSecurityAKAKeys(aka),
+		LocalEndpoint:      imssSecurityEndpoint(localAddr, contactURI, plan.PortClient),
+		RemoteEndpoint:     imssSecurityEndpoint(remoteAddr, registrarURI, plan.PortServer),
+		SelectedParameters: cloneSecurityParameters(agreement.Parameters),
+	}
+}
+
+func cloneIMSSecurityAssociationInstallRequest(req IMSSecurityAssociationInstallRequest) IMSSecurityAssociationInstallRequest {
+	req.Agreement = cloneSecurityAgreement(req.Agreement)
+	req.AKA = cloneIMSSecurityAKAKeys(req.AKA)
+	req.SelectedParameters = cloneSecurityParameters(req.SelectedParameters)
+	return req
+}
+
+func cloneSecurityAgreement(agreement SecurityAgreement) SecurityAgreement {
+	agreement.Parameters = cloneSecurityParameters(agreement.Parameters)
+	return agreement
+}
+
+func cloneSecurityParameters(params map[string]string) map[string]string {
+	if len(params) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(params))
+	for k, v := range params {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneIMSSecurityAKAKeys(keys IMSSecurityAKAKeys) IMSSecurityAKAKeys {
+	return IMSSecurityAKAKeys{
+		CK: append([]byte(nil), keys.CK...),
+		IK: append([]byte(nil), keys.IK...),
+	}
+}
+
+func imssSecurityEndpoint(addr, uri string, defaultPort int) IMSSecurityAssociationEndpoint {
+	if endpoint, ok := parseIMSSecurityEndpointAddr(addr, defaultPort); ok {
+		return endpoint
+	}
+	if endpoint, ok := parseIMSSecurityEndpointURI(uri, defaultPort); ok {
+		return endpoint
+	}
+	if defaultPort > 0 {
+		return IMSSecurityAssociationEndpoint{Port: defaultPort}
+	}
+	return IMSSecurityAssociationEndpoint{}
+}
+
+func parseIMSSecurityEndpointURI(uri string, defaultPort int) (IMSSecurityAssociationEndpoint, bool) {
+	endpoint, err := parseSIPURIEndpoint(uri)
+	if err != nil {
+		return IMSSecurityAssociationEndpoint{}, false
+	}
+	port := parseSecurityPort(endpoint.Port)
+	if defaultPort > 0 {
+		port = defaultPort
+	}
+	return IMSSecurityAssociationEndpoint{
+		Address: strings.TrimSpace(endpoint.Host),
+		Port:    port,
+	}, true
+}
+
+func parseIMSSecurityEndpointAddr(addr string, defaultPort int) (IMSSecurityAssociationEndpoint, bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return IMSSecurityAssociationEndpoint{}, false
+	}
+	lower := strings.ToLower(addr)
+	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") {
+		return parseIMSSecurityEndpointURI(addr, defaultPort)
+	}
+	host, portText, ok := splitIMSSecurityEndpointAddr(addr)
+	if !ok {
+		return IMSSecurityAssociationEndpoint{}, false
+	}
+	port := parseSecurityPort(portText)
+	if defaultPort > 0 {
+		port = defaultPort
+	}
+	return IMSSecurityAssociationEndpoint{
+		Address: host,
+		Port:    port,
+	}, true
+}
+
+func splitIMSSecurityEndpointAddr(addr string) (string, string, bool) {
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		host = strings.Trim(host, "[] ")
+		return host, port, host != ""
+	}
+	if strings.HasPrefix(addr, "[") {
+		end := strings.IndexByte(addr, ']')
+		if end < 0 {
+			return "", "", false
+		}
+		host := strings.TrimSpace(addr[1:end])
+		rest := strings.TrimSpace(addr[end+1:])
+		if strings.HasPrefix(rest, ":") {
+			return host, strings.TrimSpace(rest[1:]), host != ""
+		}
+		return host, "", host != ""
+	}
+	if ip := net.ParseIP(strings.Trim(addr, "[] ")); ip != nil {
+		return ip.String(), "", true
+	}
+	if idx := strings.LastIndex(addr, ":"); idx > 0 && !strings.Contains(addr[idx+1:], ":") {
+		host := strings.Trim(addr[:idx], "[] ")
+		return host, strings.TrimSpace(addr[idx+1:]), host != ""
+	}
+	host := strings.Trim(addr, "[] ")
+	return host, "", host != ""
 }
 
 func parseSecurityAgreement(value string) (SecurityAgreement, bool) {

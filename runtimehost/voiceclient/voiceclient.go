@@ -115,6 +115,10 @@ type SecurityPlanInstaller interface {
 	InstallSecurityPlan(context.Context, IMSSecurityAssociationPlan) error
 }
 
+type SecurityPlanRequestInstaller interface {
+	InstallSecurityPlanRequest(context.Context, IMSSecurityAssociationInstallRequest) error
+}
+
 type RegisterSession struct {
 	Transport             SIPRegisterTransport
 	AKAProvider           sim.AKAProvider
@@ -127,6 +131,8 @@ type RegisterSession struct {
 	SecurityClient        SecurityAgreement
 	SecurityRandom        io.Reader
 	SecurityPlanInstaller SecurityPlanInstaller
+	SecurityLocalAddr     string
+	SecurityRemoteAddr    string
 }
 
 type RegisterResult struct {
@@ -651,7 +657,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	}
 	securityHeaders := resp.Headers
 
-	authzInput, syncFailure, err := s.digestAuthInputForChallenge(ch, registrarURI)
+	authzInput, syncFailure, akaKeys, err := s.digestAuthInputForChallenge(ch, registrarURI)
 	if err != nil {
 		return registerFailureResult(resp, attempts, ch, ""), err
 	}
@@ -660,7 +666,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if err != nil {
 		return registerFailureResult(resp, attempts, ch, ""), err
 	}
-	if err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClient); err != nil {
+	if err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClient, akaKeys); err != nil {
 		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, Challenge: ch, AuthHeader: authz, AuthHeaderName: authzHeader}, err
 	}
 
@@ -710,7 +716,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		if err != nil {
 			return registerFailureResult(resp2, attempts, ch, authz), err
 		}
-		nextAuthInput, nextSyncFailure, err := s.digestAuthInputForChallenge(nextChallenge, registrarURI)
+		nextAuthInput, nextSyncFailure, nextAKAKeys, err := s.digestAuthInputForChallenge(nextChallenge, registrarURI)
 		if err != nil {
 			return registerFailureResult(resp2, attempts, nextChallenge, authz), err
 		}
@@ -726,7 +732,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		currentAuthInput = nextAuthInput
 		nextChallengeHeaders := resp2.Headers
 		securityHeaders = nextChallengeHeaders
-		if err := s.installChallengeSecurityPlan(ctx, nextChallengeHeaders, securityClient); err != nil {
+		if err := s.installChallengeSecurityPlan(ctx, nextChallengeHeaders, securityClient, nextAKAKeys); err != nil {
 			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: ch, AuthHeader: authz, AuthHeaderName: authzHeader}, err
 		}
 		cseq++
@@ -834,7 +840,7 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 	if err != nil {
 		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, err
 	}
-	authInput, syncFailure, err := s.digestAuthInputForChallenge(ch, registrarURI)
+	authInput, syncFailure, _, err := s.digestAuthInputForChallenge(ch, registrarURI)
 	if err != nil {
 		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, err
 	}
@@ -856,7 +862,7 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 		if err != nil {
 			return DeregisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2)}, err
 		}
-		authInput, syncFailure, err = s.digestAuthInputForChallenge(ch, registrarURI)
+		authInput, syncFailure, _, err = s.digestAuthInputForChallenge(ch, registrarURI)
 		if err != nil {
 			return DeregisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2)}, err
 		}
@@ -992,7 +998,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if err != nil {
 		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, err
 	}
-	authInput, syncFailure, err := s.digestAuthInputForChallenge(ch, registrarURI)
+	authInput, syncFailure, _, err := s.digestAuthInputForChallenge(ch, registrarURI)
 	if err != nil {
 		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, err
 	}
@@ -1020,7 +1026,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		if err != nil {
 			return RefreshResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 		}
-		authInput, syncFailure, err = s.digestAuthInputForChallenge(ch, registrarURI)
+		authInput, syncFailure, _, err = s.digestAuthInputForChallenge(ch, registrarURI)
 		if err != nil {
 			return RefreshResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 		}
@@ -1075,13 +1081,17 @@ func (s RegisterSession) securityClientAgreement() SecurityAgreement {
 	return completeSecurityAgreement(s.SecurityClient)
 }
 
-func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, client SecurityAgreement) error {
+func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, client SecurityAgreement, akaKeys IMSSecurityAKAKeys) error {
 	if s.SecurityPlanInstaller == nil {
 		return nil
 	}
-	_, plan, ok := securityPlanFromChallenge(headers, client)
+	agreement, plan, ok := securityPlanFromChallenge(headers, client)
 	if !ok {
 		return nil
+	}
+	if requestInstaller, ok := s.SecurityPlanInstaller.(SecurityPlanRequestInstaller); ok {
+		req := buildIMSSecurityAssociationInstallRequest(plan, agreement, akaKeys, s.SecurityLocalAddr, s.SecurityRemoteAddr, s.ContactURI, s.RegistrarURI)
+		return requestInstaller.InstallSecurityPlanRequest(ctx, req)
 	}
 	return s.SecurityPlanInstaller.InstallSecurityPlan(ctx, plan)
 }
@@ -1258,7 +1268,7 @@ func mergeRefreshBinding(previous, next RegistrationBinding) RegistrationBinding
 	return next
 }
 
-func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registrarURI string) (DigestAuthInput, bool, error) {
+func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registrarURI string) (DigestAuthInput, bool, IMSSecurityAKAKeys, error) {
 	input := DigestAuthInput{
 		Method:   "REGISTER",
 		URI:      registrarURI,
@@ -1267,32 +1277,35 @@ func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registr
 		NC:       1,
 	}
 	if !isAKADigestAlgorithm(ch.Algorithm) {
-		return input, false, nil
+		return input, false, IMSSecurityAKAKeys{}, nil
 	}
 	rand16, autn16, ok := ExtractAKAChallengeNonce(ch.Nonce)
 	if !ok {
-		return input, false, ErrInvalidChallenge
+		return input, false, IMSSecurityAKAKeys{}, ErrInvalidChallenge
 	}
 	if s.AKAProvider == nil {
-		return input, false, errors.New("AKA provider required for IMS digest AKA")
+		return input, false, IMSSecurityAKAKeys{}, errors.New("AKA provider required for IMS digest AKA")
 	}
 	aka, err := s.AKAProvider.CalculateAKA(rand16, autn16)
 	if errors.Is(err, sim.ErrSyncFailure) {
 		if len(aka.AUTS) == 0 {
-			return input, false, err
+			return input, false, IMSSecurityAKAKeys{}, err
 		}
 		input.AUTS = append([]byte(nil), aka.AUTS...)
-		return input, true, nil
+		return input, true, IMSSecurityAKAKeys{}, nil
 	}
 	if err != nil {
-		return input, false, err
+		return input, false, IMSSecurityAKAKeys{}, err
 	}
 	password, err := BuildAKADigestPassword(ch.Algorithm, aka)
 	if err != nil {
-		return input, false, err
+		return input, false, IMSSecurityAKAKeys{}, err
 	}
 	input.Password = password
-	return input, false, nil
+	return input, false, IMSSecurityAKAKeys{
+		CK: append([]byte(nil), aka.CK...),
+		IK: append([]byte(nil), aka.IK...),
+	}, nil
 }
 
 func (s RegisterSession) digestChallengeInputFunc() DigestChallengeInputFunc {
@@ -1300,7 +1313,7 @@ func (s RegisterSession) digestChallengeInputFunc() DigestChallengeInputFunc {
 	akaProvider := s.AKAProvider
 	cnonce := s.CNonce
 	return func(ch DigestChallenge, uri string) (DigestAuthInput, error) {
-		input, _, err := (RegisterSession{
+		input, _, _, err := (RegisterSession{
 			AKAProvider: akaProvider,
 			Profile:     profile,
 			CNonce:      cnonce,

@@ -44,6 +44,37 @@ go_mod_version() {
 	awk '$1 == "go" { print $2; exit }' go.mod
 }
 
+module_path_check() {
+	local expected legacy_base legacy_module module_path
+	local module_files=()
+	local legacy_refs=()
+
+	expected="${CI_MODULE_PATH:-github.com/boa-z/vowifi-go}"
+	legacy_base="${CI_LEGACY_MODULE_BASE:-github.com/iniwex5}"
+	legacy_module="${CI_LEGACY_MODULE:-${legacy_base%/}/vowifi-go}"
+
+	if ! module_path="$(env GOWORK=off "$GO_BIN" list -m -f '{{.Path}}')"; then
+		printf 'failed to read local module path\n' >&2
+		return 1
+	fi
+	if [[ "$module_path" != "$expected" ]]; then
+		printf 'module path mismatch: expected %s, got %s\n' "$expected" "$module_path" >&2
+		return 1
+	fi
+	printf '\n==> verified module path: %s\n' "$module_path"
+
+	mapfile -d '' module_files < <(find . \( -name '*.go' -o -name go.mod -o -name go.work \) -not -path './.git/*' -print0)
+	if [[ ${#module_files[@]} -gt 0 ]]; then
+		mapfile -t legacy_refs < <(grep -nH -- "$legacy_module" "${module_files[@]}" 2>/dev/null || true)
+	fi
+	if [[ ${#legacy_refs[@]} -gt 0 ]]; then
+		printf 'legacy vowifi-go module references found in Go module/source files:\n' >&2
+		printf '  %s\n' "${legacy_refs[@]}" >&2
+		return 1
+	fi
+	printf '\n==> verified Go module/source references do not use %s\n' "$legacy_module"
+}
+
 parse_go_version() {
 	local raw major minor patch
 	raw="${1#go}"
@@ -170,11 +201,14 @@ coverage() {
 
 usage() {
 	cat <<'USAGE'
-Usage: scripts/ci.sh [all|version|download|fmt|tidy|vet|smoke|test|race|coverage ...]
+Usage: scripts/ci.sh [all|version|module-path|download|fmt|tidy|vet|smoke|test|race|coverage ...]
 
 Environment:
   GO_BIN               path to go binary when it is not on PATH
   GOFMT_BIN            path to gofmt binary
+  CI_MODULE_PATH       expected module path, default: github.com/boa-z/vowifi-go
+  CI_LEGACY_MODULE     legacy module path rejected in Go files
+  CI_LEGACY_MODULE_BASE legacy owner/base used to build the default legacy path
   CI_SMOKE_PACKAGES    package pattern(s) for smoke tests, default: ./...
   CI_SMOKE_RUN         go test -run pattern for smoke tests, default: ^$
   SKIP_RACE=1          skip race tests
@@ -183,13 +217,13 @@ Environment:
   CI_COVERAGE_FILE     coverage profile path; default: temporary file
   CI_COVERAGE_MODE     Go coverage mode, default: atomic
 
-Default all runs version/download/fmt/tidy/vet/smoke/test. Race and coverage
-are opt-in so the main local and GitHub CI path stays lightweight.
+Default all runs version/module-path/download/fmt/tidy/vet/smoke/test. Race
+and coverage are opt-in so the main local and GitHub CI path stays lightweight.
 USAGE
 }
 
 if [[ $# -eq 0 || "${1:-}" == "all" ]]; then
-	tasks=(version download fmt tidy vet smoke test)
+	tasks=(version module-path download fmt tidy vet smoke test)
 else
 	tasks=("$@")
 fi
@@ -200,6 +234,7 @@ printf 'Using gofmt: %s\n' "$GOFMT_BIN"
 for task in "${tasks[@]}"; do
 	case "$task" in
 		version | go-version) version_check ;;
+		module-path | module_path) module_path_check ;;
 		download) download ;;
 		fmt | fmt-check) fmt_check ;;
 		tidy | tidy-check) tidy_check ;;

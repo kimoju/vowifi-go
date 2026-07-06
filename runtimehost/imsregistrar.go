@@ -50,6 +50,7 @@ type WireIMSRegistrar struct {
 	RetransmitInterval    time.Duration
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
+	SecurityPlanInstaller voiceclient.SecurityPlanInstaller
 }
 
 func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationConfig) (IMSRegistrationResult, error) {
@@ -79,14 +80,17 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		expires = 3600
 	}
 	registerSession := voiceclient.RegisterSession{
-		Transport:    transport,
-		AKAProvider:  cfg.SIM,
-		Profile:      profile,
-		RegistrarURI: registrarURI,
-		ContactURI:   contactURI,
-		CallID:       firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
-		CNonce:       firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
-		Expires:      expires,
+		Transport:             transport,
+		AKAProvider:           cfg.SIM,
+		Profile:               profile,
+		RegistrarURI:          registrarURI,
+		ContactURI:            contactURI,
+		CallID:                firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
+		CNonce:                firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
+		Expires:               expires,
+		SecurityPlanInstaller: r.SecurityPlanInstaller,
+		SecurityLocalAddr:     firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, r.LocalAddr),
+		SecurityRemoteAddr:    r.ServerAddr,
 	}
 	result, err := registerSession.Register(ctx)
 	if err != nil {

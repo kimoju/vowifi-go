@@ -161,6 +161,62 @@ func TestWireIMSRegistrarHandlesAKADigestChallenge(t *testing.T) {
 	}
 }
 
+func TestWireIMSRegistrarPassesSecurityPlanInstallerRequest(t *testing.T) {
+	rawNonce := append(runtimeBytesFrom(0x10, 16), runtimeBytesFrom(0x40, 16)...)
+	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=301;spi-s=302;port-c=5062;port-s=5063;q=0.7`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"P-Associated-URI": {"<sip:310280233641503@ims.mnc280.mcc310.3gppnetwork.org>"},
+			},
+		},
+	}}
+	installer := &wireIMSRegistrarSecurityInstaller{}
+	res, err := WireIMSRegistrar{
+		Transport:             transport,
+		ContactHost:           "192.0.2.10",
+		ContactPort:           5060,
+		ServerAddr:            "198.51.100.10:5060",
+		CNonce:                "cnonce",
+		SecurityPlanInstaller: installer,
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-1",
+		TraceID:  "trace-1",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		SIM:      &wireIMSRegistrarSIM{},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if !res.Registered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", res, len(transport.requests))
+	}
+	if len(installer.requests) != 1 || len(installer.legacyCalls) != 0 {
+		t.Fatalf("installer requests=%+v legacy=%+v", installer.requests, installer.legacyCalls)
+	}
+	req := installer.requests[0]
+	if req.Plan.SPIClient != 301 || req.Plan.SPIServer != 302 || req.SelectedParameters["q"] != "0.7" {
+		t.Fatalf("install request plan=%+v selected=%+v", req.Plan, req.SelectedParameters)
+	}
+	if req.LocalEndpoint.Address != "192.0.2.10" || req.LocalEndpoint.Port != 5062 ||
+		req.RemoteEndpoint.Address != "198.51.100.10" || req.RemoteEndpoint.Port != 5063 {
+		t.Fatalf("install request endpoints local=%+v remote=%+v", req.LocalEndpoint, req.RemoteEndpoint)
+	}
+	if hex.EncodeToString(req.AKA.CK) != hex.EncodeToString(runtimeBytesFrom(0xA0, 16)) ||
+		hex.EncodeToString(req.AKA.IK) != hex.EncodeToString(runtimeBytesFrom(0xB0, 16)) {
+		t.Fatalf("install request AKA CK=%x IK=%x", req.AKA.CK, req.AKA.IK)
+	}
+}
+
 func TestWireIMSRegistrarUsesTunnelInnerIPForContact(t *testing.T) {
 	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{{
 		StatusCode: 200,
@@ -1031,6 +1087,30 @@ func (t *wireIMSRegistrarTransport) RoundTripRegister(ctx context.Context, msg v
 	resp := t.responses[0]
 	t.responses = t.responses[1:]
 	return resp, nil
+}
+
+type wireIMSRegistrarSecurityInstaller struct {
+	requests    []voiceclient.IMSSecurityAssociationInstallRequest
+	legacyCalls []voiceclient.IMSSecurityAssociationPlan
+}
+
+func (i *wireIMSRegistrarSecurityInstaller) InstallSecurityPlan(ctx context.Context, plan voiceclient.IMSSecurityAssociationPlan) error {
+	i.legacyCalls = append(i.legacyCalls, plan)
+	return nil
+}
+
+func (i *wireIMSRegistrarSecurityInstaller) InstallSecurityPlanRequest(ctx context.Context, req voiceclient.IMSSecurityAssociationInstallRequest) error {
+	req.AKA.CK = append([]byte(nil), req.AKA.CK...)
+	req.AKA.IK = append([]byte(nil), req.AKA.IK...)
+	if len(req.SelectedParameters) > 0 {
+		selected := make(map[string]string, len(req.SelectedParameters))
+		for k, v := range req.SelectedParameters {
+			selected[k] = v
+		}
+		req.SelectedParameters = selected
+	}
+	i.requests = append(i.requests, req)
+	return nil
 }
 
 type wireIMSRegistrarSIM struct {

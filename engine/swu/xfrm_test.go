@@ -105,6 +105,51 @@ func TestBuildKernelXFRMCommandsSupportsSHA1(t *testing.T) {
 	}
 }
 
+func TestBuildKernelXFRMCommandsAddsNATTraversalEncapsulation(t *testing.T) {
+	commands, err := buildKernelXFRMCommands(KernelXFRMConfig{
+		ChildSA:           xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128),
+		OuterLocalIP:      "192.0.2.23",
+		OuterRemoteIP:     "198.51.100.7",
+		InnerLocalPrefix:  "10.10.0.2/32",
+		InnerRemotePrefix: "10.20.0.0/24",
+		NATTraversal: XFRMNATTraversalConfig{
+			Enabled:         true,
+			LocalPort:       55000,
+			RemotePort:      4500,
+			OriginalAddress: "203.0.113.9",
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildKernelXFRMCommands() error = %v", err)
+	}
+	wantOutbound := []string{"encap", "espinudp", "55000", "4500", "203.0.113.9"}
+	if got := commands[0].args[len(commands[0].args)-len(wantOutbound):]; !reflect.DeepEqual(got, wantOutbound) {
+		t.Fatalf("outbound encap args=%v, want %v", got, wantOutbound)
+	}
+	wantInbound := []string{"encap", "espinudp", "4500", "55000", "203.0.113.9"}
+	if got := commands[1].args[len(commands[1].args)-len(wantInbound):]; !reflect.DeepEqual(got, wantInbound) {
+		t.Fatalf("inbound encap args=%v, want %v", got, wantInbound)
+	}
+}
+
+func TestBuildKernelXFRMCommandsDefaultsNATTraversalEncapsulation(t *testing.T) {
+	commands, err := buildKernelXFRMCommands(KernelXFRMConfig{
+		ChildSA:           xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128),
+		OuterLocalIP:      "192.0.2.23",
+		OuterRemoteIP:     "198.51.100.7",
+		InnerLocalPrefix:  "10.10.0.2/32",
+		InnerRemotePrefix: "10.20.0.0/24",
+		NATTraversal:      XFRMNATTraversalConfig{Enabled: true},
+	})
+	if err != nil {
+		t.Fatalf("buildKernelXFRMCommands() error = %v", err)
+	}
+	want := []string{"encap", "espinudp", "4500", "4500", "0.0.0.0"}
+	if got := commands[0].args[len(commands[0].args)-len(want):]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("default encap args=%v, want %v", got, want)
+	}
+}
+
 func TestBuildKernelXFRMCommandsRejectsInvalidInput(t *testing.T) {
 	base := KernelXFRMConfig{
 		ChildSA:           xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128),
@@ -128,6 +173,12 @@ func TestBuildKernelXFRMCommandsRejectsInvalidInput(t *testing.T) {
 		{name: "xfrmi no ifid", cfg: withXFRM(base, func(c *KernelXFRMConfig) { c.XFRMInterface = XFRMInterfaceConfig{Name: "ipsec0", OuterDev: "wwan0"} })},
 		{name: "xfrmi bad outer dev", cfg: withXFRM(base, func(c *KernelXFRMConfig) {
 			c.XFRMInterface = XFRMInterfaceConfig{Name: "ipsec0", OuterDev: "bad dev", IfID: 1}
+		})},
+		{name: "natt disabled with params", cfg: withXFRM(base, func(c *KernelXFRMConfig) {
+			c.NATTraversal = XFRMNATTraversalConfig{LocalPort: 4500}
+		})},
+		{name: "natt bad original address", cfg: withXFRM(base, func(c *KernelXFRMConfig) {
+			c.NATTraversal = XFRMNATTraversalConfig{Enabled: true, OriginalAddress: "bad"}
 		})},
 	}
 	for _, tc := range cases {

@@ -6,12 +6,13 @@ GOFMT ?= $(shell command -v gofmt 2>/dev/null || printf /usr/local/go/bin/gofmt)
 CI := ./scripts/ci.sh
 VOHIVE_COMPAT := ./scripts/compat-vohive.sh
 
-.PHONY: help ci go-version download fmt-check tidy-check vet smoke test race coverage compat-vohive
+.PHONY: help ci go-version module-path download fmt-check tidy-check vet smoke test race coverage compat-vohive
 
 help:
 > @printf 'Targets:\n'
 > @printf '  make ci          run the default local CI suite used by GitHub Actions\n'
 > @printf '  make go-version  check current Go against the go.mod version pin\n'
+> @printf '  make module-path check canonical module path and Go import roots\n'
 > @printf '  make download    download Go module dependencies\n'
 > @printf '  make fmt-check   check gofmt formatting\n'
 > @printf '  make tidy-check  check go.mod/go.sum tidiness\n'
@@ -28,6 +29,9 @@ ci:
 
 go-version:
 > GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) version
+
+module-path:
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) module-path
 
 download:
 > GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) download

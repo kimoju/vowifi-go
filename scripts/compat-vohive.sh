@@ -49,8 +49,19 @@ find_module_refs() {
 	grep -RIl --exclude-dir=.git -- "$module_path" . 2>/dev/null || true
 }
 
+find_local_go_module_refs() {
+	local module_path="$1"
+	(
+		cd "$ROOT"
+		grep -RIn --include='*.go' --include='go.mod' --include='go.work' \
+			--exclude-dir=.git -- "$module_path" . 2>/dev/null || true
+	)
+}
+
 verify_local_module() {
 	local module_path
+	local local_legacy_refs=()
+
 	if ! module_path="$(
 		cd "$ROOT"
 		env GOWORK=off TMPDIR="$tmpdir/go-tmp" GOTMPDIR="$tmpdir/go-tmp" "$GO_BIN" list -m -f '{{.Path}}'
@@ -63,6 +74,16 @@ verify_local_module() {
 		return 1
 	fi
 	printf '\n==> verified local vowifi-go module path: %s\n' "$module_path"
+
+	if [[ "$LEGACY_MODULE" != "$VOWIFI_MODULE" ]]; then
+		mapfile -t local_legacy_refs < <(find_local_go_module_refs "$LEGACY_MODULE")
+		if [[ ${#local_legacy_refs[@]} -gt 0 ]]; then
+			printf 'legacy vowifi-go module references found in local Go module/source files:\n' >&2
+			printf '  %s\n' "${local_legacy_refs[@]}" >&2
+			return 1
+		fi
+	fi
+	printf '\n==> verified local Go module/source references do not use %s\n' "$LEGACY_MODULE"
 }
 
 verify_rewritten_modules() {
