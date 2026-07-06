@@ -393,6 +393,43 @@ func TestAKAChallengeAttributes(t *testing.T) {
 	}
 }
 
+func TestAUTNFields(t *testing.T) {
+	autn := mustHex(t, "0102030405068000a1a2a3a4a5a6a7a8")
+	fields, err := ParseAUTN(autn)
+	if err != nil {
+		t.Fatalf("ParseAUTN() error = %v", err)
+	}
+	if hex.EncodeToString(fields.SQNXorAK) != "010203040506" {
+		t.Fatalf("SQN xor AK=%x", fields.SQNXorAK)
+	}
+	if hex.EncodeToString(fields.AMF) != "8000" {
+		t.Fatalf("AMF=%x", fields.AMF)
+	}
+	if hex.EncodeToString(fields.MAC) != "a1a2a3a4a5a6a7a8" {
+		t.Fatalf("MAC-A=%x", fields.MAC)
+	}
+	sqn, err := fields.SQN(mustHex(t, "010101010101"))
+	if err != nil {
+		t.Fatalf("SQN() error = %v", err)
+	}
+	if hex.EncodeToString(sqn) != "000302050407" {
+		t.Fatalf("SQN=%x", sqn)
+	}
+	attrFields, err := AUTNAttribute(autn).AUTNFields()
+	if err != nil {
+		t.Fatalf("AUTNFields() error = %v", err)
+	}
+	if hex.EncodeToString(attrFields.MAC) != "a1a2a3a4a5a6a7a8" {
+		t.Fatalf("attribute AUTN MAC-A=%x", attrFields.MAC)
+	}
+	if _, err := ParseAUTN(autn[:15]); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ParseAUTN(short) err=%v, want ErrInvalidAttribute", err)
+	}
+	if _, err := fields.SQN([]byte{0x01}); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("SQN(short AK) err=%v, want ErrInvalidAttribute", err)
+	}
+}
+
 func TestAKAAttributeBoundaryValidation(t *testing.T) {
 	resAttr := RESAttribute([]byte{0x11, 0x22, 0x33, 0x44, 0x55})
 	raw, err := resAttr.MarshalBinary()

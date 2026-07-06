@@ -302,6 +302,125 @@ func TestDecryptChallengeEncryptedAttributes(t *testing.T) {
 	}
 }
 
+func TestParseChallengeWithKeysExtractsAuthenticatedFields(t *testing.T) {
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	iv := bytes.Repeat([]byte{0x33}, 16)
+	encrypted, err := EncryptAttributes(keys.KEncr, iv, []Attribute{
+		NextPseudonymAttribute("pseudo-2"),
+		NextReauthIDAttribute("reauth-2"),
+	})
+	if err != nil {
+		t.Fatalf("EncryptAttributes() error = %v", err)
+	}
+	transcript := identityTranscriptPackets(t, identity)
+	req := signedChallengeRequestWithEncryptedAttrs(t, identity, aka,
+		ResultIndAttribute(),
+		BiddingAttribute(false),
+		CheckcodeAttributeForPackets(transcript),
+		IVAttribute(iv),
+		encrypted,
+	)
+
+	challenge, err := ParseChallengeWithKeys(req, keys)
+	if err != nil {
+		t.Fatalf("ParseChallengeWithKeys() error = %v", err)
+	}
+	if len(challenge.Vectors) != 1 || !bytes.Equal(challenge.RAND, bytes.Repeat([]byte{0xa1}, 16)) ||
+		!bytes.Equal(challenge.AUTN, bytes.Repeat([]byte{0xb2}, 16)) {
+		t.Fatalf("vectors=%+v RAND=%x AUTN=%x", challenge.Vectors, challenge.RAND, challenge.AUTN)
+	}
+	if !bytes.Equal(challenge.AUTNFields.SQNXorAK, bytes.Repeat([]byte{0xb2}, AKLength)) ||
+		!bytes.Equal(challenge.AUTNFields.AMF, bytes.Repeat([]byte{0xb2}, AMFLength)) ||
+		!bytes.Equal(challenge.AUTNFields.MAC, bytes.Repeat([]byte{0xb2}, AUTNMACLength)) {
+		t.Fatalf("AUTN fields=%+v", challenge.AUTNFields)
+	}
+	if !challenge.HasMAC || len(challenge.MAC) != 16 {
+		t.Fatalf("AT_MAC present=%t len=%d", challenge.HasMAC, len(challenge.MAC))
+	}
+	if !challenge.ResultInd || !challenge.HasCheckcode || len(challenge.Checkcode) != 20 {
+		t.Fatalf("result-ind=%t checkcode=%x", challenge.ResultInd, challenge.Checkcode)
+	}
+	if !challenge.HasBidding || challenge.Bidding {
+		t.Fatalf("bidding present=%t value=%t", challenge.HasBidding, challenge.Bidding)
+	}
+	if challenge.IdentityState.NextPseudonym != "pseudo-2" || challenge.IdentityState.NextReauthID != "reauth-2" {
+		t.Fatalf("identity state=%+v", challenge.IdentityState)
+	}
+	if len(challenge.EncryptedAttributes) != 2 {
+		t.Fatalf("encrypted attrs=%+v", challenge.EncryptedAttributes)
+	}
+	challenge.EncryptedAttributes[0].Data[1] = 99
+	again, err := ParseChallengeWithKeys(req, keys)
+	if err != nil {
+		t.Fatalf("ParseChallengeWithKeys(again) error = %v", err)
+	}
+	if again.IdentityState.NextPseudonym != "pseudo-2" {
+		t.Fatalf("parse result was not cloned: state=%+v", again.IdentityState)
+	}
+}
+
+func TestParseChallengeSupportsMultipleVectors(t *testing.T) {
+	rand1 := bytes.Repeat([]byte{0x11}, 16)
+	rand2 := bytes.Repeat([]byte{0x22}, 16)
+	autn1 := mustHex(t, "0102030405068000a1a2a3a4a5a6a7a8")
+	autn2 := mustHex(t, "1112131415160000b1b2b3b4b5b6b7b8")
+	req := Packet{
+		Code:    CodeRequest,
+		Type:    TypeAKA,
+		Subtype: SubtypeChallenge,
+		Attributes: []Attribute{
+			RANDAttribute(rand1, rand2),
+			FixedAttribute(AttributeAUTN, append(append([]byte(nil), autn1...), autn2...)),
+		},
+	}
+	challenge, err := ParseChallenge(req)
+	if err != nil {
+		t.Fatalf("ParseChallenge() error = %v", err)
+	}
+	if len(challenge.Vectors) != 2 || !bytes.Equal(challenge.Vectors[0].RAND, rand1) || !bytes.Equal(challenge.Vectors[1].AUTN, autn2) {
+		t.Fatalf("vectors=%+v", challenge.Vectors)
+	}
+	if challenge.HasMAC {
+		t.Fatalf("unexpected AT_MAC=%x", challenge.MAC)
+	}
+	if _, _, err := ChallengeRANDAndAUTN(req); !errors.Is(err, ErrInvalidAKAChallenge) {
+		t.Fatalf("ChallengeRANDAndAUTN(multiple vectors) err=%v, want ErrInvalidAKAChallenge", err)
+	}
+}
+
+func TestParseChallengeRejectsInvalidVectors(t *testing.T) {
+	req := Packet{
+		Code:    CodeRequest,
+		Type:    TypeAKA,
+		Subtype: SubtypeChallenge,
+		Attributes: []Attribute{
+			RANDAttribute(bytes.Repeat([]byte{0x11}, 16), bytes.Repeat([]byte{0x22}, 16)),
+			AUTNAttribute(bytes.Repeat([]byte{0x33}, 16)),
+		},
+	}
+	if _, err := ParseChallenge(req); !errors.Is(err, ErrInvalidAKAChallenge) {
+		t.Fatalf("ParseChallenge(mismatched vectors) err=%v, want ErrInvalidAKAChallenge", err)
+	}
+
+	req.Attributes = []Attribute{
+		RANDAttribute(bytes.Repeat([]byte{0x11}, 16)),
+		RANDAttribute(bytes.Repeat([]byte{0x22}, 16)),
+		AUTNAttribute(bytes.Repeat([]byte{0x33}, 16)),
+	}
+	if _, err := ParseChallenge(req); !errors.Is(err, ErrInvalidAKAChallenge) {
+		t.Fatalf("ParseChallenge(duplicate RAND) err=%v, want ErrInvalidAKAChallenge", err)
+	}
+}
+
 func TestParseReauthenticationRequest(t *testing.T) {
 	identity := "reauth-identity@example"
 	aka := sim.AKAResult{
@@ -898,6 +1017,25 @@ func TestBuildChallengeResponseRejectsBadRequestMAC(t *testing.T) {
 	_, _, err := BuildChallengeResponse(identity, req, aka)
 	if !errors.Is(err, ErrInvalidMAC) {
 		t.Fatalf("BuildChallengeResponse() err=%v, want ErrInvalidMAC", err)
+	}
+}
+
+func TestBuildChallengeResponseRejectsMissingRAND(t *testing.T) {
+	identity := "user@example.com"
+	aka := sim.AKAResult{RES: []byte{1, 2, 3, 4}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}
+	req := Packet{
+		Code:       CodeRequest,
+		Identifier: 7,
+		Type:       TypeAKA,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{
+			AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
+			MACAttribute(nil),
+		},
+	}
+	_, _, err := BuildChallengeResponse(identity, req, aka)
+	if !errors.Is(err, ErrInvalidAKAChallenge) {
+		t.Fatalf("BuildChallengeResponse(missing RAND) err=%v, want ErrInvalidAKAChallenge", err)
 	}
 }
 

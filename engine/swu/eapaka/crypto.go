@@ -148,11 +148,7 @@ func BuildChallengeResponseWithCheckcode(identity string, request Packet, aka si
 	if err != nil {
 		return Packet{}, Keys{}, err
 	}
-	requestRaw, err := request.MarshalBinary()
-	if err != nil {
-		return Packet{}, Keys{}, err
-	}
-	if err := verifyChallengeMAC(request.Type, keys.KAut, requestRaw); err != nil {
+	if _, err := ParseChallengeWithKeys(request, keys); err != nil {
 		return Packet{}, Keys{}, err
 	}
 	if biddingDown, err := challengeBiddingDown(request); err != nil {
@@ -598,32 +594,174 @@ func buildReauthenticationResponsePacket(request Packet, keys Keys, iv []byte, p
 }
 
 func ChallengeRANDAndAUTN(request Packet) (rand16, autn16 []byte, err error) {
+	challenge, err := ParseChallenge(request)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(challenge.Vectors) != 1 {
+		return nil, nil, fmt.Errorf("%w: RAND/AUTN vector count %d", ErrInvalidAKAChallenge, len(challenge.Vectors))
+	}
+	return append([]byte(nil), challenge.RAND...), append([]byte(nil), challenge.AUTN...), nil
+}
+
+func ParseChallenge(request Packet) (Challenge, error) {
+	return parseChallenge(request, nil)
+}
+
+func ParseChallengeWithKeys(request Packet, keys Keys) (Challenge, error) {
+	return parseChallenge(request, &keys)
+}
+
+func parseChallenge(request Packet, keys *Keys) (Challenge, error) {
 	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge {
-		return nil, nil, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
+		return Challenge{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
 	}
 	if !isAKAType(request.Type) {
-		return nil, nil, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+		return Challenge{}, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
 	}
-	randAttr, ok := FindAttribute(request.Attributes, AttributeRAND)
-	if !ok {
-		return nil, nil, fmt.Errorf("%w: missing AT_RAND", ErrInvalidAKAChallenge)
+	vectors, err := challengeVectors(request)
+	if err != nil {
+		return Challenge{}, err
+	}
+	out := Challenge{
+		Packet:     clonePacket(request),
+		Vectors:    cloneChallengeVectors(vectors),
+		RAND:       append([]byte(nil), vectors[0].RAND...),
+		AUTN:       append([]byte(nil), vectors[0].AUTN...),
+		AUTNFields: cloneAUTNFields(vectors[0].AUTNFields),
+	}
+	if macAttr, ok := FindAttribute(request.Attributes, AttributeMAC); ok {
+		mac, err := macAttr.MACValue()
+		if err != nil {
+			return Challenge{}, err
+		}
+		out.MAC = mac
+		out.HasMAC = true
+	}
+	if resultInd, ok := FindAttribute(request.Attributes, AttributeResultInd); ok {
+		if err := resultInd.ResultIndValue(); err != nil {
+			return Challenge{}, err
+		}
+		out.ResultInd = true
+	}
+	if checkcodeAttr, ok := FindAttribute(request.Attributes, AttributeCheckcode); ok {
+		checkcode, err := checkcodeAttr.CheckcodeValue()
+		if err != nil {
+			return Challenge{}, err
+		}
+		out.Checkcode = checkcode
+		out.HasCheckcode = true
+	}
+	if biddingAttr, ok := FindAttribute(request.Attributes, AttributeBidding); ok {
+		bidding, err := biddingAttr.BiddingValue()
+		if err != nil {
+			return Challenge{}, err
+		}
+		out.Bidding = bidding
+		out.HasBidding = true
+	}
+	kdfs, err := kdfValues(request.Attributes)
+	if err != nil {
+		return Challenge{}, err
+	}
+	out.KDFValues = append([]uint16(nil), kdfs...)
+	if kdfInputAttr, ok := FindAttribute(request.Attributes, AttributeKDFInput); ok {
+		kdfInput, err := kdfInputAttr.KDFInputValue()
+		if err != nil {
+			return Challenge{}, err
+		}
+		out.KDFInput = kdfInput
+	}
+	if keys != nil {
+		raw, err := request.MarshalBinary()
+		if err != nil {
+			return Challenge{}, err
+		}
+		if err := verifyChallengeMAC(request.Type, keys.KAut, raw); err != nil {
+			return Challenge{}, err
+		}
+	}
+	ivAttr, hasIV := FindAttribute(request.Attributes, AttributeIV)
+	encryptedAttr, hasEncrypted := FindAttribute(request.Attributes, AttributeEncrData)
+	if hasIV || hasEncrypted {
+		if !hasIV || !hasEncrypted {
+			return Challenge{}, fmt.Errorf("%w: incomplete AT_IV/AT_ENCR_DATA pair", ErrInvalidEncryptedData)
+		}
+		if _, err := ivAttr.IVValue(); err != nil {
+			return Challenge{}, err
+		}
+		if _, err := encryptedAttr.EncrDataValue(); err != nil {
+			return Challenge{}, err
+		}
+		if keys != nil {
+			attrs, err := DecryptEncryptedAttributes(keys.KEncr, ivAttr, encryptedAttr)
+			if err != nil {
+				return Challenge{}, err
+			}
+			out.EncryptedAttributes = cloneAttributes(attrs)
+			state, err := IdentityStateFromAttributes(attrs)
+			if err != nil {
+				return Challenge{}, err
+			}
+			out.IdentityState = state
+		}
+	}
+	return out, nil
+}
+
+func challengeVectors(request Packet) ([]ChallengeVector, error) {
+	randAttr, err := singleChallengeAttribute(request.Attributes, AttributeRAND, "AT_RAND")
+	if err != nil {
+		return nil, err
 	}
 	rands, err := randAttr.RANDValues()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if len(rands) != 1 {
-		return nil, nil, fmt.Errorf("%w: RAND count %d", ErrInvalidAKAChallenge, len(rands))
-	}
-	autnAttr, ok := FindAttribute(request.Attributes, AttributeAUTN)
-	if !ok {
-		return nil, nil, fmt.Errorf("%w: missing AT_AUTN", ErrInvalidAKAChallenge)
-	}
-	autn, err := autnAttr.AUTNValue()
+	autnAttr, err := singleChallengeAttribute(request.Attributes, AttributeAUTN, "AT_AUTN")
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return rands[0], autn, nil
+	autns, err := autnAttr.AUTNValues()
+	if err != nil {
+		return nil, err
+	}
+	if len(rands) != len(autns) {
+		return nil, fmt.Errorf("%w: RAND count %d != AUTN count %d", ErrInvalidAKAChallenge, len(rands), len(autns))
+	}
+	vectors := make([]ChallengeVector, len(rands))
+	for i := range rands {
+		autnFields, err := ParseAUTN(autns[i])
+		if err != nil {
+			return nil, err
+		}
+		vectors[i] = ChallengeVector{
+			RAND:       append([]byte(nil), rands[i]...),
+			AUTN:       append([]byte(nil), autns[i]...),
+			AUTNFields: autnFields,
+		}
+	}
+	return vectors, nil
+}
+
+func singleChallengeAttribute(attrs []Attribute, typ uint8, name string) (Attribute, error) {
+	var out Attribute
+	count := 0
+	for _, attr := range attrs {
+		if attr.Type != typ {
+			continue
+		}
+		out = attr
+		count++
+	}
+	switch count {
+	case 0:
+		return Attribute{}, fmt.Errorf("%w: missing %s", ErrInvalidAKAChallenge, name)
+	case 1:
+		return out, nil
+	default:
+		return Attribute{}, fmt.Errorf("%w: duplicate %s", ErrInvalidAKAChallenge, name)
+	}
 }
 
 func buildNotificationResponse(request Packet, kAut []byte, authenticated bool) (Packet, bool, error) {
@@ -877,6 +1015,33 @@ func challengeKDFAttributes(attrs []Attribute) []Attribute {
 		}
 	}
 	return out
+}
+
+func clonePacket(packet Packet) Packet {
+	out := packet
+	out.Attributes = cloneAttributes(packet.Attributes)
+	out.Data = append([]byte(nil), packet.Data...)
+	return out
+}
+
+func cloneChallengeVectors(in []ChallengeVector) []ChallengeVector {
+	out := make([]ChallengeVector, len(in))
+	for i, vector := range in {
+		out[i] = ChallengeVector{
+			RAND:       append([]byte(nil), vector.RAND...),
+			AUTN:       append([]byte(nil), vector.AUTN...),
+			AUTNFields: cloneAUTNFields(vector.AUTNFields),
+		}
+	}
+	return out
+}
+
+func cloneAUTNFields(in AUTNFields) AUTNFields {
+	return AUTNFields{
+		SQNXorAK: append([]byte(nil), in.SQNXorAK...),
+		AMF:      append([]byte(nil), in.AMF...),
+		MAC:      append([]byte(nil), in.MAC...),
+	}
 }
 
 func cloneAttributes(attrs []Attribute) []Attribute {

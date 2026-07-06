@@ -78,11 +78,14 @@ const (
 const (
 	SupportedVersion uint16 = 1
 
-	RANDLength = 16
-	AUTNLength = 16
-	AUTSLength = 14
-	RESMinBits = 32
-	RESMaxBits = 128
+	RANDLength    = 16
+	AUTNLength    = 16
+	AUTSLength    = 14
+	AKLength      = 6
+	AMFLength     = 2
+	AUTNMACLength = 8
+	RESMinBits    = 32
+	RESMaxBits    = 128
 )
 
 var (
@@ -108,6 +111,37 @@ type Attribute struct {
 type EncryptedIdentityState struct {
 	NextPseudonym string
 	NextReauthID  string
+}
+
+type AUTNFields struct {
+	SQNXorAK []byte
+	AMF      []byte
+	MAC      []byte
+}
+
+type ChallengeVector struct {
+	RAND       []byte
+	AUTN       []byte
+	AUTNFields AUTNFields
+}
+
+type Challenge struct {
+	Packet              Packet
+	Vectors             []ChallengeVector
+	RAND                []byte
+	AUTN                []byte
+	AUTNFields          AUTNFields
+	MAC                 []byte
+	HasMAC              bool
+	ResultInd           bool
+	Checkcode           []byte
+	HasCheckcode        bool
+	Bidding             bool
+	HasBidding          bool
+	KDFInput            string
+	KDFValues           []uint16
+	EncryptedAttributes []Attribute
+	IdentityState       EncryptedIdentityState
 }
 
 type ReauthenticationRequest struct {
@@ -480,8 +514,31 @@ func (a Attribute) AUTNValue() ([]byte, error) {
 	return a.fixedValueExact(AUTNLength)
 }
 
+func (a Attribute) AUTNValues() ([][]byte, error) {
+	return fixed16Values(a)
+}
+
+func (a Attribute) AUTNFields() (AUTNFields, error) {
+	autn, err := a.AUTNValue()
+	if err != nil {
+		return AUTNFields{}, err
+	}
+	return ParseAUTN(autn)
+}
+
 func (a Attribute) AUTSValue() ([]byte, error) {
 	return a.fixedValueExact(AUTSLength)
+}
+
+func (a Attribute) MACValue() ([]byte, error) {
+	return a.fixedValueExact(16)
+}
+
+func (a Attribute) ResultIndValue() error {
+	if len(a.Data) != 2 {
+		return fmt.Errorf("%w: result-ind value length %d", ErrInvalidAttribute, len(a.Data))
+	}
+	return nil
 }
 
 func (a Attribute) KDFInputValue() (string, error) {
@@ -600,6 +657,31 @@ func VerifyCheckcodeAttribute(attr Attribute, packets [][]byte) error {
 		return ErrInvalidCheckcode
 	}
 	return nil
+}
+
+func ParseAUTN(autn16 []byte) (AUTNFields, error) {
+	if len(autn16) != AUTNLength {
+		return AUTNFields{}, fmt.Errorf("%w: AUTN length %d", ErrInvalidAttribute, len(autn16))
+	}
+	return AUTNFields{
+		SQNXorAK: append([]byte(nil), autn16[:AKLength]...),
+		AMF:      append([]byte(nil), autn16[AKLength:AKLength+AMFLength]...),
+		MAC:      append([]byte(nil), autn16[AKLength+AMFLength:]...),
+	}, nil
+}
+
+func (a AUTNFields) SQN(ak []byte) ([]byte, error) {
+	if len(a.SQNXorAK) != AKLength {
+		return nil, fmt.Errorf("%w: SQN xor AK length %d", ErrInvalidAttribute, len(a.SQNXorAK))
+	}
+	if len(ak) != AKLength {
+		return nil, fmt.Errorf("%w: AK length %d", ErrInvalidAttribute, len(ak))
+	}
+	sqn := make([]byte, AKLength)
+	for i := range sqn {
+		sqn[i] = a.SQNXorAK[i] ^ ak[i]
+	}
+	return sqn, nil
 }
 
 func (a Attribute) directUint16Value() (uint16, error) {

@@ -160,8 +160,9 @@ protocol layers needed by VoHive:
   AT_KDF negotiation, EAP-AKA Identity `AT_VERSION_LIST` /
   `AT_SELECTED_VERSION` handling, IKE_AUTH request-attribute based permanent,
   pseudonym, and reauthentication identity selection, `AT_BIDDING` downgrade protection,
-  AT_MAC verification/generation, AT_RAND/AT_AUTN challenge extraction, SIM AKA
-  RES response, AUTS synchronization-failure response, AUTN MAC-failure
+  AT_MAC verification/generation, AT_RAND/AT_AUTN challenge extraction with
+  AUTN field parsing, multi-vector challenge decoding, encrypted identity-state
+  extraction, SIM AKA RES response, AUTS synchronization-failure response, AUTN MAC-failure
   Authentication-Reject response, EAP-AKA Notification ACK, and Client-Error
   handling over encrypted IKE_AUTH
 - final IKE_AUTH CHILD_SA result parsing with responder ESP SPI,
