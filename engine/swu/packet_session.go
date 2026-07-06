@@ -46,6 +46,10 @@ type ESPPacketTransportCloser interface {
 	Close(context.Context) error
 }
 
+type NATTKeepaliveSender interface {
+	SendNATTKeepalive(context.Context) error
+}
+
 type PacketTunnelStats struct {
 	OutboundInnerPackets uint64
 	OutboundInnerBytes   uint64
@@ -91,6 +95,8 @@ type PacketSessionConfig struct {
 	Random        io.Reader
 	MOBIKEHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	MOBIKENAT     *MOBIKENATState
+	Liveness      *IKELivenessState
+	DPDHandler    func(context.Context) error
 	CloseHandler  func(context.Context) error
 }
 
@@ -103,6 +109,8 @@ type PacketSession struct {
 	random        io.Reader
 	mobikeHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	mobikeNAT     *MOBIKENATState
+	liveness      *IKELivenessState
+	dpdHandler    func(context.Context) error
 	closeHandler  func(context.Context) error
 	stats         PacketTunnelStats
 	closed        bool
@@ -112,6 +120,7 @@ var (
 	_ PacketTunnelSession     = (*PacketSession)(nil)
 	_ PacketTunnelReadSession = (*PacketSession)(nil)
 	_ MOBIKENATObserver       = (*PacketSession)(nil)
+	_ IKELivenessController   = (*PacketSession)(nil)
 )
 
 func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
@@ -145,6 +154,8 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 		random:        cfg.Random,
 		mobikeHandler: cfg.MOBIKEHandler,
 		mobikeNAT:     cfg.MOBIKENAT,
+		liveness:      cfg.Liveness,
+		dpdHandler:    cfg.DPDHandler,
 		closeHandler:  cfg.CloseHandler,
 	}, nil
 }
@@ -249,6 +260,103 @@ func (s *PacketSession) MOBIKENATSnapshot() (MOBIKENATEndpoint, time.Time) {
 		return MOBIKENATEndpoint{}, time.Time{}
 	}
 	return s.mobikeNAT.Snapshot()
+}
+
+func (s *PacketSession) AdvanceIKELiveness(ctx context.Context, now time.Time) (IKELivenessDecision, error) {
+	if s == nil {
+		return IKELivenessDecision{}, ErrInvalidPacketTunnel
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := contextReady(ctx); err != nil {
+		return IKELivenessDecision{}, err
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return IKELivenessDecision{}, ErrPacketTunnelClosed
+	}
+	if s.liveness == nil {
+		cfg := IKELivenessConfig{}
+		if s.dpdHandler == nil {
+			cfg.DisableDPD = true
+		}
+		establishedAt := s.result.EstablishedAt
+		liveness, err := NewIKELivenessState(cfg, establishedAt)
+		if err != nil {
+			s.mu.Unlock()
+			return IKELivenessDecision{}, err
+		}
+		s.liveness = liveness
+	}
+	decision := s.liveness.Advance(now)
+	transport := s.transport
+	dpdHandler := s.dpdHandler
+	s.mu.Unlock()
+	switch decision.Action {
+	case IKELivenessSendKeepalive:
+		sender, ok := transport.(NATTKeepaliveSender)
+		if !ok {
+			return decision, fmt.Errorf("%w: transport cannot send NAT-T keepalive", ErrInvalidPacketTunnel)
+		}
+		if err := sender.SendNATTKeepalive(ctx); err != nil {
+			return decision, err
+		}
+	case IKELivenessSendDPD:
+		if dpdHandler == nil {
+			return decision, fmt.Errorf("%w: DPD handler is nil", ErrInvalidPacketTunnel)
+		}
+		err := dpdHandler(ctx)
+		s.RecordIKELivenessResult(now, err == nil)
+		return decision, err
+	}
+	return decision, nil
+}
+
+func (s *PacketSession) RecordIKELivenessInbound(at time.Time) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.liveness != nil {
+		s.liveness.RecordInbound(at)
+	}
+}
+
+func (s *PacketSession) RecordIKELivenessOutbound(at time.Time) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.liveness != nil {
+		s.liveness.RecordOutbound(at)
+	}
+}
+
+func (s *PacketSession) RecordIKELivenessResult(at time.Time, ok bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.liveness != nil {
+		s.liveness.RecordLivenessResult(at, ok)
+	}
+}
+
+func (s *PacketSession) IKELivenessSnapshot() IKELivenessSnapshot {
+	if s == nil {
+		return IKELivenessSnapshot{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.liveness == nil {
+		return IKELivenessSnapshot{}
+	}
+	return s.liveness.Snapshot()
 }
 
 func completeMOBIKEResult(res MOBIKEResult, req MOBIKERequest, current TunnelResult, fallbackReason string) MOBIKEResult {
@@ -382,6 +490,9 @@ func (s *PacketSession) SendInnerPacketWithNextHeader(ctx context.Context, nextH
 	s.stats.OutboundInnerBytes += uint64(len(innerCopy))
 	s.stats.OutboundESPPackets++
 	s.stats.OutboundESPBytes += uint64(len(packet))
+	if s.liveness != nil {
+		s.liveness.RecordOutbound(time.Now())
+	}
 	s.mu.Unlock()
 	return nil
 }
@@ -421,6 +532,9 @@ func (s *PacketSession) ReceiveESPPacket(ctx context.Context, packet []byte) (Pa
 	s.stats.InboundInnerBytes += uint64(len(payload))
 	s.stats.InboundESPPackets++
 	s.stats.InboundESPBytes += uint64(len(packetCopy))
+	if s.liveness != nil {
+		s.liveness.RecordInbound(time.Now())
+	}
 	return PacketTunnelPacket{
 		SPI:        out.SPI,
 		Sequence:   out.Sequence,

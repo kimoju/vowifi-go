@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/boa-z/vowifi-go/engine/sim"
 	"github.com/boa-z/vowifi-go/engine/swu/eapaka"
@@ -132,6 +133,67 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	}
 	if !espTransport.closed {
 		t.Fatalf("ESP transport was not closed")
+	}
+}
+
+func TestIKEPacketTunnelManagerWiresLivenessDPDHandler(t *testing.T) {
+	init := ikeControlInit(t)
+	init.MOBIKESupported = true
+	control := &ikeMOBIKETransport{
+		t:         t,
+		init:      init,
+		keys:      init.Keys,
+		messageID: 5,
+	}
+	var gotPacketConfig PacketSessionConfig
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
+		SIM:          ikeTunnelAKAProvider{},
+		ChildSPI:     []byte{0x11, 0x22, 0x33, 0x44},
+		Transport:    control,
+		ESPTransport: &captureESPPacketTransport{},
+		Liveness: IKELivenessConfig{
+			DisableKeepalive: true,
+			DPDInterval:      30 * time.Second,
+			DPDTimeout:       10 * time.Second,
+		},
+		InitRunner: func(ctx context.Context, cfg ikev2.InitConfig) (ikev2.InitResult, error) {
+			return init, nil
+		},
+		AuthRunner: func(ctx context.Context, cfg ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
+			child := packetChildSA(true)
+			child.LocalSPI = append([]byte(nil), cfg.ChildSPI...)
+			return ikev2.FullAuthResult{ChildSA: &child, NextMessageID: 5}, nil
+		},
+		PacketSessionFactory: func(cfg PacketSessionConfig) (TunnelSession, error) {
+			gotPacketConfig = cfg
+			return ikeTunnelStaticSession{result: cfg.Result}, nil
+		},
+	})
+
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:     "dev-1",
+		Mode:         DataplaneModeUserspace,
+		EPDGAddress:  "198.51.100.7",
+		OuterLocalIP: "192.0.2.10",
+		IMSI:         "310280233641503",
+		MCC:          "310",
+		MNC:          "280",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	if !session.Result().MOBIKESupported {
+		t.Fatalf("session result=%+v", session.Result())
+	}
+	if gotPacketConfig.Liveness == nil || !gotPacketConfig.Liveness.Snapshot().DPDEnabled ||
+		gotPacketConfig.DPDHandler == nil {
+		t.Fatalf("packet session liveness=%+v dpd=%v", gotPacketConfig.Liveness, gotPacketConfig.DPDHandler != nil)
+	}
+	if err := gotPacketConfig.DPDHandler(context.Background()); err != nil {
+		t.Fatalf("DPDHandler() error = %v", err)
+	}
+	if control.requests != 1 {
+		t.Fatalf("control requests=%d, want 1", control.requests)
 	}
 }
 
@@ -428,6 +490,22 @@ type ikeTunnelNoopTransport struct{}
 
 func (ikeTunnelNoopTransport) ExchangeIKE(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("unexpected IKE exchange")
+}
+
+type ikeTunnelStaticSession struct {
+	result TunnelResult
+}
+
+func (s ikeTunnelStaticSession) Result() TunnelResult {
+	return s.result
+}
+
+func (s ikeTunnelStaticSession) MOBIKE(context.Context, MOBIKERequest) (MOBIKEResult, error) {
+	return MOBIKEResult{}, nil
+}
+
+func (s ikeTunnelStaticSession) Close(context.Context) error {
+	return nil
 }
 
 type ikeTunnelAKAProvider struct{}

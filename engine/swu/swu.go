@@ -149,6 +149,14 @@ type MOBIKENATObserver interface {
 	MOBIKENATSnapshot() (MOBIKENATEndpoint, time.Time)
 }
 
+type IKELivenessController interface {
+	AdvanceIKELiveness(context.Context, time.Time) (IKELivenessDecision, error)
+	RecordIKELivenessInbound(time.Time)
+	RecordIKELivenessOutbound(time.Time)
+	RecordIKELivenessResult(time.Time, bool)
+	IKELivenessSnapshot() IKELivenessSnapshot
+}
+
 type TunnelManager interface {
 	EstablishTunnel(context.Context, TunnelConfig) (TunnelSession, error)
 }

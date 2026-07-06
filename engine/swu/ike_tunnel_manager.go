@@ -76,6 +76,7 @@ type IKEPacketTunnelManagerConfig struct {
 	Configuration            ikev2.Configuration
 	AdditionalAddresses      []net.IP
 	NoAdditionalAddresses    bool
+	Liveness                 IKELivenessConfig
 	DisableControlPlaneHooks bool
 }
 
@@ -199,7 +200,18 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		return nil, err
 	}
 	result := tunnelResultFromIKE(cfg, epdg, init, child)
-	closeHandler, mobikeHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
+	closeHandler, mobikeHandler, dpdHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
+	livenessCfg := m.Config.Liveness
+	if dpdHandler == nil {
+		livenessCfg.DisableDPD = true
+	}
+	liveness, err := NewIKELivenessState(livenessCfg, result.EstablishedAt)
+	if err != nil {
+		if closer, ok := espTransport.(ESPPacketTransportCloser); ok {
+			_ = closer.Close(ctx)
+		}
+		return nil, err
+	}
 	sessionFactory := m.Config.PacketSessionFactory
 	if sessionFactory == nil {
 		sessionFactory = func(pc PacketSessionConfig) (TunnelSession, error) {
@@ -221,6 +233,8 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 			NATDetected:     init.NATDetected,
 			UpdatedAt:       result.EstablishedAt,
 		}),
+		Liveness:     liveness,
+		DPDHandler:   dpdHandler,
 		CloseHandler: closeHandler,
 	})
 	if err != nil {
@@ -364,9 +378,9 @@ func (m *IKEPacketTunnelManager) childSPI(random io.Reader) ([]byte, error) {
 	return spi, nil
 }
 
-func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, init ikev2.InitResult, auth ikev2.FullAuthResult, child ikev2.ChildSAResult, result TunnelResult, transportCfg IKETransportConfig) (func(context.Context) error, func(context.Context, MOBIKERequest) (MOBIKEResult, error)) {
+func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, init ikev2.InitResult, auth ikev2.FullAuthResult, child ikev2.ChildSAResult, result TunnelResult, transportCfg IKETransportConfig) (func(context.Context) error, func(context.Context, MOBIKERequest) (MOBIKEResult, error), func(context.Context) error) {
 	if m.Config.DisableControlPlaneHooks || auth.NextMessageID == 0 || !ikeKeysUsable(init.Keys) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	control := &ikePacketTunnelControl{
 		transport:             transport,
@@ -388,7 +402,7 @@ func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, 
 	if init.MOBIKESupported {
 		mobikeHandler = control.mobike
 	}
-	return closeHandler, mobikeHandler
+	return closeHandler, mobikeHandler, control.dpd
 }
 
 type ikePacketTunnelControl struct {
@@ -426,6 +440,24 @@ func (c *ikePacketTunnelControl) close(ctx context.Context) error {
 		Keys:      c.keys,
 		MessageID: messageID,
 		Payloads:  payloads,
+		Random:    c.random,
+	})
+	return err
+}
+
+func (c *ikePacketTunnelControl) dpd(ctx context.Context) error {
+	if c == nil {
+		return ErrInvalidIKEControl
+	}
+	c.mu.Lock()
+	messageID := c.nextMessageID
+	c.nextMessageID++
+	c.mu.Unlock()
+	_, err := ikev2.RunLivenessCheck(ctx, ikev2.InformationalConfig{
+		Transport: c.transport,
+		Init:      c.init,
+		Keys:      c.keys,
+		MessageID: messageID,
 		Random:    c.random,
 	})
 	return err

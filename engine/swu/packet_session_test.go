@@ -339,9 +339,75 @@ func TestPacketSessionObserveMOBIKENATTriggersMOBIKE(t *testing.T) {
 	}
 }
 
+func TestPacketSessionAdvanceIKELivenessSendsKeepalive(t *testing.T) {
+	start := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	liveness, err := NewIKELivenessState(IKELivenessConfig{
+		KeepaliveInterval: 20 * time.Second,
+		DisableDPD:        true,
+	}, start)
+	if err != nil {
+		t.Fatalf("NewIKELivenessState() error = %v", err)
+	}
+	transport := &captureESPPacketTransport{}
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: transport,
+		Liveness:  liveness,
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	decision, err := session.AdvanceIKELiveness(context.Background(), start.Add(20*time.Second))
+	if err != nil {
+		t.Fatalf("AdvanceIKELiveness() error = %v", err)
+	}
+	if decision.Action != IKELivenessSendKeepalive || transport.keepalives != 1 {
+		t.Fatalf("decision=%+v keepalives=%d", decision, transport.keepalives)
+	}
+	if snapshot := session.IKELivenessSnapshot(); !snapshot.LastOutbound.Equal(start.Add(20 * time.Second)) {
+		t.Fatalf("liveness snapshot=%+v", snapshot)
+	}
+}
+
+func TestPacketSessionAdvanceIKELivenessSendsDPD(t *testing.T) {
+	start := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	liveness, err := NewIKELivenessState(IKELivenessConfig{
+		DisableKeepalive: true,
+		DPDInterval:      30 * time.Second,
+		DPDTimeout:       10 * time.Second,
+	}, start)
+	if err != nil {
+		t.Fatalf("NewIKELivenessState() error = %v", err)
+	}
+	dpdCalls := 0
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: &captureESPPacketTransport{},
+		Liveness:  liveness,
+		DPDHandler: func(ctx context.Context) error {
+			dpdCalls++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	decision, err := session.AdvanceIKELiveness(context.Background(), start.Add(30*time.Second))
+	if err != nil {
+		t.Fatalf("AdvanceIKELiveness() error = %v", err)
+	}
+	if decision.Action != IKELivenessSendDPD || dpdCalls != 1 {
+		t.Fatalf("decision=%+v dpdCalls=%d", decision, dpdCalls)
+	}
+	if snapshot := session.IKELivenessSnapshot(); snapshot.OutstandingDPD || snapshot.MissedDPDProbes != 0 {
+		t.Fatalf("liveness snapshot after successful DPD=%+v", snapshot)
+	}
+}
+
 type captureESPPacketTransport struct {
-	packets [][]byte
-	closed  bool
+	packets    [][]byte
+	keepalives int
+	closed     bool
 }
 
 func (t *captureESPPacketTransport) SendESPPacket(ctx context.Context, packet []byte) error {
@@ -356,6 +422,11 @@ func (t *captureESPPacketTransport) ReadESPPacket(ctx context.Context) ([]byte, 
 	packet := append([]byte(nil), t.packets[0]...)
 	t.packets = t.packets[1:]
 	return packet, nil
+}
+
+func (t *captureESPPacketTransport) SendNATTKeepalive(ctx context.Context) error {
+	t.keepalives++
+	return nil
 }
 
 func (t *captureESPPacketTransport) Close(ctx context.Context) error {
