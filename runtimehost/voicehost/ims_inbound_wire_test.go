@@ -1217,7 +1217,7 @@ func TestIMSInboundWireServerRetransmitsInviteFinalUntilAck(t *testing.T) {
 	}
 }
 
-func TestIMSInboundWireServerDispatchesPrackUpdateReferAndOptions(t *testing.T) {
+func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifyAndOptions(t *testing.T) {
 	transport := newWireInboundTransport([]voiceclient.SIPResponse{
 		{
 			StatusCode: 200,
@@ -1233,6 +1233,7 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferAndOptions(t *testing.T) 
 			Body:       []byte(sampleSDP("127.0.0.1", 4004)),
 		},
 		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"X-Client": {"refer-ok"}}},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-Client": {"notify-ok"}}},
 	})
 	server := &IMSInboundWireServer{
 		Agent: &IMSInboundAgent{
@@ -1302,6 +1303,29 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferAndOptions(t *testing.T) 
 		t.Fatalf("client REFER=%+v", referReq)
 	}
 
+	notify := parseWireIncoming(t, wireIMSRequest("wire-call-dialog", "NOTIFY", 5, []byte("SIP/2.0 200 OK\r\n"),
+		"Event: refer\r\n",
+		"Subscription-State: terminated;reason=noresource\r\n",
+		"Content-Type: message/sipfrag\r\n",
+		"Allow-Events: refer\r\n",
+	))
+	responses, err = server.HandleRequest(context.Background(), notify)
+	if err != nil {
+		t.Fatalf("HandleRequest(NOTIFY) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 || responses[0].Headers["X-Client"] != "notify-ok" {
+		t.Fatalf("NOTIFY responses=%+v", responses)
+	}
+	notifyReq := transport.readRequest(t)
+	if notifyReq.Method != "NOTIFY" || notifyReq.Headers["CSeq"] != "5 NOTIFY" ||
+		notifyReq.Headers["Event"] != "refer" ||
+		notifyReq.Headers["Subscription-State"] != "terminated;reason=noresource" ||
+		notifyReq.Headers["Content-Type"] != "message/sipfrag" ||
+		notifyReq.Headers["Allow-Events"] != "refer" ||
+		string(notifyReq.Body) != "SIP/2.0 200 OK\r\n" {
+		t.Fatalf("client NOTIFY=%+v body=%q", notifyReq, notifyReq.Body)
+	}
+
 	options := parseWireIncoming(t, wireIMSRequest("wire-options", "OPTIONS", 1, nil))
 	responses, err = server.HandleRequest(context.Background(), options)
 	if err != nil {
@@ -1309,7 +1333,9 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferAndOptions(t *testing.T) 
 	}
 	if len(responses) != 1 || responses[0].StatusCode != 200 ||
 		!strings.Contains(responses[0].Headers["Allow"], "REFER") ||
+		!strings.Contains(responses[0].Headers["Allow"], "NOTIFY") ||
 		!strings.Contains(responses[0].Headers["Supported"], "norefersub") ||
+		responses[0].Headers["Allow-Events"] != "refer" ||
 		responses[0].Headers["Contact"] == "" {
 		t.Fatalf("OPTIONS responses=%+v", responses)
 	}

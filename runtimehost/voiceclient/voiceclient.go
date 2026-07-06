@@ -376,7 +376,7 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 		"CSeq":                 strings.TrimSpace(cseq) + " REGISTER",
 		"Max-Forwards":         "70",
 		"User-Agent":           firstNonEmpty(profile.UserAgent, "vowifi-go"),
-		"Allow":                "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, OPTIONS",
+		"Allow":                "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, NOTIFY, OPTIONS",
 		"Supported":            "path, gruu, outbound, sec-agree, 100rel, timer",
 		"Require":              "sec-agree",
 		"P-Preferred-Identity": "<" + impu + ">",

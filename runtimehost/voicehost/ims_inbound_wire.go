@@ -173,6 +173,8 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		responses, err = s.handleMessage(ctx, req)
 	case "REFER":
 		responses, err = s.handleRefer(ctx, req)
+	case "NOTIFY":
+		responses, err = s.handleNotify(ctx, req)
 	case "OPTIONS":
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(s.optionsResponse())}
 	case "BYE":
@@ -406,6 +408,22 @@ func (s *IMSInboundWireServer) handleRefer(ctx context.Context, req voiceclient.
 	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err
 }
 
+func (s *IMSInboundWireServer) handleNotify(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	if s == nil || s.Agent == nil {
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+	}
+	result, err := s.Agent.HandleInboundNotify(ctx, InboundDialogRequest{
+		CallID:            wireCallID(req),
+		CSeq:              wireCSeq(req),
+		ContentType:       firstVoiceHeader(req.Headers, "Content-Type"),
+		Body:              append([]byte(nil), req.Body...),
+		Headers:           cloneSIPHeaders(req.Headers),
+		Event:             firstVoiceHeader(req.Headers, "Event"),
+		SubscriptionState: firstVoiceHeader(req.Headers, "Subscription-State"),
+	})
+	return s.infoResultResponse(result, err), err
+}
+
 func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient.SIPIncomingRequest, key string, emit imsInboundWireResponseEmitter) ([]IMSInboundWireResponse, error) {
 	trying := s.withResponseHeaders(wireResponse(100, "Trying"))
 	responses := []IMSInboundWireResponse{trying}
@@ -599,6 +617,7 @@ func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 	resp := wireResponse(200, "OK")
 	resp.Headers["Allow"] = s.allowHeader()
 	resp.Headers["Supported"] = wireSupportedOptionsHeader()
+	resp.Headers["Allow-Events"] = "refer"
 	resp.Headers["Accept"] = "application/sdp"
 	if s != nil && (s.MessageHandler != nil || s.InfoHandler != nil) {
 		accept := []string{"application/sdp"}
@@ -615,7 +634,7 @@ func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 }
 
 func (s *IMSInboundWireServer) allowHeader() string {
-	allow := "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, REFER, OPTIONS"
+	allow := "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, REFER, NOTIFY, OPTIONS"
 	if s != nil && s.InfoHandler != nil {
 		allow += ", INFO"
 	}

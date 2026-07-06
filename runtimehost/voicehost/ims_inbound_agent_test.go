@@ -569,6 +569,75 @@ func TestIMSInboundAgentHandlesRefer(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentHandlesNotify(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":           {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact":      {"<sip:client@192.0.2.50:5060>"},
+				"Record-Route": {"<sip:client-proxy1.example;lr>, <sip:client-proxy2.example;lr>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"Contact": {"<sip:client@192.0.2.60:5060>"}, "X-Client": {"notify-ok"}}},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-notify",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	result, err := agent.HandleInboundNotify(context.Background(), InboundDialogRequest{
+		CallID:            "in-call-notify",
+		CSeq:              2,
+		Event:             "refer",
+		SubscriptionState: "terminated;reason=noresource",
+		ContentType:       "message/sipfrag",
+		Body:              []byte("SIP/2.0 200 OK\r\n"),
+		Headers: map[string][]string{
+			"Event":              {"presence"},
+			"Subscription-State": {"active"},
+			"Allow-Events":       {"refer"},
+			"X-IMS":              {"notify"},
+		},
+	})
+	if err != nil || result.StatusCode != 200 || result.Headers["X-Client"] != "notify-ok" {
+		t.Fatalf("HandleInboundNotify() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "NOTIFY" {
+		t.Fatalf("NOTIFY requests=%+v", transport.requests)
+	}
+	notify := transport.requests[1]
+	if notify.URI != "sip:client@192.0.2.50:5060" || notify.Headers["CSeq"] != "2 NOTIFY" ||
+		notify.Headers["Event"] != "refer" ||
+		notify.Headers["Subscription-State"] != "terminated;reason=noresource" ||
+		notify.Headers["Allow-Events"] != "refer" ||
+		notify.Headers["Content-Type"] != "message/sipfrag" ||
+		notify.Headers["X-IMS"] != "notify" ||
+		notify.Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" ||
+		string(notify.Body) != "SIP/2.0 200 OK\r\n" {
+		t.Fatalf("NOTIFY=%+v body=%q", notify, notify.Body)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-notify"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
+		transport.requests[2].URI != "sip:client@192.0.2.60:5060" ||
+		transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after NOTIFY=%+v", transport.requests)
+	}
+}
+
 func TestIMSInboundAgentPropagatesSessionTimerHeaders(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

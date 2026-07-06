@@ -54,14 +54,18 @@ type InboundCallResult struct {
 }
 
 type InboundDialogRequest struct {
-	CallID     string
-	CSeq       int
-	RawSDP     []byte
-	RemoteSDP  SDPInfo
-	Headers    map[string][]string
-	RAck       string
-	ReferTo    string
-	ReferredBy string
+	CallID            string
+	CSeq              int
+	ContentType       string
+	Body              []byte
+	RawSDP            []byte
+	RemoteSDP         SDPInfo
+	Headers           map[string][]string
+	RAck              string
+	ReferTo           string
+	ReferredBy        string
+	Event             string
+	SubscriptionState string
 }
 
 type imsInboundDialogState struct {
@@ -687,6 +691,59 @@ func (a *IMSInboundAgent) HandleInboundRefer(ctx context.Context, req InboundDia
 		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 500), Reason: firstVoiceNonEmpty(resp.Reason, "REFER rejected"), Headers: firstValueSIPHeaders(resp.Headers)}, nil
 	}
 	return InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 202), Reason: firstVoiceNonEmpty(resp.Reason, "Accepted"), Headers: firstValueSIPHeaders(resp.Headers)}, nil
+}
+
+func (a *IMSInboundAgent) HandleInboundNotify(ctx context.Context, req InboundDialogRequest) (IMSInfoResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.ClientTransport == nil {
+		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return IMSInfoResult{Handled: true, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	event := firstVoiceNonEmpty(req.Event, firstVoiceHeader(req.Headers, "Event"))
+	if strings.TrimSpace(event) == "" {
+		return IMSInfoResult{Handled: true, StatusCode: 400, Reason: "Event empty"}, errors.New("Event is empty")
+	}
+	subscriptionState := firstVoiceNonEmpty(req.SubscriptionState, firstVoiceHeader(req.Headers, "Subscription-State"))
+	if strings.TrimSpace(subscriptionState) == "" {
+		return IMSInfoResult{Handled: true, StatusCode: 400, Reason: "Subscription-State empty"}, errors.New("Subscription-State is empty")
+	}
+	state, ok := a.inboundDialog(callID)
+	if !ok {
+		return IMSInfoResult{Handled: true, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.clientCfg
+	notifyCSeq := inboundCSeq(req.CSeq)
+	cfg.CSeq = notifyCSeq
+	notify, err := voiceclient.BuildNotifyRequest(cfg, event, subscriptionState, req.ContentType, req.Body)
+	if err != nil {
+		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client NOTIFY failed"}, err
+	}
+	applyIncomingInfoHeaders(notify.Headers, "", req.Headers)
+	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, notifyCSeq)
+	a.storeInboundDialog(callID, state)
+	resp, err := a.ClientTransport.RoundTripRequest(ctx, notify)
+	if err != nil {
+		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client NOTIFY failed"}, err
+	}
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
+		cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, notifyCSeq)
+		state.clientCfg = cfg
+		a.storeInboundDialog(callID, state)
+	}
+	return IMSInfoResult{
+		Handled:     true,
+		StatusCode:  inboundStatusCode(resp.StatusCode, 500),
+		Reason:      firstVoiceNonEmpty(resp.Reason, "OK"),
+		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:        append([]byte(nil), resp.Body...),
+		Headers:     firstValueSIPHeaders(resp.Headers),
+	}, nil
 }
 
 func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequest) (IMSInfoResult, error) {

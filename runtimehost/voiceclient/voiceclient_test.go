@@ -161,7 +161,7 @@ func TestBuildRegisterHeaders(t *testing.T) {
 		!strings.Contains(headers["Security-Client"], "port-c=5062") || !strings.Contains(headers["Security-Client"], "port-s=5063") {
 		t.Fatalf("Security-Client has invalid default proposal: %q", headers["Security-Client"])
 	}
-	if !strings.Contains(headers["Allow"], "INFO") {
+	if !strings.Contains(headers["Allow"], "INFO") || !strings.Contains(headers["Allow"], "NOTIFY") {
 		t.Fatalf("Allow=%q", headers["Allow"])
 	}
 }
