@@ -411,6 +411,15 @@ func sipRegisterTargetFailoverStatus(code int) bool {
 	}
 }
 
+func sipDialogTargetFailoverStatus(code int) bool {
+	switch code {
+	case 408, 430, 500, 502, 503, 504, 580:
+		return true
+	default:
+		return code >= 500 && code < 600
+	}
+}
+
 func SIPRetryAfterDelay(headers map[string][]string) time.Duration {
 	var delay time.Duration
 	for _, value := range rawHeaderValues(headers, "Retry-After") {

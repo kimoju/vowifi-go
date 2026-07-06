@@ -58,8 +58,8 @@ protocol layers needed by VoHive:
 - SIP server resolution with injectable policy hooks and default `_sip._udp` /
   `_sip._tcp` SRV lookup, A/AAAA expansion, ordered candidate lists, and
   REGISTER/dialog transport failover before direct host:port fallback,
-  including REGISTER failover on recoverable P-CSCF final responses such as
-  503 or other transient 5xx statuses
+  including REGISTER and dialog request failover on recoverable P-CSCF final
+  responses such as 503 or other transient 5xx statuses
 - SWu IKE configuration payload DNS extraction, exposing negotiated internal
   DNS servers to the runtime and using them for default IMS SRV/A/AAAA lookups
 - IMS REGISTER session flow with MMTel Contact capability advertisement,

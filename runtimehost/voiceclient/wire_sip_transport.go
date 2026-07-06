@@ -58,9 +58,12 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 		timeout = 5 * time.Second
 	}
 	var lastErr error
-	for _, target := range targets {
+	for idx, target := range targets {
 		resp, err := t.roundTripTarget(ctx, network, target, timeout, msg, onProvisional)
 		if err == nil {
+			if sipDialogTargetFailoverStatus(resp.StatusCode) && idx+1 < len(targets) && ctx.Err() == nil {
+				continue
+			}
 			return resp, nil
 		}
 		if ctx.Err() != nil {

@@ -46,11 +46,11 @@ func (f *WireSIPFlow) RoundTripRegister(ctx context.Context, msg RegisterMessage
 }
 
 func (f *WireSIPFlow) RoundTripRequest(ctx context.Context, msg SIPRequestMessage) (SIPResponse, error) {
-	return f.roundTrip(ctx, msg, nil, nil)
+	return f.roundTrip(ctx, msg, nil, sipDialogTargetFailoverStatus)
 }
 
 func (f *WireSIPFlow) RoundTripInvite(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
-	return f.roundTrip(ctx, msg, onProvisional, nil)
+	return f.roundTrip(ctx, msg, onProvisional, sipDialogTargetFailoverStatus)
 }
 
 func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) error {
