@@ -567,17 +567,15 @@ func (i *Instance) StartOutboundCall(ctx context.Context, req voicehost.Outbound
 }
 
 func (i *Instance) EndVoiceCall(ctx context.Context, info voicehost.DialogInfo) error {
-	agent := i.dialogTerminator()
-	if agent == nil {
-		return voicehost.ErrIMSVoiceAgentNotReady
-	}
-	return agent.EndVoiceCall(ctx, info)
+	_, err := i.EndVoiceCallWithResult(ctx, info)
+	return err
 }
 
 func (i *Instance) EndVoiceCallWithResult(ctx context.Context, info voicehost.DialogInfo) (voicehost.DialogInfoResult, error) {
 	agent := i.dialogTerminatorWithResult()
 	if agent != nil {
-		return agent.EndVoiceCallWithResult(ctx, info)
+		result, err := agent.EndVoiceCallWithResult(ctx, info)
+		return i.recoverVoiceDialogInfoResult(ctx, result, err)
 	}
 	terminator := i.dialogTerminator()
 	if terminator == nil {
@@ -590,17 +588,15 @@ func (i *Instance) EndVoiceCallWithResult(ctx context.Context, info voicehost.Di
 }
 
 func (i *Instance) CancelVoiceCall(ctx context.Context, info voicehost.DialogInfo) error {
-	agent := i.dialogCanceller()
-	if agent == nil {
-		return voicehost.ErrIMSVoiceAgentNotReady
-	}
-	return agent.CancelVoiceCall(ctx, info)
+	_, err := i.CancelVoiceCallWithResult(ctx, info)
+	return err
 }
 
 func (i *Instance) CancelVoiceCallWithResult(ctx context.Context, info voicehost.DialogInfo) (voicehost.DialogInfoResult, error) {
 	agent := i.dialogCancellerWithResult()
 	if agent != nil {
-		return agent.CancelVoiceCallWithResult(ctx, info)
+		result, err := agent.CancelVoiceCallWithResult(ctx, info)
+		return i.recoverVoiceDialogInfoResult(ctx, result, err)
 	}
 	canceller := i.dialogCanceller()
 	if canceller == nil {
@@ -610,6 +606,15 @@ func (i *Instance) CancelVoiceCallWithResult(ctx context.Context, info voicehost
 		return voicehost.DialogInfoResult{Accepted: false, Reason: err.Error()}, err
 	}
 	return voicehost.DialogInfoResult{Accepted: true, StatusCode: 200, Reason: "OK"}, nil
+}
+
+func (i *Instance) recoverVoiceDialogInfoResult(ctx context.Context, result voicehost.DialogInfoResult, err error) (voicehost.DialogInfoResult, error) {
+	if result.RegistrationRecoveryNeeded {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter); recoveryErr != nil {
+			return result, runtimeOperationRecoveryError(err, recoveryErr)
+		}
+	}
+	return result, err
 }
 
 func (i *Instance) SendDialogInfo(ctx context.Context, req voicehost.DialogInfoRequest) (voicehost.DialogInfoResult, error) {

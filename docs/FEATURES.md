@@ -236,7 +236,8 @@ protocol layers needed by VoHive:
 - runtime voice operations consume recoverable registration or route failures
   such as 481, 503, transport errors, and other transient IMS 5xx responses to
   trigger IMS re-registration, refresh voice/SMS/USSD transports, and retry an
-  initial INVITE once after successful recovery
+  initial INVITE once after successful recovery, including BYE/CANCEL result
+  paths that terminate local softphone dialogs
 - recoverable IMS failures propagate SIP `Retry-After` delay hints from
   REGISTER refresh, voice dialogs, SMS MESSAGE, and USSD transactions so runtime
   recovery waits instead of immediately hammering a temporarily unavailable

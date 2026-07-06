@@ -616,6 +616,77 @@ func TestRuntimeIMSRecoveryHonorsRetryAfterContext(t *testing.T) {
 	}
 }
 
+func TestRuntimeIMSRecoveryAfterByeCancelRecoverableResults(t *testing.T) {
+	profile := voiceclient.IMSProfile{
+		IMPI:   "user@ims.example",
+		IMPU:   "sip:user@ims.example",
+		Domain: "ims.example",
+	}
+	binding := voiceclient.RegistrationBinding{
+		ContactURI:     "sip:user@192.0.2.10:5060",
+		PublicIdentity: "sip:user@ims.example",
+		ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+	}
+	agent := &runtimeDialogRecoveryAgent{
+		terminateResult: voicehost.DialogInfoResult{
+			Accepted:                   false,
+			StatusCode:                 503,
+			Reason:                     "Service Unavailable",
+			RegistrationRecoveryNeeded: true,
+		},
+		terminateErr: errors.New("IMS BYE rejected"),
+		cancelResult: voicehost.DialogInfoResult{
+			Accepted:                   false,
+			StatusCode:                 503,
+			Reason:                     "Service Unavailable",
+			RegistrationRecoveryNeeded: true,
+		},
+		cancelErr: errors.New("IMS CANCEL rejected"),
+	}
+	recoveries := 0
+	inst := &Instance{
+		state: State{DeviceID: "dev-bye-cancel-recover", Phase: PhaseReady, IMSReady: true},
+		voice: agent,
+		imsRecover: func(ctx context.Context) (IMSRegistrationResult, error) {
+			recoveries++
+			return IMSRegistrationResult{
+				Registered:     true,
+				StatusCode:     200,
+				Reason:         "ims recovered",
+				Profile:        profile,
+				Binding:        binding,
+				VoiceTransport: &runtimeVoiceTransport{},
+			}, nil
+		},
+	}
+
+	byeResult, err := inst.EndVoiceCallWithResult(context.Background(), voicehost.DialogInfo{CallID: "call-bye-recover"})
+	if err == nil || !strings.Contains(err.Error(), "IMS BYE rejected") {
+		t.Fatalf("EndVoiceCallWithResult() result=%+v err=%v, want BYE rejection", byeResult, err)
+	}
+	if byeResult.StatusCode != 503 || !byeResult.RegistrationRecoveryNeeded {
+		t.Fatalf("EndVoiceCallWithResult() result=%+v, want recoverable 503", byeResult)
+	}
+	if recoveries != 1 || len(agent.registrationUpdates) != 1 {
+		t.Fatalf("recoveries=%d updates=%d, want 1/1", recoveries, len(agent.registrationUpdates))
+	}
+
+	err = inst.CancelVoiceCall(context.Background(), voicehost.DialogInfo{CallID: "call-cancel-recover"})
+	if err == nil || !strings.Contains(err.Error(), "IMS CANCEL rejected") {
+		t.Fatalf("CancelVoiceCall() err=%v, want CANCEL rejection", err)
+	}
+	if recoveries != 2 || len(agent.registrationUpdates) != 2 {
+		t.Fatalf("recoveries=%d updates=%d, want 2/2", recoveries, len(agent.registrationUpdates))
+	}
+	if len(agent.terminated) != 1 || agent.terminated[0].CallID != "call-bye-recover" ||
+		len(agent.canceled) != 1 || agent.canceled[0].CallID != "call-cancel-recover" {
+		t.Fatalf("terminated=%+v canceled=%+v", agent.terminated, agent.canceled)
+	}
+	if st := inst.State(); !st.IMSReady || st.LastReason != "ims recovered" {
+		t.Fatalf("state=%+v", st)
+	}
+}
+
 func TestRuntimeIMSRecoveryRetriesSMSPartAfterTransportFailure(t *testing.T) {
 	firstTransport := &runtimeVoiceTransport{errors: []error{errors.New("stale sms pcscf flow")}}
 	recoveredTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
@@ -1294,6 +1365,30 @@ func (t *runtimeVoiceTransport) RoundTripRequest(ctx context.Context, msg voicec
 func (t *runtimeVoiceTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
 	t.writes = append(t.writes, msg)
 	return nil
+}
+
+type runtimeDialogRecoveryAgent struct {
+	terminated          []voicehost.DialogInfo
+	canceled            []voicehost.DialogInfo
+	registrationUpdates []voicehost.IMSRegistrationUpdate
+	terminateResult     voicehost.DialogInfoResult
+	cancelResult        voicehost.DialogInfoResult
+	terminateErr        error
+	cancelErr           error
+}
+
+func (a *runtimeDialogRecoveryAgent) EndVoiceCallWithResult(ctx context.Context, info voicehost.DialogInfo) (voicehost.DialogInfoResult, error) {
+	a.terminated = append(a.terminated, info)
+	return a.terminateResult, a.terminateErr
+}
+
+func (a *runtimeDialogRecoveryAgent) CancelVoiceCallWithResult(ctx context.Context, info voicehost.DialogInfo) (voicehost.DialogInfoResult, error) {
+	a.canceled = append(a.canceled, info)
+	return a.cancelResult, a.cancelErr
+}
+
+func (a *runtimeDialogRecoveryAgent) UpdateIMSRegistration(update voicehost.IMSRegistrationUpdate) {
+	a.registrationUpdates = append(a.registrationUpdates, update)
 }
 
 func runtimeSDP(ip string, port int) []byte {
