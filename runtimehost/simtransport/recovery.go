@@ -136,7 +136,31 @@ func CorrectAPDULe(apdu []byte, le int) ([]byte, error) {
 		out[len(out)-1] = leByte
 		return out, nil
 	case out[4] == 0:
-		return nil, errors.New("extended APDU Le correction is unsupported")
+		leHi, leLo, err := apduExtendedLeBytes(le)
+		if err != nil {
+			return nil, err
+		}
+		if len(out) == 7 {
+			out[5], out[6] = leHi, leLo
+			return out, nil
+		}
+		if len(out) < 7 {
+			return nil, fmt.Errorf("invalid extended APDU length for Le correction: %d bytes", len(out))
+		}
+		lc := int(out[5])<<8 | int(out[6])
+		if lc <= 0 {
+			return nil, fmt.Errorf("invalid extended APDU Lc for Le correction: %d", lc)
+		}
+		switch len(out) {
+		case 7 + lc:
+			out = append(out, leHi, leLo)
+			return out, nil
+		case 9 + lc:
+			out[len(out)-2], out[len(out)-1] = leHi, leLo
+			return out, nil
+		default:
+			return nil, fmt.Errorf("invalid extended APDU length for Le correction: %d bytes with Lc=%d", len(out), lc)
+		}
 	}
 	lc := int(out[4])
 	switch len(out) {
@@ -355,4 +379,14 @@ func apduLeByte(le int) (byte, error) {
 		return 0x00, nil
 	}
 	return byte(le), nil
+}
+
+func apduExtendedLeBytes(le int) (byte, byte, error) {
+	if le < 1 || le > 65536 {
+		return 0, 0, fmt.Errorf("invalid extended APDU Le: %d", le)
+	}
+	if le == 65536 {
+		return 0, 0, nil
+	}
+	return byte(le >> 8), byte(le), nil
 }

@@ -224,6 +224,30 @@ func TestAPDURecoveryCommands(t *testing.T) {
 		t.Fatalf("data APDU corrected Le=% X", dataWithLe)
 	}
 
+	extendedLeOnly, err := CorrectAPDULe([]byte{0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00}, 3)
+	if err != nil {
+		t.Fatalf("CorrectAPDULe(extended Le-only) error = %v", err)
+	}
+	if !reflect.DeepEqual(extendedLeOnly, []byte{0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x03}) {
+		t.Fatalf("extended Le-only APDU=% X", extendedLeOnly)
+	}
+
+	extendedDataOnly, err := CorrectAPDULe([]byte{0x00, 0x88, 0x00, 0x81, 0x00, 0x00, 0x02, 0xAA, 0xBB}, 3)
+	if err != nil {
+		t.Fatalf("CorrectAPDULe(extended data only) error = %v", err)
+	}
+	if !reflect.DeepEqual(extendedDataOnly, []byte{0x00, 0x88, 0x00, 0x81, 0x00, 0x00, 0x02, 0xAA, 0xBB, 0x00, 0x03}) {
+		t.Fatalf("extended data-only APDU with Le=% X", extendedDataOnly)
+	}
+
+	extendedDataWithLe, err := CorrectAPDULe([]byte{0x00, 0x88, 0x00, 0x81, 0x00, 0x00, 0x02, 0xAA, 0xBB, 0x00, 0x00}, 256)
+	if err != nil {
+		t.Fatalf("CorrectAPDULe(extended data with Le) error = %v", err)
+	}
+	if !reflect.DeepEqual(extendedDataWithLe, []byte{0x00, 0x88, 0x00, 0x81, 0x00, 0x00, 0x02, 0xAA, 0xBB, 0x01, 0x00}) {
+		t.Fatalf("extended data APDU corrected Le=% X", extendedDataWithLe)
+	}
+
 	getResponse, err := GetResponseAPDU(2)
 	if err != nil {
 		t.Fatalf("GetResponseAPDU() error = %v", err)
@@ -235,6 +259,6 @@ func TestAPDURecoveryCommands(t *testing.T) {
 		t.Fatal("GetResponseAPDU(0) err=nil, want error")
 	}
 	if _, err := CorrectAPDULe([]byte{0x00, 0x88, 0x00, 0x81, 0x00, 0xAA}, 1); err == nil {
-		t.Fatal("CorrectAPDULe(extended APDU) err=nil, want error")
+		t.Fatal("CorrectAPDULe(malformed extended APDU) err=nil, want error")
 	}
 }

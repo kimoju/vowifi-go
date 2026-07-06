@@ -71,6 +71,18 @@ func TestTransmitHandlesRetryLengthAndGetResponse(t *testing.T) {
 		t.Fatalf("data retry calls = %#v", dataRetry.calls)
 	}
 
+	extendedRetry := &fakeTransport{responses: []string{"6C03", "0102039000"}}
+	resp, err = Transmit(extendedRetry, 1, []byte{0x00, 0x88, 0x00, 0x81, 0x00, 0x00, 0x02, 0xAA, 0xBB})
+	if err != nil {
+		t.Fatalf("Transmit(6C extended data APDU) error = %v", err)
+	}
+	if !reflect.DeepEqual(resp.Body, []byte{1, 2, 3}) {
+		t.Fatalf("extended retry body = % X", resp.Body)
+	}
+	if !reflect.DeepEqual(extendedRetry.calls, []string{"00880081000002AABB", "00880081000002AABB0003"}) {
+		t.Fatalf("extended retry calls = %#v", extendedRetry.calls)
+	}
+
 	getResponse := &fakeTransport{responses: []string{"AA6102", "BBCC9000"}}
 	resp, err = Transmit(getResponse, 1, []byte{0x00, 0xA4, 0x00, 0x04, 0x02, 0x6F, 0x02})
 	if err != nil {

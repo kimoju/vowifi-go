@@ -129,6 +129,29 @@ func TestAdapterTransmitAPDURetries6CWithCorrectLe(t *testing.T) {
 	}
 }
 
+func TestAdapterTransmitAPDURetries6CWithExtendedCorrectLe(t *testing.T) {
+	at := &fakeAT{responses: []string{
+		`+CGLA: 4,"6C03"`,
+		`+CGLA: 10,"AABBCC9000"`,
+	}}
+	adapter := NewAdapter(at)
+
+	resp, err := adapter.TransmitAPDU(3, "00880081000002AABB")
+	if err != nil {
+		t.Fatalf("TransmitAPDU(extended 6C) error = %v", err)
+	}
+	if resp != "AABBCC9000" {
+		t.Fatalf("response = %s, want AABBCC9000", resp)
+	}
+	want := []string{
+		`AT+CGLA=3,18,"00880081000002AABB"`,
+		`AT+CGLA=3,22,"00880081000002AABB0003"`,
+	}
+	if !reflect.DeepEqual(at.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", at.calls, want)
+	}
+}
+
 func TestAdapterTransmitAPDUSendsGetResponseFor61(t *testing.T) {
 	at := &fakeAT{responses: []string{
 		`+CGLA: 8,"11226102"`,
