@@ -112,6 +112,8 @@ protocol layers needed by VoHive:
   Control Parameters, UDH Source Indicator, and RFC 822 email-header length IEs,
   ACK handling for control-only SMS-DELIVER payloads that carry UDH metadata
   without user-visible text,
+  multipart IMS MESSAGE unwrapping for CPIM, 3GPP SMS, IMDN, and text/plain
+  payload parts,
   SMS-SUBMIT relative and absolute validity-period
   encoding, SMS-SUBMIT TP-PID/TP-DCS overrides with alphabet validation,
   SMS-SUBMIT Reply-Path and Reject-Duplicates first-octet flags, USSD dialog

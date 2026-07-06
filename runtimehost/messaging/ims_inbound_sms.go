@@ -1,8 +1,14 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net/textproto"
 	"strings"
 	"time"
 )
@@ -57,6 +63,9 @@ type smsConcatState struct {
 
 func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {
 	contentType := normalizedIMSMessageContentType(msg.ContentType)
+	if strings.HasPrefix(contentType, "multipart/") {
+		return s.handleIMSMultipartMessage(ctx, msg)
+	}
 	if contentType == IMSCPIMContentType {
 		return s.handleIMSCPIMMessage(ctx, msg)
 	}
@@ -83,6 +92,120 @@ func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (
 		err := errors.New("unsupported IMS MESSAGE content type")
 		return IMSMessageResult{StatusCode: 415, Reason: err.Error(), UnsupportedContent: true}, err
 	}
+}
+
+func (s *Service) handleIMSMultipartMessage(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {
+	_, params, err := mime.ParseMediaType(msg.ContentType)
+	if err != nil {
+		return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
+	}
+	boundary := strings.TrimSpace(params["boundary"])
+	if boundary == "" {
+		err := errors.New("IMS MESSAGE multipart boundary is empty")
+		return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
+	}
+	parts, err := readIMSMessageMultipartParts(msg.Body, boundary)
+	if err != nil {
+		return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
+	}
+	for _, priority := range imsMultipartContentPriorities() {
+		for _, part := range parts {
+			if normalizedIMSMessageContentType(part.ContentType) != priority {
+				continue
+			}
+			nested := msg
+			nested.ContentType = part.ContentType
+			nested.Body = part.Body
+			nested.Headers = mergeIMSMessageHeaders(msg.Headers, part.Headers)
+			return s.HandleIMSMessage(ctx, nested)
+		}
+	}
+	err = errors.New("unsupported IMS MESSAGE multipart content")
+	return IMSMessageResult{StatusCode: 415, Reason: err.Error(), UnsupportedContent: true}, err
+}
+
+type imsMessageMultipartPart struct {
+	ContentType string
+	Headers     map[string][]string
+	Body        []byte
+}
+
+func readIMSMessageMultipartParts(body []byte, boundary string) ([]imsMessageMultipartPart, error) {
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	var parts []imsMessageMultipartPart
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		partBody, err := io.ReadAll(part)
+		_ = part.Close()
+		if err != nil {
+			return nil, err
+		}
+		headers := mapFromMIMEHeader(part.Header)
+		contentType := textproto.MIMEHeader(part.Header).Get("Content-Type")
+		if strings.TrimSpace(contentType) == "" {
+			contentType = "text/plain"
+		}
+		parts = append(parts, imsMessageMultipartPart{
+			ContentType: contentType,
+			Headers:     headers,
+			Body:        partBody,
+		})
+	}
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("IMS MESSAGE multipart has no parts")
+	}
+	return parts, nil
+}
+
+func imsMultipartContentPriorities() []string {
+	return []string{
+		IMSCPIMContentType,
+		IMS3GPPSMSContentType,
+		imsIMDNContentType,
+		"text/plain",
+	}
+}
+
+func mapFromMIMEHeader(headers textproto.MIMEHeader) map[string][]string {
+	out := make(map[string][]string, len(headers))
+	for key, values := range headers {
+		out[key] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func mergeIMSMessageHeaders(base, overlay map[string][]string) map[string][]string {
+	if len(base) == 0 && len(overlay) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(base)+len(overlay))
+	for key, values := range base {
+		out[key] = append([]string(nil), values...)
+	}
+	for key, values := range overlay {
+		appendIMSMessageHeaderValues(out, key, values)
+	}
+	return out
+}
+
+func appendIMSMessageHeaderValues(headers map[string][]string, key string, values []string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	for candidate, existing := range headers {
+		if strings.EqualFold(strings.TrimSpace(candidate), key) {
+			headers[candidate] = append(append([]string(nil), existing...), values...)
+			return
+		}
+	}
+	headers[key] = append([]string(nil), values...)
 }
 
 func (s *Service) handleIMSCPIMMessage(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {
