@@ -447,7 +447,10 @@ func ParseSMSDeliverTPDU(tpdu []byte) (SMSDeliver, error) {
 	}
 	oaTOA := tpdu[i]
 	i++
-	oaOctets := (oaDigits + 1) / 2
+	oaOctets, err := smsAddressOctets(oaDigits, oaTOA)
+	if err != nil {
+		return SMSDeliver{}, err
+	}
 	if i+oaOctets > len(tpdu) {
 		return SMSDeliver{}, errors.New("SMS-DELIVER originator address truncated")
 	}
@@ -519,7 +522,10 @@ func ParseSMSStatusReportTPDU(tpdu []byte) (SMSStatusReport, error) {
 	}
 	raTOA := tpdu[i]
 	i++
-	raOctets := (raDigits + 1) / 2
+	raOctets, err := smsAddressOctets(raDigits, raTOA)
+	if err != nil {
+		return SMSStatusReport{}, err
+	}
 	if i+raOctets > len(tpdu) {
 		return SMSStatusReport{}, errors.New("SMS-STATUS-REPORT recipient address truncated")
 	}
@@ -813,6 +819,16 @@ func decodeRPAddressValue(value []byte) (string, error) {
 	return decodeSMSAddress((len(value)-1)*2, value[0], value[1:])
 }
 
+func smsAddressOctets(digits int, toa byte) (int, error) {
+	if digits < 0 {
+		return 0, errors.New("sms address digit count is invalid")
+	}
+	if toa&0x70 == 0x50 {
+		return (digits*7 + 7) / 8, nil
+	}
+	return (digits + 1) / 2, nil
+}
+
 func encodeSMSAddress(number string) (digits int, toa byte, bcd []byte, err error) {
 	number = normalizeSMSNumber(number)
 	if number == "" {
@@ -850,6 +866,9 @@ func encodeSMSAddress(number string) (digits int, toa byte, bcd []byte, err erro
 func decodeSMSAddress(digits int, toa byte, bcd []byte) (string, error) {
 	if digits < 0 {
 		return "", errors.New("sms address digit count is invalid")
+	}
+	if toa&0x70 == 0x50 {
+		return decodeGSM7(unpackSeptets(bcd, digits, 0)), nil
 	}
 	var b strings.Builder
 	if toa&0x70 == 0x10 {

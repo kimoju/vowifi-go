@@ -308,6 +308,17 @@ func TestParseSMSDeliverTPDUGSM7(t *testing.T) {
 	}
 }
 
+func TestParseSMSDeliverTPDUAlphanumericSender(t *testing.T) {
+	tpdu := mustHex(t, "0006D0C7F7FBCC2E0300006270502143650005E8329BFD06")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	if deliver.Sender != "Google" || deliver.Text != "hello" {
+		t.Fatalf("deliver=%+v", deliver)
+	}
+}
+
 func TestParseSMSDeliverTPDUUCS2WithConcatUDH(t *testing.T) {
 	tpdu := mustHex(t, "4005810180F6000862705021436500080500037A02014F60")
 	deliver, err := ParseSMSDeliverTPDU(tpdu)

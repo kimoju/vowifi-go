@@ -410,6 +410,32 @@ func TestHandleIMSMessageDispatchesRPDataAndReturnsAck(t *testing.T) {
 	}
 }
 
+func TestHandleIMSMessageAcceptsAlphanumericSender(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+	tpdu := mustHex(t, "0006D0C7F7FBCC2E0300006270502143650005E8329BFD06")
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x37, tpdu),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.Incoming == nil || result.Incoming.Sender != "Google" || result.Incoming.Content != "hello" || string(result.ReplyBody) != string(BuildSMSRPAck(0x37)) {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%d", len(dispatch.events))
+	}
+	got, ok := dispatch.events[0].(eventhost.SMSReceived)
+	if !ok || got.Sender != "Google" || got.Content != "hello" {
+		t.Fatalf("event=%+v", dispatch.events[0])
+	}
+}
+
 func TestHandleIMSMessagePreservesDeliverProtocolMetadata(t *testing.T) {
 	svc := NewService("dev-1", "310280233641503", nil, nil)
 	tpdu := mustHex(t, "A405810180F67F006270502143650005E8329BFD06")
