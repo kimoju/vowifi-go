@@ -598,6 +598,77 @@ func TestRegisterSessionDeregisterRetriesDigestChallenge(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionDeregisterHandlesAKASynchronizationFailure(t *testing.T) {
+	firstNonce := append(bytesFrom(0x12, 16), bytesFrom(0x42, 16)...)
+	secondNonce := append(bytesFrom(0x62, 16), bytesFrom(0x82, 16)...)
+	firstChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(firstNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	secondChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(secondNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {firstChallenge},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
+			},
+		},
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {secondChallenge},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	auts := bytesFrom(0xC1, 14)
+	aka := &syncFailureAKAProvider{auts: auts}
+	session := RegisterSession{
+		Transport:    transport,
+		AKAProvider:  aka,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-dereg-sync",
+		CNonce:       "cnonce",
+	}
+	result, err := session.Deregister(context.Background(), DeregisterRequest{
+		Binding: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
+		},
+		CSeq: 9,
+	})
+	if err != nil {
+		t.Fatalf("Deregister() error = %v", err)
+	}
+	if !result.Deregistered || result.Attempts != 3 || result.StatusCode != 200 {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 3 {
+		t.Fatalf("requests=%d, want 3", len(transport.requests))
+	}
+	if transport.requests[0].Headers["CSeq"] != "9 REGISTER" || transport.requests[1].Headers["CSeq"] != "10 REGISTER" ||
+		transport.requests[2].Headers["CSeq"] != "11 REGISTER" {
+		t.Fatalf("CSeqs=%q/%q/%q", transport.requests[0].Headers["CSeq"], transport.requests[1].Headers["CSeq"], transport.requests[2].Headers["CSeq"])
+	}
+	syncAuth := transport.requests[1].Headers["Authorization"]
+	if !strings.Contains(syncAuth, `auts="`+base64.StdEncoding.EncodeToString(auts)+`"`) {
+		t.Fatalf("sync deregister Authorization=%s", syncAuth)
+	}
+	finalAuth := transport.requests[2].Headers["Authorization"]
+	if strings.Contains(finalAuth, `auts=`) || !strings.Contains(finalAuth, `nonce="`+base64.StdEncoding.EncodeToString(secondNonce)+`"`) {
+		t.Fatalf("final deregister Authorization=%s", finalAuth)
+	}
+	if got := transport.requests[2].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=333") {
+		t.Fatalf("Security-Verify=%q", got)
+	}
+	if len(aka.rands) != 2 || !bytesEqual(aka.rands[1], bytesFrom(0x62, 16)) {
+		t.Fatalf("AKA rands=%x", aka.rands)
+	}
+}
+
 func TestRegisterSessionRefreshUsesExistingBindingAndAuth(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{{
 		StatusCode: 200,
@@ -904,6 +975,85 @@ func TestRegisterSessionRefreshRetriesDigestChallenge(t *testing.T) {
 	if second["Expires"] != "600" || second["CSeq"] != "12 REGISTER" || !strings.Contains(second["Authorization"], `nonce="nonce-refresh"`) ||
 		!strings.Contains(second["Security-Verify"], "spi-c=701") {
 		t.Fatalf("second refresh headers=%+v", second)
+	}
+}
+
+func TestRegisterSessionRefreshHandlesAKASynchronizationFailure(t *testing.T) {
+	firstNonce := append(bytesFrom(0x14, 16), bytesFrom(0x44, 16)...)
+	secondNonce := append(bytesFrom(0x64, 16), bytesFrom(0x84, 16)...)
+	firstChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(firstNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	secondChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(secondNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {firstChallenge},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
+			},
+		},
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {secondChallenge},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact": {`<sip:user@192.0.2.10:5060>;expires=900`},
+			},
+		},
+	}}
+	auts := bytesFrom(0xD1, 14)
+	aka := &syncFailureAKAProvider{auts: auts}
+	session := RegisterSession{
+		Transport:    transport,
+		AKAProvider:  aka,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-refresh-sync",
+		CNonce:       "cnonce",
+	}
+	result, err := session.Refresh(context.Background(), RefreshRequest{
+		Binding: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			Expires:        600,
+			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
+		},
+		CSeq: 11,
+	})
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if !result.Refreshed || result.Attempts != 3 || result.NextCSeq != 14 || result.Binding.Expires != 900 ||
+		result.Binding.SecurityAgreement.SPIClient != 333 || !result.AuthState.Usable() {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 3 {
+		t.Fatalf("requests=%d, want 3", len(transport.requests))
+	}
+	if transport.requests[0].Headers["CSeq"] != "11 REGISTER" || transport.requests[1].Headers["CSeq"] != "12 REGISTER" ||
+		transport.requests[2].Headers["CSeq"] != "13 REGISTER" {
+		t.Fatalf("CSeqs=%q/%q/%q", transport.requests[0].Headers["CSeq"], transport.requests[1].Headers["CSeq"], transport.requests[2].Headers["CSeq"])
+	}
+	syncAuth := transport.requests[1].Headers["Authorization"]
+	if !strings.Contains(syncAuth, `auts="`+base64.StdEncoding.EncodeToString(auts)+`"`) {
+		t.Fatalf("sync refresh Authorization=%s", syncAuth)
+	}
+	finalAuth := transport.requests[2].Headers["Authorization"]
+	if strings.Contains(finalAuth, `auts=`) || !strings.Contains(finalAuth, `nonce="`+base64.StdEncoding.EncodeToString(secondNonce)+`"`) {
+		t.Fatalf("final refresh Authorization=%s", finalAuth)
+	}
+	if got := transport.requests[2].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=333") {
+		t.Fatalf("Security-Verify=%q", got)
+	}
+	if len(aka.rands) != 2 || !bytesEqual(aka.rands[1], bytesFrom(0x64, 16)) {
+		t.Fatalf("AKA rands=%x", aka.rands)
 	}
 }
 

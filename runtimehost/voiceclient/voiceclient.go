@@ -660,22 +660,13 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 		result := DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}
 		return result, fmt.Errorf("%w: deregister %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
 	}
-	challengeHeader := "WWW-Authenticate"
-	authHeaderName = "Authorization"
-	if firstHeader(resp.Headers, challengeHeader) == "" {
-		challengeHeader = "Proxy-Authenticate"
-		authHeaderName = "Proxy-Authorization"
-	}
-	ch, err := SelectDigestChallenge(resp.Headers, challengeHeader)
+	ch, authHeaderName, err := registerDigestChallenge(resp.Headers)
 	if err != nil {
 		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, err
 	}
 	authInput, syncFailure, err := s.digestAuthInputForChallenge(ch, registrarURI)
 	if err != nil {
 		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, err
-	}
-	if syncFailure {
-		return DeregisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, sim.ErrSyncFailure
 	}
 	authz, err = BuildDigestAuthorization(ch, authInput)
 	if err != nil {
@@ -685,6 +676,32 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 	resp2, err := sendDeregister(cseq, authHeaderName, authz, resp.Headers)
 	if err != nil {
 		return DeregisterResult{Attempts: attempts}, err
+	}
+	if syncFailure && !isSIPSuccess(resp2.StatusCode) {
+		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
+			result := DeregisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2)}
+			return result, fmt.Errorf("%w: deregister %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
+		}
+		ch, authHeaderName, err = registerDigestChallenge(resp2.Headers)
+		if err != nil {
+			return DeregisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2)}, err
+		}
+		authInput, syncFailure, err = s.digestAuthInputForChallenge(ch, registrarURI)
+		if err != nil {
+			return DeregisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2)}, err
+		}
+		if syncFailure {
+			return DeregisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2)}, sim.ErrSyncFailure
+		}
+		authz, err = BuildDigestAuthorization(ch, authInput)
+		if err != nil {
+			return DeregisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts}, err
+		}
+		cseq++
+		resp2, err = sendDeregister(cseq, authHeaderName, authz, resp2.Headers)
+		if err != nil {
+			return DeregisterResult{Attempts: attempts}, err
+		}
 	}
 	result := DeregisterResult{Deregistered: isSIPSuccess(resp2.StatusCode), StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2)}
 	if !result.Deregistered {
@@ -801,13 +818,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		result := RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}
 		return result, fmt.Errorf("%w: refresh %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
 	}
-	challengeHeader := "WWW-Authenticate"
-	authHeaderName = "Authorization"
-	if firstHeader(resp.Headers, challengeHeader) == "" {
-		challengeHeader = "Proxy-Authenticate"
-		authHeaderName = "Proxy-Authorization"
-	}
-	ch, err := SelectDigestChallenge(resp.Headers, challengeHeader)
+	ch, authHeaderName, err := registerDigestChallenge(resp.Headers)
 	if err != nil {
 		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, err
 	}
@@ -815,24 +826,54 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if err != nil {
 		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, err
 	}
-	if syncFailure {
-		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, sim.ErrSyncFailure
-	}
 	authz, err = BuildDigestAuthorization(ch, authInput)
 	if err != nil {
 		return RefreshResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, err
 	}
-	authState = newDigestAuthState(authHeaderName, ch, authInput, authz)
+	if syncFailure {
+		authState = DigestAuthState{}
+	} else {
+		authState = newDigestAuthState(authHeaderName, ch, authInput, authz)
+	}
 	cseq++
 	resp2, err := sendRefresh(cseq, authHeaderName, authz, resp.Headers)
 	if err != nil {
 		return RefreshResult{Attempts: attempts}, err
 	}
-	resp2, authHeaderName, authz, authState, _, err = retryMinExpires(resp2, authHeaderName, authz, authState, resp.Headers)
+	challengeHeaders := resp.Headers
+	if syncFailure && !isSIPSuccess(resp2.StatusCode) {
+		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
+			result := RefreshResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}
+			return result, fmt.Errorf("%w: refresh %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
+		}
+		ch, authHeaderName, err = registerDigestChallenge(resp2.Headers)
+		if err != nil {
+			return RefreshResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
+		}
+		authInput, syncFailure, err = s.digestAuthInputForChallenge(ch, registrarURI)
+		if err != nil {
+			return RefreshResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
+		}
+		if syncFailure {
+			return RefreshResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, sim.ErrSyncFailure
+		}
+		authz, err = BuildDigestAuthorization(ch, authInput)
+		if err != nil {
+			return RefreshResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
+		}
+		authState = newDigestAuthState(authHeaderName, ch, authInput, authz)
+		challengeHeaders = resp2.Headers
+		cseq++
+		resp2, err = sendRefresh(cseq, authHeaderName, authz, challengeHeaders)
+		if err != nil {
+			return RefreshResult{Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
+		}
+	}
+	resp2, authHeaderName, authz, authState, _, err = retryMinExpires(resp2, authHeaderName, authz, authState, challengeHeaders)
 	if err != nil {
 		return RefreshResult{Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 	}
-	resultBinding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClientFromBinding(req.Binding), resp.Headers))
+	resultBinding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClientFromBinding(req.Binding), challengeHeaders))
 	result := RefreshResult{
 		Refreshed:      isSIPSuccess(resp2.StatusCode),
 		StatusCode:     resp2.StatusCode,
@@ -878,6 +919,17 @@ func nextDigestAuthorizationWithBody(state DigestAuthState, method, uri string, 
 		return firstNonEmpty(next.headerName, headerName), authz, next, nil
 	}
 	return firstNonEmpty(fallbackName, headerName), strings.TrimSpace(fallbackHeader), state.clone(), nil
+}
+
+func registerDigestChallenge(headers map[string][]string) (DigestChallenge, string, error) {
+	challengeHeader := "WWW-Authenticate"
+	authHeaderName := "Authorization"
+	if firstHeader(headers, challengeHeader) == "" {
+		challengeHeader = "Proxy-Authenticate"
+		authHeaderName = "Proxy-Authorization"
+	}
+	ch, err := SelectDigestChallenge(headers, challengeHeader)
+	return ch, authHeaderName, err
 }
 
 func updateDigestAuthStateFromInfo(state DigestAuthState, headers map[string][]string, authHeaderName string, body []byte) (DigestAuthState, error) {
