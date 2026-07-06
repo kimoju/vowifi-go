@@ -1217,7 +1217,7 @@ func TestIMSInboundWireServerRetransmitsInviteFinalUntilAck(t *testing.T) {
 	}
 }
 
-func TestIMSInboundWireServerDispatchesPrackUpdateAndOptions(t *testing.T) {
+func TestIMSInboundWireServerDispatchesPrackUpdateReferAndOptions(t *testing.T) {
 	transport := newWireInboundTransport([]voiceclient.SIPResponse{
 		{
 			StatusCode: 200,
@@ -1232,6 +1232,7 @@ func TestIMSInboundWireServerDispatchesPrackUpdateAndOptions(t *testing.T) {
 			Headers:    map[string][]string{"Contact": {"<sip:client@127.0.0.1:5070>"}},
 			Body:       []byte(sampleSDP("127.0.0.1", 4004)),
 		},
+		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"X-Client": {"refer-ok"}}},
 	})
 	server := &IMSInboundWireServer{
 		Agent: &IMSInboundAgent{
@@ -1281,12 +1282,35 @@ func TestIMSInboundWireServerDispatchesPrackUpdateAndOptions(t *testing.T) {
 		t.Fatalf("client UPDATE=%+v", updateReq)
 	}
 
+	refer := parseWireIncoming(t, wireIMSRequest("wire-call-dialog", "REFER", 4, nil,
+		"Refer-To: <sip:+18005551313@ims.example>\r\n",
+		"Referred-By: <sip:+18005551212@ims.example>\r\n",
+		"Refer-Sub: true\r\n",
+	))
+	responses, err = server.HandleRequest(context.Background(), refer)
+	if err != nil {
+		t.Fatalf("HandleRequest(REFER) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 202 || responses[0].Headers["X-Client"] != "refer-ok" {
+		t.Fatalf("REFER responses=%+v", responses)
+	}
+	referReq := transport.readRequest(t)
+	if referReq.Method != "REFER" || referReq.Headers["CSeq"] != "4 REFER" ||
+		referReq.Headers["Refer-To"] != "<sip:+18005551313@ims.example>" ||
+		referReq.Headers["Referred-By"] != "<sip:+18005551212@ims.example>" ||
+		referReq.Headers["Refer-Sub"] != "true" {
+		t.Fatalf("client REFER=%+v", referReq)
+	}
+
 	options := parseWireIncoming(t, wireIMSRequest("wire-options", "OPTIONS", 1, nil))
 	responses, err = server.HandleRequest(context.Background(), options)
 	if err != nil {
 		t.Fatalf("HandleRequest(OPTIONS) error = %v", err)
 	}
-	if len(responses) != 1 || responses[0].StatusCode != 200 || !strings.Contains(responses[0].Headers["Allow"], "UPDATE") || responses[0].Headers["Contact"] == "" {
+	if len(responses) != 1 || responses[0].StatusCode != 200 ||
+		!strings.Contains(responses[0].Headers["Allow"], "REFER") ||
+		!strings.Contains(responses[0].Headers["Supported"], "norefersub") ||
+		responses[0].Headers["Contact"] == "" {
 		t.Fatalf("OPTIONS responses=%+v", responses)
 	}
 }

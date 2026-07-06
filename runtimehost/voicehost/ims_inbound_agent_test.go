@@ -505,6 +505,70 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentHandlesRefer(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":           {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact":      {"<sip:client@192.0.2.50:5060>"},
+				"Record-Route": {"<sip:client-proxy1.example;lr>, <sip:client-proxy2.example;lr>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"Contact": {"<sip:client@192.0.2.60:5060>"}, "X-Client": {"refer-ok"}}},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-refer",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	result, err := agent.HandleInboundRefer(context.Background(), InboundDialogRequest{
+		CallID:     "in-call-refer",
+		CSeq:       2,
+		ReferTo:    "<sip:+18005551313@ims.example>",
+		ReferredBy: "<sip:+18005551212@ims.example>",
+		Headers: map[string][]string{
+			"Refer-To":    {"<sip:wrong@ims.example>"},
+			"Referred-By": {"<sip:wrong-referrer@ims.example>"},
+			"Refer-Sub":   {"true"},
+			"X-IMS":       {"refer"},
+		},
+	})
+	if err != nil || !result.Accepted || result.StatusCode != 202 || result.Headers["X-Client"] != "refer-ok" {
+		t.Fatalf("HandleInboundRefer() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "REFER" {
+		t.Fatalf("REFER requests=%+v", transport.requests)
+	}
+	refer := transport.requests[1]
+	if refer.URI != "sip:client@192.0.2.50:5060" || refer.Headers["CSeq"] != "2 REFER" ||
+		refer.Headers["Refer-To"] != "<sip:+18005551313@ims.example>" ||
+		refer.Headers["Referred-By"] != "<sip:+18005551212@ims.example>" ||
+		refer.Headers["Refer-Sub"] != "true" || refer.Headers["X-IMS"] != "refer" ||
+		refer.Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" {
+		t.Fatalf("REFER=%+v", refer)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-refer"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
+		transport.requests[2].URI != "sip:client@192.0.2.60:5060" ||
+		transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after REFER=%+v", transport.requests)
+	}
+}
+
 func TestIMSInboundAgentPropagatesSessionTimerHeaders(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

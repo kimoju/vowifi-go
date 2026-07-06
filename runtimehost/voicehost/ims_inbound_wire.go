@@ -171,6 +171,8 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		responses, err = s.handleInfo(ctx, req)
 	case "MESSAGE":
 		responses, err = s.handleMessage(ctx, req)
+	case "REFER":
+		responses, err = s.handleRefer(ctx, req)
 	case "OPTIONS":
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(s.optionsResponse())}
 	case "BYE":
@@ -384,6 +386,26 @@ func (s *IMSInboundWireServer) handlePrack(ctx context.Context, req voiceclient.
 	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err
 }
 
+func (s *IMSInboundWireServer) handleRefer(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	if s == nil || s.Agent == nil {
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+	}
+	result, err := s.Agent.HandleInboundRefer(ctx, InboundDialogRequest{
+		CallID:     wireCallID(req),
+		CSeq:       wireCSeq(req),
+		Headers:    cloneSIPHeaders(req.Headers),
+		ReferTo:    firstVoiceHeader(req.Headers, "Refer-To"),
+		ReferredBy: firstVoiceHeader(req.Headers, "Referred-By"),
+	})
+	final := wireResponse(inboundStatusCode(result.StatusCode, 500), firstVoiceNonEmpty(result.Reason, "Server Internal Error"))
+	if result.Accepted {
+		final.StatusCode = inboundStatusCode(result.StatusCode, 202)
+		final.Reason = firstVoiceNonEmpty(result.Reason, "Accepted")
+	}
+	applyInboundWireResultHeaders(final.Headers, result.Headers)
+	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err
+}
+
 func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient.SIPIncomingRequest, key string, emit imsInboundWireResponseEmitter) ([]IMSInboundWireResponse, error) {
 	trying := s.withResponseHeaders(wireResponse(100, "Trying"))
 	responses := []IMSInboundWireResponse{trying}
@@ -567,7 +589,7 @@ func wireResponse(statusCode int, reason string) IMSInboundWireResponse {
 	return IMSInboundWireResponse{StatusCode: statusCode, Reason: reason, Headers: make(map[string]string)}
 }
 
-var wireSupportedOptionTags = []string{"100rel", "timer", "replaces", "outbound"}
+var wireSupportedOptionTags = []string{"100rel", "timer", "replaces", "outbound", "norefersub"}
 
 func wireSupportedOptionsHeader() string {
 	return strings.Join(wireSupportedOptionTags, ", ")
@@ -593,7 +615,7 @@ func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 }
 
 func (s *IMSInboundWireServer) allowHeader() string {
-	allow := "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, OPTIONS"
+	allow := "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, REFER, OPTIONS"
 	if s != nil && s.InfoHandler != nil {
 		allow += ", INFO"
 	}

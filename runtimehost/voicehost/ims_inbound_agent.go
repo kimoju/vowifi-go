@@ -54,12 +54,14 @@ type InboundCallResult struct {
 }
 
 type InboundDialogRequest struct {
-	CallID    string
-	CSeq      int
-	RawSDP    []byte
-	RemoteSDP SDPInfo
-	Headers   map[string][]string
-	RAck      string
+	CallID     string
+	CSeq       int
+	RawSDP     []byte
+	RemoteSDP  SDPInfo
+	Headers    map[string][]string
+	RAck       string
+	ReferTo    string
+	ReferredBy string
 }
 
 type imsInboundDialogState struct {
@@ -640,6 +642,51 @@ func (a *IMSInboundAgent) HandleInboundPrack(ctx context.Context, req InboundDia
 		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 500), Reason: firstVoiceNonEmpty(resp.Reason, "PRACK rejected")}, nil
 	}
 	return InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...), Headers: firstValueSIPHeaders(resp.Headers)}, nil
+}
+
+func (a *IMSInboundAgent) HandleInboundRefer(ctx context.Context, req InboundDialogRequest) (InboundCallResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.ClientTransport == nil {
+		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	referTo := firstVoiceNonEmpty(req.ReferTo, firstVoiceHeader(req.Headers, "Refer-To"))
+	if strings.TrimSpace(referTo) == "" {
+		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "Refer-To empty"}, errors.New("Refer-To is empty")
+	}
+	state, ok := a.inboundDialog(callID)
+	if !ok {
+		return InboundCallResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.clientCfg
+	referCSeq := inboundCSeq(req.CSeq)
+	cfg.CSeq = referCSeq
+	refer, err := voiceclient.BuildReferRequest(cfg, referTo, firstVoiceNonEmpty(req.ReferredBy, firstVoiceHeader(req.Headers, "Referred-By")))
+	if err != nil {
+		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client REFER failed"}, err
+	}
+	applyIncomingInfoHeaders(refer.Headers, "", req.Headers)
+	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, referCSeq)
+	a.storeInboundDialog(callID, state)
+	resp, err := a.ClientTransport.RoundTripRequest(ctx, refer)
+	if err != nil {
+		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client REFER failed"}, err
+	}
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
+		cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, referCSeq)
+		state.clientCfg = cfg
+		a.storeInboundDialog(callID, state)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 500), Reason: firstVoiceNonEmpty(resp.Reason, "REFER rejected"), Headers: firstValueSIPHeaders(resp.Headers)}, nil
+	}
+	return InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 202), Reason: firstVoiceNonEmpty(resp.Reason, "Accepted"), Headers: firstValueSIPHeaders(resp.Headers)}, nil
 }
 
 func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequest) (IMSInfoResult, error) {
