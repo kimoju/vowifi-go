@@ -16,8 +16,20 @@ const (
 
 const (
 	NotifyUnsupportedCriticalPayload uint16 = 1
+	NotifyInvalidIKESPI              uint16 = 4
+	NotifyInvalidMajorVersion        uint16 = 5
 	NotifyInvalidSyntax              uint16 = 7
+	NotifyInvalidMessageID           uint16 = 9
+	NotifyInvalidSPI                 uint16 = 11
 	NotifyNoProposalChosen           uint16 = 14
+	NotifyInvalidKEPayload           uint16 = 17
+	NotifyAuthenticationFailed       uint16 = 24
+	NotifySinglePairRequired         uint16 = 34
+	NotifyNoAdditionalSAs            uint16 = 35
+	NotifyInternalAddressFailure     uint16 = 36
+	NotifyFailedCPRequired           uint16 = 37
+	NotifyTSUnacceptable             uint16 = 38
+	NotifyInvalidSelectors           uint16 = 39
 	NotifyUnacceptableAddresses      uint16 = 40
 	NotifyUnexpectedNATDetected      uint16 = 41
 	NotifyNATDetectionSourceIP       uint16 = 16388
@@ -44,8 +56,22 @@ var (
 	ErrInvalidNotify                    = errors.New("invalid ikev2 notify payload")
 	ErrIKEv2NotifyError                 = errors.New("ikev2 notify error")
 	ErrNotifyUnsupportedCriticalPayload = errors.New("ikev2 unsupported critical payload notify")
+	ErrNotifyInvalidIKESPI              = errors.New("ikev2 invalid ike spi notify")
+	ErrNotifyInvalidMajorVersion        = errors.New("ikev2 invalid major version notify")
 	ErrNotifyInvalidSyntax              = errors.New("ikev2 invalid syntax notify")
+	ErrNotifyInvalidMessageID           = errors.New("ikev2 invalid message id notify")
+	ErrNotifyInvalidSPI                 = errors.New("ikev2 invalid spi notify")
 	ErrNotifyNoProposalChosen           = errors.New("ikev2 no proposal chosen notify")
+	ErrNotifyInvalidKEPayload           = errors.New("ikev2 invalid ke payload notify")
+	ErrNotifyAuthenticationFailed       = errors.New("ikev2 authentication failed notify")
+	ErrNotifySinglePairRequired         = errors.New("ikev2 single pair required notify")
+	ErrNotifyNoAdditionalSAs            = errors.New("ikev2 no additional sas notify")
+	ErrNotifyInternalAddressFailure     = errors.New("ikev2 internal address failure notify")
+	ErrNotifyFailedCPRequired           = errors.New("ikev2 failed cp required notify")
+	ErrNotifyTSUnacceptable             = errors.New("ikev2 ts unacceptable notify")
+	ErrNotifyInvalidSelectors           = errors.New("ikev2 invalid selectors notify")
+	ErrNotifyUnacceptableAddresses      = errors.New("ikev2 unacceptable addresses notify")
+	ErrNotifyUnexpectedNATDetected      = errors.New("ikev2 unexpected nat detected notify")
 	ErrInvalidDelete                    = errors.New("invalid ikev2 delete payload")
 	ErrInvalidAddress                   = errors.New("invalid ikev2 address")
 )
@@ -145,10 +171,34 @@ func NotifyTypeName(notifyType uint16) string {
 	switch notifyType {
 	case NotifyUnsupportedCriticalPayload:
 		return "UNSUPPORTED_CRITICAL_PAYLOAD"
+	case NotifyInvalidIKESPI:
+		return "INVALID_IKE_SPI"
+	case NotifyInvalidMajorVersion:
+		return "INVALID_MAJOR_VERSION"
 	case NotifyInvalidSyntax:
 		return "INVALID_SYNTAX"
+	case NotifyInvalidMessageID:
+		return "INVALID_MESSAGE_ID"
+	case NotifyInvalidSPI:
+		return "INVALID_SPI"
 	case NotifyNoProposalChosen:
 		return "NO_PROPOSAL_CHOSEN"
+	case NotifyInvalidKEPayload:
+		return "INVALID_KE_PAYLOAD"
+	case NotifyAuthenticationFailed:
+		return "AUTHENTICATION_FAILED"
+	case NotifySinglePairRequired:
+		return "SINGLE_PAIR_REQUIRED"
+	case NotifyNoAdditionalSAs:
+		return "NO_ADDITIONAL_SAS"
+	case NotifyInternalAddressFailure:
+		return "INTERNAL_ADDRESS_FAILURE"
+	case NotifyFailedCPRequired:
+		return "FAILED_CP_REQUIRED"
+	case NotifyTSUnacceptable:
+		return "TS_UNACCEPTABLE"
+	case NotifyInvalidSelectors:
+		return "INVALID_SELECTORS"
 	case NotifyUnacceptableAddresses:
 		return "UNACCEPTABLE_ADDRESSES"
 	case NotifyUnexpectedNATDetected:
@@ -182,10 +232,38 @@ func notifyErrorClass(notifyType uint16) error {
 	switch notifyType {
 	case NotifyUnsupportedCriticalPayload:
 		return ErrNotifyUnsupportedCriticalPayload
+	case NotifyInvalidIKESPI:
+		return ErrNotifyInvalidIKESPI
+	case NotifyInvalidMajorVersion:
+		return ErrNotifyInvalidMajorVersion
 	case NotifyInvalidSyntax:
 		return ErrNotifyInvalidSyntax
+	case NotifyInvalidMessageID:
+		return ErrNotifyInvalidMessageID
+	case NotifyInvalidSPI:
+		return ErrNotifyInvalidSPI
 	case NotifyNoProposalChosen:
 		return ErrNotifyNoProposalChosen
+	case NotifyInvalidKEPayload:
+		return ErrNotifyInvalidKEPayload
+	case NotifyAuthenticationFailed:
+		return ErrNotifyAuthenticationFailed
+	case NotifySinglePairRequired:
+		return ErrNotifySinglePairRequired
+	case NotifyNoAdditionalSAs:
+		return ErrNotifyNoAdditionalSAs
+	case NotifyInternalAddressFailure:
+		return ErrNotifyInternalAddressFailure
+	case NotifyFailedCPRequired:
+		return ErrNotifyFailedCPRequired
+	case NotifyTSUnacceptable:
+		return ErrNotifyTSUnacceptable
+	case NotifyInvalidSelectors:
+		return ErrNotifyInvalidSelectors
+	case NotifyUnacceptableAddresses:
+		return ErrNotifyUnacceptableAddresses
+	case NotifyUnexpectedNATDetected:
+		return ErrNotifyUnexpectedNATDetected
 	default:
 		if notifyType < 16384 {
 			return ErrIKEv2NotifyError

@@ -35,8 +35,22 @@ func TestNotifyErrorClassification(t *testing.T) {
 		want       error
 	}{
 		{"unsupported critical", NotifyUnsupportedCriticalPayload, ErrNotifyUnsupportedCriticalPayload},
+		{"invalid ike spi", NotifyInvalidIKESPI, ErrNotifyInvalidIKESPI},
+		{"invalid major version", NotifyInvalidMajorVersion, ErrNotifyInvalidMajorVersion},
 		{"invalid syntax", NotifyInvalidSyntax, ErrNotifyInvalidSyntax},
+		{"invalid message id", NotifyInvalidMessageID, ErrNotifyInvalidMessageID},
+		{"invalid spi", NotifyInvalidSPI, ErrNotifyInvalidSPI},
 		{"no proposal chosen", NotifyNoProposalChosen, ErrNotifyNoProposalChosen},
+		{"invalid ke payload", NotifyInvalidKEPayload, ErrNotifyInvalidKEPayload},
+		{"authentication failed", NotifyAuthenticationFailed, ErrNotifyAuthenticationFailed},
+		{"single pair required", NotifySinglePairRequired, ErrNotifySinglePairRequired},
+		{"no additional sas", NotifyNoAdditionalSAs, ErrNotifyNoAdditionalSAs},
+		{"internal address failure", NotifyInternalAddressFailure, ErrNotifyInternalAddressFailure},
+		{"failed cp required", NotifyFailedCPRequired, ErrNotifyFailedCPRequired},
+		{"ts unacceptable", NotifyTSUnacceptable, ErrNotifyTSUnacceptable},
+		{"invalid selectors", NotifyInvalidSelectors, ErrNotifyInvalidSelectors},
+		{"unacceptable addresses", NotifyUnacceptableAddresses, ErrNotifyUnacceptableAddresses},
+		{"unexpected nat detected", NotifyUnexpectedNATDetected, ErrNotifyUnexpectedNATDetected},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -72,6 +86,9 @@ func TestNotifyErrorClassification(t *testing.T) {
 		t.Fatalf("NotifyErrorFor(MOBIKE_SUPPORTED) error = %v", err)
 	}
 	if got, want := NotifyTypeName(NotifyNoProposalChosen), "NO_PROPOSAL_CHOSEN"; got != want {
+		t.Fatalf("NotifyTypeName()=%q, want %q", got, want)
+	}
+	if got, want := NotifyTypeName(NotifyAuthenticationFailed), "AUTHENTICATION_FAILED"; got != want {
 		t.Fatalf("NotifyTypeName()=%q, want %q", got, want)
 	}
 }
