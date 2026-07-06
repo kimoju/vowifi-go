@@ -713,7 +713,8 @@ func TestIMSOutboundAgentSendsDialogRefer(t *testing.T) {
 		CallID:     "call-refer",
 		ReferTo:    "sip:+18005551313@ims.example",
 		ReferredBy: "sip:user@ims.example",
-		Headers:    map[string]string{"X-Test": "refer", "Refer-To": "<sip:wrong@ims.example>"},
+		ReferSub:   "true",
+		Headers:    map[string]string{"X-Test": "refer", "Refer-To": "<sip:wrong@ims.example>", "Refer-Sub": "false"},
 	})
 	if err != nil || !result.Accepted || result.StatusCode != 202 || result.Headers["X-IMS"] != "refer-ok" {
 		t.Fatalf("SendDialogRefer() result=%+v err=%v", result, err)
@@ -725,7 +726,7 @@ func TestIMSOutboundAgentSendsDialogRefer(t *testing.T) {
 	if refer.URI != "sip:carrier@198.51.100.1:5060" || refer.Headers["CSeq"] != "2 REFER" ||
 		refer.Headers["Refer-To"] != "<sip:+18005551313@ims.example>" ||
 		refer.Headers["Referred-By"] != "<sip:user@ims.example>" ||
-		refer.Headers["Refer-Sub"] != "false" || refer.Headers["Supported"] == "" ||
+		refer.Headers["Refer-Sub"] != "true" || refer.Headers["Supported"] == "" ||
 		refer.Headers["X-Test"] != "refer" || len(refer.Body) != 0 {
 		t.Fatalf("REFER=%+v body=%q", refer, refer.Body)
 	}

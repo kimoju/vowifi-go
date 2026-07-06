@@ -679,6 +679,11 @@ func (a *IMSOutboundAgent) SendDialogRefer(ctx context.Context, req DialogReferR
 	if referTo == "" {
 		return DialogReferResult{Accepted: false, StatusCode: 400, Reason: "Refer-To empty"}, errors.New("Refer-To is empty")
 	}
+	referSub, ok := normalizeReferSub(req.ReferSub)
+	if !ok {
+		return DialogReferResult{Accepted: false, StatusCode: 400, Reason: "Refer-Sub invalid"}, errors.New("Refer-Sub must be true or false")
+	}
+	effectiveReferSub := firstVoiceNonEmpty(referSub, voiceclient.DefaultReferSub)
 	a.mu.Lock()
 	state, ok := a.dialogs[callID]
 	if !ok {
@@ -691,11 +696,15 @@ func (a *IMSOutboundAgent) SendDialogRefer(ctx context.Context, req DialogReferR
 	var resp voiceclient.SIPResponse
 	redirectRetries := 0
 	for {
-		refer, err := voiceclient.BuildReferRequest(cfg, referTo, req.ReferredBy)
+		refer, err := voiceclient.BuildReferRequestWithOptions(cfg, referTo, voiceclient.ReferRequestOptions{
+			ReferredBy: req.ReferredBy,
+			ReferSub:   effectiveReferSub,
+		})
 		if err != nil {
 			return DialogReferResult{Accepted: false, StatusCode: 500, Reason: "build IMS REFER failed"}, err
 		}
 		applyDialogUpdateHeaders(refer.Headers, req.Headers)
+		refer.Headers["Refer-Sub"] = effectiveReferSub
 		a.storeOutboundDialogAttempt(callID, cfg)
 		resp, err = a.roundTripRequest(ctx, refer)
 		if err != nil {

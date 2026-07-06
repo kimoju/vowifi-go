@@ -615,6 +615,7 @@ func TestGatewayHandleClientReferSendsDialogRefer(t *testing.T) {
 	tx := &fakeServerTransaction{}
 	req := newReferRequest("call-refer", "<sip:+18005551313@ims.example>", "<sip:user@example>")
 	req.AppendHeader(sip.NewHeader("X-Client", "refer"))
+	req.AppendHeader(sip.NewHeader("Refer-Sub", "true"))
 
 	g.HandleClientRefer("dev-1", req, tx)
 
@@ -624,7 +625,8 @@ func TestGatewayHandleClientReferSendsDialogRefer(t *testing.T) {
 	got := agent.refers[0]
 	if got.DeviceID != "dev-1" || got.CallID != "call-refer" ||
 		got.ReferTo != "<sip:+18005551313@ims.example>" || got.ReferredBy != "<sip:user@example>" ||
-		got.Headers["X-Client"] != "refer" || got.Headers["Refer-To"] != "" || got.Headers["Referred-By"] != "" {
+		got.ReferSub != "true" || got.Headers["X-Client"] != "refer" ||
+		got.Headers["Refer-To"] != "" || got.Headers["Referred-By"] != "" || got.Headers["Refer-Sub"] != "" {
 		t.Fatalf("DialogReferRequest=%+v", got)
 	}
 	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 202 ||

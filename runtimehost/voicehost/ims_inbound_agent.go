@@ -717,6 +717,11 @@ func (a *IMSInboundAgent) HandleInboundRefer(ctx context.Context, req InboundDia
 	if strings.TrimSpace(referTo) == "" {
 		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "Refer-To empty"}, errors.New("Refer-To is empty")
 	}
+	referSub, ok := normalizeReferSub(firstVoiceHeader(req.Headers, "Refer-Sub"))
+	if !ok {
+		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "Refer-Sub invalid"}, errors.New("Refer-Sub must be true or false")
+	}
+	effectiveReferSub := firstVoiceNonEmpty(referSub, voiceclient.DefaultReferSub)
 	state, ok := a.inboundDialog(callID)
 	if !ok {
 		return InboundCallResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
@@ -729,11 +734,15 @@ func (a *IMSInboundAgent) HandleInboundRefer(ctx context.Context, req InboundDia
 	var err error
 	redirectRetries := 0
 	for {
-		refer, err = voiceclient.BuildReferRequest(cfg, referTo, firstVoiceNonEmpty(req.ReferredBy, firstVoiceHeader(req.Headers, "Referred-By")))
+		refer, err = voiceclient.BuildReferRequestWithOptions(cfg, referTo, voiceclient.ReferRequestOptions{
+			ReferredBy: firstVoiceNonEmpty(req.ReferredBy, firstVoiceHeader(req.Headers, "Referred-By")),
+			ReferSub:   effectiveReferSub,
+		})
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client REFER failed"}, err
 		}
 		applyIncomingInfoHeaders(refer.Headers, "", req.Headers)
+		refer.Headers["Refer-Sub"] = effectiveReferSub
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
 		a.storeInboundDialog(callID, state)

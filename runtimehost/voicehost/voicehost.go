@@ -178,6 +178,7 @@ type DialogReferRequest struct {
 	CallID     string
 	ReferTo    string
 	ReferredBy string
+	ReferSub   string
 	Headers    map[string]string
 }
 
@@ -666,12 +667,20 @@ func (g *Gateway) HandleClientRefer(deviceID string, req *sip.Request, tx sip.Se
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Refer-To", nil))
 		return
 	}
+	referSub := sipHeaderValue(req, "Refer-Sub")
+	if _, ok := normalizeReferSub(referSub); !ok {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Invalid Refer-Sub", nil))
+		return
+	}
+	headers := sipRequestHeaderMap(req)
+	deleteSIPHeaderValue(headers, "Refer-Sub")
 	result, err := sender.SendDialogRefer(context.Background(), DialogReferRequest{
 		DeviceID:   strings.TrimSpace(deviceID),
 		CallID:     callID,
 		ReferTo:    referTo,
 		ReferredBy: sipHeaderValue(req, "Referred-By"),
-		Headers:    sipRequestHeaderMap(req),
+		ReferSub:   referSub,
+		Headers:    headers,
 	})
 	if err != nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi REFER failed", nil))
@@ -1215,6 +1224,14 @@ func deleteSIPHeaderValue(headers map[string]string, name string) {
 			delete(headers, key)
 		}
 	}
+}
+
+func normalizeReferSub(value string) (string, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || value == "true" || value == "false" {
+		return value, true
+	}
+	return "", false
 }
 
 func sipRequestHeaderMap(req *sip.Request) map[string]string {

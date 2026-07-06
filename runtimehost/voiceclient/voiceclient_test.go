@@ -1435,6 +1435,19 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if !strings.Contains(refer.Headers["Security-Verify"], "spi-c=111") {
 		t.Fatalf("refer Security-Verify=%q", refer.Headers["Security-Verify"])
 	}
+	referWithSubscription, err := BuildReferRequestWithOptions(cfg, "sip:+18005551313@ims.example", ReferRequestOptions{
+		ReferredBy: "sip:user@example",
+		ReferSub:   "true",
+	})
+	if err != nil {
+		t.Fatalf("BuildReferRequestWithOptions() error = %v", err)
+	}
+	if referWithSubscription.Headers["Refer-Sub"] != "true" || referWithSubscription.Headers["Supported"] == "" {
+		t.Fatalf("referWithSubscription=%+v", referWithSubscription)
+	}
+	if _, err := BuildReferRequestWithOptions(cfg, "sip:+18005551313@ims.example", ReferRequestOptions{ReferSub: "maybe"}); !errors.Is(err, ErrInvalidDialogConfig) {
+		t.Fatalf("BuildReferRequestWithOptions(invalid Refer-Sub) err=%v, want ErrInvalidDialogConfig", err)
+	}
 	notify, err := BuildNotifyRequest(cfg, "refer", "terminated;reason=noresource", "message/sipfrag", []byte("SIP/2.0 200 OK\r\n"))
 	if err != nil {
 		t.Fatalf("BuildNotifyRequest() error = %v", err)

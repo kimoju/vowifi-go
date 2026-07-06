@@ -14,6 +14,7 @@ const (
 	imsMMTelContactFeature  = `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
 	imsMMTelAcceptContact   = "*;" + imsMMTelContactFeature
 	DefaultSubscribeExpires = "3600"
+	DefaultReferSub         = "false"
 )
 
 type SIPRequestMessage struct {
@@ -50,6 +51,11 @@ type DialogRequestConfig struct {
 	AuthHeader       string
 	AuthHeaderName   string
 	AuthSession      *DigestAuthSession
+}
+
+type ReferRequestOptions struct {
+	ReferredBy string
+	ReferSub   string
 }
 
 func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage, error) {
@@ -172,6 +178,10 @@ func BuildMessageRequest(cfg DialogRequestConfig, contentType string, body []byt
 }
 
 func BuildReferRequest(cfg DialogRequestConfig, referTo, referredBy string) (SIPRequestMessage, error) {
+	return BuildReferRequestWithOptions(cfg, referTo, ReferRequestOptions{ReferredBy: referredBy})
+}
+
+func BuildReferRequestWithOptions(cfg DialogRequestConfig, referTo string, opts ReferRequestOptions) (SIPRequestMessage, error) {
 	referTo = strings.TrimSpace(referTo)
 	if referTo == "" {
 		return SIPRequestMessage{}, fmt.Errorf("%w: Refer-To is empty", ErrInvalidDialogConfig)
@@ -181,10 +191,17 @@ func BuildReferRequest(cfg DialogRequestConfig, referTo, referredBy string) (SIP
 		return SIPRequestMessage{}, err
 	}
 	msg.Headers["Refer-To"] = formatReferHeader(referTo)
-	if referredBy = strings.TrimSpace(referredBy); referredBy != "" {
+	if referredBy := strings.TrimSpace(opts.ReferredBy); referredBy != "" {
 		msg.Headers["Referred-By"] = formatReferHeader(referredBy)
 	}
-	msg.Headers["Refer-Sub"] = "false"
+	referSub := strings.ToLower(strings.TrimSpace(opts.ReferSub))
+	if referSub == "" {
+		referSub = DefaultReferSub
+	}
+	if referSub != "true" && referSub != "false" {
+		return SIPRequestMessage{}, fmt.Errorf("%w: Refer-Sub must be true or false", ErrInvalidDialogConfig)
+	}
+	msg.Headers["Refer-Sub"] = referSub
 	msg.Headers["Supported"] = "replaces, norefersub, outbound"
 	return msg, nil
 }
