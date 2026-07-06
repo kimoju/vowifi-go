@@ -120,8 +120,13 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		ctx = context.Background()
 	}
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
-	if method != "ACK" && !wireValidRequestCSeq(req) {
-		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(400, "Bad CSeq"))}, nil
+	if method != "ACK" {
+		if !wireValidRequestCSeq(req) {
+			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(400, "Bad CSeq"))}, nil
+		}
+		if code, reason, reject := wireMaxForwardsRejection(req); reject {
+			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(code, reason))}, nil
+		}
 	}
 	key := wireTransactionKey(req)
 	if method != "ACK" && key != "" {
@@ -1105,6 +1110,38 @@ func wireValidRequestCSeq(req voiceclient.SIPIncomingRequest) bool {
 		return false
 	}
 	return strings.EqualFold(fields[1], method)
+}
+
+func wireMaxForwardsRejection(req voiceclient.SIPIncomingRequest) (int, string, bool) {
+	value, ok := wireFirstHeader(req.Headers, "Max-Forwards")
+	if !ok {
+		return 0, "", false
+	}
+	if value == "" {
+		return 400, "Bad Max-Forwards", true
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 400, "Bad Max-Forwards", true
+		}
+	}
+	hops, err := strconv.Atoi(value)
+	if err != nil {
+		return 400, "Bad Max-Forwards", true
+	}
+	if hops == 0 {
+		return 483, "Too Many Hops", true
+	}
+	return 0, "", false
+}
+
+func wireFirstHeader(headers map[string][]string, name string) (string, bool) {
+	for key, values := range headers {
+		if strings.EqualFold(key, name) && len(values) > 0 {
+			return strings.TrimSpace(values[0]), true
+		}
+	}
+	return "", false
 }
 
 func wireHeaderURI(req voiceclient.SIPIncomingRequest, name string) string {

@@ -587,6 +587,49 @@ func TestIMSInboundWireServerRejectsMalformedCSeq(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerRejectsBadMaxForwards(t *testing.T) {
+	handled := false
+	server := &IMSInboundWireServer{
+		MessageHandler: IMSMessageHandlerFunc(func(ctx context.Context, req IMSMessageRequest) (IMSMessageResult, error) {
+			handled = true
+			return IMSMessageResult{StatusCode: 200, Reason: "OK"}, nil
+		}),
+	}
+	tests := []struct {
+		name       string
+		value      string
+		statusCode int
+		reason     string
+	}{
+		{name: "zero", value: "0", statusCode: 483, reason: "Too Many Hops"},
+		{name: "blank", value: "", statusCode: 400, reason: "Bad Max-Forwards"},
+		{name: "nondigit", value: "ten", statusCode: 400, reason: "Bad Max-Forwards"},
+		{name: "negative", value: "-1", statusCode: 400, reason: "Bad Max-Forwards"},
+		{name: "overflow", value: strings.Repeat("9", 64), statusCode: 400, reason: "Bad Max-Forwards"},
+	}
+	for _, tc := range tests {
+		handled = false
+		responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+			Method: "MESSAGE",
+			URI:    "sip:user@ims.example",
+			Headers: map[string][]string{
+				"Call-ID":      {"bad-max-forwards-" + tc.name},
+				"CSeq":         {"1 MESSAGE"},
+				"Max-Forwards": {tc.value},
+			},
+		})
+		if err != nil {
+			t.Fatalf("%s HandleRequest() error = %v", tc.name, err)
+		}
+		if len(responses) != 1 || responses[0].StatusCode != tc.statusCode || responses[0].Reason != tc.reason {
+			t.Fatalf("%s responses=%+v, want %d %s", tc.name, responses, tc.statusCode, tc.reason)
+		}
+		if handled {
+			t.Fatalf("%s bad Max-Forwards reached message handler", tc.name)
+		}
+	}
+}
+
 func TestIMSInboundWireServerCancelsPendingInvite(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
