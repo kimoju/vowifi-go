@@ -28,6 +28,67 @@ func TestDecodeISIMIdentityString(t *testing.T) {
 	}
 }
 
+func TestEncodeISIMIdentityStringRoundTrip(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		wantPrefix []byte
+	}{
+		{
+			name:       "short",
+			value:      "sip:user@ims.example",
+			wantPrefix: []byte{0x80, 0x14},
+		},
+		{
+			name:       "long one byte",
+			value:      strings.Repeat("a", 130) + "@ims.example",
+			wantPrefix: []byte{0x80, 0x81, 0x8E},
+		},
+		{
+			name:       "long two byte",
+			value:      strings.Repeat("b", 300),
+			wantPrefix: []byte{0x80, 0x82, 0x01, 0x2C},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded, err := EncodeISIMIdentityString(tt.value)
+			if err != nil {
+				t.Fatalf("EncodeISIMIdentityString() error = %v", err)
+			}
+			if got := encoded[:len(tt.wantPrefix)]; !reflect.DeepEqual(got, tt.wantPrefix) {
+				t.Fatalf("encoded prefix=% X, want % X", got, tt.wantPrefix)
+			}
+			if got := DecodeISIMIdentityString(encoded); got != tt.value {
+				t.Fatalf("DecodeISIMIdentityString(encoded) = %q, want %q", got, tt.value)
+			}
+		})
+	}
+}
+
+func TestPadISIMIdentityRecord(t *testing.T) {
+	encoded, err := EncodeISIMIdentityString("sip:user@ims.example")
+	if err != nil {
+		t.Fatalf("EncodeISIMIdentityString() error = %v", err)
+	}
+	record, err := PadISIMIdentityRecord(encoded, len(encoded)+3)
+	if err != nil {
+		t.Fatalf("PadISIMIdentityRecord() error = %v", err)
+	}
+	if got := DecodeISIMIdentityString(record); got != "sip:user@ims.example" {
+		t.Fatalf("DecodeISIMIdentityString(record) = %q", got)
+	}
+	if tail := record[len(encoded):]; !reflect.DeepEqual(tail, []byte{0xFF, 0xFF, 0xFF}) {
+		t.Fatalf("record padding=% X", tail)
+	}
+	if got, err := PadISIMIdentityRecord(encoded, len(encoded)-1); err == nil {
+		t.Fatalf("PadISIMIdentityRecord(short) = %x nil error, want error", got)
+	}
+	if got, err := EncodeISIMIdentityString(" "); err == nil {
+		t.Fatalf("EncodeISIMIdentityString(empty) = %x nil error, want error", got)
+	}
+}
+
 func TestDecodeUSIMIMSI(t *testing.T) {
 	tests := []struct {
 		name string

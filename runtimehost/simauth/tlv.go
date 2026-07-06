@@ -10,6 +10,22 @@ type TLV struct {
 	Value []byte
 }
 
+func EncodeTLV(tag int, value []byte) ([]byte, error) {
+	tagBytes, err := encodeTag(tag)
+	if err != nil {
+		return nil, err
+	}
+	lengthBytes, err := encodeLength(len(value))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(tagBytes)+len(lengthBytes)+len(value))
+	out = append(out, tagBytes...)
+	out = append(out, lengthBytes...)
+	out = append(out, value...)
+	return out, nil
+}
+
 func ParseTLVList(data []byte) ([]TLV, error) {
 	var out []TLV
 	for len(data) > 0 {
@@ -57,6 +73,42 @@ func FindTLV(data []byte, tag int) ([]byte, bool) {
 		}
 	}
 	return nil, false
+}
+
+func encodeTag(tag int) ([]byte, error) {
+	if tag <= 0 {
+		return nil, fmt.Errorf("invalid TLV tag 0x%X", tag)
+	}
+	if tag <= 0xFF {
+		return []byte{byte(tag)}, nil
+	}
+	var stack [4]byte
+	i := len(stack)
+	for tag > 0 {
+		i--
+		stack[i] = byte(tag)
+		tag >>= 8
+	}
+	return append([]byte(nil), stack[i:]...), nil
+}
+
+func encodeLength(length int) ([]byte, error) {
+	switch {
+	case length < 0:
+		return nil, fmt.Errorf("invalid TLV length %d", length)
+	case length <= 0x7f:
+		return []byte{byte(length)}, nil
+	case length <= 0xff:
+		return []byte{0x81, byte(length)}, nil
+	case length <= 0xffff:
+		return []byte{0x82, byte(length >> 8), byte(length)}, nil
+	case length <= 0xffffff:
+		return []byte{0x83, byte(length >> 16), byte(length >> 8), byte(length)}, nil
+	case uint64(length) <= 0xffffffff:
+		return []byte{0x84, byte(length >> 24), byte(length >> 16), byte(length >> 8), byte(length)}, nil
+	default:
+		return nil, fmt.Errorf("TLV length %d exceeds supported long form", length)
+	}
 }
 
 func FileSizeFromFCP(fcp []byte) int {

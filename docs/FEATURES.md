@@ -43,7 +43,8 @@ protocol layers needed by VoHive:
   recovery error classification with opt-in non-destructive retry hooks,
   human-readable APDU/CRSM status-word descriptions for common SIM/USIM/ISIM
   success, warning, procedure, and checking-error responses,
-  reusable ISIM identity, USIM EF_IMSI, and EF_AD MNC-length decoders, and
+  reusable ISIM identity, USIM EF_IMSI, and EF_AD MNC-length decoders, ISIM
+  EF identity string TLV encoding and linear-fixed record padding helpers, and
   USIM/ISIM AKA AUTHENTICATE primitives
 - carrier presets and JSON carrier overrides, including AT&T TS.43/E911
   configuration for native `310/280` and `310/410` profiles, plus normalized

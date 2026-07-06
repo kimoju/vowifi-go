@@ -86,6 +86,33 @@ func DecodeISIMIdentityString(raw []byte) string {
 	return decodeISIMStringValue(data)
 }
 
+// EncodeISIMIdentityString encodes EF_IMPI, EF_IMPU, and EF_DOMAIN text as
+// the tag 0x80 data object used by ISIM identity elementary files.
+func EncodeISIMIdentityString(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, fmt.Errorf("ISIM identity string is empty")
+	}
+	return EncodeTLV(0x80, []byte(value))
+}
+
+// PadISIMIdentityRecord pads an encoded ISIM identity data object for an
+// EF_IMPU-style linear fixed record.
+func PadISIMIdentityRecord(encoded []byte, recordLength int) ([]byte, error) {
+	if recordLength <= 0 {
+		return nil, fmt.Errorf("ISIM record length must be positive: %d", recordLength)
+	}
+	if len(encoded) > recordLength {
+		return nil, fmt.Errorf("ISIM record length %d is too small for %d encoded byte(s)", recordLength, len(encoded))
+	}
+	out := make([]byte, recordLength)
+	copy(out, encoded)
+	for i := len(encoded); i < len(out); i++ {
+		out[i] = 0xFF
+	}
+	return out, nil
+}
+
 // DecodeUSIMIMSI decodes the transparent EF_IMSI mobile-identity payload.
 func DecodeUSIMIMSI(raw []byte) (string, error) {
 	if len(trimEFPadding(raw)) == 0 {
