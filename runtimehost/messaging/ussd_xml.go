@@ -19,8 +19,10 @@ const IMSUSSDContentDisposition = "Info-Package"
 type IMSUSSDOperation string
 
 const (
-	IMSUSSDOperationRequest IMSUSSDOperation = "request"
-	IMSUSSDOperationNotify  IMSUSSDOperation = "notify"
+	IMSUSSDOperationRequest  IMSUSSDOperation = "request"
+	IMSUSSDOperationResponse IMSUSSDOperation = "response"
+	IMSUSSDOperationNotify   IMSUSSDOperation = "notify"
+	IMSUSSDOperationRelease  IMSUSSDOperation = "release"
 )
 
 type IMSUSSDPayload struct {
@@ -35,31 +37,43 @@ type IMSUSSDPayload struct {
 }
 
 type ussdDataXML struct {
-	XMLName               xml.Name       `xml:"ussd-data"`
-	Language              string         `xml:"language,omitempty"`
-	String                string         `xml:"ussd-string,omitempty"`
-	ErrorCode             string         `xml:"error-code,omitempty"`
-	Operation             string         `xml:"operation,omitempty"`
-	UnstructuredSSRequest *struct{}      `xml:"UnstructuredSS-Request,omitempty"`
-	UnstructuredSSNotify  *struct{}      `xml:"UnstructuredSS-Notify,omitempty"`
-	Request               *struct{}      `xml:"request,omitempty"`
-	Notify                *struct{}      `xml:"notify,omitempty"`
-	AlertingPattern       string         `xml:"alertingPattern,omitempty"`
-	AnyExt                *ussdAnyExtXML `xml:"anyExt,omitempty"`
+	XMLName                xml.Name       `xml:"ussd-data"`
+	Language               string         `xml:"language,omitempty"`
+	String                 string         `xml:"ussd-string,omitempty"`
+	ErrorCode              string         `xml:"error-code,omitempty"`
+	Operation              string         `xml:"operation,omitempty"`
+	UnstructuredSSRequest  *struct{}      `xml:"UnstructuredSS-Request,omitempty"`
+	UnstructuredSSResponse *struct{}      `xml:"UnstructuredSS-Response,omitempty"`
+	UnstructuredSSNotify   *struct{}      `xml:"UnstructuredSS-Notify,omitempty"`
+	UnstructuredSSRelease  *struct{}      `xml:"UnstructuredSS-Release,omitempty"`
+	Request                *struct{}      `xml:"request,omitempty"`
+	Response               *struct{}      `xml:"response,omitempty"`
+	Notify                 *struct{}      `xml:"notify,omitempty"`
+	Release                *struct{}      `xml:"release,omitempty"`
+	AlertingPattern        string         `xml:"alertingPattern,omitempty"`
+	AnyExt                 *ussdAnyExtXML `xml:"anyExt,omitempty"`
 }
 
 type ussdAnyExtXML struct {
-	UnstructuredSSRequest *struct{} `xml:"UnstructuredSS-Request,omitempty"`
-	UnstructuredSSNotify  *struct{} `xml:"UnstructuredSS-Notify,omitempty"`
-	Request               *struct{} `xml:"request,omitempty"`
-	Notify                *struct{} `xml:"notify,omitempty"`
-	Operation             string    `xml:"operation,omitempty"`
-	AlertingPattern       string    `xml:"alertingPattern,omitempty"`
+	UnstructuredSSRequest  *struct{} `xml:"UnstructuredSS-Request,omitempty"`
+	UnstructuredSSResponse *struct{} `xml:"UnstructuredSS-Response,omitempty"`
+	UnstructuredSSNotify   *struct{} `xml:"UnstructuredSS-Notify,omitempty"`
+	UnstructuredSSRelease  *struct{} `xml:"UnstructuredSS-Release,omitempty"`
+	Request                *struct{} `xml:"request,omitempty"`
+	Response               *struct{} `xml:"response,omitempty"`
+	Notify                 *struct{} `xml:"notify,omitempty"`
+	Release                *struct{} `xml:"release,omitempty"`
+	Operation              string    `xml:"operation,omitempty"`
+	AlertingPattern        string    `xml:"alertingPattern,omitempty"`
 }
 
 func BuildIMSUSSDXML(payload IMSUSSDPayload) ([]byte, error) {
+	op := payload.Operation
+	if op == "" {
+		op = IMSUSSDOperationRequest
+	}
 	text := strings.TrimSpace(payload.Text)
-	if text == "" && !payload.HasError {
+	if text == "" && !payload.HasError && op != IMSUSSDOperationRelease {
 		return nil, errors.New("USSD text is empty")
 	}
 	language := strings.TrimSpace(payload.Language)
@@ -68,10 +82,6 @@ func BuildIMSUSSDXML(payload IMSUSSDPayload) ([]byte, error) {
 	}
 	if strings.ContainsAny(language, " \t\r\n") {
 		return nil, fmt.Errorf("USSD language contains whitespace: %q", language)
-	}
-	op := payload.Operation
-	if op == "" {
-		op = IMSUSSDOperationRequest
 	}
 	data := ussdDataXML{
 		Language: language,
@@ -86,8 +96,12 @@ func BuildIMSUSSDXML(payload IMSUSSDPayload) ([]byte, error) {
 	switch op {
 	case IMSUSSDOperationRequest:
 		data.UnstructuredSSRequest = &struct{}{}
+	case IMSUSSDOperationResponse:
+		data.UnstructuredSSResponse = &struct{}{}
 	case IMSUSSDOperationNotify:
 		data.UnstructuredSSNotify = &struct{}{}
+	case IMSUSSDOperationRelease:
+		data.UnstructuredSSRelease = &struct{}{}
 	default:
 		return nil, fmt.Errorf("unsupported USSD operation: %s", op)
 	}
@@ -126,6 +140,12 @@ func ParseIMSUSSDXML(body []byte) (IMSUSSDPayload, error) {
 	if data.Request != nil {
 		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRequest, "request", true)
 	}
+	if data.UnstructuredSSResponse != nil {
+		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationResponse, "UnstructuredSS-Response", true)
+	}
+	if data.Response != nil {
+		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationResponse, "response", true)
+	}
 	if op, raw := parseIMSUSSDOperationText(data.Operation); op != "" {
 		setIMSUSSDPayloadOperation(&payload, op, raw, false)
 	}
@@ -135,12 +155,24 @@ func ParseIMSUSSDXML(body []byte) (IMSUSSDPayload, error) {
 	if data.Notify != nil {
 		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationNotify, "notify", true)
 	}
+	if data.UnstructuredSSRelease != nil {
+		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRelease, "UnstructuredSS-Release", true)
+	}
+	if data.Release != nil {
+		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRelease, "release", true)
+	}
 	if data.AnyExt != nil {
 		if data.AnyExt.UnstructuredSSRequest != nil {
 			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRequest, "UnstructuredSS-Request", false)
 		}
 		if data.AnyExt.Request != nil {
 			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRequest, "request", false)
+		}
+		if data.AnyExt.UnstructuredSSResponse != nil {
+			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationResponse, "UnstructuredSS-Response", false)
+		}
+		if data.AnyExt.Response != nil {
+			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationResponse, "response", false)
 		}
 		if op, raw := parseIMSUSSDOperationText(data.AnyExt.Operation); op != "" {
 			setIMSUSSDPayloadOperation(&payload, op, raw, false)
@@ -150,6 +182,12 @@ func ParseIMSUSSDXML(body []byte) (IMSUSSDPayload, error) {
 		}
 		if data.AnyExt.Notify != nil {
 			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationNotify, "notify", false)
+		}
+		if data.AnyExt.UnstructuredSSRelease != nil {
+			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRelease, "UnstructuredSS-Release", false)
+		}
+		if data.AnyExt.Release != nil {
+			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRelease, "release", false)
 		}
 		if strings.TrimSpace(data.AlertingPattern) == "" {
 			data.AlertingPattern = data.AnyExt.AlertingPattern
@@ -193,8 +231,12 @@ func parseIMSUSSDOperationText(value string) (IMSUSSDOperation, string) {
 	switch strings.ToLower(raw) {
 	case "request", "unstructuredss-request", "unstructuredssrequest":
 		return IMSUSSDOperationRequest, firstNonEmpty(raw, "request")
+	case "response", "unstructuredss-response", "unstructuredssresponse":
+		return IMSUSSDOperationResponse, firstNonEmpty(raw, "response")
 	case "notify", "notification", "unstructuredss-notify", "unstructuredssnotify":
 		return IMSUSSDOperationNotify, firstNonEmpty(raw, "notify")
+	case "release", "unstructuredss-release", "unstructuredssrelease":
+		return IMSUSSDOperationRelease, firstNonEmpty(raw, "release")
 	default:
 		return "", ""
 	}
@@ -256,7 +298,7 @@ func DecodeIMSUSSDDocument(contentType string, body []byte) (IMSUSSDPayload, boo
 }
 
 func ussdResultFromPayload(sessionID string, payload IMSUSSDPayload, status int) USSDResult {
-	done := payload.HasError || payload.Operation == IMSUSSDOperationNotify
+	done := payload.HasError || payload.Operation == IMSUSSDOperationNotify || payload.Operation == IMSUSSDOperationRelease
 	res := USSDResult{
 		SessionID: sessionID,
 		Text:      payload.Text,

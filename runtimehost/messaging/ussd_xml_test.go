@@ -54,6 +54,102 @@ func TestParseIMSUSSDXMLLowercaseNotifyAndOperationText(t *testing.T) {
 	}
 }
 
+func TestIMSUSSDXMLResponseAndReleaseOperations(t *testing.T) {
+	responseBody, err := BuildIMSUSSDXML(IMSUSSDPayload{
+		Language:  "en",
+		Text:      "1",
+		Operation: IMSUSSDOperationResponse,
+	})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML(response) error = %v", err)
+	}
+	if !strings.Contains(string(responseBody), "UnstructuredSS-Response") {
+		t.Fatalf("response body=%s", responseBody)
+	}
+	response, err := ParseIMSUSSDXML(responseBody)
+	if err != nil {
+		t.Fatalf("ParseIMSUSSDXML(response) error = %v", err)
+	}
+	if response.Operation != IMSUSSDOperationResponse || response.RawOperationElement != "UnstructuredSS-Response" || response.Text != "1" {
+		t.Fatalf("response payload=%+v", response)
+	}
+	responseResult := ussdResultFromPayload("ussd-response", response, 200)
+	if responseResult.Done {
+		t.Fatalf("response result=%+v, want open session", responseResult)
+	}
+
+	releaseBody, err := BuildIMSUSSDXML(IMSUSSDPayload{Operation: IMSUSSDOperationRelease})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML(release) error = %v", err)
+	}
+	if !strings.Contains(string(releaseBody), "UnstructuredSS-Release") {
+		t.Fatalf("release body=%s", releaseBody)
+	}
+	release, err := ParseIMSUSSDXML(releaseBody)
+	if err != nil {
+		t.Fatalf("ParseIMSUSSDXML(release) error = %v", err)
+	}
+	if release.Operation != IMSUSSDOperationRelease || release.RawOperationElement != "UnstructuredSS-Release" {
+		t.Fatalf("release payload=%+v", release)
+	}
+	releaseResult := ussdResultFromPayload("ussd-release", release, 200)
+	if !releaseResult.Done || releaseResult.SessionID != "ussd-release" {
+		t.Fatalf("release result=%+v, want completed session", releaseResult)
+	}
+}
+
+func TestParseIMSUSSDXMLResponseAndReleaseAliases(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want IMSUSSDOperation
+		raw  string
+		done bool
+	}{
+		{
+			name: "lower response",
+			body: `<ussd-data><ussd-string>2</ussd-string><response/></ussd-data>`,
+			want: IMSUSSDOperationResponse,
+			raw:  "response",
+		},
+		{
+			name: "operation response in anyExt",
+			body: `<ussd-data><ussd-string>2</ussd-string><anyExt><operation>UnstructuredSS-Response</operation></anyExt></ussd-data>`,
+			want: IMSUSSDOperationResponse,
+			raw:  "UnstructuredSS-Response",
+		},
+		{
+			name: "lower release",
+			body: `<ussd-data><release/></ussd-data>`,
+			want: IMSUSSDOperationRelease,
+			raw:  "release",
+			done: true,
+		},
+		{
+			name: "operation release in anyExt",
+			body: `<ussd-data><anyExt><operation>unstructuredSSRelease</operation></anyExt></ussd-data>`,
+			want: IMSUSSDOperationRelease,
+			raw:  "unstructuredSSRelease",
+			done: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload, err := ParseIMSUSSDXML([]byte(tt.body))
+			if err != nil {
+				t.Fatalf("ParseIMSUSSDXML() error = %v", err)
+			}
+			if payload.Operation != tt.want || payload.RawOperationElement != tt.raw {
+				t.Fatalf("payload=%+v, want op=%q raw=%q", payload, tt.want, tt.raw)
+			}
+			result := ussdResultFromPayload("ussd-alias", payload, 200)
+			if result.Done != tt.done {
+				t.Fatalf("result=%+v, want Done=%v", result, tt.done)
+			}
+		})
+	}
+}
+
 func TestDecodeIMSUSSDDocumentFromMultipart(t *testing.T) {
 	xmlBody, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "Balance: 10", Operation: IMSUSSDOperationNotify})
 	if err != nil {
