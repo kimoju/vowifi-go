@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+	cat <<'USAGE'
+Usage: VOHIVE_DIR=/path/to/vohive scripts/compat-vohive.sh
+
+Runs VoHive compatibility checks from an isolated temporary copy of the VoHive
+checkout. The source checkout is not modified.
+
+Environment:
+  VOHIVE_DIR                    path to a local VoHive checkout
+  GO_BIN                        path to go binary
+  VOWIFI_MODULE                 module path for this repository
+  VOWIFI_COMPAT_LEGACY_BASE     legacy module owner/base to rewrite
+  VOHIVE_COMPAT_PACKAGES        package list for go test
+  VOHIVE_COMPAT_RUN             go test -run pattern
+  VOHIVE_COMPAT_BUILD_PACKAGES  optional package list for go build
+  VOHIVE_COMPAT_TMPDIR          parent directory for temporary compatibility work
+USAGE
+}
+
+find_go() {
+	if [[ -n "${GO_BIN:-}" ]]; then
+		printf '%s\n' "$GO_BIN"
+		return
+	fi
+	if command -v go >/dev/null 2>&1; then
+		command -v go
+		return
+	fi
+	if [[ -x /usr/local/go/bin/go ]]; then
+		printf '%s\n' /usr/local/go/bin/go
+		return
+	fi
+	printf 'go not found; set GO_BIN=/path/to/go\n' >&2
+	return 127
+}
+
+run() {
+	printf '\n==> %s\n' "$*"
+	"$@"
+}
+
+VOHIVE_DIR="${VOHIVE_DIR:-${1:-}}"
+if [[ -z "$VOHIVE_DIR" ]]; then
+	usage >&2
+	exit 2
+fi
+if [[ ! -d "$VOHIVE_DIR" ]]; then
+	printf 'VOHIVE_DIR does not exist or is not a directory: %s\n' "$VOHIVE_DIR" >&2
+	exit 2
+fi
+
+GO_BIN="$(find_go)"
+VOWIFI_MODULE="${VOWIFI_MODULE:-github.com/boa-z/vowifi-go}"
+legacy_base="${VOWIFI_COMPAT_LEGACY_BASE:-github.com/iniwex5}"
+legacy_base="${legacy_base%/}"
+LEGACY_MODULE="${legacy_base}/vowifi-go"
+VOHIVE_COMPAT_PACKAGES="${VOHIVE_COMPAT_PACKAGES:-./internal/vowifihost ./internal/api ./internal/notify ./internal/e911}"
+VOHIVE_COMPAT_RUN="${VOHIVE_COMPAT_RUN:-VoWiFi|RuntimeStart|StartRuntime|Tunnel|MOBIKE|Dataplane|IMS|Voice|USSD|E911|Emergency|Websheet}"
+VOHIVE_COMPAT_BUILD_PACKAGES="${VOHIVE_COMPAT_BUILD_PACKAGES:-}"
+VOHIVE_COMPAT_TMPDIR="${VOHIVE_COMPAT_TMPDIR:-${TMPDIR:-/tmp}}"
+
+mkdir -p "$VOHIVE_COMPAT_TMPDIR"
+tmpdir="$(mktemp -d -p "$VOHIVE_COMPAT_TMPDIR" vowifi-go-vohive-compat-XXXXXX)"
+cleanup() {
+	rm -rf "$tmpdir"
+}
+trap cleanup EXIT
+
+workdir="$tmpdir/vohive"
+if [[ -d "$VOHIVE_DIR/.git" ]]; then
+	run git clone --quiet --shared "$VOHIVE_DIR" "$workdir"
+else
+	mkdir -p "$workdir"
+	(
+		cd "$VOHIVE_DIR"
+		tar --exclude .git -cf - .
+	) | (
+		cd "$workdir"
+		tar -xf -
+	)
+fi
+
+cd "$workdir"
+mkdir -p "$tmpdir/go-tmp"
+
+mapfile -t legacy_files < <(grep -RIl --exclude-dir=.git -- "$LEGACY_MODULE" . 2>/dev/null || true)
+if [[ ${#legacy_files[@]} -gt 0 ]]; then
+	printf '\n==> rewriting legacy vowifi-go imports in temporary VoHive copy\n'
+	LEGACY_MODULE="$LEGACY_MODULE" VOWIFI_MODULE="$VOWIFI_MODULE" \
+	perl -0pi -e 's/\Q$ENV{LEGACY_MODULE}\E/$ENV{VOWIFI_MODULE}/g' "${legacy_files[@]}"
+fi
+
+run env GOWORK=off TMPDIR="$tmpdir/go-tmp" GOTMPDIR="$tmpdir/go-tmp" "$GO_BIN" mod edit -replace "${VOWIFI_MODULE}=${ROOT}"
+run env GOWORK=off TMPDIR="$tmpdir/go-tmp" GOTMPDIR="$tmpdir/go-tmp" "$GO_BIN" mod tidy
+
+read -r -a test_packages <<< "$VOHIVE_COMPAT_PACKAGES"
+if [[ ${#test_packages[@]} -gt 0 ]]; then
+	run env GOWORK=off TMPDIR="$tmpdir/go-tmp" GOTMPDIR="$tmpdir/go-tmp" "$GO_BIN" test "${test_packages[@]}" -run "$VOHIVE_COMPAT_RUN"
+fi
+
+read -r -a build_packages <<< "$VOHIVE_COMPAT_BUILD_PACKAGES"
+if [[ ${#build_packages[@]} -gt 0 ]]; then
+	run env GOWORK=off TMPDIR="$tmpdir/go-tmp" GOTMPDIR="$tmpdir/go-tmp" "$GO_BIN" build "${build_packages[@]}"
+fi
