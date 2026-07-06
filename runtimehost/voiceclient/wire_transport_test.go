@@ -66,6 +66,32 @@ func TestSIPRetryAfterDelayParsesDeltaSeconds(t *testing.T) {
 	}
 }
 
+func TestSIPRetryAfterDelayParsesHTTPDate(t *testing.T) {
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		value string
+		want  time.Duration
+	}{
+		{now.Add(90 * time.Second).Format(time.RFC1123), 90 * time.Second},
+		{now.Add(2 * time.Minute).Format(time.RFC1123Z), 2 * time.Minute},
+		{now.Add(3 * time.Minute).Format(time.RFC850), 3 * time.Minute},
+		{now.Add(4*time.Minute).Format(time.ANSIC) + ";duration=30", 4 * time.Minute},
+		{now.Add(-time.Minute).Format(time.RFC1123), 0},
+	}
+	for _, tc := range tests {
+		got, ok := parseSIPRetryAfterValueAt(tc.value, now)
+		if !ok || got != tc.want {
+			t.Fatalf("parseSIPRetryAfterValueAt(%q)=%v,%v want %v,true", tc.value, got, ok, tc.want)
+		}
+	}
+	future := time.Now().UTC().Add(30 * time.Second)
+	if got := SIPRetryAfterDelay(map[string][]string{
+		"Retry-After": {future.Format(time.RFC1123)},
+	}); got < 0 || got > 31*time.Second {
+		t.Fatalf("SIPRetryAfterDelay(date)=%v, want about <=31s", got)
+	}
+}
+
 func TestParseSIPResponseRejectsInvalidStatusCode(t *testing.T) {
 	for _, status := range []string{"99", "700", "0200", "2xx"} {
 		_, err := ParseSIPResponse([]byte(strings.Join([]string{

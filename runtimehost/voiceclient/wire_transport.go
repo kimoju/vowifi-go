@@ -485,8 +485,9 @@ func sipTargetsWithRedirects(targets []string, currentIndex int, redirects []str
 
 func SIPRetryAfterDelay(headers map[string][]string) time.Duration {
 	var delay time.Duration
+	now := time.Now()
 	for _, value := range rawHeaderValues(headers, "Retry-After") {
-		parsed, ok := parseSIPRetryAfterValue(value)
+		parsed, ok := parseSIPRetryAfterValueAt(value, now)
 		if !ok {
 			continue
 		}
@@ -498,6 +499,10 @@ func SIPRetryAfterDelay(headers map[string][]string) time.Duration {
 }
 
 func parseSIPRetryAfterValue(value string) (time.Duration, bool) {
+	return parseSIPRetryAfterValueAt(value, time.Now())
+}
+
+func parseSIPRetryAfterValueAt(value string, now time.Time) (time.Duration, bool) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return 0, false
@@ -513,14 +518,39 @@ func parseSIPRetryAfterValue(value string) (time.Duration, bool) {
 	}
 parse:
 	token := strings.TrimSpace(value[:end])
-	if token == "" {
-		return 0, false
+	if token != "" {
+		seconds, err := strconv.Atoi(token)
+		if err == nil && seconds >= 0 {
+			return time.Duration(seconds) * time.Second, true
+		}
 	}
-	seconds, err := strconv.Atoi(token)
-	if err != nil || seconds < 0 {
-		return 0, false
+	candidate := sipRetryAfterDateValue(value)
+	for _, layout := range []string{time.RFC1123, time.RFC1123Z, time.RFC850, time.ANSIC} {
+		t, err := time.Parse(layout, candidate)
+		if err != nil {
+			continue
+		}
+		if now.IsZero() {
+			now = time.Now()
+		}
+		delay := t.Sub(now)
+		if delay < 0 {
+			delay = 0
+		}
+		return delay, true
 	}
-	return time.Duration(seconds) * time.Second, true
+	return 0, false
+}
+
+func sipRetryAfterDateValue(value string) string {
+	value = strings.TrimSpace(value)
+	if semi := strings.IndexByte(value, ';'); semi >= 0 {
+		value = value[:semi]
+	}
+	if open := strings.IndexByte(value, '('); open >= 0 {
+		value = value[:open]
+	}
+	return strings.TrimSpace(value)
 }
 
 func validSIPStatusCode(code int) bool {
