@@ -34,25 +34,29 @@ type SIPIncomingRequest struct {
 }
 
 type DialogRequestConfig struct {
-	Profile          IMSProfile
-	Registration     RegistrationBinding
-	ContactURI       string
-	LocalURI         string
-	RemoteURI        string
-	RemoteTargetURI  string
-	CallID           string
-	LocalTag         string
-	RemoteTag        string
-	CSeq             int
-	RouteSet         []string
-	UserAgent        string
-	SessionExpires   int
-	SessionRefresher string
-	MinSE            int
-	InviteHeaders    map[string]string
-	AuthHeader       string
-	AuthHeaderName   string
-	AuthSession      *DigestAuthSession
+	Profile           IMSProfile
+	Registration      RegistrationBinding
+	ContactURI        string
+	LocalURI          string
+	RemoteURI         string
+	RemoteTargetURI   string
+	CallID            string
+	LocalTag          string
+	RemoteTag         string
+	CSeq              int
+	RouteSet          []string
+	UserAgent         string
+	PreferredIdentity string
+	AccessNetworkInfo string
+	Reason            string
+	CarrierHeaders    map[string]string
+	SessionExpires    int
+	SessionRefresher  string
+	MinSE             int
+	InviteHeaders     map[string]string
+	AuthHeader        string
+	AuthHeaderName    string
+	AuthSession       *DigestAuthSession
 }
 
 type ReferRequestOptions struct {
@@ -108,6 +112,32 @@ func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage,
 
 func BuildAckRequest(cfg DialogRequestConfig) (SIPRequestMessage, error) {
 	return buildDialogRequest("ACK", cfg, nil)
+}
+
+func BuildAckRequestForInviteResponse(cfg DialogRequestConfig, resp SIPResponse) (SIPRequestMessage, bool, error) {
+	if !DialogResponseRequiresAck("INVITE", resp) {
+		return SIPRequestMessage{}, false, nil
+	}
+	cseqValue := firstHeader(resp.Headers, "CSeq")
+	if cseqValue == "" {
+		return SIPRequestMessage{}, false, fmt.Errorf("%w: missing INVITE response CSeq", ErrInvalidSIPMessage)
+	}
+	cseq, method, ok := sipCSeqParts(cseqValue)
+	if !ok || !strings.EqualFold(method, "INVITE") {
+		return SIPRequestMessage{}, false, fmt.Errorf("%w: invalid INVITE response CSeq", ErrInvalidSIPMessage)
+	}
+	cfg.CSeq = cseq
+	if cfg.RemoteTag == "" {
+		cfg.RemoteTag = sipHeaderTag(firstHeader(resp.Headers, "To"))
+	}
+	if cfg.RemoteTargetURI == "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		cfg.RemoteTargetURI = firstContactURI(resp.Headers)
+	}
+	msg, err := BuildAckRequest(cfg)
+	if err != nil {
+		return SIPRequestMessage{}, false, err
+	}
+	return msg, true, nil
 }
 
 func BuildByeRequest(cfg DialogRequestConfig) (SIPRequestMessage, error) {
@@ -202,7 +232,7 @@ func ParseProvisionalResponseInfo(resp SIPResponse) (ProvisionalResponseInfo, er
 		Reason:          strings.TrimSpace(resp.Reason),
 		ContentType:     firstHeader(resp.Headers, "Content-Type"),
 		RemoteTag:       sipHeaderTag(firstHeader(resp.Headers, "To")),
-		RemoteTargetURI: firstProvisionalContactURI(resp.Headers),
+		RemoteTargetURI: firstContactURI(resp.Headers),
 	}
 	if isSIPProvisionalResponse(resp.StatusCode) && sipContentTypeMatches(info.ContentType, "application/sdp") && len(resp.Body) > 0 {
 		info.EarlyMedia = true
@@ -255,6 +285,9 @@ func AdvanceDialogSessionState(state DialogSessionState, method string, resp SIP
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			return DialogSessionStateConfirmed
 		case resp.StatusCode >= 300 && resp.StatusCode < 700:
+			if state == DialogSessionStateConfirmed && resp.StatusCode != 481 {
+				return DialogSessionStateConfirmed
+			}
 			return DialogSessionStateTerminated
 		}
 	case "CANCEL":
@@ -277,6 +310,43 @@ func AdvanceDialogSessionState(state DialogSessionState, method string, resp SIP
 		}
 	}
 	return state
+}
+
+func DialogResponseRequiresAck(method string, resp SIPResponse) bool {
+	return strings.EqualFold(strings.TrimSpace(method), "INVITE") && resp.StatusCode >= 200 && resp.StatusCode < 700
+}
+
+func DialogResponseIsInviteTerminated(resp SIPResponse) bool {
+	return resp.StatusCode == 487
+}
+
+func DialogResponseIsRequestPending(resp SIPResponse) bool {
+	return resp.StatusCode == 491
+}
+
+func FormatDialogReasonHeader(protocol string, cause int, text string) (string, error) {
+	protocol = strings.TrimSpace(protocol)
+	if protocol == "" {
+		return "", fmt.Errorf("%w: Reason protocol is empty", ErrInvalidDialogConfig)
+	}
+	if strings.ContainsAny(protocol, " \t\r\n;") {
+		return "", fmt.Errorf("%w: invalid Reason protocol", ErrInvalidDialogConfig)
+	}
+	if cause <= 0 {
+		return "", fmt.Errorf("%w: invalid Reason cause", ErrInvalidDialogConfig)
+	}
+	value := protocol + ";cause=" + strconv.Itoa(cause)
+	text = strings.TrimSpace(text)
+	if strings.ContainsAny(text, "\r\n") {
+		return "", fmt.Errorf("%w: invalid Reason text", ErrInvalidDialogConfig)
+	}
+	if text == "" && strings.EqualFold(protocol, "SIP") && validSIPStatusCode(cause) {
+		text = defaultSIPReason(cause)
+	}
+	if text != "" {
+		value += `;text="` + quote(text) + `"`
+	}
+	return value, nil
 }
 
 func BuildInfoRequest(cfg DialogRequestConfig, contentType string, body []byte) (SIPRequestMessage, error) {
@@ -446,9 +516,10 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 		"Max-Forwards":          "70",
 		"User-Agent":            firstNonEmpty(cfg.UserAgent, cfg.Profile.UserAgent, "vowifi-go"),
 		"Allow":                 "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, NOTIFY, SUBSCRIBE, OPTIONS",
-		"P-Preferred-Identity":  "<" + localURI + ">",
+		"P-Preferred-Identity":  formatPreferredIdentityHeader(localURI),
 		"P-Access-Network-Info": "IEEE-802.11",
 	}
+	applyDialogCarrierHeaders(headers, cfg)
 	if contactURI != "" && (method == "INVITE" || method == "UPDATE" || method == "INFO" || method == "REFER" || method == "NOTIFY" || method == "SUBSCRIBE") {
 		headers["Contact"] = "<" + contactURI + ">"
 	}
@@ -500,6 +571,42 @@ func dialogDigestAuthorization(cfg DialogRequestConfig, session *DigestAuthSessi
 		header = fallbackHeader
 	}
 	return headerName, header, nil
+}
+
+func applyDialogCarrierHeaders(dst map[string]string, cfg DialogRequestConfig) {
+	if dst == nil {
+		return
+	}
+	if identity := formatPreferredIdentityHeader(cfg.PreferredIdentity); identity != "" {
+		setDialogRequestHeader(dst, "P-Preferred-Identity", identity)
+	}
+	if accessNetworkInfo := strings.TrimSpace(cfg.AccessNetworkInfo); accessNetworkInfo != "" {
+		setDialogRequestHeader(dst, "P-Access-Network-Info", accessNetworkInfo)
+	}
+	if reason := strings.TrimSpace(cfg.Reason); reason != "" {
+		setDialogRequestHeader(dst, "Reason", reason)
+	}
+	for key, value := range cfg.CarrierHeaders {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" {
+			continue
+		}
+		canonical := canonicalHeaderName(key)
+		switch strings.ToLower(canonical) {
+		case "p-preferred-identity":
+			value = formatPreferredIdentityHeader(value)
+			if value == "" {
+				continue
+			}
+		case "p-access-network-info", "reason":
+		default:
+			if isProtectedDialogRequestHeader(key) || isProtectedDialogRequestHeader(canonical) {
+				continue
+			}
+		}
+		setDialogRequestHeader(dst, canonical, value)
+	}
 }
 
 func applySessionIntervalHeaders(headers map[string]string, cfg DialogRequestConfig) {
@@ -592,6 +699,18 @@ func formatReferHeader(value string) string {
 	return value
 }
 
+func formatPreferredIdentityHeader(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.Contains(value, "<") {
+		return value
+	}
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") || strings.HasPrefix(lower, "tel:") {
+		return "<" + value + ">"
+	}
+	return value
+}
+
 func sipHeaderHasToken(headers map[string][]string, name, token string) bool {
 	token = strings.ToLower(strings.TrimSpace(token))
 	if token == "" {
@@ -625,7 +744,7 @@ func parsePositiveSIPHeaderInt(value string) (int, error) {
 	return n, nil
 }
 
-func firstProvisionalContactURI(headers map[string][]string) string {
+func firstContactURI(headers map[string][]string) string {
 	contacts := trimHeaderValues(headerListValues(headers, "Contact"))
 	if len(contacts) == 0 {
 		return ""

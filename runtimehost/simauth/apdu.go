@@ -136,11 +136,9 @@ func Transmit(t LogicalChannelTransport, channel int, cmd []byte) (Response, err
 		return Response{}, err
 	}
 	if resp.SW1 == 0x6C {
-		retry := append([]byte(nil), cmd...)
-		if len(retry) >= 5 {
-			retry[len(retry)-1] = resp.SW2
-		} else {
-			retry = append(retry, resp.SW2)
+		retry, err := correctAPDULe(cmd, apduLeFromSW2(resp.SW2))
+		if err != nil {
+			return Response{}, err
 		}
 		resp, err = transmitOnce(t, channel, retry)
 		if err != nil {
@@ -160,6 +158,54 @@ func Transmit(t LogicalChannelTransport, channel int, cmd []byte) (Response, err
 		return getResp, nil
 	}
 	return resp, nil
+}
+
+func correctAPDULe(apdu []byte, le int) ([]byte, error) {
+	leByte, err := apduLeByte(le)
+	if err != nil {
+		return nil, err
+	}
+	out := append([]byte(nil), apdu...)
+	switch {
+	case len(out) < 4:
+		return nil, fmt.Errorf("APDU too short for Le correction: %d bytes", len(out))
+	case len(out) == 4:
+		out = append(out, leByte)
+		return out, nil
+	case len(out) == 5:
+		out[len(out)-1] = leByte
+		return out, nil
+	case out[4] == 0:
+		return nil, errors.New("extended APDU Le correction is unsupported")
+	}
+	lc := int(out[4])
+	switch len(out) {
+	case 5 + lc:
+		out = append(out, leByte)
+		return out, nil
+	case 6 + lc:
+		out[len(out)-1] = leByte
+		return out, nil
+	default:
+		return nil, fmt.Errorf("invalid short APDU length for Le correction: %d bytes with Lc=%d", len(out), lc)
+	}
+}
+
+func apduLeFromSW2(sw2 byte) int {
+	if sw2 == 0 {
+		return 256
+	}
+	return int(sw2)
+}
+
+func apduLeByte(le int) (byte, error) {
+	if le < 1 || le > 256 {
+		return 0, fmt.Errorf("invalid APDU Le: %d", le)
+	}
+	if le == 256 {
+		return 0x00, nil
+	}
+	return byte(le), nil
 }
 
 func transmitOnce(t LogicalChannelTransport, channel int, cmd []byte) (Response, error) {

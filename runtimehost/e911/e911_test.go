@@ -345,6 +345,115 @@ func TestParseEntitlementResponseCapturesTS43RoutesAddressAndExpiryJSON(t *testi
 	}
 }
 
+func TestParseEntitlementResponsePreservesWebsheetUserDataAndLocationValidationContext(t *testing.T) {
+	body := []byte(`{
+		"status": 1000,
+		"token": "entitlement-token",
+		"websheet": {
+			"url": "https://example.test/e911/websheet",
+			"user-data": "opaque-websheet-state",
+			"content-type": "text/html"
+		},
+		"location-validation": {
+			"status": "validated"
+		},
+		"emergency-pdn": {
+			"dnn": "sos.dnn.example",
+			"pdp-type": "IPv4v6",
+			"domain": "ims.example"
+		},
+		"emergency-location": {
+			"civicAddress": {
+				"PRD": "N",
+				"RD": "Main",
+				"STS": "St",
+				"POD": "SW",
+				"LMK": "Library",
+				"LOC": "Lobby",
+				"PLC": "office",
+				"POBOX": "123",
+				"ADDCODE": "A1",
+				"SEAT": "42"
+			}
+		}
+	}`)
+
+	info, err := ParseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("ParseEntitlementResponse() error = %v", err)
+	}
+	if info.Status != 1000 {
+		t.Fatalf("Status=%d", info.Status)
+	}
+	if info.UserData != "opaque-websheet-state" {
+		t.Fatalf("UserData=%q, want websheet-scoped user-data", info.UserData)
+	}
+	if info.LocationValidationStatus != "validated" {
+		t.Fatalf("LocationValidationStatus=%q", info.LocationValidationStatus)
+	}
+	if info.PDN.APN != "sos.dnn.example" || info.PDN.Type != "IPv4v6" || info.PDN.Realm != "ims.example" {
+		t.Fatalf("PDN=%+v", info.PDN)
+	}
+	if info.Address.StreetDirection != "N" || info.Address.Street != "Main" ||
+		info.Address.StreetSuffix != "St" || info.Address.StreetPostDirection != "SW" ||
+		info.Address.Landmark != "Library" || info.Address.LocationDescription != "Lobby" ||
+		info.Address.PlaceType != "office" || info.Address.PostOfficeBox != "123" ||
+		info.Address.AdditionalCode != "A1" || info.Address.Seat != "42" {
+		t.Fatalf("Address=%+v fields=%+v", info.Address, info.Address.Fields)
+	}
+	ws := websheetFromEntitlement("", entitlementResult{
+		WebsheetURL: "https://example.test/e911/websheet",
+		UserData:    info.UserData,
+		ContentType: info.ContentType,
+		Title:       info.Title,
+	})
+	if ws.UserData != "opaque-websheet-state" || ws.URL != "https://example.test/e911/websheet" {
+		t.Fatalf("websheet=%+v", ws)
+	}
+}
+
+func TestParseEntitlementResponseCapturesRoutePDNAndCacheControlAliases(t *testing.T) {
+	body := []byte(`{
+		"status": 1000,
+		"emergencyRouteInfo": {
+			"service-type": "medical",
+			"p-cscf-ip-address": ["2001:db8::1"],
+			"e-cscf-uri": "sip:ecscf@example.test",
+			"sos-uri": "sips:sos@example.test"
+		},
+		"pdnConfiguration": {
+			"accessPointNameNetworkIdentifier": "sos.apn.example",
+			"bearerType": "IPv6",
+			"homeRealm": "ims.example"
+		},
+		"cache-control": {"max-age": "PT10M"},
+		"expires-in": "PT30M"
+	}`)
+
+	info, err := ParseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("ParseEntitlementResponse() error = %v", err)
+	}
+	if info.CacheMaxAge != 10*time.Minute || info.ExpiresIn != 30*time.Minute {
+		t.Fatalf("cache/expires: CacheMaxAge=%s ExpiresIn=%s", info.CacheMaxAge, info.ExpiresIn)
+	}
+	if info.PDN.APN != "sos.apn.example" || info.PDN.Type != "IPv6" || info.PDN.Realm != "ims.example" {
+		t.Fatalf("PDN=%+v", info.PDN)
+	}
+	if !sameStrings(info.ServiceURNs, []string{"urn:service:sos.ambulance"}) {
+		t.Fatalf("ServiceURNs=%+v", info.ServiceURNs)
+	}
+	if len(info.Routes) != 1 {
+		t.Fatalf("routes=%+v", info.Routes)
+	}
+	route := info.Routes[0]
+	if route.ServiceURN != "urn:service:sos.ambulance" ||
+		!sameStrings(route.PCSCF, []string{"2001:db8::1"}) ||
+		!sameStrings(route.Endpoints, []string{"sip:ecscf@example.test", "sips:sos@example.test"}) {
+		t.Fatalf("route=%+v", route)
+	}
+}
+
 func TestParseEntitlementResponseNormalizesRegisteredEmergencyServiceAliases(t *testing.T) {
 	body := []byte(`{
 		"status": 1000,

@@ -116,6 +116,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		CallID:           strings.TrimSpace(req.CallID),
 		LocalTag:         firstVoiceNonEmpty(a.LocalTag, "vowifi-go"),
 		CSeq:             1,
+		RouteSet:         copyStringSlice(req.RouteSet),
 		UserAgent:        firstVoiceNonEmpty(a.UserAgent, a.Profile.UserAgent, "vowifi-go"),
 		SessionExpires:   a.SessionExpires,
 		SessionRefresher: normalizeSessionRefresher(a.SessionRefresher),
@@ -2071,6 +2072,13 @@ func copyVoiceHeaderMap(headers map[string]string) map[string]string {
 		}
 	}
 	return out
+}
+
+func copyStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	return append([]string(nil), values...)
 }
 
 func recordRouteSet(headers map[string][]string) []string {

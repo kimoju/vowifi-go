@@ -193,6 +193,51 @@ func TestReplayWindowSizeCapsAt64Packets(t *testing.T) {
 	}
 }
 
+func TestReplayWindowIgnoresFailedIntegrityPacket(t *testing.T) {
+	sealer := newTestSA(t, 0x34343434, 0)
+	packet, err := sealer.Seal(NextHeaderIPv4, []byte{0x45, 0x00, 0x00, 0x14}, SealOptions{
+		Sequence: 7,
+		IV:       bytes.Repeat([]byte{0x34}, 16),
+	})
+	if err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+	tampered := append([]byte(nil), packet...)
+	tampered[len(tampered)-1] ^= 0xff
+	opener := newTestSA(t, 0x34343434, 64)
+	if _, err := opener.Open(tampered); !errors.Is(err, ErrInvalidPacket) {
+		t.Fatalf("Open(tampered) err=%v, want ErrInvalidPacket", err)
+	}
+	out, err := opener.Open(packet)
+	if err != nil {
+		t.Fatalf("Open(valid after tampered) error = %v", err)
+	}
+	if out.Sequence != 7 || opener.HighestSequence != 7 || opener.ReplayBitmap != 1 {
+		t.Fatalf("out=%+v highest=%d bitmap=%064b", out, opener.HighestSequence, opener.ReplayBitmap)
+	}
+}
+
+func TestReplayWindowDisabledAllowsDuplicatePackets(t *testing.T) {
+	sealer := newTestSA(t, 0x35353535, 0)
+	packet, err := sealer.Seal(NextHeaderIPv4, []byte{0x45, 0x00}, SealOptions{
+		Sequence: 5,
+		IV:       bytes.Repeat([]byte{0x35}, 16),
+	})
+	if err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+	opener := newTestSA(t, 0x35353535, 0)
+	if _, err := opener.Open(packet); err != nil {
+		t.Fatalf("Open(first) error = %v", err)
+	}
+	if _, err := opener.Open(packet); err != nil {
+		t.Fatalf("Open(duplicate with replay disabled) error = %v", err)
+	}
+	if opener.HighestSequence != 5 || opener.ReplayBitmap != 0 {
+		t.Fatalf("highest=%d bitmap=%064b", opener.HighestSequence, opener.ReplayBitmap)
+	}
+}
+
 func TestSealRejectsSequenceOverflow(t *testing.T) {
 	sa := newTestSA(t, 0x44444444, 0)
 	sa.Sequence = ^uint32(0)

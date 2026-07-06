@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"reflect"
@@ -167,6 +168,62 @@ func TestPrepareStartKeepsProfileIMEI(t *testing.T) {
 	}
 }
 
+func TestPrepareStartRecordsDeviceIDIMEIFallback(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		DeviceID: "modem-imei-490154203237518",
+		Profile:  Profile{IMSI: "001010123456789"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.IdentityIMSISource != IMSISourceProfile || prepared.IdentityIMEISource != IMEISourceDeviceID {
+		t.Fatalf("sources IMSI=%q IMEI=%q, want profile/device_id", prepared.IdentityIMSISource, prepared.IdentityIMEISource)
+	}
+	if len(prepared.Fallbacks) != 1 {
+		t.Fatalf("Fallbacks=%#v, want IMEI fallback metadata", prepared.Fallbacks)
+	}
+	meta := prepared.Fallbacks[0]
+	if meta.Field != IdentityFieldIMEI || meta.PrimarySource != IMEISourceProfile ||
+		meta.FallbackSource != IMEISourceDeviceID || !meta.Used || meta.RecoveryClass != simtransport.RecoveryClassNone {
+		t.Fatalf("IMEI fallback metadata=%+v", meta)
+	}
+}
+
+func TestPrepareStartClassifiesISIMReadFallback(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		Profile: Profile{IMSI: "001010123456789", IMEI: "490154203237518"},
+		Access:  failingAccess{err: context.DeadlineExceeded},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.IMSIdentity.RequestedSource != IMSIdentitySourceISIM ||
+		prepared.IMSIdentity.ActualSource != IMSIdentitySourceProfile ||
+		!prepared.IMSIdentity.FallbackUsed ||
+		prepared.IMSIdentity.RecoveryClass != simtransport.RecoveryClassControlPortHung {
+		t.Fatalf("IMS fallback resolution=%+v", prepared.IMSIdentity)
+	}
+	if len(prepared.Fallbacks) != 1 {
+		t.Fatalf("Fallbacks=%#v, want ISIM fallback metadata", prepared.Fallbacks)
+	}
+	meta := prepared.Fallbacks[0]
+	if meta.Field != IdentityFieldIMSIdentity || meta.PrimarySource != IMSIdentitySourceISIM ||
+		meta.FallbackSource != IMSIdentitySourceProfile || !meta.Used || !meta.Recoverable ||
+		meta.RecoveryClass != simtransport.RecoveryClassControlPortHung {
+		t.Fatalf("ISIM fallback metadata=%+v", meta)
+	}
+}
+
+func TestNewReadFallbackMetadataClassifiesIMSIReadFailure(t *testing.T) {
+	meta := NewReadFallbackMetadata(IdentityFieldIMSI, "qmi", IMSISourceProfile, context.DeadlineExceeded)
+	if meta.Field != IdentityFieldIMSI || meta.PrimarySource != "qmi" || meta.FallbackSource != IMSISourceProfile {
+		t.Fatalf("metadata sources=%+v", meta)
+	}
+	if !meta.Used || !meta.Recoverable || meta.RecoveryClass != simtransport.RecoveryClassControlPortHung {
+		t.Fatalf("metadata recovery=%+v, want control port hung fallback", meta)
+	}
+}
+
 func TestExtractIMEIIgnoresNonIMEIDeviceID(t *testing.T) {
 	if got := ExtractIMEI("dev-1"); got != "" {
 		t.Fatalf("ExtractIMEI(dev-1) = %q, want empty", got)
@@ -181,6 +238,12 @@ type partialAccess struct {
 }
 
 func (a partialAccess) GetISIMIdentity() (Identity, error) { return a.id, nil }
+
+type failingAccess struct {
+	err error
+}
+
+func (a failingAccess) GetISIMIdentity() (Identity, error) { return Identity{}, a.err }
 
 type crsmIdentityFake struct {
 	binaryCalls []string

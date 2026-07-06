@@ -224,8 +224,10 @@ type createChildTransport struct {
 	responseSA        SecurityAssociation
 	responseNotify    *Notify
 	responseNonce     []byte
+	rekeySPI          []byte
 	omitResponseNonce bool
 	requests          int
+	sawRekey          bool
 	sawSA             bool
 	sawNonce          bool
 	sawTSi            bool
@@ -245,6 +247,17 @@ func (tr *createChildTransport) ExchangeIKE(ctx context.Context, request []byte)
 	tr.requests++
 	for _, payload := range inner {
 		switch payload.Type {
+		case PayloadNotify:
+			notify, err := ParseNotify(payload.Body)
+			if err != nil {
+				tr.t.Fatalf("ParseNotify() error = %v", err)
+			}
+			if notify.NotifyType == NotifyRekeySA {
+				if notify.ProtocolID != ProtocolESP || !bytes.Equal(notify.SPI, tr.rekeySPI) {
+					tr.t.Fatalf("rekey notify=%+v want SPI %x", notify, tr.rekeySPI)
+				}
+				tr.sawRekey = true
+			}
 		case PayloadSA:
 			sa, err := ParseSecurityAssociation(payload.Body)
 			if err != nil {

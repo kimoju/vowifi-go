@@ -216,6 +216,71 @@ func TestParseIMSCPIMIMDNReportDeliveryFailure(t *testing.T) {
 	}
 }
 
+func TestParseIMSCPIMIMDNReportTextStatusAndLooseDateTime(t *testing.T) {
+	payload := strings.Join([]string{
+		`<imdn xmlns="urn:ietf:params:xml:ns:imdn">`,
+		`  <recipient-uri>tel:+18005551212</recipient-uri>`,
+		`  <delivery-notification><status><error>carrier timeout</error></status></delivery-notification>`,
+		`</imdn>`,
+	}, "")
+	body := []byte(strings.Join([]string{
+		"From: <sip:smsc@ims.example>",
+		"To: <sip:user@ims.example>",
+		"NS: x <urn:ietf:params:imdn>",
+		"x.Message-ID: header-message-id",
+		"x.DateTime: 2026-07-07T10:03:04+0800",
+		"",
+		"Content-Type: message/imdn+xml; charset=UTF-8",
+		"Content-Length: " + strconv.Itoa(len(payload)),
+		"",
+		payload,
+	}, "\r\n"))
+
+	cpim, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	report, err := parseIMSCPIMIMDNReport(cpim)
+	if err != nil {
+		t.Fatalf("parseIMSCPIMIMDNReport() error = %v", err)
+	}
+
+	if report.MessageID != "header-message-id" || report.Notification != "delivery" || report.Status != "error" || report.State != "failed" {
+		t.Fatalf("report=%+v", report)
+	}
+	if report.StatusText != "carrier timeout" || !strings.Contains(report.ErrorText, "carrier timeout") {
+		t.Fatalf("status text/error=%q/%q", report.StatusText, report.ErrorText)
+	}
+	wantAt := time.Date(2026, 7, 7, 10, 3, 4, 0, time.FixedZone("", 8*3600))
+	if !report.DateTime.Equal(wantAt) {
+		t.Fatalf("DateTime=%s want %s", report.DateTime, wantAt)
+	}
+}
+
+func TestParseIMSCPIMIMDNReportStatusCharacterData(t *testing.T) {
+	payload := strings.Join([]string{
+		`<imdn xmlns="urn:ietf:params:xml:ns:imdn">`,
+		`  <message-id>msg-displayed</message-id>`,
+		`  <display-notification><status>displayed</status></display-notification>`,
+		`</imdn>`,
+	}, "")
+	body, err := BuildIMSCPIMMessageWithHeaders(map[string][]string{"From": {"<sip:smsc@ims.example>"}}, map[string][]string{"Content-Type": {imsIMDNContentType}}, []byte(payload))
+	if err != nil {
+		t.Fatalf("BuildIMSCPIMMessageWithHeaders() error = %v", err)
+	}
+	cpim, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	report, err := parseIMSCPIMIMDNReport(cpim)
+	if err != nil {
+		t.Fatalf("parseIMSCPIMIMDNReport() error = %v", err)
+	}
+	if report.Notification != "display" || report.Status != "displayed" || report.State != "delivered" || report.ErrorText != "" {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
 func cpimTestHasValue(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

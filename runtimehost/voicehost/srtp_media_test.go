@@ -166,6 +166,62 @@ func TestSDPCryptoInlineKeyParamsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSDPCryptoAttributeKeyHelpers(t *testing.T) {
+	key := bytes.Repeat([]byte{0x11}, 16)
+	salt := bytes.Repeat([]byte{0x22}, 14)
+	attr, err := BuildSDPCryptoAttribute("3", SRTPProfileAes128CmHmacSha1_80, SDPCryptoInlineKeyParams{
+		MasterKey:  key,
+		MasterSalt: salt,
+		Lifetime:   "2^20",
+		MKIValue:   "7",
+		MKILength:  4,
+	}, "UNENCRYPTED_SRTCP")
+	if err != nil {
+		t.Fatalf("BuildSDPCryptoAttribute() error = %v", err)
+	}
+	if attr.Tag != "3" || attr.Suite != "AES_CM_128_HMAC_SHA1_80" || attr.SessionParams != "UNENCRYPTED_SRTCP" {
+		t.Fatalf("attr=%+v", attr)
+	}
+	if attr.SDPValue() == "" {
+		t.Fatalf("empty crypto SDP value attr=%+v", attr)
+	}
+	profile, parsed, err := ParseSDPCryptoAttributeKeys(attr)
+	if err != nil {
+		t.Fatalf("ParseSDPCryptoAttributeKeys() error = %v", err)
+	}
+	if profile != SRTPProfileAes128CmHmacSha1_80 || !bytes.Equal(parsed.MasterKey, key) ||
+		!bytes.Equal(parsed.MasterSalt, salt) || parsed.Lifetime != "2^20" || parsed.MKIValue != "7" || parsed.MKILength != 4 {
+		t.Fatalf("profile=%q parsed=%+v", profile, parsed)
+	}
+
+	answer := BuildSDPAnswerWithSecurity(SDPInfo{
+		ConnectionIP: "192.0.2.2",
+		MediaPort:    6000,
+		Payloads:     []int{0},
+		Direction:    "sendrecv",
+	}, SDPSecurityInfo{
+		RTPProfile: "RTP/SAVP",
+		Crypto:     []SDPCryptoAttribute{attr},
+	})
+	_, security, err := ParseSDPWithSecurity(answer)
+	if err != nil {
+		t.Fatalf("ParseSDPWithSecurity(answer) error = %v", err)
+	}
+	if len(security.Crypto) != 1 {
+		t.Fatalf("security=%+v", security)
+	}
+	if _, reparsed, err := ParseSDPCryptoAttributeKeys(security.Crypto[0]); err != nil ||
+		!bytes.Equal(reparsed.MasterKey, key) || !bytes.Equal(reparsed.MasterSalt, salt) {
+		t.Fatalf("reparsed=%+v err=%v", reparsed, err)
+	}
+	if _, _, err := ParseSDPCryptoAttributeKeys(SDPCryptoAttribute{Suite: "bogus", KeyParams: attr.KeyParams}); !errors.Is(err, ErrSRTPMediaConfig) {
+		t.Fatalf("ParseSDPCryptoAttributeKeys(bogus) err=%v, want ErrSRTPMediaConfig", err)
+	}
+	if _, err := BuildSDPCryptoAttribute("", SRTPProfileAes128CmHmacSha1_80, SDPCryptoInlineKeyParams{MasterKey: key, MasterSalt: salt}, ""); !errors.Is(err, ErrSRTPMediaConfig) {
+		t.Fatalf("BuildSDPCryptoAttribute(empty tag) err=%v, want ErrSRTPMediaConfig", err)
+	}
+}
+
 func TestSRTPMediaSessionSupportsGCMProfile(t *testing.T) {
 	cfg := testSRTPMediaConfig()
 	cfg.Profile = SRTPProfileAeadAes128Gcm

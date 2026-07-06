@@ -33,6 +33,34 @@ func TestResolveEffectiveCarrierConfigNormalizesTwoDigitMNC(t *testing.T) {
 	}
 }
 
+func TestNormalizeSubscriberProfileDerivesRealmsAndNAI(t *testing.T) {
+	profile := NormalizeSubscriberProfile(SubscriberProfileInput{IMSI: "001010123456789"})
+	if profile.MCC != "001" || profile.MNC != "010" || profile.PresetID != "001010" {
+		t.Fatalf("profile PLMN=(%q,%q) PresetID=%q, want 001010", profile.MCC, profile.MNC, profile.PresetID)
+	}
+	if profile.Network.IMSRealm != "ims.mnc010.mcc001.3gppnetwork.org" ||
+		profile.Network.NAIRealm != "nai.epc.mnc010.mcc001.3gppnetwork.org" ||
+		profile.Network.EPDGFQDN != "epdg.epc.mnc010.mcc001.pub.3gppnetwork.org" {
+		t.Fatalf("Network=%+v, want derived 3GPP defaults", profile.Network)
+	}
+	if profile.IMSPrivateIdentity != "001010123456789@ims.mnc010.mcc001.3gppnetwork.org" ||
+		profile.IMSPublicIdentity != "sip:001010123456789@ims.mnc010.mcc001.3gppnetwork.org" ||
+		profile.PermanentNAI != "0001010123456789@nai.epc.mnc010.mcc001.3gppnetwork.org" {
+		t.Fatalf("derived identities=%+v", profile)
+	}
+}
+
+func TestResolveEffectiveCarrierConfigDerivesPLMNFromIMSI(t *testing.T) {
+	ClearCarrierOverrides()
+	cfg := ResolveEffectiveCarrierConfig(EffectiveCarrierConfigInput{IMSI: "310280233621715"})
+	if cfg.MCC != "310" || cfg.MNC != "280" || cfg.PresetID != "310280" {
+		t.Fatalf("config PLMN=(%q,%q) PresetID=%q, want 310280", cfg.MCC, cfg.MNC, cfg.PresetID)
+	}
+	if !cfg.E911.Enabled || cfg.Network.IMSRealm != "ims.mnc280.mcc310.3gppnetwork.org" {
+		t.Fatalf("config=%+v, want ATT preset with normalized network", cfg)
+	}
+}
+
 func TestLoadCarrierOverrides(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "carriers.json")
 	if err := os.WriteFile(path, []byte(`{

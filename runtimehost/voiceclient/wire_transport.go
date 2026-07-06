@@ -917,16 +917,26 @@ func defaultSIPReason(code int) string {
 		return "Trying"
 	case 180:
 		return "Ringing"
+	case 183:
+		return "Session Progress"
 	case 200:
 		return "OK"
+	case 202:
+		return "Accepted"
 	case 400:
 		return "Bad Request"
+	case 480:
+		return "Temporarily Unavailable"
 	case 481:
 		return "Call/Transaction Does Not Exist"
 	case 486:
 		return "Busy Here"
+	case 487:
+		return "Request Terminated"
 	case 488:
 		return "Not Acceptable Here"
+	case 491:
+		return "Request Pending"
 	case 500:
 		return "Server Internal Error"
 	case 503:

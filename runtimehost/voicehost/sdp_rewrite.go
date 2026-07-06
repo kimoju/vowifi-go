@@ -3,6 +3,7 @@ package voicehost
 import (
 	"errors"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -18,6 +19,12 @@ type SDPCodec struct {
 	Channels     int
 	FMTP         string
 }
+
+const (
+	SDPCodecAMR            = "AMR"
+	SDPCodecAMRWB          = "AMR-WB"
+	SDPCodecTelephoneEvent = "telephone-event"
+)
 
 type SDPMediaDescription struct {
 	Info         SDPInfo
@@ -36,6 +43,42 @@ type SDPAnswerOptions struct {
 
 type SDPMediaRewriteOptions struct {
 	RTCPMux bool
+}
+
+func NewSDPAMRCodec(payload int, fmtp string) SDPCodec {
+	return SDPCodec{
+		Payload:      payload,
+		EncodingName: SDPCodecAMR,
+		ClockRate:    8000,
+		Channels:     1,
+		FMTP:         strings.TrimSpace(fmtp),
+	}
+}
+
+func NewSDPAMRWBCodec(payload int, fmtp string) SDPCodec {
+	return SDPCodec{
+		Payload:      payload,
+		EncodingName: SDPCodecAMRWB,
+		ClockRate:    16000,
+		Channels:     1,
+		FMTP:         strings.TrimSpace(fmtp),
+	}
+}
+
+func NewSDPTelephoneEventCodec(payload, clockRate int) SDPCodec {
+	if clockRate <= 0 {
+		clockRate = DefaultRTPDTMFClockRate
+	}
+	if payload < 0 {
+		payload = DefaultRTPDTMFPayloadType
+	}
+	return SDPCodec{
+		Payload:      payload,
+		EncodingName: SDPCodecTelephoneEvent,
+		ClockRate:    clockRate,
+		Channels:     1,
+		FMTP:         "0-16",
+	}
 }
 
 func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
@@ -224,12 +267,12 @@ func SelectSDPAnswerCodecs(offer, local []SDPCodec) []SDPCodec {
 	for _, want := range local {
 		want = normalizeSDPCodec(want)
 		for i, offered := range offer {
-			if used[i] || !sdpCodecMatches(offered, want) {
+			if used[i] {
 				continue
 			}
-			answer := normalizeSDPCodec(offered)
-			if strings.TrimSpace(want.FMTP) != "" {
-				answer.FMTP = strings.TrimSpace(want.FMTP)
+			answer, ok := selectSDPCodecAnswer(offered, want)
+			if !ok {
+				continue
 			}
 			selected = append(selected, answer)
 			used[i] = true
@@ -537,6 +580,146 @@ func sdpCodecMatches(offered, want SDPCodec) bool {
 	return true
 }
 
+func selectSDPCodecAnswer(offered, want SDPCodec) (SDPCodec, bool) {
+	if !sdpCodecMatches(offered, want) {
+		return SDPCodec{}, false
+	}
+	answer := normalizeSDPCodec(offered)
+	if sdpCodecIsAMR(answer) && sdpCodecIsAMR(want) {
+		fmtp, ok := selectSDPAMRAnswerFMTP(answer.FMTP, want.FMTP)
+		if !ok {
+			return SDPCodec{}, false
+		}
+		answer.FMTP = fmtp
+		return answer, true
+	}
+	if strings.TrimSpace(want.FMTP) != "" {
+		answer.FMTP = strings.TrimSpace(want.FMTP)
+	}
+	return answer, true
+}
+
+func sdpCodecIsAMR(codec SDPCodec) bool {
+	name := strings.ToUpper(strings.TrimSpace(codec.EncodingName))
+	return name == SDPCodecAMR || name == SDPCodecAMRWB
+}
+
+func selectSDPAMRAnswerFMTP(offered, want string) (string, bool) {
+	offered = strings.TrimSpace(offered)
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return offered, true
+	}
+	offeredParams := ParseSDPFmtpParameters(offered)
+	wantParams := ParseSDPFmtpParameters(want)
+	out := make(map[string]string, len(offeredParams)+len(wantParams))
+	for key, value := range offeredParams {
+		out[key] = value
+	}
+	for _, key := range []string{"octet-align", "crc", "robust-sorting", "interleaving"} {
+		value, ok := selectSDPAMRBinaryFMTPParam(offeredParams, wantParams, key)
+		if !ok {
+			return "", false
+		}
+		if strings.TrimSpace(value) != "" {
+			out[key] = value
+		}
+	}
+	if wantModeSet, ok := wantParams["mode-set"]; ok {
+		if offeredModeSet, hasOffered := offeredParams["mode-set"]; hasOffered {
+			intersection, ok := intersectSDPAMRModeSet(offeredModeSet, wantModeSet)
+			if !ok {
+				return "", false
+			}
+			out["mode-set"] = intersection
+		} else {
+			out["mode-set"] = strings.TrimSpace(wantModeSet)
+		}
+	}
+	for key, value := range wantParams {
+		switch key {
+		case "octet-align", "crc", "robust-sorting", "interleaving", "mode-set":
+			continue
+		default:
+			if strings.TrimSpace(value) != "" {
+				out[key] = value
+			}
+		}
+	}
+	return BuildSDPFmtpParameters(out), true
+}
+
+func selectSDPAMRBinaryFMTPParam(offered, want map[string]string, key string) (string, bool) {
+	wantValue, hasWant := want[key]
+	offerValue, hasOffer := offered[key]
+	if !hasWant {
+		return strings.TrimSpace(offerValue), true
+	}
+	wantValue = normalizeSDPAMRBinaryFMTPValue(wantValue)
+	if wantValue == "" {
+		return "", false
+	}
+	if !hasOffer {
+		if wantValue == "0" {
+			return wantValue, true
+		}
+		return "", false
+	}
+	offerValue = normalizeSDPAMRBinaryFMTPValue(offerValue)
+	if offerValue == "" || offerValue != wantValue {
+		return "", false
+	}
+	return wantValue, true
+}
+
+func normalizeSDPAMRBinaryFMTPValue(value string) string {
+	switch strings.TrimSpace(value) {
+	case "0", "1":
+		return strings.TrimSpace(value)
+	default:
+		return ""
+	}
+}
+
+func intersectSDPAMRModeSet(offered, want string) (string, bool) {
+	offeredModes := parseSDPAMRModeSet(offered)
+	wantModes := parseSDPAMRModeSet(want)
+	if len(offeredModes) == 0 || len(wantModes) == 0 {
+		return "", false
+	}
+	offeredSet := make(map[string]bool, len(offeredModes))
+	for _, mode := range offeredModes {
+		offeredSet[mode] = true
+	}
+	intersection := make([]string, 0, len(wantModes))
+	seen := make(map[string]bool, len(wantModes))
+	for _, mode := range wantModes {
+		if offeredSet[mode] && !seen[mode] {
+			intersection = append(intersection, mode)
+			seen[mode] = true
+		}
+	}
+	if len(intersection) == 0 {
+		return "", false
+	}
+	return strings.Join(intersection, ","), true
+}
+
+func parseSDPAMRModeSet(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		mode := strings.TrimSpace(part)
+		if mode == "" {
+			continue
+		}
+		if _, err := strconv.Atoi(mode); err != nil {
+			return nil
+		}
+		out = append(out, mode)
+	}
+	return out
+}
+
 func staticSDPCodec(payload int) (SDPCodec, bool) {
 	switch payload {
 	case 0:
@@ -588,6 +771,112 @@ func sdpCodecAttributeLines(payloads []int, codecs []SDPCodec, telephoneEventPay
 		}
 		if fmtp := strings.TrimSpace(codec.FMTP); fmtp != "" {
 			out = append(out, "a=fmtp:"+strconv.Itoa(payload)+" "+fmtp)
+		}
+	}
+	return out
+}
+
+func ParseSDPFmtpParameters(fmtp string) map[string]string {
+	parts := splitSDPFmtpParameters(fmtp)
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(parts))
+	for _, part := range parts {
+		key, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func BuildSDPFmtpParameters(params map[string]string) string {
+	if len(params) == 0 {
+		return ""
+	}
+	normalized := make(map[string]string, len(params))
+	for key, value := range params {
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		if key != "" && value != "" {
+			normalized[key] = value
+		}
+	}
+	if len(normalized) == 0 {
+		return ""
+	}
+	params = normalized
+	preferred := []string{
+		"octet-align",
+		"crc",
+		"robust-sorting",
+		"interleaving",
+		"mode-set",
+		"mode-change-period",
+		"mode-change-neighbor",
+		"max-red",
+	}
+	used := make(map[string]bool, len(params))
+	var parts []string
+	for _, key := range preferred {
+		if value := strings.TrimSpace(params[key]); value != "" {
+			parts = append(parts, key+"="+value)
+			used[key] = true
+		}
+	}
+	var rest []string
+	for key, value := range params {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" || used[key] || strings.TrimSpace(value) == "" {
+			continue
+		}
+		rest = append(rest, key)
+	}
+	sort.Strings(rest)
+	for _, key := range rest {
+		parts = append(parts, key+"="+strings.TrimSpace(params[key]))
+	}
+	return strings.Join(parts, ";")
+}
+
+func splitSDPFmtpParameters(fmtp string) []string {
+	fmtp = strings.TrimSpace(fmtp)
+	if fmtp == "" {
+		return nil
+	}
+	segments := strings.Split(fmtp, ";")
+	out := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		if strings.Contains(segment, "=") {
+			if strings.Count(segment, "=") > 1 && strings.ContainsAny(segment, " \t") {
+				for _, field := range strings.Fields(segment) {
+					if strings.Contains(field, "=") {
+						out = append(out, field)
+					}
+				}
+				continue
+			}
+			out = append(out, segment)
+			continue
+		}
+		for _, field := range strings.Fields(segment) {
+			if strings.Contains(field, "=") {
+				out = append(out, field)
+			}
 		}
 	}
 	return out

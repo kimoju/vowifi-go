@@ -119,6 +119,11 @@ type AUTNFields struct {
 	MAC      []byte
 }
 
+type AUTSFields struct {
+	SQNMSXorAK []byte
+	MACS       []byte
+}
+
 type ChallengeVector struct {
 	RAND       []byte
 	AUTN       []byte
@@ -423,6 +428,95 @@ func FindAttribute(attrs []Attribute, attributeType uint8) (Attribute, bool) {
 	return Attribute{}, false
 }
 
+func ValidateAttributes(attrs []Attribute) error {
+	for _, attr := range attrs {
+		if err := ValidateAttribute(attr); err != nil {
+			return fmt.Errorf("attribute %d: %w", attr.Type, err)
+		}
+	}
+	return nil
+}
+
+func ValidateAttribute(a Attribute) error {
+	switch a.Type {
+	case AttributeRAND:
+		_, err := a.RANDValues()
+		return err
+	case AttributeAUTN:
+		_, err := a.AUTNValues()
+		return err
+	case AttributeRES:
+		_, _, err := a.RESValue()
+		return err
+	case AttributeAUTS:
+		_, err := a.AUTSValue()
+		return err
+	case AttributePadding:
+		totalLength := len(a.Data) + 2
+		if totalLength != 4 && totalLength != 8 && totalLength != 12 {
+			return fmt.Errorf("%w: padding length %d", ErrInvalidAttribute, totalLength)
+		}
+		return requireZeroBytes(a.Data, "padding bytes")
+	case AttributePermanentIDReq, AttributeAnyIDReq, AttributeFullAuthIDReq:
+		_, err := a.fixedValueExact(0)
+		return err
+	case AttributeMAC:
+		_, err := a.MACValue()
+		return err
+	case AttributeNotification:
+		_, err := a.NotificationValue()
+		return err
+	case AttributeIdentity:
+		_, err := a.IdentityValue()
+		return err
+	case AttributeVersionList:
+		_, err := a.VersionListValue()
+		return err
+	case AttributeSelectedVersion:
+		_, err := a.SelectedVersionValue()
+		return err
+	case AttributeCounter:
+		_, err := a.CounterValue()
+		return err
+	case AttributeCounterTooSmall:
+		return a.CounterTooSmallValue()
+	case AttributeNonceS:
+		_, err := a.NonceSValue()
+		return err
+	case AttributeClientErrorCode:
+		_, err := a.ClientErrorCodeValue()
+		return err
+	case AttributeKDFInput:
+		_, err := a.KDFInputValue()
+		return err
+	case AttributeKDF:
+		_, err := a.KDFValue()
+		return err
+	case AttributeIV:
+		_, err := a.IVValue()
+		return err
+	case AttributeEncrData:
+		_, err := a.EncrDataValue()
+		return err
+	case AttributeNextPseudonym:
+		_, err := a.NextPseudonymValue()
+		return err
+	case AttributeNextReauthID:
+		_, err := a.NextReauthIDValue()
+		return err
+	case AttributeCheckcode:
+		_, err := a.CheckcodeValue()
+		return err
+	case AttributeResultInd:
+		return a.ResultIndValue()
+	case AttributeBidding:
+		_, err := a.BiddingValue()
+		return err
+	default:
+		return nil
+	}
+}
+
 func (a Attribute) VariableValue() ([]byte, error) {
 	if len(a.Data) < 2 {
 		return nil, ErrInvalidAttribute
@@ -537,6 +631,14 @@ func (a Attribute) AUTNFields() (AUTNFields, error) {
 
 func (a Attribute) AUTSValue() ([]byte, error) {
 	return a.fixedValueExact(AUTSLength)
+}
+
+func (a Attribute) AUTSFields() (AUTSFields, error) {
+	auts, err := a.AUTSValue()
+	if err != nil {
+		return AUTSFields{}, err
+	}
+	return ParseAUTS(auts)
 }
 
 func (a Attribute) MACValue() ([]byte, error) {
@@ -688,6 +790,16 @@ func ParseAUTN(autn16 []byte) (AUTNFields, error) {
 	}, nil
 }
 
+func ParseAUTS(auts14 []byte) (AUTSFields, error) {
+	if len(auts14) != AUTSLength {
+		return AUTSFields{}, fmt.Errorf("%w: AUTS length %d", ErrInvalidAttribute, len(auts14))
+	}
+	return AUTSFields{
+		SQNMSXorAK: append([]byte(nil), auts14[:AKLength]...),
+		MACS:       append([]byte(nil), auts14[AKLength:]...),
+	}, nil
+}
+
 func (a AUTNFields) SQN(ak []byte) ([]byte, error) {
 	if len(a.SQNXorAK) != AKLength {
 		return nil, fmt.Errorf("%w: SQN xor AK length %d", ErrInvalidAttribute, len(a.SQNXorAK))
@@ -698,6 +810,33 @@ func (a AUTNFields) SQN(ak []byte) ([]byte, error) {
 	sqn := make([]byte, AKLength)
 	for i := range sqn {
 		sqn[i] = a.SQNXorAK[i] ^ ak[i]
+	}
+	return sqn, nil
+}
+
+func (a AUTSFields) Bytes() ([]byte, error) {
+	if len(a.SQNMSXorAK) != AKLength {
+		return nil, fmt.Errorf("%w: AUTS SQN_MS xor AK length %d", ErrInvalidAttribute, len(a.SQNMSXorAK))
+	}
+	if len(a.MACS) != AUTNMACLength {
+		return nil, fmt.Errorf("%w: AUTS MAC-S length %d", ErrInvalidAttribute, len(a.MACS))
+	}
+	out := make([]byte, 0, AUTSLength)
+	out = append(out, a.SQNMSXorAK...)
+	out = append(out, a.MACS...)
+	return out, nil
+}
+
+func (a AUTSFields) SQNMS(ak []byte) ([]byte, error) {
+	if len(a.SQNMSXorAK) != AKLength {
+		return nil, fmt.Errorf("%w: AUTS SQN_MS xor AK length %d", ErrInvalidAttribute, len(a.SQNMSXorAK))
+	}
+	if len(ak) != AKLength {
+		return nil, fmt.Errorf("%w: AK length %d", ErrInvalidAttribute, len(ak))
+	}
+	sqn := make([]byte, AKLength)
+	for i := range sqn {
+		sqn[i] = a.SQNMSXorAK[i] ^ ak[i]
 	}
 	return sqn, nil
 }

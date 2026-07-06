@@ -3,6 +3,7 @@ package simtransport
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -70,6 +71,8 @@ func TestStatusStringRecoveryClass(t *testing.T) {
 		{status: "6283", want: RecoveryClassSIMBusy},
 		{status: "6400", want: RecoveryClassSIMBusy},
 		{status: "6F00", want: RecoveryClassSIMBusy},
+		{status: "6102", want: RecoveryClassMalformedReply},
+		{status: "6C10", want: RecoveryClassMalformedReply},
 		{status: "6A86", want: RecoveryClassMalformedReply},
 		{status: "not-status", want: RecoveryClassNone},
 	}
@@ -90,5 +93,81 @@ func TestResultRecoveryClass(t *testing.T) {
 	}
 	if got := (CRSMResult{SW1: 0x90, SW2: 0x00}).RecoveryClass(); got != RecoveryClassNone {
 		t.Fatalf("CRSM 9000 recovery class = %q, want none", got)
+	}
+}
+
+func TestAPDUStatusRecoveryPlan(t *testing.T) {
+	plan := PlanAPDUStatusRecovery(0x6C, 0x00)
+	if plan.Action != APDURecoveryCorrectLe || plan.Le != 256 || !plan.Recoverable() {
+		t.Fatalf("6C00 plan=%+v", plan)
+	}
+	leByte, err := plan.LeByte()
+	if err != nil {
+		t.Fatalf("LeByte() error = %v", err)
+	}
+	if leByte != 0x00 {
+		t.Fatalf("LeByte() = 0x%02X, want 0", leByte)
+	}
+
+	plan = PlanAPDUStatusRecovery(0x61, 0x02)
+	if plan.Action != APDURecoveryGetResponse || plan.Le != 2 {
+		t.Fatalf("6102 plan=%+v", plan)
+	}
+
+	plan = PlanAPDUStatusRecovery(0x90, 0x00)
+	if plan.Recoverable() {
+		t.Fatalf("9000 plan=%+v, want not recoverable", plan)
+	}
+}
+
+func TestAPDURecoveryCommands(t *testing.T) {
+	apdu := []byte{0x00, 0xB0, 0x00, 0x00, 0x00}
+	corrected, err := CorrectAPDULe(apdu, 3)
+	if err != nil {
+		t.Fatalf("CorrectAPDULe() error = %v", err)
+	}
+	if !reflect.DeepEqual(corrected, []byte{0x00, 0xB0, 0x00, 0x00, 0x03}) {
+		t.Fatalf("corrected APDU=% X", corrected)
+	}
+	if apdu[4] != 0x00 {
+		t.Fatalf("CorrectAPDULe mutated input: % X", apdu)
+	}
+
+	withLe, err := CorrectAPDULe([]byte{0x00, 0x84, 0x00, 0x00}, 256)
+	if err != nil {
+		t.Fatalf("CorrectAPDULe(no Le) error = %v", err)
+	}
+	if !reflect.DeepEqual(withLe, []byte{0x00, 0x84, 0x00, 0x00, 0x00}) {
+		t.Fatalf("APDU with Le=% X", withLe)
+	}
+
+	dataOnly, err := CorrectAPDULe([]byte{0x00, 0x88, 0x00, 0x81, 0x02, 0xAA, 0xBB}, 3)
+	if err != nil {
+		t.Fatalf("CorrectAPDULe(data only) error = %v", err)
+	}
+	if !reflect.DeepEqual(dataOnly, []byte{0x00, 0x88, 0x00, 0x81, 0x02, 0xAA, 0xBB, 0x03}) {
+		t.Fatalf("data-only APDU with Le=% X", dataOnly)
+	}
+
+	dataWithLe, err := CorrectAPDULe([]byte{0x00, 0x88, 0x00, 0x81, 0x02, 0xAA, 0xBB, 0x00}, 3)
+	if err != nil {
+		t.Fatalf("CorrectAPDULe(data with Le) error = %v", err)
+	}
+	if !reflect.DeepEqual(dataWithLe, []byte{0x00, 0x88, 0x00, 0x81, 0x02, 0xAA, 0xBB, 0x03}) {
+		t.Fatalf("data APDU corrected Le=% X", dataWithLe)
+	}
+
+	getResponse, err := GetResponseAPDU(2)
+	if err != nil {
+		t.Fatalf("GetResponseAPDU() error = %v", err)
+	}
+	if !reflect.DeepEqual(getResponse, []byte{0x00, 0xC0, 0x00, 0x00, 0x02}) {
+		t.Fatalf("GET RESPONSE APDU=% X", getResponse)
+	}
+	if _, err := GetResponseAPDU(0); err == nil {
+		t.Fatal("GetResponseAPDU(0) err=nil, want error")
+	}
+	if _, err := CorrectAPDULe([]byte{0x00, 0x88, 0x00, 0x81, 0x00, 0xAA}, 1); err == nil {
+		t.Fatal("CorrectAPDULe(extended APDU) err=nil, want error")
 	}
 }

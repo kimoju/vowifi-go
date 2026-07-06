@@ -36,6 +36,24 @@ func TestParseIMSUSSDXMLNotifyWithError(t *testing.T) {
 	}
 }
 
+func TestParseIMSUSSDXMLLowercaseNotifyAndOperationText(t *testing.T) {
+	payload, err := ParseIMSUSSDXML([]byte(`<ussd-data><language>en</language><ussd-string>Balance: 10</ussd-string><notify/></ussd-data>`))
+	if err != nil {
+		t.Fatalf("ParseIMSUSSDXML(notify) error = %v", err)
+	}
+	if payload.Operation != IMSUSSDOperationNotify || payload.RawOperationElement != "notify" || payload.Text != "Balance: 10" {
+		t.Fatalf("notify payload=%+v", payload)
+	}
+
+	payload, err = ParseIMSUSSDXML([]byte(`<ussd-data><ussd-string>1</ussd-string><anyExt><operation>request</operation></anyExt></ussd-data>`))
+	if err != nil {
+		t.Fatalf("ParseIMSUSSDXML(operation) error = %v", err)
+	}
+	if payload.Operation != IMSUSSDOperationRequest || payload.RawOperationElement != "request" || payload.Text != "1" {
+		t.Fatalf("operation payload=%+v", payload)
+	}
+}
+
 func TestDecodeIMSUSSDDocumentFromMultipart(t *testing.T) {
 	xmlBody, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "Balance: 10", Operation: IMSUSSDOperationNotify})
 	if err != nil {

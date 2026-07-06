@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"reflect"
 	"testing"
 
@@ -147,6 +148,95 @@ func TestBuildKernelXFRMCommandsDefaultsNATTraversalEncapsulation(t *testing.T) 
 	want := []string{"encap", "espinudp", "4500", "4500", "0.0.0.0"}
 	if got := commands[0].args[len(commands[0].args)-len(want):]; !reflect.DeepEqual(got, want) {
 		t.Fatalf("default encap args=%v, want %v", got, want)
+	}
+}
+
+func TestKernelXFRMConfigFromIKENegotiation(t *testing.T) {
+	child := xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128)
+	child.Configuration = &ikev2.Configuration{
+		Type: ikev2.CFGReply,
+		Attributes: []ikev2.ConfigurationAttribute{{
+			Type:  ikev2.ConfigInternalIPv4Address,
+			Value: []byte{10, 10, 0, 2},
+		}},
+	}
+	child.TSr = ikev2.TrafficSelectors{Selectors: []ikev2.TrafficSelector{{
+		Type:      ikev2.TSIPv4AddressRange,
+		StartAddr: net.IPv4(0, 0, 0, 0),
+		EndAddr:   net.IPv4(255, 255, 255, 255),
+	}}}
+
+	cfg, err := KernelXFRMConfigFromIKE(KernelXFRMConfigFromIKEConfig{
+		Tunnel: TunnelConfig{
+			DeviceID:     "dev-1",
+			Mode:         DataplaneModeKernel,
+			EPDGAddress:  "198.51.100.7",
+			OuterLocalIP: "192.0.2.23",
+			IMSI:         "310280233641503",
+			MCC:          "310",
+			MNC:          "280",
+		},
+		Transport: IKETransportConfig{
+			EPDGAddress: "198.51.100.7",
+			LocalIP:     net.IPv4(192, 0, 2, 23),
+			RemoteIP:    net.IPv4(198, 51, 100, 7),
+			LocalPort:   55000,
+			RemotePort:  4500,
+		},
+		Init:                 ikev2.InitResult{NATDetected: true},
+		ChildSA:              child,
+		ReqID:                77,
+		Mark:                 "0x1/0xffffffff",
+		InterfaceID:          42,
+		IncludeForwardPolicy: true,
+		XFRMInterface: XFRMInterfaceConfig{
+			Name:     "ipsec0",
+			OuterDev: "wwan0",
+			IfID:     42,
+			MTU:      1360,
+		},
+	})
+	if err != nil {
+		t.Fatalf("KernelXFRMConfigFromIKE() error = %v", err)
+	}
+	if cfg.OuterLocalIP != "192.0.2.23" || cfg.OuterRemoteIP != "198.51.100.7" {
+		t.Fatalf("outer addresses=%s/%s", cfg.OuterLocalIP, cfg.OuterRemoteIP)
+	}
+	if cfg.InnerLocalPrefix != "10.10.0.2/32" || cfg.InnerRemotePrefix != "0.0.0.0/0" {
+		t.Fatalf("inner prefixes=%s/%s", cfg.InnerLocalPrefix, cfg.InnerRemotePrefix)
+	}
+	if !cfg.NATTraversal.Enabled || cfg.NATTraversal.LocalPort != 55000 || cfg.NATTraversal.RemotePort != 4500 || cfg.NATTraversal.OriginalAddress != "0.0.0.0" {
+		t.Fatalf("nat traversal=%+v", cfg.NATTraversal)
+	}
+	if !reflect.DeepEqual(cfg.ChildSA, child) || cfg.ReqID != 77 || cfg.Mark != "0x1/0xffffffff" || cfg.InterfaceID != 42 || !cfg.IncludeForwardPolicy {
+		t.Fatalf("xfrm config did not preserve child/options: %+v", cfg)
+	}
+	commands, err := buildKernelXFRMCommands(cfg)
+	if err != nil {
+		t.Fatalf("buildKernelXFRMCommands() error = %v", err)
+	}
+	wantEncap := []string{"encap", "espinudp", "55000", "4500", "0.0.0.0"}
+	if got := commands[3].args[len(commands[3].args)-len(wantEncap):]; !reflect.DeepEqual(got, wantEncap) {
+		t.Fatalf("derived outbound encap args=%v, want %v", got, wantEncap)
+	}
+}
+
+func TestKernelXFRMConfigFromIKERejectsUnresolvedOuterRemote(t *testing.T) {
+	_, err := KernelXFRMConfigFromIKE(KernelXFRMConfigFromIKEConfig{
+		Tunnel: TunnelConfig{
+			DeviceID:      "dev-1",
+			EPDGAddress:   "epdg.example",
+			OuterLocalIP:  "192.0.2.23",
+			InnerLocalIP:  "10.10.0.2",
+			RemoteInnerIP: "0.0.0.0/0",
+			IMSI:          "310280233641503",
+			MCC:           "310",
+			MNC:           "280",
+		},
+		ChildSA: xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128),
+	})
+	if !errors.Is(err, ErrInvalidXFRMConfig) {
+		t.Fatalf("KernelXFRMConfigFromIKE() err=%v, want ErrInvalidXFRMConfig", err)
 	}
 }
 

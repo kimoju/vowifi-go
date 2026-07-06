@@ -14,8 +14,11 @@ const (
 	IMSIdentitySourceProfile = "profile"
 	IMSIdentitySourceISIM    = "isim"
 
-	IMEISourceProfile  = "profile"
-	IMEISourceDeviceID = "device_id"
+	IMSISourceProfile = "profile"
+
+	IMEISourceProfile     = "profile"
+	IMEISourceDeviceID    = "device_id"
+	IMEISourceUnavailable = "unavailable"
 
 	AKAAppPreferenceUSIM       = "usim"
 	AKAAppPreferenceAuto       = "auto"
@@ -45,6 +48,9 @@ type IMSIdentityResolution struct {
 	IMPI             string
 	IMPU             string
 	Domain           string
+	FallbackUsed     bool
+	FallbackReason   string
+	RecoveryClass    simtransport.RecoveryClass
 }
 
 type EffectiveCarrier struct {
@@ -58,8 +64,10 @@ type PreparedSession struct {
 	EffectiveCarrier   EffectiveCarrier
 	EPDGAddr           string
 	EPDGSource         string
+	IdentityIMSISource string
 	IdentityIMEISource string
 	IMSIdentity        IMSIdentityResolution
+	Fallbacks          []FallbackMetadata
 }
 
 type PrepareStartInput struct {
@@ -96,10 +104,25 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 		return PreparedSession{}, errors.New("IMSI is empty")
 	}
 	imeiSource := IMEISourceProfile
+	var fallbacks []FallbackMetadata
 	if profile.IMEI == "" {
 		if imei := ExtractIMEI(in.DeviceID); imei != "" {
 			profile.IMEI = imei
 			imeiSource = IMEISourceDeviceID
+			fallbacks = append(fallbacks, NewReadFallbackMetadata(
+				IdentityFieldIMEI,
+				IMEISourceProfile,
+				IMEISourceDeviceID,
+				errors.New("profile IMEI is empty"),
+			))
+		} else {
+			imeiSource = IMEISourceUnavailable
+			fallbacks = append(fallbacks, NewReadFallbackMetadata(
+				IdentityFieldIMEI,
+				IMEISourceProfile,
+				"",
+				errors.New("profile IMEI is empty and device ID fallback is unavailable"),
+			))
 		}
 	}
 	prepared := PreparedSession{
@@ -111,6 +134,7 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 		},
 		EPDGAddr:           defaultEPDG(profile),
 		EPDGSource:         "derived",
+		IdentityIMSISource: IMSISourceProfile,
 		IdentityIMEISource: imeiSource,
 		IMSIdentity: IMSIdentityResolution{
 			RequestedSource:  IMSIdentitySourceProfile,
@@ -121,6 +145,7 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 			IMPU:             profileIMPU(profile),
 			Domain:           "",
 		},
+		Fallbacks: fallbacks,
 	}
 	if override := strings.TrimSpace(in.RuntimeEPDGOverride); override != "" {
 		prepared.EPDGAddr = override
@@ -128,7 +153,15 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 	}
 	if in.Access != nil {
 		id, err := in.Access.GetISIMIdentity()
-		if err == nil && (strings.TrimSpace(id.IMPI) != "" || len(id.IMPU) > 0 || strings.TrimSpace(id.Domain) != "") {
+		if err != nil {
+			meta := NewReadFallbackMetadata(IdentityFieldIMSIdentity, IMSIdentitySourceISIM, IMSIdentitySourceProfile, err)
+			prepared.Fallbacks = append(prepared.Fallbacks, meta)
+			prepared.IMSIdentity.RequestedSource = IMSIdentitySourceISIM
+			prepared.IMSIdentity.ActualSource = IMSIdentitySourceProfile
+			prepared.IMSIdentity.FallbackUsed = true
+			prepared.IMSIdentity.FallbackReason = meta.Reason
+			prepared.IMSIdentity.RecoveryClass = meta.RecoveryClass
+		} else if strings.TrimSpace(id.IMPI) != "" || len(id.IMPU) > 0 || strings.TrimSpace(id.Domain) != "" {
 			if strings.TrimSpace(id.IMPI) == "" || len(id.IMPU) == 0 || strings.TrimSpace(id.Domain) == "" {
 				return PreparedSession{}, fmt.Errorf("ISIM 身份不完整: impi=%t impu=%d domain=%t",
 					strings.TrimSpace(id.IMPI) != "", len(id.IMPU), strings.TrimSpace(id.Domain) != "")

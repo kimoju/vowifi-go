@@ -19,9 +19,16 @@ const (
 	AKACKLength     = 16
 	AKAIKLength     = 16
 	AKAAUTSLength   = 14
+	AKAAKLength     = 6
+	AKAMACLength    = 8
 )
 
 type AKAResult = swusim.AKAResult
+
+type AUTSFields struct {
+	SQNMSXorAK []byte
+	MACS       []byte
+}
 
 type AKAProvider struct {
 	Transport LogicalChannelTransport
@@ -141,8 +148,8 @@ func ParseUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAResult, error) {
 		if err != nil {
 			return AKAResult{}, err
 		}
-		if len(data) != AKAAUTSLength {
-			return AKAResult{}, fmt.Errorf("AKA AUTS length must be %d bytes: %d", AKAAUTSLength, len(data))
+		if _, err := ParseAUTS(data); err != nil {
+			return AKAResult{}, err
 		}
 		return AKAResult{AUTS: append([]byte(nil), data...)}, swusim.ErrSyncFailure
 	case 0xDD:
@@ -150,6 +157,43 @@ func ParseUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAResult, error) {
 	default:
 		return AKAResult{}, fmt.Errorf("unknown AKA response tag: 0x%02X", body[0])
 	}
+}
+
+func ParseAUTS(auts14 []byte) (AUTSFields, error) {
+	if len(auts14) != AKAAUTSLength {
+		return AUTSFields{}, fmt.Errorf("AKA AUTS length must be %d bytes: %d", AKAAUTSLength, len(auts14))
+	}
+	return AUTSFields{
+		SQNMSXorAK: append([]byte(nil), auts14[:AKAAKLength]...),
+		MACS:       append([]byte(nil), auts14[AKAAKLength:]...),
+	}, nil
+}
+
+func (a AUTSFields) Bytes() ([]byte, error) {
+	if len(a.SQNMSXorAK) != AKAAKLength {
+		return nil, fmt.Errorf("AKA AUTS SQN_MS xor AK length must be %d bytes: %d", AKAAKLength, len(a.SQNMSXorAK))
+	}
+	if len(a.MACS) != AKAMACLength {
+		return nil, fmt.Errorf("AKA AUTS MAC-S length must be %d bytes: %d", AKAMACLength, len(a.MACS))
+	}
+	out := make([]byte, 0, AKAAUTSLength)
+	out = append(out, a.SQNMSXorAK...)
+	out = append(out, a.MACS...)
+	return out, nil
+}
+
+func (a AUTSFields) SQNMS(ak []byte) ([]byte, error) {
+	if len(a.SQNMSXorAK) != AKAAKLength {
+		return nil, fmt.Errorf("AKA AUTS SQN_MS xor AK length must be %d bytes: %d", AKAAKLength, len(a.SQNMSXorAK))
+	}
+	if len(ak) != AKAAKLength {
+		return nil, fmt.Errorf("AKA AK length must be %d bytes: %d", AKAAKLength, len(ak))
+	}
+	sqn := make([]byte, AKAAKLength)
+	for i := range sqn {
+		sqn[i] = a.SQNMSXorAK[i] ^ ak[i]
+	}
+	return sqn, nil
 }
 
 func parseSimpleTLVData(body []byte) ([]byte, error) {

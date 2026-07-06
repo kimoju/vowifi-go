@@ -2011,6 +2011,89 @@ func TestBuildIMSDialogINVITEAppliesEmergencyHeaders(t *testing.T) {
 	}
 }
 
+func TestBuildIMSDialogRequestsInjectCarrierHeaders(t *testing.T) {
+	cfg := DialogRequestConfig{
+		Profile: IMSProfile{IMPU: "sip:user@example"},
+		Registration: RegistrationBinding{
+			ContactURI: "sip:user@192.0.2.10:5060",
+		},
+		RemoteURI:         "sip:+18005551212@ims.example",
+		RemoteTargetURI:   "sip:+18005551212@pcscf.example",
+		CallID:            "call-carrier",
+		LocalTag:          "ltag",
+		PreferredIdentity: "tel:+15551234567",
+		AccessNetworkInfo: `IEEE-802.11;i-wlan-node-id="node-1"`,
+		Reason:            `SIP;cause=487;text="Request Terminated"`,
+		CarrierHeaders: map[string]string{
+			"P-Preferred-Identity":  "sip:preferred@example",
+			"P-Access-Network-Info": `3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100abcde`,
+			"Reason":                `Q.850;cause=16;text="normal call clearing"`,
+			"P-Charging-Vector":     "icid-value=call-carrier",
+			"To":                    "<sip:changed@example>",
+			"i":                     "changed-call-id",
+		},
+	}
+	cancel, err := BuildCancelRequest(cfg)
+	if err != nil {
+		t.Fatalf("BuildCancelRequest() error = %v", err)
+	}
+	if cancel.Headers["P-Preferred-Identity"] != "<sip:preferred@example>" ||
+		cancel.Headers["P-Access-Network-Info"] != `3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100abcde` ||
+		cancel.Headers["Reason"] != `Q.850;cause=16;text="normal call clearing"` ||
+		cancel.Headers["P-Charging-Vector"] != "icid-value=call-carrier" {
+		t.Fatalf("carrier CANCEL headers=%+v", cancel.Headers)
+	}
+	if cancel.Headers["To"] != "<sip:+18005551212@ims.example>" {
+		t.Fatalf("protected To was overwritten: %+v", cancel.Headers)
+	}
+	if cancel.Headers["Call-ID"] != "call-carrier" {
+		t.Fatalf("protected compact Call-ID was overwritten: %+v", cancel.Headers)
+	}
+	bye, err := BuildByeRequest(DialogRequestConfig{
+		Profile:           cfg.Profile,
+		RemoteURI:         cfg.RemoteURI,
+		RemoteTargetURI:   cfg.RemoteTargetURI,
+		CallID:            "call-carrier-bye",
+		PreferredIdentity: cfg.PreferredIdentity,
+		AccessNetworkInfo: cfg.AccessNetworkInfo,
+		Reason:            cfg.Reason,
+	})
+	if err != nil {
+		t.Fatalf("BuildByeRequest() error = %v", err)
+	}
+	if bye.Headers["P-Preferred-Identity"] != "<tel:+15551234567>" ||
+		bye.Headers["P-Access-Network-Info"] != `IEEE-802.11;i-wlan-node-id="node-1"` ||
+		bye.Headers["Reason"] != `SIP;cause=487;text="Request Terminated"` {
+		t.Fatalf("carrier BYE headers=%+v", bye.Headers)
+	}
+}
+
+func TestFormatDialogReasonHeader(t *testing.T) {
+	sipReason, err := FormatDialogReasonHeader("SIP", 487, "")
+	if err != nil {
+		t.Fatalf("FormatDialogReasonHeader(SIP) error = %v", err)
+	}
+	if sipReason != `SIP;cause=487;text="Request Terminated"` {
+		t.Fatalf("SIP Reason=%q", sipReason)
+	}
+	q850Reason, err := FormatDialogReasonHeader("Q.850", 16, `normal "clear"`)
+	if err != nil {
+		t.Fatalf("FormatDialogReasonHeader(Q.850) error = %v", err)
+	}
+	if q850Reason != `Q.850;cause=16;text="normal \"clear\""` {
+		t.Fatalf("Q.850 Reason=%q", q850Reason)
+	}
+	if _, err := FormatDialogReasonHeader("SIP;bad", 487, ""); !errors.Is(err, ErrInvalidDialogConfig) {
+		t.Fatalf("FormatDialogReasonHeader(invalid protocol) err=%v, want ErrInvalidDialogConfig", err)
+	}
+	if _, err := FormatDialogReasonHeader("SIP", 0, ""); !errors.Is(err, ErrInvalidDialogConfig) {
+		t.Fatalf("FormatDialogReasonHeader(invalid cause) err=%v, want ErrInvalidDialogConfig", err)
+	}
+	if _, err := FormatDialogReasonHeader("SIP", 487, "bad\r\nReason: injected"); !errors.Is(err, ErrInvalidDialogConfig) {
+		t.Fatalf("FormatDialogReasonHeader(invalid text) err=%v, want ErrInvalidDialogConfig", err)
+	}
+}
+
 func TestBuildIMSDialogRequestsIncludeSessionRefresher(t *testing.T) {
 	cfg := DialogRequestConfig{
 		Profile:          IMSProfile{IMPU: "sip:user@example"},
@@ -2123,6 +2206,49 @@ func TestBuildPrackRequestForProvisionalResponseSkipsUnreliable(t *testing.T) {
 	}
 }
 
+func TestBuildAckRequestForInviteResponse(t *testing.T) {
+	resp := SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers: map[string][]string{
+			"CSeq":    {"7 INVITE"},
+			"To":      {"<sip:+18005551212@ims.example>;tag=remote-ack"},
+			"Contact": {"<sip:+18005551212@pcscf.example>"},
+		},
+	}
+	ack, ok, err := BuildAckRequestForInviteResponse(DialogRequestConfig{
+		Profile:   IMSProfile{IMPU: "sip:user@example"},
+		RemoteURI: "sip:+18005551212@ims.example",
+		CallID:    "call-ack",
+		LocalTag:  "local-ack",
+	}, resp)
+	if err != nil || !ok {
+		t.Fatalf("BuildAckRequestForInviteResponse() ok=%v err=%v", ok, err)
+	}
+	if ack.Method != "ACK" || ack.URI != "sip:+18005551212@pcscf.example" ||
+		ack.Headers["CSeq"] != "7 ACK" ||
+		ack.Headers["To"] != "<sip:+18005551212@ims.example>;tag=remote-ack" {
+		t.Fatalf("ACK=%+v", ack)
+	}
+	if !DialogResponseRequiresAck("INVITE", SIPResponse{StatusCode: 487}) ||
+		DialogResponseRequiresAck("UPDATE", SIPResponse{StatusCode: 491}) ||
+		!DialogResponseIsInviteTerminated(SIPResponse{StatusCode: 487}) ||
+		!DialogResponseIsRequestPending(SIPResponse{StatusCode: 491}) {
+		t.Fatalf("dialog response helpers returned unexpected values")
+	}
+	provisional, ok, err := BuildAckRequestForInviteResponse(DialogRequestConfig{}, SIPResponse{StatusCode: 183})
+	if err != nil || ok || provisional.Method != "" {
+		t.Fatalf("BuildAckRequestForInviteResponse(provisional) msg=%+v ok=%v err=%v", provisional, ok, err)
+	}
+	_, _, err = BuildAckRequestForInviteResponse(DialogRequestConfig{}, SIPResponse{
+		StatusCode: 486,
+		Headers:    map[string][]string{"CSeq": {"bad INVITE"}},
+	})
+	if !errors.Is(err, ErrInvalidSIPMessage) {
+		t.Fatalf("BuildAckRequestForInviteResponse(invalid CSeq) err=%v, want ErrInvalidSIPMessage", err)
+	}
+}
+
 func TestAdvanceDialogSessionStateInviteCancelBye(t *testing.T) {
 	state := AdvanceDialogSessionState("", "INVITE", SIPResponse{StatusCode: 100})
 	if state != DialogSessionStateCalling {
@@ -2149,6 +2275,16 @@ func TestAdvanceDialogSessionStateInviteCancelBye(t *testing.T) {
 	}
 	if canceling := AdvanceDialogSessionState(DialogSessionStateEarly, "CANCEL", SIPResponse{StatusCode: 200}); canceling != DialogSessionStateTerminating {
 		t.Fatalf("200 CANCEL state=%q", canceling)
+	}
+	canceling := AdvanceDialogSessionState(DialogSessionStateEarly, "CANCEL", SIPResponse{StatusCode: 200})
+	if terminated := AdvanceDialogSessionState(canceling, "INVITE", SIPResponse{StatusCode: 487}); terminated != DialogSessionStateTerminated {
+		t.Fatalf("487 INVITE after CANCEL state=%q", terminated)
+	}
+	if pending := AdvanceDialogSessionState(DialogSessionStateConfirmed, "INVITE", SIPResponse{StatusCode: 491}); pending != DialogSessionStateConfirmed {
+		t.Fatalf("491 re-INVITE state=%q", pending)
+	}
+	if gone := AdvanceDialogSessionState(DialogSessionStateConfirmed, "INVITE", SIPResponse{StatusCode: 481}); gone != DialogSessionStateTerminated {
+		t.Fatalf("481 re-INVITE state=%q", gone)
 	}
 	if gone := AdvanceDialogSessionState(DialogSessionStateEarly, "UPDATE", SIPResponse{StatusCode: 481}); gone != DialogSessionStateTerminated {
 		t.Fatalf("481 UPDATE state=%q", gone)

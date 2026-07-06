@@ -3,11 +3,13 @@ package simtransport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 )
 
 type RecoveryClass string
+type APDURecoveryAction string
 
 const (
 	RecoveryClassNone            RecoveryClass = ""
@@ -19,6 +21,17 @@ const (
 	RecoveryClassATError         RecoveryClass = "at_error"
 )
 
+const (
+	APDURecoveryNone        APDURecoveryAction = ""
+	APDURecoveryCorrectLe   APDURecoveryAction = "correct_le"
+	APDURecoveryGetResponse APDURecoveryAction = "get_response"
+)
+
+type APDURecoveryPlan struct {
+	Action APDURecoveryAction
+	Le     int
+}
+
 type recoveryClassifier interface {
 	RecoveryClass() RecoveryClass
 }
@@ -29,6 +42,64 @@ type statusCarrier interface {
 
 func (c RecoveryClass) Recoverable() bool {
 	return c != RecoveryClassNone
+}
+
+func (p APDURecoveryPlan) Recoverable() bool {
+	return p.Action != APDURecoveryNone
+}
+
+func (p APDURecoveryPlan) LeByte() (byte, error) {
+	return apduLeByte(p.Le)
+}
+
+func PlanAPDUStatusRecovery(sw1, sw2 byte) APDURecoveryPlan {
+	switch sw1 {
+	case 0x6C:
+		return APDURecoveryPlan{Action: APDURecoveryCorrectLe, Le: apduLeFromSW2(sw2)}
+	case 0x61:
+		return APDURecoveryPlan{Action: APDURecoveryGetResponse, Le: apduLeFromSW2(sw2)}
+	default:
+		return APDURecoveryPlan{}
+	}
+}
+
+func CorrectAPDULe(apdu []byte, le int) ([]byte, error) {
+	leByte, err := apduLeByte(le)
+	if err != nil {
+		return nil, err
+	}
+	out := append([]byte(nil), apdu...)
+	switch {
+	case len(out) < 4:
+		return nil, fmt.Errorf("APDU too short for Le correction: %d bytes", len(out))
+	case len(out) == 4:
+		out = append(out, leByte)
+		return out, nil
+	case len(out) == 5:
+		out[len(out)-1] = leByte
+		return out, nil
+	case out[4] == 0:
+		return nil, errors.New("extended APDU Le correction is unsupported")
+	}
+	lc := int(out[4])
+	switch len(out) {
+	case 5 + lc:
+		out = append(out, leByte)
+		return out, nil
+	case 6 + lc:
+		out[len(out)-1] = leByte
+		return out, nil
+	default:
+		return nil, fmt.Errorf("invalid short APDU length for Le correction: %d bytes with Lc=%d", len(out), lc)
+	}
+}
+
+func GetResponseAPDU(le int) ([]byte, error) {
+	leByte, err := apduLeByte(le)
+	if err != nil {
+		return nil, err
+	}
+	return []byte{0x00, 0xC0, 0x00, 0x00, leByte}, nil
 }
 
 func ClassifyError(err error) RecoveryClass {
@@ -61,6 +132,8 @@ func StatusRecoveryClass(sw1, sw2 byte) RecoveryClass {
 	switch {
 	case sw1 == 0x90 && sw2 == 0x00:
 		return RecoveryClassNone
+	case PlanAPDUStatusRecovery(sw1, sw2).Recoverable():
+		return RecoveryClassMalformedReply
 	case isFileNotFoundStatus(sw1, sw2):
 		return RecoveryClassFileNotFound
 	case sw1 == 0x62 && sw2 == 0x82:
@@ -200,4 +273,21 @@ func statusTextRecoveryClass(text string) RecoveryClass {
 		}
 	}
 	return RecoveryClassNone
+}
+
+func apduLeFromSW2(sw2 byte) int {
+	if sw2 == 0 {
+		return 256
+	}
+	return int(sw2)
+}
+
+func apduLeByte(le int) (byte, error) {
+	if le < 1 || le > 256 {
+		return 0, fmt.Errorf("invalid APDU Le: %d", le)
+	}
+	if le == 256 {
+		return 0x00, nil
+	}
+	return byte(le), nil
 }

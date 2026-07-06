@@ -189,6 +189,39 @@ func BuildSDPCryptoInlineKeyParams(profile SRTPProtectionProfile, params SDPCryp
 	return value, nil
 }
 
+func ParseSDPCryptoAttributeKeys(attr SDPCryptoAttribute) (SRTPProtectionProfile, SDPCryptoInlineKeyParams, error) {
+	profile, err := SRTPProtectionProfileFromSDPCryptoSuite(attr.Suite)
+	if err != nil {
+		return "", SDPCryptoInlineKeyParams{}, err
+	}
+	params, err := ParseSDPCryptoInlineKeyParams(profile, attr.KeyParams)
+	if err != nil {
+		return "", SDPCryptoInlineKeyParams{}, err
+	}
+	return profile, params, nil
+}
+
+func BuildSDPCryptoAttribute(tag string, profile SRTPProtectionProfile, params SDPCryptoInlineKeyParams, sessionParams string) (SDPCryptoAttribute, error) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return SDPCryptoAttribute{}, fmt.Errorf("%w: SDP crypto tag is empty", ErrSRTPMediaConfig)
+	}
+	suite := profile.SDPCryptoSuite()
+	if suite == "" {
+		return SDPCryptoAttribute{}, fmt.Errorf("%w: unsupported SDP crypto suite %q", ErrSRTPMediaConfig, profile)
+	}
+	keyParams, err := BuildSDPCryptoInlineKeyParams(profile, params)
+	if err != nil {
+		return SDPCryptoAttribute{}, err
+	}
+	return SDPCryptoAttribute{
+		Tag:           tag,
+		Suite:         suite,
+		KeyParams:     keyParams,
+		SessionParams: strings.TrimSpace(sessionParams),
+	}, nil
+}
+
 func NewSRTPMediaSession(cfg SRTPMediaConfig) (*SRTPMediaSession, error) {
 	profile, err := srtpProtectionProfile(cfg.Profile)
 	if err != nil {

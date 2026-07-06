@@ -1111,6 +1111,48 @@ func TestBuildSynchronizationFailureResponse(t *testing.T) {
 	}
 }
 
+func TestBuildAKAFailureResponse(t *testing.T) {
+	req := Packet{Code: CodeRequest, Identifier: 3, Type: TypeAKA, Subtype: SubtypeChallenge}
+	wantAUTS := bytes.Repeat([]byte{0xaa}, 14)
+
+	resp, handled, err := BuildAKAFailureResponse(req, sim.AKAResult{AUTS: wantAUTS}, sim.ErrSyncFailure)
+	if err != nil {
+		t.Fatalf("BuildAKAFailureResponse(sync) error = %v", err)
+	}
+	if !handled || resp.Subtype != SubtypeSynchronizationFailure {
+		t.Fatalf("sync failure handled=%t response=%+v", handled, resp)
+	}
+	attr, ok := FindAttribute(resp.Attributes, AttributeAUTS)
+	if !ok {
+		t.Fatal("missing AT_AUTS")
+	}
+	auts, err := attr.AUTSValue()
+	if err != nil {
+		t.Fatalf("AUTSValue() error = %v", err)
+	}
+	if !bytes.Equal(auts, wantAUTS) {
+		t.Fatalf("AUTS=%x", auts)
+	}
+
+	resp, handled, err = BuildAKAFailureResponse(req, sim.AKAResult{}, sim.ErrAuthFailure)
+	if err != nil {
+		t.Fatalf("BuildAKAFailureResponse(auth) error = %v", err)
+	}
+	if !handled || resp.Subtype != SubtypeAuthenticationReject {
+		t.Fatalf("auth failure handled=%t response=%+v", handled, resp)
+	}
+
+	sentinel := errors.New("aka transport failure")
+	_, handled, err = BuildAKAFailureResponse(req, sim.AKAResult{}, sentinel)
+	if handled || !errors.Is(err, sentinel) {
+		t.Fatalf("unknown failure handled=%t err=%v", handled, err)
+	}
+	_, handled, err = BuildAKAFailureResponse(req, sim.AKAResult{}, nil)
+	if handled || err != nil {
+		t.Fatalf("nil failure handled=%t err=%v", handled, err)
+	}
+}
+
 func TestBuildSynchronizationFailureResponseRejectsInvalidAUTS(t *testing.T) {
 	req := Packet{Code: CodeRequest, Identifier: 3, Type: TypeAKA, Subtype: SubtypeChallenge}
 	if _, err := BuildSynchronizationFailureResponse(req, bytes.Repeat([]byte{0xaa}, 13)); !errors.Is(err, ErrInvalidAKAChallenge) {
@@ -1186,6 +1228,15 @@ func TestChallengeRANDAndAUTNRejectsInvalidAttributes(t *testing.T) {
 	}
 	if _, _, err := ChallengeRANDAndAUTN(req); !errors.Is(err, ErrInvalidAttribute) {
 		t.Fatalf("ChallengeRANDAndAUTN(short AUTN) err=%v, want ErrInvalidAttribute", err)
+	}
+
+	req.Attributes = []Attribute{
+		RANDAttribute(bytes.Repeat([]byte{0xa1}, 16)),
+		AUTNAttribute(bytes.Repeat([]byte{0xb2}, 16)),
+		{Type: AttributeResultInd, Data: []byte{0x00, 0x01}},
+	}
+	if _, _, err := ChallengeRANDAndAUTN(req); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ChallengeRANDAndAUTN(bad result-ind) err=%v, want ErrInvalidAttribute", err)
 	}
 
 	req.Subtype = SubtypeIdentity

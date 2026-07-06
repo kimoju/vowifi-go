@@ -3,7 +3,6 @@ package messaging
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -71,7 +70,8 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		}
 		resp, err = voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, msg)
 		if err != nil {
-			result := SMSSendResult{CallID: callID, RPMR: cseq, SIPCode: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}
+			handling := imsMessagingResponseHandlingFor(resp)
+			result := SMSSendResult{CallID: callID, RPMR: cseq, SIPCode: resp.StatusCode, RetryAfter: handling.RetryAfter}
 			result.State = "failed"
 			result.ErrorText = err.Error()
 			result.RegistrationRecoveryNeeded = true
@@ -86,11 +86,12 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		}
 		break
 	}
-	result := SMSSendResult{CallID: callID, RPMR: cseq, SIPCode: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}
+	handling := imsMessagingResponseHandlingFor(resp)
+	result := SMSSendResult{CallID: callID, RPMR: cseq, SIPCode: handling.StatusCode, RetryAfter: handling.RetryAfter}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		result.State = "failed"
-		result.ErrorText = strings.TrimSpace(firstNonEmpty(resp.Reason, fmt.Sprintf("IMS MESSAGE rejected: %d", resp.StatusCode)))
-		result.RegistrationRecoveryNeeded = IMSRegistrationRecoveryNeededStatus(resp.StatusCode)
+		result.ErrorText = handling.FailureText
+		result.RegistrationRecoveryNeeded = handling.RegistrationRecoveryNeeded
 		return result, errors.New(result.ErrorText)
 	}
 	result.State = "sent"

@@ -22,6 +22,23 @@ type NetworkConfig struct {
 	EPDGFQDN string `json:"epdg_fqdn"`
 }
 
+type SubscriberProfileInput struct {
+	IMSI string
+	MCC  string
+	MNC  string
+}
+
+type SubscriberProfile struct {
+	IMSI               string
+	MCC                string
+	MNC                string
+	PresetID           string
+	Network            NetworkConfig
+	IMSPrivateIdentity string
+	IMSPublicIdentity  string
+	PermanentNAI       string
+}
+
 type EffectiveCarrierConfig struct {
 	MCC      string        `json:"mcc"`
 	MNC      string        `json:"mnc"`
@@ -31,8 +48,9 @@ type EffectiveCarrierConfig struct {
 }
 
 type EffectiveCarrierConfigInput struct {
-	MCC string
-	MNC string
+	IMSI string
+	MCC  string
+	MNC  string
 }
 
 type LoadResult struct {
@@ -127,8 +145,13 @@ func ClearCarrierOverrides() {
 }
 
 func ResolveEffectiveCarrierConfig(in EffectiveCarrierConfigInput) EffectiveCarrierConfig {
-	mcc := normalizeMCC(in.MCC)
-	mnc := normalizeMNC(in.MNC)
+	profile := NormalizeSubscriberProfile(SubscriberProfileInput{
+		IMSI: in.IMSI,
+		MCC:  in.MCC,
+		MNC:  in.MNC,
+	})
+	mcc := profile.MCC
+	mnc := profile.MNC
 	key := presetKey(mcc, mnc)
 	overridesMu.RLock()
 	if cfg, ok := overrides[key]; ok {
@@ -148,6 +171,34 @@ func ResolveEffectiveCarrierConfig(in EffectiveCarrierConfigInput) EffectiveCarr
 			Provider: "",
 		},
 	})
+}
+
+func NormalizeSubscriberProfile(in SubscriberProfileInput) SubscriberProfile {
+	imsi := strings.TrimSpace(in.IMSI)
+	mcc := normalizeMCC(in.MCC)
+	mnc := normalizeMNC(in.MNC)
+	if mcc == "" && len(imsi) >= 3 {
+		mcc = normalizeMCC(imsi[:3])
+	}
+	if mnc == "" {
+		switch {
+		case len(imsi) >= 6:
+			mnc = normalizeMNC(imsi[3:6])
+		case len(imsi) >= 5:
+			mnc = normalizeMNC(imsi[3:5])
+		}
+	}
+	network := normalizeNetworkConfig(mcc, mnc, NetworkConfig{})
+	return SubscriberProfile{
+		IMSI:               imsi,
+		MCC:                mcc,
+		MNC:                mnc,
+		PresetID:           presetKey(mcc, mnc),
+		Network:            network,
+		IMSPrivateIdentity: DeriveIMSPrivateIdentity(imsi, mcc, mnc),
+		IMSPublicIdentity:  DeriveIMSPublicIdentity(imsi, mcc, mnc),
+		PermanentNAI:       DerivePermanentNAI(imsi, mcc, mnc),
+	}
 }
 
 var blockedMCC = map[string]struct{}{
@@ -216,6 +267,33 @@ func DefaultEPDGFQDN(mcc, mnc string) string {
 		return ""
 	}
 	return fmt.Sprintf("epdg.epc.mnc%s.mcc%s.pub.3gppnetwork.org", mnc, mcc)
+}
+
+func DeriveIMSPrivateIdentity(imsi, mcc, mnc string) string {
+	imsi = strings.TrimSpace(imsi)
+	realm := DefaultIMSRealm(mcc, mnc)
+	if imsi == "" || realm == "" {
+		return ""
+	}
+	return imsi + "@" + realm
+}
+
+func DeriveIMSPublicIdentity(imsi, mcc, mnc string) string {
+	imsi = strings.TrimSpace(imsi)
+	realm := DefaultIMSRealm(mcc, mnc)
+	if imsi == "" || realm == "" {
+		return ""
+	}
+	return "sip:" + imsi + "@" + realm
+}
+
+func DerivePermanentNAI(imsi, mcc, mnc string) string {
+	imsi = strings.TrimSpace(imsi)
+	realm := DefaultNAIRealm(mcc, mnc)
+	if imsi == "" || realm == "" {
+		return ""
+	}
+	return "0" + imsi + "@" + realm
 }
 
 func normalizeNetworkConfig(mcc, mnc string, cfg NetworkConfig) NetworkConfig {

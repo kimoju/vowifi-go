@@ -124,25 +124,38 @@ type WebsheetRequest struct {
 }
 
 type EmergencyAddress struct {
-	Street            string
-	Unit              string
-	City              string
-	State             string
-	PostalCode        string
-	Country           string
-	Latitude          string
-	Longitude         string
-	Formatted         string
-	HouseNumber       string
-	HouseNumberSuffix string
-	County            string
-	District          string
-	Neighborhood      string
-	Building          string
-	Floor             string
-	Room              string
-	Name              string
-	Fields            map[string]string
+	Street              string
+	Unit                string
+	City                string
+	State               string
+	PostalCode          string
+	Country             string
+	Latitude            string
+	Longitude           string
+	Formatted           string
+	HouseNumber         string
+	HouseNumberSuffix   string
+	County              string
+	District            string
+	Neighborhood        string
+	Building            string
+	Floor               string
+	Room                string
+	Name                string
+	StreetDirection     string
+	StreetPostDirection string
+	StreetSuffix        string
+	Landmark            string
+	LocationDescription string
+	PlaceType           string
+	Premise             string
+	PostOfficeBox       string
+	AdditionalCode      string
+	Seat                string
+	RoadSection         string
+	RoadBranch          string
+	RoadSubBranch       string
+	Fields              map[string]string
 }
 
 type EmergencyPDN struct {
@@ -588,25 +601,38 @@ func entitlementInfoFromResult(result entitlementResult) EntitlementInfo {
 func emergencyAddressFromFields(fields map[string]string) EmergencyAddress {
 	copied := copyStringMap(fields)
 	return EmergencyAddress{
-		Street:            copied["street"],
-		Unit:              copied["unit"],
-		City:              copied["city"],
-		State:             copied["state"],
-		PostalCode:        copied["postal_code"],
-		Country:           copied["country"],
-		Latitude:          copied["latitude"],
-		Longitude:         copied["longitude"],
-		Formatted:         copied["formatted"],
-		HouseNumber:       copied["house_number"],
-		HouseNumberSuffix: copied["house_number_suffix"],
-		County:            copied["county"],
-		District:          copied["district"],
-		Neighborhood:      copied["neighborhood"],
-		Building:          copied["building"],
-		Floor:             copied["floor"],
-		Room:              copied["room"],
-		Name:              copied["name"],
-		Fields:            copied,
+		Street:              copied["street"],
+		Unit:                copied["unit"],
+		City:                copied["city"],
+		State:               copied["state"],
+		PostalCode:          copied["postal_code"],
+		Country:             copied["country"],
+		Latitude:            copied["latitude"],
+		Longitude:           copied["longitude"],
+		Formatted:           copied["formatted"],
+		HouseNumber:         copied["house_number"],
+		HouseNumberSuffix:   copied["house_number_suffix"],
+		County:              copied["county"],
+		District:            copied["district"],
+		Neighborhood:        copied["neighborhood"],
+		Building:            copied["building"],
+		Floor:               copied["floor"],
+		Room:                copied["room"],
+		Name:                copied["name"],
+		StreetDirection:     copied["street_direction"],
+		StreetPostDirection: copied["street_post_direction"],
+		StreetSuffix:        copied["street_suffix"],
+		Landmark:            copied["landmark"],
+		LocationDescription: copied["location_description"],
+		PlaceType:           copied["place_type"],
+		Premise:             copied["premise"],
+		PostOfficeBox:       copied["post_office_box"],
+		AdditionalCode:      copied["additional_code"],
+		Seat:                copied["seat"],
+		RoadSection:         copied["road_section"],
+		RoadBranch:          copied["road_branch"],
+		RoadSubBranch:       copied["road_sub_branch"],
+		Fields:              copied,
 	}
 }
 
@@ -664,6 +690,21 @@ type entitlementXMLNode struct {
 	Children []entitlementXMLNode `xml:",any"`
 }
 
+type entitlementWalkContext struct {
+	inEmergencyAddress   bool
+	inEmergencyRoute     bool
+	inLocationValidation bool
+	inWebsheet           bool
+}
+
+func (c entitlementWalkContext) withKey(canonical string) entitlementWalkContext {
+	c.inEmergencyAddress = c.inEmergencyAddress || isEmergencyAddressKey(canonical)
+	c.inEmergencyRoute = c.inEmergencyRoute || isEmergencyRouteKey(canonical)
+	c.inLocationValidation = c.inLocationValidation || isLocationValidationKey(canonical)
+	c.inWebsheet = c.inWebsheet || isWebsheetKey(canonical)
+	return c
+}
+
 func parseXMLEntitlementResponse(body []byte) (entitlementResult, error) {
 	var root entitlementXMLNode
 	if err := xml.Unmarshal(body, &root); err != nil {
@@ -679,61 +720,78 @@ func parseXMLEntitlementResponse(body []byte) (entitlementResult, error) {
 }
 
 func walkEntitlement(v any, out *entitlementResult) {
-	walkEntitlementValue(v, out, false, false)
+	walkEntitlementValue(v, out, entitlementWalkContext{})
 }
 
-func walkEntitlementValue(v any, out *entitlementResult, inEmergencyAddress, inEmergencyRoute bool) {
+func walkEntitlementValue(v any, out *entitlementResult, ctx entitlementWalkContext) {
 	switch x := v.(type) {
 	case []any:
 		for _, item := range x {
-			walkEntitlementValue(item, out, inEmergencyAddress, inEmergencyRoute)
+			walkEntitlementValue(item, out, ctx)
 		}
 	case map[string]any:
 		for key, value := range x {
 			canonical := normalizeEntitlementKey(key)
-			consumeEntitlementField(key, value, out, inEmergencyRoute)
-			nextInEmergencyAddress := inEmergencyAddress || isEmergencyAddressKey(canonical)
-			nextInEmergencyRoute := inEmergencyRoute || isEmergencyRouteKey(canonical)
-			if nextInEmergencyAddress {
+			consumeEntitlementField(key, value, out, ctx)
+			nextCtx := ctx.withKey(canonical)
+			if nextCtx.inEmergencyAddress {
 				collectEmergencyAddressField(key, value, out)
 			}
-			walkEntitlementValue(value, out, nextInEmergencyAddress, nextInEmergencyRoute)
+			if nextCtx.inLocationValidation {
+				collectLocationValidationField(key, value, out)
+			}
+			walkEntitlementValue(value, out, nextCtx)
 		}
 	}
 }
 
 func walkXMLEntitlement(node entitlementXMLNode, out *entitlementResult, inEmergencyAddress bool) {
-	walkXMLEntitlementValue(node, out, inEmergencyAddress, false)
+	ctx := entitlementWalkContext{inEmergencyAddress: inEmergencyAddress}
+	walkXMLEntitlementValue(node, out, ctx)
 }
 
-func walkXMLEntitlementValue(node entitlementXMLNode, out *entitlementResult, inEmergencyAddress, inEmergencyRoute bool) {
+func walkXMLEntitlementValue(node entitlementXMLNode, out *entitlementResult, ctx entitlementWalkContext) {
 	key := node.XMLName.Local
 	canonical := normalizeEntitlementKey(key)
 	text := strings.TrimSpace(node.Text)
-	nextInEmergencyRoute := inEmergencyRoute || isEmergencyRouteKey(canonical)
+	nextCtx := ctx.withKey(canonical)
 	if text != "" {
-		consumeEntitlementField(key, text, out, inEmergencyRoute)
+		consumeEntitlementField(key, text, out, ctx)
 	}
-	nextInEmergencyAddress := inEmergencyAddress || isEmergencyAddressKey(canonical)
-	if nextInEmergencyAddress && text != "" && len(node.Children) == 0 {
+	if nextCtx.inEmergencyAddress && text != "" && len(node.Children) == 0 {
 		collectEmergencyAddressField(key, text, out)
 	}
+	if nextCtx.inLocationValidation && text != "" && len(node.Children) == 0 {
+		collectLocationValidationField(key, text, out)
+	}
 	for _, attr := range node.Attrs {
-		consumeEntitlementField(attr.Name.Local, attr.Value, out, nextInEmergencyRoute)
+		consumeEntitlementField(attr.Name.Local, attr.Value, out, nextCtx)
 		if isPDNKey(canonical) {
 			consumePDNField(attr.Name.Local, attr.Value, out)
 		}
-		if nextInEmergencyAddress {
+		if nextCtx.inEmergencyAddress {
 			collectEmergencyAddressField(attr.Name.Local, attr.Value, out)
+		}
+		if nextCtx.inLocationValidation {
+			collectLocationValidationField(attr.Name.Local, attr.Value, out)
 		}
 	}
 	for _, child := range node.Children {
-		walkXMLEntitlementValue(child, out, nextInEmergencyAddress, nextInEmergencyRoute)
+		walkXMLEntitlementValue(child, out, nextCtx)
 	}
 }
 
-func consumeEntitlementField(key string, value any, out *entitlementResult, inEmergencyRoute bool) {
-	switch normalizeEntitlementKey(key) {
+func consumeEntitlementField(key string, value any, out *entitlementResult, ctx entitlementWalkContext) {
+	canonical := normalizeEntitlementKey(key)
+	if ctx.inLocationValidation && isLocationValidationStatusKey(canonical) {
+		setScalarString(&out.LocationValidationStatus, value)
+		return
+	}
+	if isWebsheetUserDataKey(canonical) {
+		setStringOverride(&out.UserData, value)
+		return
+	}
+	switch canonical {
 	case "status", "statuscode", "entitlementstatus", "resultcode", "responsecode":
 		if n, ok := numberValue(value); ok {
 			out.Status = n
@@ -746,14 +804,18 @@ func consumeEntitlementField(key string, value any, out *entitlementResult, inEm
 			out.ResponseID = value
 		}
 	case "websheet", "websheeturl", "e911websheet", "e911websheeturl", "addressurl", "addressupdateurl", "emergencyaddressurl", "emergencyaddresswebsheeturl", "emergencyaddressupdateurl", "e911addressurl", "e911addressupdateurl", "locationurl", "locationvalidationurl", "url":
-		if !inEmergencyRoute {
+		if !ctx.inEmergencyRoute {
 			setHTTPURL(&out.WebsheetURL, value)
 		}
 	case "endpoint", "addressendpoint", "emergencyaddressendpoint", "e911endpoint", "websheetendpoint", "locationendpoint", "locationvalidationendpoint":
-		if !inEmergencyRoute {
+		if !ctx.inEmergencyRoute {
 			setHTTPURL(&out.Endpoint, value)
 		}
 	case "userdata", "userdatatoken", "token", "entitlementtoken", "authtoken", "authorizationtoken", "accesstoken", "bearertoken":
+		if ctx.inWebsheet || isWebsheetUserDataKey(canonical) {
+			setStringOverride(&out.UserData, value)
+			return
+		}
 		setString(&out.UserData, value)
 	case "contenttype", "mimetype":
 		setString(&out.ContentType, value)
@@ -778,9 +840,9 @@ func consumeEntitlementField(key string, value any, out *entitlementResult, inEm
 	case "pdn", "pdnname", "pdnid", "emergencypdn":
 		parsePDN(value, out)
 		setString(&out.PDN, value)
-	case "pdntype", "emergencypdntype":
+	case "pdntype", "emergencypdntype", "ipversion", "iptype", "pdptype", "pdnprotocol", "protocoltype", "bearertype", "ipaddresstype":
 		setString(&out.PDNType, value)
-	case "apn", "accesspointname", "emergencyapn", "imsapn":
+	case "apn", "accesspointname", "emergencyapn", "imsapn", "dnn", "emergencydnn", "datanetworkname", "networkidentifier", "apnni", "accesspointnamenetworkidentifier":
 		setString(&out.APN, value)
 	case "realm", "networkrealm", "imsrealm", "nairealm", "homerealm":
 		setString(&out.Realm, value)
@@ -796,15 +858,17 @@ func consumeEntitlementField(key string, value any, out *entitlementResult, inEm
 		setExpiry(&out.CacheExpiresAt, &out.CacheMaxAge, value)
 	case "cacheexpiresin", "cachemaxage", "cachettl", "cachetimetolive", "maxage":
 		setDuration(&out.CacheMaxAge, value)
-	case "locationvalidationstatus", "validationstatus", "addressvalidationstatus", "e911addressvalidationstatus", "locationstatus":
-		setString(&out.LocationValidationStatus, value)
+	case "locationvalidationstatus", "validationstatus", "addressvalidationstatus", "e911addressvalidationstatus", "locationstatus", "locationvalidationresult", "validationresult", "addressvalidationresult", "civicaddressvalidationstatus", "civiclocationvalidationstatus":
+		setScalarString(&out.LocationValidationStatus, value)
 	default:
-		canonical := normalizeEntitlementKey(key)
 		if isServiceURNKey(canonical) {
 			collectServiceURNs(value, out)
 		}
 		if isEmergencyAddressKey(canonical) {
 			parseEmergencyAddress(value, out)
+		}
+		if isLocationValidationKey(canonical) {
+			collectLocationValidationField(key, value, out)
 		}
 	}
 }
@@ -833,6 +897,24 @@ func setString(dst *string, value any) {
 		return
 	}
 	if s := strings.TrimSpace(stringValue(value)); s != "" {
+		*dst = s
+	}
+}
+
+func setStringOverride(dst *string, value any) {
+	if dst == nil {
+		return
+	}
+	if s := strings.TrimSpace(stringValue(value)); s != "" {
+		*dst = s
+	}
+}
+
+func setScalarString(dst *string, value any) {
+	if dst == nil || strings.TrimSpace(*dst) != "" {
+		return
+	}
+	if s := strings.TrimSpace(scalarStringValue(value)); s != "" {
 		*dst = s
 	}
 }
@@ -874,19 +956,67 @@ func setCacheControlMaxAge(dst *time.Duration, value any) {
 	if dst == nil || *dst != 0 {
 		return
 	}
-	for _, s := range stringsFromAny(value) {
-		for _, part := range strings.Split(s, ",") {
-			item := strings.TrimSpace(part)
-			lower := strings.ToLower(item)
-			if !strings.HasPrefix(lower, "max-age=") {
-				continue
+	if d, ok := cacheControlMaxAgeValue(value); ok && d > 0 {
+		*dst = d
+	}
+}
+
+func cacheControlMaxAgeValue(value any) (time.Duration, bool) {
+	switch x := value.(type) {
+	case map[string]any:
+		for key, item := range x {
+			switch normalizeEntitlementKey(key) {
+			case "maxage", "smaxage", "cachemaxage", "ttl":
+				if d, ok := durationValue(item); ok && d > 0 {
+					return d, true
+				}
 			}
-			if d, ok := durationValue(strings.TrimSpace(item[len("max-age="):])); ok && d > 0 {
-				*dst = d
-				return
+		}
+	case []any:
+		for _, item := range x {
+			if d, ok := cacheControlMaxAgeValue(item); ok {
+				return d, true
+			}
+		}
+	case []string:
+		for _, item := range x {
+			if d, ok := cacheControlMaxAgeValue(item); ok {
+				return d, true
 			}
 		}
 	}
+	for _, s := range stringsFromAny(value) {
+		if d, ok := cacheControlMaxAgeString(s); ok {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+func cacheControlMaxAgeString(s string) (time.Duration, bool) {
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ';'
+	}) {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			key, value, ok = strings.Cut(item, ":")
+		}
+		if !ok {
+			continue
+		}
+		switch normalizeEntitlementKey(key) {
+		case "maxage", "smaxage", "cachemaxage":
+			value = strings.Trim(strings.TrimSpace(value), `"'`)
+			if d, ok := durationValue(value); ok && d > 0 {
+				return d, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func timeOrDurationValue(value any) (time.Time, time.Duration, bool) {
@@ -1056,7 +1186,7 @@ func boolValue(v any) (bool, bool) {
 
 func isEmergencyAddressKey(canonical string) bool {
 	switch canonical {
-	case "emergencyaddress", "e911address", "address", "civicaddress", "serviceaddress", "registeredaddress", "locationaddress":
+	case "emergencyaddress", "e911address", "address", "civicaddress", "civiclocation", "serviceaddress", "registeredaddress", "locationaddress", "emergencylocation", "e911location", "location", "geolocation", "geodeticlocation":
 		return true
 	default:
 		return false
@@ -1065,7 +1195,7 @@ func isEmergencyAddressKey(canonical string) bool {
 
 func isPDNKey(canonical string) bool {
 	switch canonical {
-	case "pdn", "pdninfo", "pdnconfiguration", "pdnconnection", "emergencypdn", "emergencybearer", "imsbearer":
+	case "pdn", "pdninfo", "pdnconfiguration", "pdnconnection", "pdnsettings", "emergencypdn", "emergencypdninfo", "emergencypdnconfiguration", "emergencybearer", "imsbearer", "apnconfiguration", "apnsettings", "dnnconfiguration", "emergencyapn", "emergencydnn":
 		return true
 	default:
 		return false
@@ -1074,7 +1204,43 @@ func isPDNKey(canonical string) bool {
 
 func isEmergencyRouteKey(canonical string) bool {
 	switch canonical {
-	case "route", "routes", "routing", "emergencyroute", "emergencyroutes", "emergencyrouting", "emergencyserviceroute", "emergencyserviceroutes", "emergencycallrouting", "sosroute", "sosroutes", "sosrouting", "imsrouting", "callrouting":
+	case "route", "routes", "routing", "routeinfo", "routesinfo", "routinginfo", "emergencyroute", "emergencyroutes", "emergencyrouteinfo", "emergencyrouting", "emergencyroutinginfo", "emergencyserviceroute", "emergencyserviceroutes", "emergencycallrouting", "sosroute", "sosroutes", "sosrouteinfo", "sosrouting", "imsrouting", "callrouting", "callroute", "callroutes", "siproute", "siproutes":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLocationValidationKey(canonical string) bool {
+	switch canonical {
+	case "locationvalidation", "locationvalidationinfo", "locationvalidationresult", "locationvalidity", "addressvalidation", "addressvalidationinfo", "addressvalidationresult", "emergencyaddressvalidation", "e911addressvalidation", "civicaddressvalidation", "civiclocationvalidation":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLocationValidationStatusKey(canonical string) bool {
+	switch canonical {
+	case "status", "state", "result", "statuscode", "resultcode", "validationstatus", "validationresult", "locationstatus", "locationvalidationstatus", "locationvalidationresult", "addressvalidationstatus", "addressvalidationresult":
+		return true
+	default:
+		return false
+	}
+}
+
+func isWebsheetKey(canonical string) bool {
+	switch canonical {
+	case "websheet", "websheetinfo", "websheetdata", "websheetrequest", "e911websheet", "emergencyaddresswebsheet", "addresswebsheet":
+		return true
+	default:
+		return false
+	}
+}
+
+func isWebsheetUserDataKey(canonical string) bool {
+	switch canonical {
+	case "websheetuserdata", "websheetuserdatatoken", "websheettoken", "websheetauthtoken", "websheetauthorizationtoken":
 		return true
 	default:
 		return false
@@ -1247,7 +1413,7 @@ func isServiceURNKey(canonical string) bool {
 
 func isPCSCFKey(canonical string) bool {
 	switch canonical {
-	case "pcscf", "pcscfs", "pcscfaddress", "pcscfaddresses", "pcscffqdn", "pcscffqdns", "pcscfserver", "pcscfservers", "pcscflist", "pcscfuri", "pcscfuris", "proxycscf", "pcscfendpoint", "pcscfendpoints":
+	case "pcscf", "pcscfs", "pcscfaddress", "pcscfaddresses", "pcscffqdn", "pcscffqdns", "pcscfhost", "pcscfhosts", "pcscfdomain", "pcscfdomains", "pcscfserver", "pcscfservers", "pcscflist", "pcscfuri", "pcscfuris", "pcscfip", "pcscfipaddress", "pcscfipaddresses", "pcscfipv4", "pcscfipv4address", "pcscfipv6", "pcscfipv6address", "pcscfname", "proxycscf", "pcscfendpoint", "pcscfendpoints":
 		return true
 	default:
 		return false
@@ -1256,7 +1422,7 @@ func isPCSCFKey(canonical string) bool {
 
 func isESRPKey(canonical string) bool {
 	switch canonical {
-	case "esrp", "esrps", "esrpuri", "esrpuris", "esrpurl", "esrpurls", "esrpaddress", "esrpaddresses", "esrpendpoint", "esrpendpoints", "emergencyservicesroutingproxy", "emergencyroutingproxy":
+	case "esrp", "esrps", "esrpuri", "esrpuris", "esrpurl", "esrpurls", "esrpaddress", "esrpaddresses", "esrpfqdn", "esrpfqdns", "esrphost", "esrphosts", "esrpserver", "esrpservers", "esrpendpoint", "esrpendpoints", "emergencyservicesroutingproxy", "emergencyroutingproxy":
 		return true
 	default:
 		return false
@@ -1265,7 +1431,7 @@ func isESRPKey(canonical string) bool {
 
 func isSpecificRouteEndpointKey(canonical string) bool {
 	switch canonical {
-	case "routeendpoint", "routeendpoints", "routingendpoint", "routingendpoints", "emergencyendpoint", "emergencyendpoints", "sipendpoint", "sipendpoints", "sipsendpoint", "sipsendpoints", "callendpoint", "callendpoints", "sosendpoint", "sosendpoints":
+	case "routeendpoint", "routeendpoints", "routingendpoint", "routingendpoints", "emergencyendpoint", "emergencyendpoints", "sipendpoint", "sipendpoints", "sipsendpoint", "sipsendpoints", "callendpoint", "callendpoints", "sosendpoint", "sosendpoints", "sosuri", "sosuris", "ecscf", "ecscfs", "ecscfuri", "ecscfuris", "ecscfaddress", "ecscfaddresses", "ecscffqdn", "ecscffqdns", "ecscfendpoint", "ecscfendpoints", "emergencycscf", "emergencycscfuri", "emergencycscfendpoint":
 		return true
 	default:
 		return false
@@ -1274,7 +1440,7 @@ func isSpecificRouteEndpointKey(canonical string) bool {
 
 func isGenericRouteEndpointKey(canonical string) bool {
 	switch canonical {
-	case "endpoint", "endpoints", "uri", "uris", "url", "urls", "address", "addresses":
+	case "endpoint", "endpoints", "uri", "uris", "url", "urls", "address", "addresses", "fqdn", "fqdns", "host", "hosts", "server", "servers":
 		return true
 	default:
 		return false
@@ -1485,11 +1651,11 @@ func consumePDNField(key string, value any, out *entitlementResult) {
 	switch normalizeEntitlementKey(key) {
 	case "name", "id", "pdn", "pdnname", "pdnid", "emergencypdn":
 		setString(&out.PDN, value)
-	case "type", "pdntype", "emergencypdntype", "iptype":
+	case "type", "pdntype", "emergencypdntype", "iptype", "ipversion", "pdptype", "pdnprotocol", "protocol", "protocoltype", "bearertype", "ipaddresstype":
 		setString(&out.PDNType, value)
-	case "apn", "accesspointname", "emergencyapn", "imsapn":
+	case "apn", "accesspointname", "emergencyapn", "imsapn", "dnn", "emergencydnn", "datanetworkname", "networkidentifier", "apnni", "accesspointnamenetworkidentifier":
 		setString(&out.APN, value)
-	case "realm", "networkrealm", "imsrealm", "nairealm", "homerealm":
+	case "realm", "networkrealm", "imsrealm", "nairealm", "homerealm", "domain", "fqdn", "operatoridentifier":
 		setString(&out.Realm, value)
 	case "endpoint", "url", "uri", "addressendpoint", "e911endpoint", "locationendpoint":
 		setHTTPURL(&out.Endpoint, value)
@@ -1525,8 +1691,10 @@ func collectEmergencyAddressField(key string, value any, out *entitlementResult)
 	}
 	canonical := normalizeEntitlementKey(key)
 	if isEmergencyAddressKey(canonical) {
-		parseEmergencyAddress(value, out)
-		return
+		if canonical != "location" || strings.TrimSpace(stringValue(value)) == "" {
+			parseEmergencyAddress(value, out)
+			return
+		}
 	}
 	switch canonical {
 	case "street", "street1", "streetaddress", "addressline1", "address1", "line1", "road", "rd", "a6":
@@ -1565,6 +1733,32 @@ func collectEmergencyAddressField(key string, value any, out *entitlementResult)
 		canonical = "room"
 	case "name", "nam":
 		canonical = "name"
+	case "prd", "predirectional", "streetdirection", "leadingstreetdirection":
+		canonical = "street_direction"
+	case "pod", "postdirectional", "streetpostdirection", "trailingstreetdirection":
+		canonical = "street_post_direction"
+	case "sts", "streetsuffix", "streettype", "roadtype":
+		canonical = "street_suffix"
+	case "lmk", "landmark":
+		canonical = "landmark"
+	case "loc", "location", "locationdescription":
+		canonical = "location_description"
+	case "plc", "placetype":
+		canonical = "place_type"
+	case "prm", "premise":
+		canonical = "premise"
+	case "pobox", "postofficebox":
+		canonical = "post_office_box"
+	case "addcode", "additionalcode":
+		canonical = "additional_code"
+	case "seat":
+		canonical = "seat"
+	case "rdsec", "roadsection":
+		canonical = "road_section"
+	case "rdbr", "roadbranch":
+		canonical = "road_branch"
+	case "rdsubbr", "roadsubbranch":
+		canonical = "road_sub_branch"
 	default:
 		return
 	}
@@ -1573,6 +1767,19 @@ func collectEmergencyAddressField(key string, value any, out *entitlementResult)
 			out.EmergencyAddress = make(map[string]string)
 		}
 		out.EmergencyAddress[canonical] = s
+	}
+}
+
+func collectLocationValidationField(key string, value any, out *entitlementResult) {
+	if out == nil {
+		return
+	}
+	canonical := normalizeEntitlementKey(key)
+	switch {
+	case isLocationValidationKey(canonical):
+		setScalarString(&out.LocationValidationStatus, value)
+	case isLocationValidationStatusKey(canonical):
+		setScalarString(&out.LocationValidationStatus, value)
 	}
 }
 
@@ -1949,6 +2156,33 @@ func stringValue(v any) string {
 		return x.String()
 	case fmt.Stringer:
 		return x.String()
+	default:
+		return ""
+	}
+}
+
+func scalarStringValue(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case json.Number:
+		return x.String()
+	case fmt.Stringer:
+		return x.String()
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case float64:
+		if x == float64(int64(x)) {
+			return fmt.Sprintf("%.0f", x)
+		}
+		return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%f", x), "0"), ".")
+	case int:
+		return fmt.Sprint(x)
+	case int64:
+		return fmt.Sprint(x)
 	default:
 		return ""
 	}

@@ -417,7 +417,10 @@ func parseSMSRPDataFields(body []byte) (originator string, destination string, t
 		return "", "", nil, errors.New("RP originator address truncated")
 	}
 	if oaLen > 0 {
-		originator, _ = decodeRPAddressValue(body[i : i+oaLen])
+		originator, err = decodeRPAddressValue(body[i : i+oaLen])
+		if err != nil {
+			return "", "", nil, fmt.Errorf("RP originator address invalid: %w", err)
+		}
 	}
 	i += oaLen
 	if i >= len(body) {
@@ -429,7 +432,10 @@ func parseSMSRPDataFields(body []byte) (originator string, destination string, t
 		return "", "", nil, errors.New("RP destination address truncated")
 	}
 	if daLen > 0 {
-		destination, _ = decodeRPAddressValue(body[i : i+daLen])
+		destination, err = decodeRPAddressValue(body[i : i+daLen])
+		if err != nil {
+			return "", "", nil, fmt.Errorf("RP destination address invalid: %w", err)
+		}
 	}
 	i += daLen
 	if i >= len(body) {
@@ -440,7 +446,11 @@ func parseSMSRPDataFields(body []byte) (originator string, destination string, t
 	if i+udLen > len(body) {
 		return "", "", nil, errors.New("RP user data truncated")
 	}
-	return originator, destination, append([]byte(nil), body[i:i+udLen]...), nil
+	end := i + udLen
+	if end != len(body) {
+		return "", "", nil, errors.New("RP-DATA has trailing data")
+	}
+	return originator, destination, append([]byte(nil), body[i:end]...), nil
 }
 
 func ParseSMSRPErrorCause(body []byte) (byte, error) {
@@ -478,9 +488,16 @@ func parseSMSRPUserData(body []byte, offset int, label string) ([]byte, error) {
 		return nil, fmt.Errorf("%s user data truncated", label)
 	}
 	if udLen == 0 {
+		if offset != len(body) {
+			return nil, fmt.Errorf("%s has trailing data", label)
+		}
 		return nil, nil
 	}
-	return append([]byte(nil), body[offset:offset+udLen]...), nil
+	end := offset + udLen
+	if end != len(body) {
+		return nil, fmt.Errorf("%s has trailing data", label)
+	}
+	return append([]byte(nil), body[offset:end]...), nil
 }
 
 func BuildSMSRPAck(rpMR byte) []byte {
@@ -499,6 +516,21 @@ func BuildSMSRPAckWithTPDU(rpMR byte, tpdu []byte) ([]byte, error) {
 
 func BuildSMSRPError(rpMR byte, cause byte) []byte {
 	return []byte{0x04, rpMR, 0x01, cause, 0x00}
+}
+
+func BuildSMSRPErrorWithDiagnostics(rpMR byte, cause byte, diagnostics []byte, tpdu []byte) ([]byte, error) {
+	if len(diagnostics) > 254 {
+		return nil, fmt.Errorf("SMS RP-ERROR diagnostics too long: %d", len(diagnostics))
+	}
+	if len(tpdu) > 255 {
+		return nil, fmt.Errorf("SMS TPDU too long: %d", len(tpdu))
+	}
+	out := make([]byte, 0, 5+len(diagnostics)+len(tpdu))
+	out = append(out, 0x04, rpMR, byte(1+len(diagnostics)), cause)
+	out = append(out, diagnostics...)
+	out = append(out, byte(len(tpdu)))
+	out = append(out, tpdu...)
+	return out, nil
 }
 
 func smsRPCauseText(code int) string {
@@ -930,6 +962,9 @@ func encodeRPAddress(number string) ([]byte, error) {
 	_, toa, bcd, err := encodeSMSAddress(number)
 	if err != nil {
 		return nil, err
+	}
+	if len(bcd) > 254 {
+		return nil, fmt.Errorf("SMS RP address too long: %d octets", len(bcd)+1)
 	}
 	out := make([]byte, 0, 2+len(bcd))
 	out = append(out, byte(1+len(bcd)), toa)

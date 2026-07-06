@@ -1,11 +1,14 @@
 package swu
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/bits"
+	"net"
 	"strconv"
 	"strings"
 
@@ -33,6 +36,22 @@ type KernelXFRMConfig struct {
 	ChildSA              ikev2.ChildSAResult
 	OuterLocalIP         string
 	OuterRemoteIP        string
+	InnerLocalPrefix     string
+	InnerRemotePrefix    string
+	ReqID                int
+	Mark                 string
+	InterfaceID          uint32
+	IncludeForwardPolicy bool
+	XFRMInterface        XFRMInterfaceConfig
+	NATTraversal         XFRMNATTraversalConfig
+}
+
+// KernelXFRMConfigFromIKEConfig carries the negotiated IKE state needed to build a kernel XFRM config.
+type KernelXFRMConfigFromIKEConfig struct {
+	Tunnel               TunnelConfig
+	Transport            IKETransportConfig
+	Init                 ikev2.InitResult
+	ChildSA              ikev2.ChildSAResult
 	InnerLocalPrefix     string
 	InnerRemotePrefix    string
 	ReqID                int
@@ -88,6 +107,76 @@ func (m LinuxXFRMManager) Cleanup(ctx context.Context, state KernelXFRMState) er
 		runner = ExecIPCommandRunner{}
 	}
 	return runIPUndo(ctx, runner, state.undo)
+}
+
+// KernelXFRMConfigFromIKE builds a validated XFRM config without applying kernel state.
+func KernelXFRMConfigFromIKE(cfg KernelXFRMConfigFromIKEConfig) (KernelXFRMConfig, error) {
+	outerLocal := xfrmIPString(cfg.Transport.LocalIP, tunnelAddressHost(cfg.Transport.LocalAddr), tunnelAddressHost(cfg.Tunnel.OuterLocalIP))
+	if outerLocal == "" {
+		return KernelXFRMConfig{}, fmt.Errorf("%w: outer local ip is empty", ErrInvalidXFRMConfig)
+	}
+	epdg := firstPacketNonEmpty(cfg.Transport.EPDGAddress, cfg.Tunnel.EPDGAddress, epdgAddressForTunnel(cfg.Tunnel))
+	outerRemote := xfrmIPString(cfg.Transport.RemoteIP, tunnelAddressHost(cfg.Transport.RemoteAddr), tunnelAddressHost(epdg))
+	if outerRemote == "" {
+		return KernelXFRMConfig{}, fmt.Errorf("%w: outer remote ip is empty", ErrInvalidXFRMConfig)
+	}
+	innerLocal := firstPacketNonEmpty(
+		cfg.InnerLocalPrefix,
+		cfg.Tunnel.InnerLocalIP,
+		childConfigurationAddress(cfg.ChildSA, ikev2.ConfigInternalIPv4Address),
+		childConfigurationAddress(cfg.ChildSA, ikev2.ConfigInternalIPv6Address),
+	)
+	if innerLocal == "" {
+		innerLocal = firstXFRMTrafficSelectorPrefix(cfg.ChildSA.TSi)
+	}
+	if innerLocal == "" {
+		return KernelXFRMConfig{}, fmt.Errorf("%w: inner local prefix is empty", ErrInvalidXFRMConfig)
+	}
+	innerRemote := firstPacketNonEmpty(cfg.InnerRemotePrefix, cfg.Tunnel.RemoteInnerIP)
+	if innerRemote == "" {
+		innerRemote = firstXFRMTrafficSelectorPrefix(cfg.ChildSA.TSr)
+	}
+	if innerRemote == "" {
+		return KernelXFRMConfig{}, fmt.Errorf("%w: inner remote prefix is empty", ErrInvalidXFRMConfig)
+	}
+	natt := cfg.NATTraversal
+	if natt.Enabled || cfg.Init.NATDetected {
+		natt.Enabled = true
+		if natt.LocalPort == 0 {
+			natt.LocalPort = xfrmTransportPort(cfg.Transport.LocalPort, cfg.Transport.LocalAddr)
+		}
+		if natt.RemotePort == 0 {
+			natt.RemotePort = xfrmTransportPort(cfg.Transport.RemotePort, cfg.Transport.RemoteAddr)
+		}
+	}
+	out := KernelXFRMConfig{
+		ChildSA:              cfg.ChildSA,
+		OuterLocalIP:         outerLocal,
+		OuterRemoteIP:        outerRemote,
+		InnerLocalPrefix:     innerLocal,
+		InnerRemotePrefix:    innerRemote,
+		ReqID:                cfg.ReqID,
+		Mark:                 cfg.Mark,
+		InterfaceID:          cfg.InterfaceID,
+		IncludeForwardPolicy: cfg.IncludeForwardPolicy,
+		XFRMInterface:        cfg.XFRMInterface,
+		NATTraversal:         natt,
+	}
+	params, err := normalizeKernelXFRMConfig(out)
+	if err != nil {
+		return KernelXFRMConfig{}, err
+	}
+	out.OuterLocalIP = params.outerLocal
+	out.OuterRemoteIP = params.outerRemote
+	out.InnerLocalPrefix = params.innerLocal
+	out.InnerRemotePrefix = params.innerRemote
+	if params.natt.enabled {
+		out.NATTraversal.Enabled = true
+		out.NATTraversal.LocalPort = xfrmPortUint16(params.natt.localPort)
+		out.NATTraversal.RemotePort = xfrmPortUint16(params.natt.remotePort)
+		out.NATTraversal.OriginalAddress = params.natt.originalAddress
+	}
+	return out, nil
 }
 
 func buildKernelXFRMCommands(cfg KernelXFRMConfig) ([]ipCommand, error) {
@@ -410,6 +499,90 @@ func xfrmAuthAlgorithm(integrity uint16) (name string, truncBits int, err error)
 	default:
 		return "", 0, fmt.Errorf("%w: unsupported ESP integrity %d", ErrInvalidXFRMConfig, integrity)
 	}
+}
+
+func xfrmIPString(primary net.IP, fallbacks ...string) string {
+	if ip := normalizedMOBIKEIP(primary, fallbacks...); ip != nil {
+		return ip.String()
+	}
+	return ""
+}
+
+func firstXFRMTrafficSelectorPrefix(ts ikev2.TrafficSelectors) string {
+	for _, selector := range ts.Selectors {
+		if prefix, ok := xfrmTrafficSelectorPrefix(selector); ok {
+			return prefix
+		}
+	}
+	return ""
+}
+
+func xfrmTrafficSelectorPrefix(selector ikev2.TrafficSelector) (string, bool) {
+	var start, end net.IP
+	switch selector.Type {
+	case ikev2.TSIPv4AddressRange:
+		start, end = selector.StartAddr.To4(), selector.EndAddr.To4()
+	case ikev2.TSIPv6AddressRange:
+		if selector.StartAddr.To4() != nil || selector.EndAddr.To4() != nil {
+			return "", false
+		}
+		start, end = selector.StartAddr.To16(), selector.EndAddr.To16()
+	default:
+		return "", false
+	}
+	if start == nil || end == nil {
+		return "", false
+	}
+	prefixLen, ok := xfrmSinglePrefixRange(start, end)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("%s/%d", net.IP(start).String(), prefixLen), true
+}
+
+func xfrmSinglePrefixRange(start, end []byte) (int, bool) {
+	if len(start) == 0 || len(start) != len(end) || bytes.Compare(start, end) > 0 {
+		return 0, false
+	}
+	prefixLen := len(start) * 8
+	for i := range start {
+		diff := start[i] ^ end[i]
+		if diff == 0 {
+			continue
+		}
+		prefixLen = i*8 + bits.LeadingZeros8(diff)
+		break
+	}
+	for bit := prefixLen; bit < len(start)*8; bit++ {
+		if xfrmIPBit(start, bit) != 0 || xfrmIPBit(end, bit) != 1 {
+			return 0, false
+		}
+	}
+	return prefixLen, true
+}
+
+func xfrmIPBit(ip []byte, bit int) byte {
+	return (ip[bit/8] >> (7 - uint(bit%8))) & 1
+}
+
+func xfrmPortUint16(value string) uint16 {
+	port, _ := strconv.ParseUint(value, 10, 16)
+	return uint16(port)
+}
+
+func xfrmTransportPort(port uint16, addr string) uint16 {
+	if port != 0 {
+		return port
+	}
+	_, rawPort, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return 0
+	}
+	parsed, err := strconv.ParseUint(rawPort, 10, 16)
+	if err != nil {
+		return 0
+	}
+	return uint16(parsed)
 }
 
 func xfrmID(id uint32) string {

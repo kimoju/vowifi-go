@@ -39,8 +39,11 @@ type ussdDataXML struct {
 	Language              string         `xml:"language,omitempty"`
 	String                string         `xml:"ussd-string,omitempty"`
 	ErrorCode             string         `xml:"error-code,omitempty"`
+	Operation             string         `xml:"operation,omitempty"`
 	UnstructuredSSRequest *struct{}      `xml:"UnstructuredSS-Request,omitempty"`
 	UnstructuredSSNotify  *struct{}      `xml:"UnstructuredSS-Notify,omitempty"`
+	Request               *struct{}      `xml:"request,omitempty"`
+	Notify                *struct{}      `xml:"notify,omitempty"`
 	AlertingPattern       string         `xml:"alertingPattern,omitempty"`
 	AnyExt                *ussdAnyExtXML `xml:"anyExt,omitempty"`
 }
@@ -48,6 +51,9 @@ type ussdDataXML struct {
 type ussdAnyExtXML struct {
 	UnstructuredSSRequest *struct{} `xml:"UnstructuredSS-Request,omitempty"`
 	UnstructuredSSNotify  *struct{} `xml:"UnstructuredSS-Notify,omitempty"`
+	Request               *struct{} `xml:"request,omitempty"`
+	Notify                *struct{} `xml:"notify,omitempty"`
+	Operation             string    `xml:"operation,omitempty"`
 	AlertingPattern       string    `xml:"alertingPattern,omitempty"`
 }
 
@@ -115,21 +121,35 @@ func ParseIMSUSSDXML(body []byte) (IMSUSSDPayload, error) {
 		Text:     strings.ToValidUTF8(data.String, ""),
 	}
 	if data.UnstructuredSSRequest != nil {
-		payload.Operation = IMSUSSDOperationRequest
-		payload.RawOperationElement = "UnstructuredSS-Request"
+		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRequest, "UnstructuredSS-Request", true)
+	}
+	if data.Request != nil {
+		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRequest, "request", true)
+	}
+	if op, raw := parseIMSUSSDOperationText(data.Operation); op != "" {
+		setIMSUSSDPayloadOperation(&payload, op, raw, false)
 	}
 	if data.UnstructuredSSNotify != nil {
-		payload.Operation = IMSUSSDOperationNotify
-		payload.RawOperationElement = "UnstructuredSS-Notify"
+		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationNotify, "UnstructuredSS-Notify", true)
+	}
+	if data.Notify != nil {
+		setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationNotify, "notify", true)
 	}
 	if data.AnyExt != nil {
-		if payload.Operation == "" && data.AnyExt.UnstructuredSSRequest != nil {
-			payload.Operation = IMSUSSDOperationRequest
-			payload.RawOperationElement = "UnstructuredSS-Request"
+		if data.AnyExt.UnstructuredSSRequest != nil {
+			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRequest, "UnstructuredSS-Request", false)
 		}
-		if payload.Operation == "" && data.AnyExt.UnstructuredSSNotify != nil {
-			payload.Operation = IMSUSSDOperationNotify
-			payload.RawOperationElement = "UnstructuredSS-Notify"
+		if data.AnyExt.Request != nil {
+			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationRequest, "request", false)
+		}
+		if op, raw := parseIMSUSSDOperationText(data.AnyExt.Operation); op != "" {
+			setIMSUSSDPayloadOperation(&payload, op, raw, false)
+		}
+		if data.AnyExt.UnstructuredSSNotify != nil {
+			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationNotify, "UnstructuredSS-Notify", false)
+		}
+		if data.AnyExt.Notify != nil {
+			setIMSUSSDPayloadOperation(&payload, IMSUSSDOperationNotify, "notify", false)
 		}
 		if strings.TrimSpace(data.AlertingPattern) == "" {
 			data.AlertingPattern = data.AnyExt.AlertingPattern
@@ -155,6 +175,29 @@ func ParseIMSUSSDXML(body []byte) (IMSUSSDPayload, error) {
 		payload.Operation = IMSUSSDOperationNotify
 	}
 	return payload, nil
+}
+
+func setIMSUSSDPayloadOperation(payload *IMSUSSDPayload, op IMSUSSDOperation, raw string, override bool) {
+	if payload == nil || op == "" {
+		return
+	}
+	if payload.Operation != "" && !override {
+		return
+	}
+	payload.Operation = op
+	payload.RawOperationElement = strings.TrimSpace(raw)
+}
+
+func parseIMSUSSDOperationText(value string) (IMSUSSDOperation, string) {
+	raw := strings.TrimSpace(value)
+	switch strings.ToLower(raw) {
+	case "request", "unstructuredss-request", "unstructuredssrequest":
+		return IMSUSSDOperationRequest, firstNonEmpty(raw, "request")
+	case "notify", "notification", "unstructuredss-notify", "unstructuredssnotify":
+		return IMSUSSDOperationNotify, firstNonEmpty(raw, "notify")
+	default:
+		return "", ""
+	}
 }
 
 func normalizeUSSDContentType(contentType string) string {

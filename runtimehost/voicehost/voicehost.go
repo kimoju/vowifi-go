@@ -91,6 +91,7 @@ type OutboundCallRequest struct {
 	CallID     string
 	Callee     string
 	RequestURI string
+	RouteSet   []string
 	RemoteSDP  SDPInfo
 	RawSDP     []byte
 	Headers    map[string]string

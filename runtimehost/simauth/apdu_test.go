@@ -59,6 +59,18 @@ func TestTransmitHandlesRetryLengthAndGetResponse(t *testing.T) {
 		t.Fatalf("retry calls = %#v", retry.calls)
 	}
 
+	dataRetry := &fakeTransport{responses: []string{"6C03", "0102039000"}}
+	resp, err = Transmit(dataRetry, 1, []byte{0x00, 0x88, 0x00, 0x81, 0x02, 0xAA, 0xBB})
+	if err != nil {
+		t.Fatalf("Transmit(6C data APDU) error = %v", err)
+	}
+	if !reflect.DeepEqual(resp.Body, []byte{1, 2, 3}) {
+		t.Fatalf("data retry body = % X", resp.Body)
+	}
+	if !reflect.DeepEqual(dataRetry.calls, []string{"0088008102AABB", "0088008102AABB03"}) {
+		t.Fatalf("data retry calls = %#v", dataRetry.calls)
+	}
+
 	getResponse := &fakeTransport{responses: []string{"AA6102", "BBCC9000"}}
 	resp, err = Transmit(getResponse, 1, []byte{0x00, 0xA4, 0x00, 0x04, 0x02, 0x6F, 0x02})
 	if err != nil {
@@ -163,6 +175,44 @@ func TestBuildAndParseUSIMAuth(t *testing.T) {
 	_, err = ParseUSIMAuthResponse([]byte{0xDD, 0x00}, 0x90, 0x00)
 	if !errors.Is(err, swusim.ErrAuthFailure) {
 		t.Fatalf("auth failure err=%v, want ErrAuthFailure", err)
+	}
+}
+
+func TestParseAUTSFields(t *testing.T) {
+	raw := bytesFrom(0x10, AKAAUTSLength)
+	fields, err := ParseAUTS(raw)
+	if err != nil {
+		t.Fatalf("ParseAUTS() error = %v", err)
+	}
+	if hex.EncodeToString(fields.SQNMSXorAK) != "101112131415" || hex.EncodeToString(fields.MACS) != "161718191a1b1c1d" {
+		t.Fatalf("AUTS fields=%+v", fields)
+	}
+
+	raw[0] = 0xff
+	rebuilt, err := fields.Bytes()
+	if err != nil {
+		t.Fatalf("AUTSFields.Bytes() error = %v", err)
+	}
+	if hex.EncodeToString(rebuilt) != "101112131415161718191a1b1c1d" {
+		t.Fatalf("rebuilt AUTS=%x", rebuilt)
+	}
+
+	sqn, err := fields.SQNMS([]byte{1, 1, 1, 1, 1, 1})
+	if err != nil {
+		t.Fatalf("AUTSFields.SQNMS() error = %v", err)
+	}
+	if hex.EncodeToString(sqn) != "111013121514" {
+		t.Fatalf("SQN_MS=%x", sqn)
+	}
+
+	if _, err := ParseAUTS(bytesFrom(0x20, AKAAUTSLength-1)); err == nil {
+		t.Fatal("ParseAUTS(short) err=nil, want error")
+	}
+	if _, err := (AUTSFields{SQNMSXorAK: []byte{1}, MACS: bytesFrom(0x30, AKAMACLength)}).Bytes(); err == nil {
+		t.Fatal("AUTSFields.Bytes(short SQN) err=nil, want error")
+	}
+	if _, err := fields.SQNMS([]byte{1}); err == nil {
+		t.Fatal("AUTSFields.SQNMS(short AK) err=nil, want error")
 	}
 }
 

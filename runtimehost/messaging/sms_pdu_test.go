@@ -439,6 +439,44 @@ func TestParseSMSRPDUErrorPreservesDiagnosticsAndUserData(t *testing.T) {
 	}
 }
 
+func TestParseSMSRPDUBoundsUserDataLength(t *testing.T) {
+	tpdu := mustHex(t, "0005810180F600006270502143650005E8329BFD06")
+	rpData, err := BuildSMSRPData(0x33, "", tpdu)
+	if err != nil {
+		t.Fatalf("BuildSMSRPData() error = %v", err)
+	}
+	if _, err := ParseSMSRPDU(append(append([]byte(nil), rpData...), 0xff)); err == nil || !strings.Contains(err.Error(), "trailing") {
+		t.Fatalf("ParseSMSRPDU(RP-DATA trailing) err=%v, want trailing data", err)
+	}
+	if _, err := ParseSMSRPDU([]byte{0x02, 0x22, 0x00, 0xff}); err == nil || !strings.Contains(err.Error(), "trailing") {
+		t.Fatalf("ParseSMSRPDU(RP-ACK trailing) err=%v, want trailing data", err)
+	}
+	if _, err := ParseSMSRPDU([]byte{0x04, 0x23, 0x01, SMSRPCauseTemporaryFailure, 0x00, 0xff}); err == nil || !strings.Contains(err.Error(), "trailing") {
+		t.Fatalf("ParseSMSRPDU(RP-ERROR trailing) err=%v, want trailing data", err)
+	}
+	if _, err := ParseSMSRPDU([]byte{0x04, 0x23, 0x03, SMSRPCauseTemporaryFailure}); err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("ParseSMSRPDU(RP-ERROR truncated cause) err=%v, want truncation", err)
+	}
+}
+
+func TestBuildSMSRPErrorWithDiagnosticsRoundTrip(t *testing.T) {
+	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000046")
+	body, err := BuildSMSRPErrorWithDiagnostics(0x56, SMSRPCauseTemporaryFailure, []byte{0x80, 0x01}, tpdu)
+	if err != nil {
+		t.Fatalf("BuildSMSRPErrorWithDiagnostics() error = %v", err)
+	}
+	rpdu, err := ParseSMSRPDU(body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPDU() error = %v", err)
+	}
+	if rpdu.Kind != SMSRPDUKindError || rpdu.MR != 0x56 || rpdu.Cause != int(SMSRPCauseTemporaryFailure) {
+		t.Fatalf("rpdu=%+v", rpdu)
+	}
+	if string(rpdu.CauseDiagnostics) != string([]byte{0x80, 0x01}) || string(rpdu.TPDU) != string(tpdu) {
+		t.Fatalf("diagnostics=%x tpdu=%x", rpdu.CauseDiagnostics, rpdu.TPDU)
+	}
+}
+
 func TestParseSMSDeliverTPDUGSM7(t *testing.T) {
 	tpdu := mustHex(t, "0005810180F600006270502143650005E8329BFD06")
 	deliver, err := ParseSMSDeliverTPDU(tpdu)

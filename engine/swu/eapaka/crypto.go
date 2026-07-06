@@ -357,6 +357,21 @@ func BuildSynchronizationFailureResponse(request Packet, auts []byte) (Packet, e
 	}, nil
 }
 
+func BuildAKAFailureResponse(request Packet, aka sim.AKAResult, cause error) (Packet, bool, error) {
+	switch {
+	case cause == nil:
+		return Packet{}, false, nil
+	case errors.Is(cause, sim.ErrSyncFailure):
+		response, err := BuildSynchronizationFailureResponse(request, aka.AUTS)
+		return response, true, err
+	case errors.Is(cause, sim.ErrAuthFailure):
+		response, err := BuildAuthenticationRejectResponse(request)
+		return response, true, err
+	default:
+		return Packet{}, false, cause
+	}
+}
+
 func EncryptAttributes(kEncr, iv []byte, attrs []Attribute) (Attribute, error) {
 	block, err := encryptedDataBlock(kEncr, iv)
 	if err != nil {
@@ -618,6 +633,9 @@ func parseChallenge(request Packet, keys *Keys) (Challenge, error) {
 	}
 	if !isAKAType(request.Type) {
 		return Challenge{}, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+	}
+	if err := ValidateAttributes(request.Attributes); err != nil {
+		return Challenge{}, err
 	}
 	vectors, err := challengeVectors(request)
 	if err != nil {

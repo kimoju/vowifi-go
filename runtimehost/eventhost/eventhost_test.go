@@ -1,0 +1,78 @@
+package eventhost
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
+)
+
+type captureDispatcher struct {
+	events []Event
+}
+
+func (d *captureDispatcher) Dispatch(ctx context.Context, ev Event) {
+	d.events = append(d.events, ev)
+}
+
+func TestNewControlPortHangRecoveryBuildsStructuredHint(t *testing.T) {
+	ev := NewControlPortHangRecovery("dev-1", "identity", "AT", "read_imsi", context.DeadlineExceeded)
+	if ev.Class != simtransport.RecoveryClassControlPortHung || !ev.Recoverable {
+		t.Fatalf("recovery=%+v, want control port hung recoverable", ev)
+	}
+	if ev.Hint == nil || ev.Hint.PortType != ControlPortAT ||
+		ev.Hint.Operation != "read_imsi" ||
+		ev.Hint.SuggestedAction != RecoveryActionRestartControlPort {
+		t.Fatalf("hint=%+v, want AT restart hint", ev.Hint)
+	}
+}
+
+func TestNewControlPortHangRecoveryDefaultsUnknownErrorToHung(t *testing.T) {
+	ev := NewControlPortHangRecovery("dev-1", "carrier", "qmi", "read_profile", nil)
+	if ev.Class != simtransport.RecoveryClassControlPortHung || !ev.Recoverable {
+		t.Fatalf("recovery=%+v, want explicit hung class", ev)
+	}
+	if ev.Hint == nil || ev.Hint.PortType != ControlPortQMI {
+		t.Fatalf("hint=%+v, want QMI hint", ev.Hint)
+	}
+}
+
+func TestNewFallbackRecoveryClassifiesAndNormalizesMetadata(t *testing.T) {
+	ev := NewFallbackRecovery(
+		"dev-1",
+		"identity",
+		"prepare_start",
+		"IMSI",
+		"QMI",
+		"profile",
+		errors.New("AT CME ERROR: SIM busy"),
+	)
+	if ev.Field != "imsi" || ev.PrimarySource != "qmi" || ev.FallbackSource != "profile" || !ev.UsedFallback {
+		t.Fatalf("fallback recovery=%+v", ev)
+	}
+	if ev.Class != simtransport.RecoveryClassSIMBusy || !ev.Recoverable {
+		t.Fatalf("fallback recovery=%+v, want SIM busy recoverable", ev)
+	}
+}
+
+func TestDispatchRecoveryFillsTimeAndSkipsNilDispatcher(t *testing.T) {
+	if DispatchRecovery(context.Background(), nil, RuntimeRecovery{}) {
+		t.Fatal("DispatchRecovery(nil) = true, want false")
+	}
+	dispatcher := &captureDispatcher{}
+	ev := RuntimeRecovery{Class: simtransport.RecoveryClassSIMBusy}
+	if !DispatchRecovery(context.Background(), dispatcher, ev) {
+		t.Fatal("DispatchRecovery() = false, want true")
+	}
+	if len(dispatcher.events) != 1 {
+		t.Fatalf("events=%d, want one event", len(dispatcher.events))
+	}
+	got, ok := dispatcher.events[0].(RuntimeRecovery)
+	if !ok {
+		t.Fatalf("event type=%T, want RuntimeRecovery", dispatcher.events[0])
+	}
+	if got.Time.IsZero() || !got.Recoverable {
+		t.Fatalf("event=%+v, want time and recoverable populated", got)
+	}
+}

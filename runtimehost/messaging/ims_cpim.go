@@ -72,6 +72,7 @@ type imsCPIMIMDNReport struct {
 	OriginalRecipientURI string
 	Notification         string
 	Status               string
+	StatusText           string
 	State                string
 	ErrorText            string
 }
@@ -99,6 +100,7 @@ type imsIMDNStatus struct {
 	Failed    *struct{} `xml:"failed"`
 	Forbidden *struct{} `xml:"forbidden"`
 	Error     *struct{} `xml:"error"`
+	Text      string
 }
 
 func parseIMSCPIMIMDNReport(cpim IMSCPIMMessage) (imsCPIMIMDNReport, error) {
@@ -137,8 +139,9 @@ func parseIMSCPIMIMDNReport(cpim IMSCPIMMessage) (imsCPIMIMDNReport, error) {
 		OriginalRecipientURI: firstNonEmpty(doc.OriginalRecipientURI, firstCPIMHeaderValue(headers, "imdn.Original-To")),
 		Notification:         notification,
 		Status:               status,
+		StatusText:           doc.notificationStatusText(notification),
 		State:                state,
-		ErrorText:            imsIMDNErrorText(notification, status, state),
+		ErrorText:            imsIMDNErrorText(notification, status, state, doc.notificationStatusText(notification)),
 	}, nil
 }
 
@@ -172,6 +175,85 @@ func (s imsIMDNStatus) value() string {
 	case s.Error != nil:
 		return "error"
 	default:
+		return normalizeIMSIMDNStatusText(s.Text)
+	}
+}
+
+func (doc imsIMDNXMLDocument) notificationStatusText(notification string) string {
+	switch notification {
+	case "delivery":
+		if doc.Delivery != nil {
+			return strings.TrimSpace(doc.Delivery.Status.Text)
+		}
+	case "display":
+		if doc.Display != nil {
+			return strings.TrimSpace(doc.Display.Status.Text)
+		}
+	case "processing":
+		if doc.Processing != nil {
+			return strings.TrimSpace(doc.Processing.Status.Text)
+		}
+	}
+	return ""
+}
+
+func (s *imsIMDNStatus) UnmarshalXML(decoder *xml.Decoder, start xml.StartElement) error {
+	var text strings.Builder
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		switch item := tok.(type) {
+		case xml.StartElement:
+			childText, err := readIMSXMLText(decoder, item)
+			if err != nil {
+				return err
+			}
+			if s.setStatusElement(item.Name.Local) && strings.TrimSpace(childText) != "" {
+				appendIMSStatusText(&text, childText)
+				continue
+			}
+			appendIMSStatusText(&text, childText)
+		case xml.CharData:
+			appendIMSStatusText(&text, string(item))
+		case xml.EndElement:
+			if item.Name == start.Name {
+				s.Text = strings.TrimSpace(text.String())
+				return nil
+			}
+		}
+	}
+}
+
+func (s *imsIMDNStatus) setStatusElement(name string) bool {
+	switch normalizeIMSIMDNStatusText(name) {
+	case "delivered":
+		s.Delivered = &struct{}{}
+	case "displayed":
+		s.Displayed = &struct{}{}
+	case "processed":
+		s.Processed = &struct{}{}
+	case "stored":
+		s.Stored = &struct{}{}
+	case "failed":
+		s.Failed = &struct{}{}
+	case "forbidden":
+		s.Forbidden = &struct{}{}
+	case "error":
+		s.Error = &struct{}{}
+	default:
+		return false
+	}
+	return true
+}
+
+func normalizeIMSIMDNStatusText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "delivered", "displayed", "processed", "stored", "failed", "forbidden", "error":
+		return value
+	default:
 		return ""
 	}
 }
@@ -194,20 +276,75 @@ func parseIMSCPIMIMDNTime(value string) (time.Time, error) {
 	if value == "" {
 		return time.Time{}, nil
 	}
-	reportAt, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid IMDN datetime: %q", value)
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02T15:04:05.999999999Z0700",
+		"2006-01-02T15:04:05Z0700",
+		time.RFC1123Z,
+		time.RFC1123,
+	} {
+		if reportAt, err := time.Parse(layout, value); err == nil {
+			return reportAt, nil
+		}
 	}
-	return reportAt, nil
+	for _, layout := range []string{
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+	} {
+		if reportAt, err := time.ParseInLocation(layout, value, time.UTC); err == nil {
+			return reportAt, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid IMDN datetime: %q", value)
 }
 
-func imsIMDNErrorText(notification, status, state string) string {
+func imsIMDNErrorText(notification, status, state, detail string) string {
 	if state != "failed" {
 		return ""
 	}
 	notification = firstNonEmpty(notification, "delivery")
 	status = firstNonEmpty(status, "failed")
+	detail = strings.TrimSpace(detail)
+	if detail != "" && !strings.EqualFold(detail, status) {
+		return "IMDN " + notification + " notification " + status + ": " + detail
+	}
 	return "IMDN " + notification + " notification " + status
+}
+
+func readIMSXMLText(decoder *xml.Decoder, start xml.StartElement) (string, error) {
+	var text strings.Builder
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		switch item := tok.(type) {
+		case xml.StartElement:
+			childText, err := readIMSXMLText(decoder, item)
+			if err != nil {
+				return "", err
+			}
+			appendIMSStatusText(&text, childText)
+		case xml.CharData:
+			appendIMSStatusText(&text, string(item))
+		case xml.EndElement:
+			if item.Name == start.Name {
+				return strings.TrimSpace(text.String()), nil
+			}
+		}
+	}
+}
+
+func appendIMSStatusText(out *strings.Builder, value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	if out.Len() > 0 {
+		out.WriteByte(' ')
+	}
+	out.WriteString(value)
 }
 
 func BuildIMSCPIMMessage(from, to, contentType string, body []byte) ([]byte, error) {

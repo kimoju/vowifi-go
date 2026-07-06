@@ -137,6 +137,46 @@ func TestIMSSMSTransportFollowsRedirectContact(t *testing.T) {
 	}
 }
 
+func TestIMSMessagingResponseHandlingClassifiesRedirectAndAuth(t *testing.T) {
+	redirect := imsMessagingResponseHandlingFor(voiceclient.SIPResponse{
+		StatusCode: 302,
+		Reason:     "Moved Temporarily",
+		Headers: map[string][]string{
+			"Contact": {"<tel:+18005551212>", "<sip:sms-as@ims.example>;expires=60"},
+		},
+	})
+	if redirect.RedirectURI != "sip:sms-as@ims.example" || redirect.FailureText != "Moved Temporarily" {
+		t.Fatalf("redirect handling=%+v", redirect)
+	}
+	if redirect.AuthChallengeHeader != "" || redirect.AuthAuthorizationHeader != "" || redirect.AuthChallenge != "" {
+		t.Fatalf("redirect auth handling=%+v", redirect)
+	}
+
+	unauthorized := imsMessagingResponseHandlingFor(voiceclient.SIPResponse{
+		StatusCode: 401,
+		Reason:     "Unauthorized",
+		Headers: map[string][]string{
+			"WWW-Authenticate": {`Digest realm="ims.example", nonce="n1"`},
+			"Retry-After":      {"4"},
+		},
+	})
+	if unauthorized.AuthChallengeHeader != "WWW-Authenticate" || unauthorized.AuthAuthorizationHeader != "Authorization" || !strings.Contains(unauthorized.AuthChallenge, `nonce="n1"`) {
+		t.Fatalf("unauthorized handling=%+v", unauthorized)
+	}
+	if unauthorized.RetryAfter != 4*time.Second || unauthorized.FailureText != "Unauthorized" {
+		t.Fatalf("unauthorized retry/failure=%+v", unauthorized)
+	}
+
+	proxy := imsMessagingResponseHandlingFor(voiceclient.SIPResponse{
+		StatusCode: 407,
+		Reason:     "Proxy Authentication Required",
+		Headers:    map[string][]string{"Proxy-Authenticate": {`Digest realm="ims.example", nonce="p1"`}},
+	})
+	if proxy.AuthChallengeHeader != "Proxy-Authenticate" || proxy.AuthAuthorizationHeader != "Proxy-Authorization" || !strings.Contains(proxy.AuthChallenge, `nonce="p1"`) {
+		t.Fatalf("proxy handling=%+v", proxy)
+	}
+}
+
 func TestIMSSMSTransportAllowsTextPlainPayload(t *testing.T) {
 	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 200, Reason: "OK"}}}
 	sms := IMSSMSTransport{

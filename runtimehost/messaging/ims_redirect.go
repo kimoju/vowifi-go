@@ -1,15 +1,58 @@
 package messaging
 
 import (
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 const maxIMSMessagingRedirects = 4
 
+type imsMessagingResponseHandling struct {
+	StatusCode                 int
+	Reason                     string
+	RetryAfter                 time.Duration
+	RedirectURI                string
+	AuthChallengeHeader        string
+	AuthChallenge              string
+	AuthAuthorizationHeader    string
+	RegistrationRecoveryNeeded bool
+	FailureText                string
+}
+
+func imsMessagingResponseHandlingFor(resp voiceclient.SIPResponse) imsMessagingResponseHandling {
+	info := imsMessagingResponseHandling{
+		StatusCode:                 resp.StatusCode,
+		Reason:                     strings.TrimSpace(resp.Reason),
+		RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+		RedirectURI:                firstMessagingRedirectContactURI(resp),
+		RegistrationRecoveryNeeded: IMSRegistrationRecoveryNeededStatus(resp.StatusCode),
+	}
+	info.AuthChallengeHeader, info.AuthAuthorizationHeader = imsMessagingAuthHeaders(resp.StatusCode)
+	if info.AuthChallengeHeader != "" {
+		info.AuthChallenge = firstHeaderValue(resp.Headers, info.AuthChallengeHeader)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		info.FailureText = firstNonEmpty(info.Reason, "IMS MESSAGE rejected: "+strconv.Itoa(resp.StatusCode))
+	}
+	return info
+}
+
+func imsMessagingAuthHeaders(statusCode int) (challengeHeader, authorizationHeader string) {
+	switch statusCode {
+	case 401:
+		return "WWW-Authenticate", "Authorization"
+	case 407:
+		return "Proxy-Authenticate", "Proxy-Authorization"
+	default:
+		return "", ""
+	}
+}
+
 func retryMessagingDialogConfigForRedirect(cfg voiceclient.DialogRequestConfig, resp voiceclient.SIPResponse, cseq int) (voiceclient.DialogRequestConfig, bool) {
-	target := firstMessagingRedirectContactURI(resp)
+	target := imsMessagingResponseHandlingFor(resp).RedirectURI
 	if target == "" {
 		return voiceclient.DialogRequestConfig{}, false
 	}

@@ -102,11 +102,36 @@ func TestBuildUsableEmergencySIPRequestInfoUsesEntitlementSnapshot(t *testing.T)
 	if len(info.Routes) != 2 {
 		t.Fatalf("routes=%+v, want service route plus generic route", info.Routes)
 	}
+	if !sameStrings(info.RouteSet, []string{"<sip:pcscf-fire.ims.example;lr>", "<sips:any@example.test;lr>"}) {
+		t.Fatalf("RouteSet=%+v", info.RouteSet)
+	}
 	if info.Routes[0].ServiceURN != "urn:service:sos.fire" || !sameStrings(info.Routes[0].PCSCF, []string{"pcscf-fire.ims.example"}) {
 		t.Fatalf("service route=%+v", info.Routes[0])
 	}
 	if !sameStrings(info.Routes[1].Endpoints, []string{"sips:any@example.test"}) {
 		t.Fatalf("generic route=%+v", info.Routes[1])
+	}
+}
+
+func TestEmergencySIPRouteSetFormatsEntitlementRoutes(t *testing.T) {
+	got := EmergencySIPRouteSet([]EmergencyRoute{
+		{
+			PCSCF:     []string{"pcscf-emergency.ims.example", "sip:pcscf-emergency.ims.example;lr"},
+			ESRP:      []string{"sips:esrp.ims.example"},
+			Endpoints: []string{"<sip:psap.example;transport=tcp;lr>"},
+		},
+		{
+			Endpoints: []string{"tel:+15551212", "pcscf-emergency.ims.example"},
+		},
+	})
+	want := []string{
+		"<sip:pcscf-emergency.ims.example;lr>",
+		"<sips:esrp.ims.example;lr>",
+		"<sip:psap.example;transport=tcp;lr>",
+		"<tel:+15551212>",
+	}
+	if !sameStrings(got, want) {
+		t.Fatalf("RouteSet=%+v, want %+v", got, want)
 	}
 }
 

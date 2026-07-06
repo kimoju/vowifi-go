@@ -111,6 +111,10 @@ func TestIMSOutboundAgentEmergencyINVITEUsesRequestURIAndHeaders(t *testing.T) {
 		GeolocationURI:     "cid:location-1",
 		GeolocationRouting: true,
 	})
+	info.RouteSet = e911.EmergencySIPRouteSet([]e911.EmergencyRoute{
+		{PCSCF: []string{"pcscf-emergency.ims.example"}},
+		{ESRP: []string{"sips:esrp-emergency.ims.example"}},
+	})
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
 			StatusCode: 200,
@@ -136,6 +140,7 @@ func TestIMSOutboundAgentEmergencyINVITEUsesRequestURIAndHeaders(t *testing.T) {
 		CallID:     "call-emergency",
 		Callee:     "911",
 		RequestURI: info.RequestURI,
+		RouteSet:   info.RouteSet,
 		RawSDP:     []byte(sampleSDP("192.0.2.50", 4002)),
 		Headers:    info.Headers,
 	})
@@ -154,6 +159,9 @@ func TestIMSOutboundAgentEmergencyINVITEUsesRequestURIAndHeaders(t *testing.T) {
 		invite.Headers["Geolocation"] != "<cid:location-1>;inserted-by=endpoint" ||
 		invite.Headers["Geolocation-Routing"] != "yes" {
 		t.Fatalf("emergency INVITE headers=%+v", invite.Headers)
+	}
+	if invite.Headers["Route"] != "<sip:pcscf-emergency.ims.example;lr>, <sips:esrp-emergency.ims.example;lr>" {
+		t.Fatalf("emergency INVITE Route=%q", invite.Headers["Route"])
 	}
 	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" ||
 		transport.writes[0].URI != "sip:emergency-carrier@198.51.100.9:5060" {

@@ -39,6 +39,7 @@ type EmergencySIPRequestInfo struct {
 	RequestURI string
 	Headers    map[string]string
 	Routes     []EmergencyRoute
+	RouteSet   []string
 }
 
 func NormalizeEmergencyServiceURN(s string) string {
@@ -139,7 +140,69 @@ func buildUsableEmergencySIPRequestInfo(snapshot EntitlementSnapshot, cfg Emerge
 	}
 	info := BuildEmergencySIPRequestInfo(cfg)
 	info.Routes = copyEmergencyRoutes(routes)
+	info.RouteSet = EmergencySIPRouteSet(routes)
 	return info, true
+}
+
+func EmergencySIPRouteSet(routes []EmergencyRoute) []string {
+	var out []string
+	for _, route := range routes {
+		out = appendEmergencySIPRouteSet(out, route.PCSCF...)
+		out = appendEmergencySIPRouteSet(out, route.ESRP...)
+		out = appendEmergencySIPRouteSet(out, route.Endpoints...)
+	}
+	return out
+}
+
+func appendEmergencySIPRouteSet(dst []string, values ...string) []string {
+	for _, value := range values {
+		route := formatEmergencySIPRoute(value)
+		if route == "" || containsSIPRoute(dst, route) {
+			continue
+		}
+		dst = append(dst, route)
+	}
+	return dst
+}
+
+func formatEmergencySIPRoute(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "<") {
+		return value
+	}
+	uri := value
+	lower := strings.ToLower(uri)
+	if !strings.HasPrefix(lower, "sip:") && !strings.HasPrefix(lower, "sips:") && !strings.Contains(uri, ":") {
+		uri = "sip:" + uri
+		lower = strings.ToLower(uri)
+	}
+	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") {
+		uri = ensureLooseRoute(uri)
+	}
+	return "<" + uri + ">"
+}
+
+func ensureLooseRoute(uri string) string {
+	base, suffix, ok := strings.Cut(uri, "?")
+	if strings.Contains(strings.ToLower(base), ";lr") {
+		return uri
+	}
+	if ok {
+		return base + ";lr?" + suffix
+	}
+	return base + ";lr"
+}
+
+func containsSIPRoute(routes []string, route string) bool {
+	for _, existing := range routes {
+		if strings.EqualFold(existing, route) {
+			return true
+		}
+	}
+	return false
 }
 
 func emergencyGeolocationHeader(cfg EmergencySIPHeaderConfig) string {

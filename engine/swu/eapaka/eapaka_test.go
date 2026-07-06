@@ -482,6 +482,56 @@ func TestAKAAttributeBoundaryValidation(t *testing.T) {
 	}
 }
 
+func TestAUTSFieldsAndAttributeValidation(t *testing.T) {
+	auts := mustHex(t, "010203040506a1a2a3a4a5a6a7a8")
+	fields, err := ParseAUTS(auts)
+	if err != nil {
+		t.Fatalf("ParseAUTS() error = %v", err)
+	}
+	if hex.EncodeToString(fields.SQNMSXorAK) != "010203040506" || hex.EncodeToString(fields.MACS) != "a1a2a3a4a5a6a7a8" {
+		t.Fatalf("AUTS fields=%+v", fields)
+	}
+	auts[0] = 0xff
+	rebuilt, err := fields.Bytes()
+	if err != nil {
+		t.Fatalf("AUTSFields.Bytes() error = %v", err)
+	}
+	if hex.EncodeToString(rebuilt) != "010203040506a1a2a3a4a5a6a7a8" {
+		t.Fatalf("rebuilt AUTS=%x", rebuilt)
+	}
+	sqnMS, err := fields.SQNMS(mustHex(t, "010101010101"))
+	if err != nil {
+		t.Fatalf("AUTSFields.SQNMS() error = %v", err)
+	}
+	if hex.EncodeToString(sqnMS) != "000302050407" {
+		t.Fatalf("SQN_MS=%x", sqnMS)
+	}
+
+	attrFields, err := AUTSAttribute(rebuilt).AUTSFields()
+	if err != nil {
+		t.Fatalf("AUTSAttribute().AUTSFields() error = %v", err)
+	}
+	if hex.EncodeToString(attrFields.MACS) != "a1a2a3a4a5a6a7a8" {
+		t.Fatalf("attribute AUTS MAC-S=%x", attrFields.MACS)
+	}
+
+	valid := []Attribute{
+		RANDAttribute(mustHex(t, "101112131415161718191a1b1c1d1e1f")),
+		AUTNAttribute(mustHex(t, "20212223242580003031323334353637")),
+		MACAttribute(nil),
+		ResultIndAttribute(),
+	}
+	if err := ValidateAttributes(valid); err != nil {
+		t.Fatalf("ValidateAttributes(valid) error = %v", err)
+	}
+	if err := ValidateAttribute(Attribute{Type: AttributeResultInd, Data: []byte{0x00, 0x01}}); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ValidateAttribute(bad result-ind) err=%v, want ErrInvalidAttribute", err)
+	}
+	if err := ValidateAttribute(Attribute{Type: AttributePadding, Data: []byte{0, 0, 0, 0}}); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ValidateAttribute(bad padding length) err=%v, want ErrInvalidAttribute", err)
+	}
+}
+
 func TestAKAAttributeRejectsNonZeroReservedAndPadding(t *testing.T) {
 	raw, err := IdentityAttribute("abcde").MarshalBinary()
 	if err != nil {

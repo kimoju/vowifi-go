@@ -110,7 +110,7 @@ func TestSelectSDPAnswerCodecsAndBuildMuxedAnswer(t *testing.T) {
 		"a=rtcp-mux\r\n" +
 		"a=rtpmap:111 opus/48000/2\r\n" +
 		"a=rtpmap:96 AMR/8000\r\n" +
-		"a=fmtp:96 octet-align=0\r\n" +
+		"a=fmtp:96 octet-align=1\r\n" +
 		"a=rtpmap:110 telephone-event/16000\r\n"))
 	if err != nil {
 		t.Fatalf("ParseSDPMediaDescription() error = %v", err)
@@ -145,6 +145,88 @@ func TestSelectSDPAnswerCodecsAndBuildMuxedAnswer(t *testing.T) {
 	}
 	if strings.Contains(answer, "a=rtcp:") || strings.Contains(answer, "opus") || strings.Contains(answer, "111") {
 		t.Fatalf("answer kept unselected media:\n%s", answer)
+	}
+}
+
+func TestSelectSDPAnswerCodecsNegotiatesAMRAndAMRWB(t *testing.T) {
+	offer, err := ParseSDPMediaDescription([]byte("v=0\r\n" +
+		"c=IN IP4 203.0.113.8\r\n" +
+		"m=audio 49170 RTP/SAVPF 96 97 110\r\n" +
+		"a=rtcp-mux\r\n" +
+		"a=rtpmap:96 AMR/8000\r\n" +
+		"a=fmtp:96 octet-align=1;mode-set=0,2,4,7\r\n" +
+		"a=rtpmap:97 AMR-WB/16000\r\n" +
+		"a=fmtp:97 octet-align=1;mode-set=0,1,2\r\n" +
+		"a=rtpmap:110 telephone-event/16000\r\n"))
+	if err != nil {
+		t.Fatalf("ParseSDPMediaDescription() error = %v", err)
+	}
+	codecs := SelectSDPAnswerCodecs(offer.Codecs, []SDPCodec{
+		NewSDPAMRWBCodec(0, "octet-align=1;mode-set=1,2,8"),
+		NewSDPAMRCodec(0, "octet-align=1;mode-set=2,7;mode-change-period=2"),
+		NewSDPTelephoneEventCodec(0, 16000),
+	})
+	if len(codecs) != 3 || codecs[0].Payload != 97 || codecs[1].Payload != 96 || codecs[2].Payload != 110 {
+		t.Fatalf("selected codecs=%+v", codecs)
+	}
+	if codecs[0].FMTP != "octet-align=1;mode-set=1,2" || codecs[1].FMTP != "octet-align=1;mode-set=2,7;mode-change-period=2" {
+		t.Fatalf("AMR fmtp=%q/%q", codecs[0].FMTP, codecs[1].FMTP)
+	}
+	answer := string(BuildSDPAnswerWithOptions(SDPInfo{
+		ConnectionIP: "192.0.2.2",
+		MediaPort:    6000,
+		RTCPPort:     6001,
+		Direction:    "sendrecv",
+	}, SDPAnswerOptions{
+		RTPProfile: offer.RTPProfile,
+		RTCPMux:    offer.RTCPMux,
+		Codecs:     codecs,
+	}))
+	for _, want := range []string{
+		"m=audio 6000 RTP/SAVPF 97 96 110\r\n",
+		"a=rtcp-mux\r\n",
+		"a=rtpmap:97 AMR-WB/16000\r\n",
+		"a=fmtp:97 octet-align=1;mode-set=1,2\r\n",
+		"a=rtpmap:96 AMR/8000\r\n",
+		"a=fmtp:96 octet-align=1;mode-set=2,7;mode-change-period=2\r\n",
+		"a=rtpmap:110 telephone-event/16000\r\n",
+	} {
+		if !strings.Contains(answer, want) {
+			t.Fatalf("answer missing %q:\n%s", want, answer)
+		}
+	}
+}
+
+func TestSelectSDPAnswerCodecsRejectsIncompatibleAMROctetAlign(t *testing.T) {
+	offer, err := ParseSDPMediaDescription([]byte("v=0\r\n" +
+		"c=IN IP4 203.0.113.8\r\n" +
+		"m=audio 49170 RTP/AVP 96 110\r\n" +
+		"a=rtpmap:96 AMR/8000\r\n" +
+		"a=fmtp:96 octet-align=0\r\n" +
+		"a=rtpmap:110 telephone-event/8000\r\n"))
+	if err != nil {
+		t.Fatalf("ParseSDPMediaDescription() error = %v", err)
+	}
+	codecs := SelectSDPAnswerCodecs(offer.Codecs, []SDPCodec{
+		NewSDPAMRCodec(0, "octet-align=1"),
+		NewSDPTelephoneEventCodec(0, 8000),
+	})
+	if len(codecs) != 1 || codecs[0].Payload != 110 || codecs[0].EncodingName != "telephone-event" {
+		t.Fatalf("selected codecs=%+v", codecs)
+	}
+}
+
+func TestSDPFmtpParametersRoundTrip(t *testing.T) {
+	params := ParseSDPFmtpParameters("mode-set=7,2; octet-align=1; mode-change-period=2")
+	if params["octet-align"] != "1" || params["mode-set"] != "7,2" || params["mode-change-period"] != "2" {
+		t.Fatalf("params=%+v", params)
+	}
+	if got := BuildSDPFmtpParameters(map[string]string{
+		"Mode-Set":           params["mode-set"],
+		" OCTET-ALIGN ":      params["octet-align"],
+		"mode-change-period": params["mode-change-period"],
+	}); got != "octet-align=1;mode-set=7,2;mode-change-period=2" {
+		t.Fatalf("BuildSDPFmtpParameters()=%q", got)
 	}
 }
 
