@@ -189,11 +189,99 @@ func TestIKEPacketTunnelManagerWiresLivenessDPDHandler(t *testing.T) {
 		gotPacketConfig.DPDHandler == nil {
 		t.Fatalf("packet session liveness=%+v dpd=%v", gotPacketConfig.Liveness, gotPacketConfig.DPDHandler != nil)
 	}
+	if gotPacketConfig.RekeyHandler == nil {
+		t.Fatal("packet session config missing rekey handler")
+	}
 	if err := gotPacketConfig.DPDHandler(context.Background()); err != nil {
 		t.Fatalf("DPDHandler() error = %v", err)
 	}
 	if control.requests != 1 {
 		t.Fatalf("control requests=%d, want 1", control.requests)
+	}
+}
+
+func TestIKEPacketTunnelManagerWiresChildSARekeyHandler(t *testing.T) {
+	init := ikeControlInit(t)
+	oldChild := packetChildSA(true)
+	oldChild.LocalSPI = []byte{0x11, 0x22, 0x33, 0x44}
+	oldChild.SelectedSA = ikev2.DefaultESPProposal(oldChild.RemoteSPI)
+	oldChild.TSi = ikev2.IPv4AnyTrafficSelectors()
+	oldChild.TSr = ikev2.IPv4AnyTrafficSelectors()
+	firstLocalSPI := []byte{0xaa, 0xbb, 0xcc, 0xdd}
+	secondLocalSPI := []byte{0xee, 0xff, 0x00, 0x11}
+	random := append([]byte{}, firstLocalSPI...)
+	random = append(random, bytes.Repeat([]byte{0x31}, 32)...)
+	random = append(random, bytes.Repeat([]byte{0x32}, init.Keys.Profile.EncryptionBlockSize)...)
+	random = append(random, secondLocalSPI...)
+	random = append(random, bytes.Repeat([]byte{0x41}, 32)...)
+	random = append(random, bytes.Repeat([]byte{0x42}, init.Keys.Profile.EncryptionBlockSize)...)
+	transport := &ikeRekeyTransport{
+		t:          t,
+		init:       init,
+		keys:       init.Keys,
+		messageIDs: []uint32{7, 8},
+		localSPIs:  [][]byte{firstLocalSPI, secondLocalSPI},
+		remoteSPIs: [][]byte{
+			{0xca, 0xfe, 0xba, 0xbe},
+			{0xba, 0xad, 0xf0, 0x0d},
+		},
+		rekeySPIs: [][]byte{oldChild.LocalSPI, firstLocalSPI},
+	}
+	var gotPacketConfig PacketSessionConfig
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
+		SIM:          ikeTunnelAKAProvider{},
+		Random:       bytes.NewReader(random),
+		ChildSPI:     oldChild.LocalSPI,
+		Transport:    transport,
+		ESPTransport: &captureESPPacketTransport{},
+		InitRunner: func(ctx context.Context, cfg ikev2.InitConfig) (ikev2.InitResult, error) {
+			return init, nil
+		},
+		AuthRunner: func(ctx context.Context, cfg ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
+			if !bytes.Equal(cfg.ChildSPI, oldChild.LocalSPI) {
+				t.Fatalf("auth child SPI=%x, want %x", cfg.ChildSPI, oldChild.LocalSPI)
+			}
+			return ikev2.FullAuthResult{ChildSA: &oldChild, NextMessageID: 7}, nil
+		},
+		PacketSessionFactory: func(cfg PacketSessionConfig) (TunnelSession, error) {
+			gotPacketConfig = cfg
+			return ikeTunnelStaticSession{result: cfg.Result}, nil
+		},
+	})
+
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:    "dev-1",
+		Mode:        DataplaneModeUserspace,
+		EPDGAddress: "198.51.100.7",
+		IMSI:        "310280233641503",
+		MCC:         "310",
+		MNC:         "280",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	if gotPacketConfig.RekeyHandler == nil {
+		t.Fatal("packet session config missing rekey handler")
+	}
+	firstChild, err := gotPacketConfig.RekeyHandler(context.Background())
+	if err != nil {
+		t.Fatalf("RekeyHandler(first) error = %v", err)
+	}
+	secondChild, err := gotPacketConfig.RekeyHandler(context.Background())
+	if err != nil {
+		t.Fatalf("RekeyHandler(second) error = %v", err)
+	}
+	if transport.requests != 2 || transport.sawRekey != 2 {
+		t.Fatalf("transport requests=%d sawRekey=%d", transport.requests, transport.sawRekey)
+	}
+	if !bytes.Equal(firstChild.LocalSPI, firstLocalSPI) || !bytes.Equal(firstChild.RemoteSPI, transport.remoteSPIs[0]) ||
+		firstChild.NextMessageID != 8 {
+		t.Fatalf("first child=%+v", firstChild)
+	}
+	if !bytes.Equal(secondChild.LocalSPI, secondLocalSPI) || !bytes.Equal(secondChild.RemoteSPI, transport.remoteSPIs[1]) ||
+		secondChild.NextMessageID != 9 {
+		t.Fatalf("second child=%+v", secondChild)
 	}
 }
 
@@ -506,6 +594,101 @@ func (s ikeTunnelStaticSession) MOBIKE(context.Context, MOBIKERequest) (MOBIKERe
 
 func (s ikeTunnelStaticSession) Close(context.Context) error {
 	return nil
+}
+
+type ikeRekeyTransport struct {
+	t          *testing.T
+	init       ikev2.InitResult
+	keys       ikev2.IKEKeys
+	messageIDs []uint32
+	localSPIs  [][]byte
+	remoteSPIs [][]byte
+	rekeySPIs  [][]byte
+	requests   int
+	sawRekey   int
+}
+
+func (tr *ikeRekeyTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
+	tr.t.Helper()
+	requestIndex := tr.requests
+	if requestIndex >= len(tr.messageIDs) || requestIndex >= len(tr.localSPIs) ||
+		requestIndex >= len(tr.remoteSPIs) || requestIndex >= len(tr.rekeySPIs) {
+		tr.t.Fatalf("unexpected rekey request index %d", requestIndex)
+	}
+	messageID := tr.messageIDs[requestIndex]
+	localSPI := tr.localSPIs[requestIndex]
+	rekeySPI := tr.rekeySPIs[requestIndex]
+	msg, inner, err := ikev2.UnprotectMessage(request, tr.keys, true)
+	if err != nil {
+		tr.t.Fatalf("UnprotectMessage(rekey request) error = %v", err)
+	}
+	if msg.Header.ExchangeType != ikev2.ExchangeCREATE_CHILD_SA || msg.Header.MessageID != messageID ||
+		msg.Header.Flags&ikev2.FlagInitiator == 0 {
+		tr.t.Fatalf("rekey request header=%+v", msg.Header)
+	}
+	tr.requests++
+	var sawSA bool
+	for _, payload := range inner {
+		switch payload.Type {
+		case ikev2.PayloadNotify:
+			notify, err := ikev2.ParseNotify(payload.Body)
+			if err != nil {
+				tr.t.Fatalf("ParseNotify(rekey) error = %v", err)
+			}
+			if notify.NotifyType == ikev2.NotifyRekeySA {
+				if notify.ProtocolID != ikev2.ProtocolESP || !bytes.Equal(notify.SPI, rekeySPI) {
+					tr.t.Fatalf("rekey notify=%+v want SPI %x", notify, rekeySPI)
+				}
+				tr.sawRekey++
+			}
+		case ikev2.PayloadSA:
+			sa, err := ikev2.ParseSecurityAssociation(payload.Body)
+			if err != nil {
+				tr.t.Fatalf("ParseSecurityAssociation(rekey) error = %v", err)
+			}
+			if len(sa.Proposals) != 1 || !bytes.Equal(sa.Proposals[0].SPI, localSPI) {
+				tr.t.Fatalf("request SA=%+v want local SPI %x", sa, localSPI)
+			}
+			sawSA = true
+		}
+	}
+	if !sawSA {
+		tr.t.Fatal("rekey request missing SA")
+	}
+	saPayload, err := ikev2.SecurityAssociationPayload(ikev2.DefaultESPProposal(tr.remoteSPIs[requestIndex]))
+	if err != nil {
+		tr.t.Fatalf("SecurityAssociationPayload(response) error = %v", err)
+	}
+	tsiPayload, err := ikev2.TrafficSelectorsPayload(ikev2.PayloadTSi, ikev2.IPv4AnyTrafficSelectors())
+	if err != nil {
+		tr.t.Fatalf("TrafficSelectorsPayload(TSi) error = %v", err)
+	}
+	tsrPayload, err := ikev2.TrafficSelectorsPayload(ikev2.PayloadTSr, ikev2.IPv4AnyTrafficSelectors())
+	if err != nil {
+		tr.t.Fatalf("TrafficSelectorsPayload(TSr) error = %v", err)
+	}
+	_, raw, err := ikev2.ProtectMessage(
+		ikev2.Header{
+			InitiatorSPI: tr.init.InitiatorSPI,
+			ResponderSPI: tr.init.ResponderSPI,
+			ExchangeType: ikev2.ExchangeCREATE_CHILD_SA,
+			Flags:        ikev2.FlagResponse,
+			MessageID:    messageID,
+		},
+		tr.keys,
+		false,
+		[]ikev2.Payload{
+			saPayload,
+			ikev2.NoncePayload(bytes.Repeat([]byte{byte(0x90 + requestIndex)}, 32)),
+			tsiPayload,
+			tsrPayload,
+		},
+		bytes.Repeat([]byte{byte(0xa0 + requestIndex)}, tr.keys.Profile.EncryptionBlockSize),
+	)
+	if err != nil {
+		tr.t.Fatalf("ProtectMessage(rekey response) error = %v", err)
+	}
+	return raw, nil
 }
 
 type ikeTunnelAKAProvider struct{}

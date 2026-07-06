@@ -178,6 +178,39 @@ func TestBuildAndParseUSIMAuth(t *testing.T) {
 	}
 }
 
+func TestParseUSIMAuthResponseNestedTLVAndPadding(t *testing.T) {
+	successPayload := append([]byte{0x04, 0x11, 0x22, 0x33, 0x44, 0x10}, bytesFrom(0x01, 16)...)
+	successPayload = append(successPayload, 0x10)
+	successPayload = append(successPayload, bytesFrom(0x21, 16)...)
+	success := append([]byte{0xDB, byte(len(successPayload))}, successPayload...)
+	wrapped := append([]byte{0xA0, byte(len(success))}, success...)
+	wrapped = append(wrapped, 0x00, 0xFF)
+	res, err := ParseUSIMAuthResponse(wrapped, 0x90, 0x00)
+	if err != nil {
+		t.Fatalf("ParseUSIMAuthResponse(wrapped success) error = %v", err)
+	}
+	if hex.EncodeToString(res.RES) != "11223344" || len(res.CK) != 16 || len(res.IK) != 16 {
+		t.Fatalf("wrapped AKA result=%+v", res)
+	}
+
+	auts := bytesFrom(0xA0, AKAAUTSLength)
+	wrappedSync := append([]byte{0xA0, 0x10, 0xDC, 0x0E}, auts...)
+	res, err = ParseUSIMAuthResponse(wrappedSync, 0x90, 0x00)
+	if !errors.Is(err, swusim.ErrSyncFailure) || hex.EncodeToString(res.AUTS) != hex.EncodeToString(auts) {
+		t.Fatalf("wrapped sync failure res=%+v err=%v", res, err)
+	}
+
+	_, err = ParseUSIMAuthResponse([]byte{0xA0, 0x02, 0xDD, 0x00}, 0x90, 0x00)
+	if !errors.Is(err, swusim.ErrAuthFailure) {
+		t.Fatalf("wrapped MAC failure err=%v, want ErrAuthFailure", err)
+	}
+
+	_, err = ParseUSIMAuthResponse(append([]byte{0xDC, 0x0E}, append(bytesFrom(0xA0, AKAAUTSLength), 0x01)...), 0x90, 0x00)
+	if err == nil {
+		t.Fatal("ParseUSIMAuthResponse(non-padding trailing byte) err=nil, want error")
+	}
+}
+
 func TestParseAUTSFields(t *testing.T) {
 	raw := bytesFrom(0x10, AKAAUTSLength)
 	fields, err := ParseAUTS(raw)
@@ -236,10 +269,15 @@ func TestParseUSIMAuthRejectsInvalidLengths(t *testing.T) {
 		t.Fatal("ParseUSIMAuthResponse(short AUTS) err=nil, want error")
 	}
 
+	padded := append([]byte{0xDC, 0x0E}, bytesFrom(0xA0, 14)...)
+	padded = append(padded, 0x00, 0xFF)
+	if _, err := ParseUSIMAuthResponse(padded, 0x90, 0x00); !errors.Is(err, swusim.ErrSyncFailure) {
+		t.Fatalf("ParseUSIMAuthResponse(padded AUTS) err=%v, want ErrSyncFailure", err)
+	}
 	trailing := append([]byte{0xDC, 0x0E}, bytesFrom(0xA0, 14)...)
-	trailing = append(trailing, 0x00)
+	trailing = append(trailing, 0x01)
 	if _, err := ParseUSIMAuthResponse(trailing, 0x90, 0x00); err == nil {
-		t.Fatal("ParseUSIMAuthResponse(trailing TLV bytes) err=nil, want error")
+		t.Fatal("ParseUSIMAuthResponse(non-padding trailing TLV bytes) err=nil, want error")
 	}
 }
 

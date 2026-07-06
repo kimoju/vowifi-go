@@ -2121,6 +2121,122 @@ func TestBuildIMSDialogRequestsIncludeSessionRefresher(t *testing.T) {
 	}
 }
 
+func TestParseDialogSessionTimerInfoAndRefreshDelay(t *testing.T) {
+	resp := SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers: map[string][]string{
+			"Session-Expires": {"1800;refresher=uac"},
+			"Min-SE":          {"90"},
+		},
+	}
+	info, err := ParseDialogSessionTimerInfo(resp)
+	if err != nil {
+		t.Fatalf("ParseDialogSessionTimerInfo() error = %v", err)
+	}
+	if !info.Active || info.Interval != 1800 || info.Refresher != "uac" || info.MinSE != 90 ||
+		info.RefreshAfter != 900*time.Second || info.RetryRequired {
+		t.Fatalf("timer info=%+v", info)
+	}
+	delay, ok, err := DialogSessionRefreshDelay(DialogRequestConfig{}, resp)
+	if err != nil || !ok || delay != 900*time.Second {
+		t.Fatalf("DialogSessionRefreshDelay() delay=%v ok=%v err=%v", delay, ok, err)
+	}
+}
+
+func TestDialogSessionRefreshDelaySkipsRemoteRefresher(t *testing.T) {
+	resp := SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"Session-Expires": {"120;refresher=uas"}},
+	}
+	delay, ok, err := DialogSessionRefreshDelay(DialogRequestConfig{SessionRefresher: "uac"}, resp)
+	if err != nil || ok || delay != 0 {
+		t.Fatalf("DialogSessionRefreshDelay(uas) delay=%v ok=%v err=%v", delay, ok, err)
+	}
+
+	resp.Headers["Session-Expires"] = []string{"120"}
+	delay, ok, err = DialogSessionRefreshDelay(DialogRequestConfig{SessionRefresher: "uas"}, resp)
+	if err != nil || ok || delay != 0 {
+		t.Fatalf("DialogSessionRefreshDelay(fallback uas) delay=%v ok=%v err=%v", delay, ok, err)
+	}
+	delay, ok, err = DialogSessionRefreshDelay(DialogRequestConfig{}, resp)
+	if err != nil || !ok || delay != time.Minute {
+		t.Fatalf("DialogSessionRefreshDelay(default uac) delay=%v ok=%v err=%v", delay, ok, err)
+	}
+}
+
+func TestParseDialogSessionTimerInfoHandlesMinSEAndRejectsMalformedHeaders(t *testing.T) {
+	info, err := ParseDialogSessionTimerInfo(SIPResponse{
+		StatusCode: 422,
+		Reason:     "Session Interval Too Small",
+		Headers:    map[string][]string{"Min-SE": {"600"}},
+	})
+	if err != nil {
+		t.Fatalf("ParseDialogSessionTimerInfo(422) error = %v", err)
+	}
+	if info.Active || !info.RetryRequired || info.MinSE != 600 {
+		t.Fatalf("422 timer info=%+v", info)
+	}
+	for name, resp := range map[string]SIPResponse{
+		"bad Session-Expires": {
+			StatusCode: 200,
+			Headers:    map[string][]string{"Session-Expires": {"zero;refresher=uac"}},
+		},
+		"bad refresher": {
+			StatusCode: 200,
+			Headers:    map[string][]string{"Session-Expires": {"1800;refresher=peer"}},
+		},
+		"bad Min-SE": {
+			StatusCode: 422,
+			Headers:    map[string][]string{"Min-SE": {"0"}},
+		},
+	} {
+		if _, err := ParseDialogSessionTimerInfo(resp); !errors.Is(err, ErrInvalidSIPMessage) {
+			t.Fatalf("%s error=%v, want ErrInvalidSIPMessage", name, err)
+		}
+	}
+}
+
+func TestDialogSessionTimerRetryConfigAppliesMinSE(t *testing.T) {
+	cfg := DialogRequestConfig{
+		Profile:         IMSProfile{IMPU: "sip:user@example"},
+		Registration:    RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060"},
+		RemoteURI:       "sip:+18005551212@ims.example",
+		RemoteTargetURI: "sip:+18005551212@pcscf.example",
+		CallID:          "call-min-se",
+		CSeq:            8,
+		SessionExpires:  90,
+		MinSE:           60,
+	}
+	next, ok, err := DialogSessionTimerRetryConfig(cfg, SIPResponse{
+		StatusCode: 422,
+		Reason:     "Session Interval Too Small",
+		Headers:    map[string][]string{"Min-SE": {"600"}},
+	})
+	if err != nil || !ok {
+		t.Fatalf("DialogSessionTimerRetryConfig() ok=%v err=%v", ok, err)
+	}
+	if next.MinSE != 600 || next.SessionExpires != 600 || next.CallID != cfg.CallID || next.CSeq != cfg.CSeq {
+		t.Fatalf("next config=%+v", next)
+	}
+	update, err := BuildUpdateRequest(next, nil)
+	if err != nil {
+		t.Fatalf("BuildUpdateRequest(retry) error = %v", err)
+	}
+	if update.Headers["Min-SE"] != "600" || update.Headers["Session-Expires"] != "600" {
+		t.Fatalf("retry UPDATE headers=%+v", update.Headers)
+	}
+
+	unchanged, ok, err := DialogSessionTimerRetryConfig(cfg, SIPResponse{StatusCode: 200})
+	if err != nil || ok || unchanged.MinSE != cfg.MinSE || unchanged.SessionExpires != cfg.SessionExpires {
+		t.Fatalf("non-422 next=%+v ok=%v err=%v", unchanged, ok, err)
+	}
+	if _, ok, err := DialogSessionTimerRetryConfig(cfg, SIPResponse{StatusCode: 422}); !errors.Is(err, ErrInvalidSIPMessage) || ok {
+		t.Fatalf("missing Min-SE ok=%v err=%v, want ErrInvalidSIPMessage", ok, err)
+	}
+}
+
 func TestParseProvisionalResponseInfoReliableEarlyMedia(t *testing.T) {
 	body := []byte("v=0\r\nm=audio 40000 RTP/AVP 0\r\n")
 	resp := SIPResponse{

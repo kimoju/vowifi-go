@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestClassifyRecoveryErrors(t *testing.T) {
@@ -117,6 +118,56 @@ func TestAPDUStatusRecoveryPlan(t *testing.T) {
 	plan = PlanAPDUStatusRecovery(0x90, 0x00)
 	if plan.Recoverable() {
 		t.Fatalf("9000 plan=%+v, want not recoverable", plan)
+	}
+}
+
+func TestATControlRecoveryPlan(t *testing.T) {
+	tests := []struct {
+		name    string
+		class   RecoveryClass
+		attempt int
+		want    []ATRecoveryStep
+	}{
+		{
+			name:    "control port first attempt uses cfun cycle",
+			class:   RecoveryClassControlPortHung,
+			attempt: -1,
+			want: []ATRecoveryStep{
+				{Command: "AT+CFUN=0", Timeout: 5 * time.Second, DelayAfter: 2 * time.Second, ContinueOnError: true},
+				{Command: "AT+CFUN=1", Timeout: 10 * time.Second, DelayAfter: 5 * time.Second},
+			},
+		},
+		{
+			name:    "at error second attempt restarts modem",
+			class:   RecoveryClassATError,
+			attempt: 1,
+			want: []ATRecoveryStep{
+				{Command: "AT+CFUN=1,1", Timeout: 10 * time.Second, DelayAfter: 20 * time.Second},
+			},
+		},
+		{
+			name:    "later attempts use vendor reset",
+			class:   RecoveryClassControlPortHung,
+			attempt: 2,
+			want: []ATRecoveryStep{
+				{Command: "AT!RESET", Timeout: 10 * time.Second, DelayAfter: 30 * time.Second, VendorSpecific: true},
+			},
+		},
+		{
+			name:    "non control class has no reset plan",
+			class:   RecoveryClassFileNotFound,
+			attempt: 0,
+			want:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := PlanATControlRecovery(tt.class, tt.attempt)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("PlanATControlRecovery() = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }
 

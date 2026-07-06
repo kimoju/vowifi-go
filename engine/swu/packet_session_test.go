@@ -3,6 +3,7 @@ package swu
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"testing"
@@ -97,6 +98,119 @@ func TestPacketSessionResultClonesDNSServers(t *testing.T) {
 	result.DNSServers[0] = "198.51.100.53"
 	if got := session.Result().DNSServers[0]; got != "10.0.0.1" {
 		t.Fatalf("Result() DNS=%q, want original", got)
+	}
+}
+
+func TestPacketSessionRekeyChildSAReplacesSAsAndResult(t *testing.T) {
+	transport := &captureESPPacketTransport{}
+	newChild := packetRekeyChildSA(true)
+	rekeyCalls := 0
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: transport,
+		Result: TunnelResult{
+			Ready:             true,
+			Mode:              DataplaneModeUserspace,
+			IKEEstablished:    true,
+			IPsecEstablished:  true,
+			LocalInnerIP:      "10.0.0.2",
+			RemoteInnerIP:     "0.0.0.0/0",
+			DNSServers:        []string{"10.0.0.1"},
+			ChildSAIdentifier: "11111111/22222222",
+			Reason:            "packet tunnel ready",
+		},
+		RekeyHandler: func(context.Context) (ikev2.ChildSAResult, error) {
+			rekeyCalls++
+			return newChild, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	if err := session.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14}); err != nil {
+		t.Fatalf("SendInnerPacket(before rekey) error = %v", err)
+	}
+	statsBefore := session.PacketStats()
+
+	result, err := session.RekeyChildSA(context.Background())
+	if err != nil {
+		t.Fatalf("RekeyChildSA() error = %v", err)
+	}
+	if rekeyCalls != 1 {
+		t.Fatalf("rekey calls=%d, want 1", rekeyCalls)
+	}
+	if !result.IsReady() || result.ChildSAIdentifier != "33333333/44444444" ||
+		result.Reason != "child sa rekeyed" || result.LocalInnerIP != "10.0.0.2" ||
+		len(result.DNSServers) != 1 || result.DNSServers[0] != "10.0.0.1" {
+		t.Fatalf("result=%+v", result)
+	}
+	if stats := session.PacketStats(); stats != statsBefore {
+		t.Fatalf("stats changed during rekey: before=%+v after=%+v", statsBefore, stats)
+	}
+
+	if err := session.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14, 0xaa}); err != nil {
+		t.Fatalf("SendInnerPacket(after rekey) error = %v", err)
+	}
+	if gotSPI := binary.BigEndian.Uint32(transport.packets[len(transport.packets)-1][0:4]); gotSPI != 0x44444444 {
+		t.Fatalf("outbound SPI=%08x, want new remote SPI", gotSPI)
+	}
+	peerOutbound, err := esp.NewOutboundSAFromChild(packetRekeyChildSA(false))
+	if err != nil {
+		t.Fatalf("NewOutboundSAFromChild(peer) error = %v", err)
+	}
+	packet, err := peerOutbound.Seal(esp.NextHeaderIPv4, []byte{0x45, 0x00, 0x00, 0x14, 0xbb}, esp.SealOptions{
+		Sequence: 1,
+		IV:       bytes.Repeat([]byte{0x77}, 16),
+	})
+	if err != nil {
+		t.Fatalf("Seal(peer) error = %v", err)
+	}
+	got, err := session.ReceiveESPPacket(context.Background(), packet)
+	if err != nil {
+		t.Fatalf("ReceiveESPPacket(after rekey) error = %v", err)
+	}
+	if got.SPI != 0x33333333 || got.NextHeader != esp.NextHeaderIPv4 {
+		t.Fatalf("received packet=%+v", got)
+	}
+}
+
+func TestPacketSessionRekeyChildSAErrorKeepsOldSAAndResult(t *testing.T) {
+	wantErr := errors.New("rekey failed")
+	transport := &captureESPPacketTransport{}
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: transport,
+		Result: TunnelResult{
+			Ready:             true,
+			Mode:              DataplaneModeUserspace,
+			IKEEstablished:    true,
+			IPsecEstablished:  true,
+			ChildSAIdentifier: "11111111/22222222",
+			Reason:            "packet tunnel ready",
+		},
+		RekeyHandler: func(context.Context) (ikev2.ChildSAResult, error) {
+			return ikev2.ChildSAResult{}, wantErr
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	statsBefore := session.PacketStats()
+	_, err = session.RekeyChildSA(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("RekeyChildSA() err=%v, want rekey failed", err)
+	}
+	if result := session.Result(); result.ChildSAIdentifier != "11111111/22222222" || result.Reason != "packet tunnel ready" || !result.IsReady() {
+		t.Fatalf("result changed after failed rekey: %+v", result)
+	}
+	if stats := session.PacketStats(); stats != statsBefore {
+		t.Fatalf("stats changed during failed rekey: before=%+v after=%+v", statsBefore, stats)
+	}
+	if err := session.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14}); err != nil {
+		t.Fatalf("SendInnerPacket(after failed rekey) error = %v", err)
+	}
+	if gotSPI := binary.BigEndian.Uint32(transport.packets[0][0:4]); gotSPI != 0x22222222 {
+		t.Fatalf("outbound SPI=%08x, want old remote SPI", gotSPI)
 	}
 }
 
@@ -457,6 +571,34 @@ func packetChildSA(aToB bool) ikev2.ChildSAResult {
 	}
 	child.LocalSPI = []byte{0x22, 0x22, 0x22, 0x22}
 	child.RemoteSPI = []byte{0x11, 0x11, 0x11, 0x11}
+	child.Keys.Outbound = aInbound
+	child.Keys.Inbound = aOutbound
+	return child
+}
+
+func packetRekeyChildSA(aToB bool) ikev2.ChildSAResult {
+	aOutbound := ikev2.ESPKeys{
+		EncryptionKey: bytes.Repeat([]byte{0x50}, 16),
+		IntegrityKey:  bytes.Repeat([]byte{0x60}, 32),
+	}
+	aInbound := ikev2.ESPKeys{
+		EncryptionKey: bytes.Repeat([]byte{0x70}, 16),
+		IntegrityKey:  bytes.Repeat([]byte{0x80}, 32),
+	}
+	child := ikev2.ChildSAResult{
+		LocalSPI:  []byte{0x33, 0x33, 0x33, 0x33},
+		RemoteSPI: []byte{0x44, 0x44, 0x44, 0x44},
+		Keys: ikev2.ChildSAKeys{
+			Profile:  ikev2.ESPKeyProfile{IntegrityID: ikev2.INTEG_HMAC_SHA2_256_128},
+			Outbound: aOutbound,
+			Inbound:  aInbound,
+		},
+	}
+	if aToB {
+		return child
+	}
+	child.LocalSPI = []byte{0x44, 0x44, 0x44, 0x44}
+	child.RemoteSPI = []byte{0x33, 0x33, 0x33, 0x33}
 	child.Keys.Outbound = aInbound
 	child.Keys.Inbound = aOutbound
 	return child

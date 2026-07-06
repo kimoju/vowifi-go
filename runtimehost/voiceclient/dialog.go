@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var ErrInvalidDialogConfig = errors.New("invalid IMS dialog config")
@@ -88,6 +89,15 @@ type ProvisionalResponseInfo struct {
 	SDP             []byte
 	RemoteTag       string
 	RemoteTargetURI string
+}
+
+type DialogSessionTimerInfo struct {
+	Active        bool
+	Interval      int
+	Refresher     string
+	MinSE         int
+	RefreshAfter  time.Duration
+	RetryRequired bool
 }
 
 func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage, error) {
@@ -262,6 +272,65 @@ func ParseProvisionalResponseInfo(resp SIPResponse) (ProvisionalResponseInfo, er
 	info.CSeqMethod = method
 	info.RAck = strconv.Itoa(rseq) + " " + strconv.Itoa(cseq) + " " + method
 	return info, nil
+}
+
+func ParseDialogSessionTimerInfo(resp SIPResponse) (DialogSessionTimerInfo, error) {
+	info := DialogSessionTimerInfo{
+		RetryRequired: resp.StatusCode == 422,
+	}
+	if minSE := firstHeader(resp.Headers, "Min-SE"); strings.TrimSpace(minSE) != "" {
+		value, err := parsePositiveSIPHeaderInt(minSE)
+		if err != nil {
+			return info, fmt.Errorf("%w: invalid Min-SE", ErrInvalidSIPMessage)
+		}
+		info.MinSE = value
+	}
+	sessionExpires := firstHeader(resp.Headers, "Session-Expires")
+	if strings.TrimSpace(sessionExpires) == "" {
+		return info, nil
+	}
+	interval, refresher, err := parseSessionExpiresHeader(sessionExpires)
+	if err != nil {
+		return info, err
+	}
+	info.Active = true
+	info.Interval = interval
+	info.Refresher = refresher
+	info.RefreshAfter = sessionRefreshDelay(interval)
+	return info, nil
+}
+
+func DialogSessionRefreshDelay(cfg DialogRequestConfig, resp SIPResponse) (time.Duration, bool, error) {
+	info, err := ParseDialogSessionTimerInfo(resp)
+	if err != nil || !info.Active {
+		return 0, false, err
+	}
+	refresher := info.Refresher
+	if refresher == "" {
+		refresher = normalizeSessionRefresher(cfg.SessionRefresher)
+	}
+	if refresher == "uas" {
+		return 0, false, nil
+	}
+	return info.RefreshAfter, true, nil
+}
+
+func DialogSessionTimerRetryConfig(cfg DialogRequestConfig, resp SIPResponse) (DialogRequestConfig, bool, error) {
+	info, err := ParseDialogSessionTimerInfo(resp)
+	if err != nil || !info.RetryRequired {
+		return cfg, false, err
+	}
+	if info.MinSE <= 0 {
+		return cfg, false, fmt.Errorf("%w: 422 response missing Min-SE", ErrInvalidSIPMessage)
+	}
+	next := cfg
+	if next.MinSE < info.MinSE {
+		next.MinSE = info.MinSE
+	}
+	if next.SessionExpires <= 0 || next.SessionExpires < next.MinSE {
+		next.SessionExpires = next.MinSE
+	}
+	return next, true, nil
 }
 
 func AdvanceDialogSessionState(state DialogSessionState, method string, resp SIPResponse) DialogSessionState {
@@ -742,6 +811,36 @@ func parsePositiveSIPHeaderInt(value string) (int, error) {
 		return 0, ErrInvalidSIPMessage
 	}
 	return n, nil
+}
+
+func parseSessionExpiresHeader(value string) (int, string, error) {
+	parts := splitSIPHeaderParams(value)
+	if len(parts) == 0 {
+		return 0, "", fmt.Errorf("%w: invalid Session-Expires", ErrInvalidSIPMessage)
+	}
+	interval, err := parsePositiveSIPHeaderInt(parts[0])
+	if err != nil {
+		return 0, "", fmt.Errorf("%w: invalid Session-Expires", ErrInvalidSIPMessage)
+	}
+	var refresher string
+	for _, part := range parts[1:] {
+		key, raw, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "refresher") {
+			continue
+		}
+		refresher = normalizeSessionRefresher(strings.Trim(strings.TrimSpace(raw), `"`))
+		if refresher == "" {
+			return 0, "", fmt.Errorf("%w: invalid Session-Expires refresher", ErrInvalidSIPMessage)
+		}
+	}
+	return interval, refresher, nil
+}
+
+func sessionRefreshDelay(interval int) time.Duration {
+	if interval <= 1 {
+		return time.Second
+	}
+	return time.Duration(interval/2) * time.Second
 }
 
 func firstContactURI(headers map[string][]string) string {

@@ -122,6 +122,27 @@ func TestPrepareStartPrefersSIPIMPUOverTEL(t *testing.T) {
 	}
 }
 
+func TestPrepareStartDerivesProfileIMSIdentityWith3GPPRealm(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		Profile: Profile{IMSI: "001010123456789"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.Profile.MCC != "001" || prepared.Profile.MNC != "010" {
+		t.Fatalf("profile PLMN=(%q,%q), want 001/010", prepared.Profile.MCC, prepared.Profile.MNC)
+	}
+	if prepared.IMSIdentity.IMPI != "001010123456789@ims.mnc010.mcc001.3gppnetwork.org" ||
+		prepared.IMSIdentity.IMPU != "sip:001010123456789@ims.mnc010.mcc001.3gppnetwork.org" ||
+		prepared.IMSIdentity.Domain != "ims.mnc010.mcc001.3gppnetwork.org" ||
+		prepared.IMSIdentity.ActualSource != IMSIdentitySourceProfile {
+		t.Fatalf("profile IMS identity=%+v", prepared.IMSIdentity)
+	}
+	if prepared.EPDGAddr != "epdg.epc.mnc010.mcc001.pub.3gppnetwork.org" {
+		t.Fatalf("EPDGAddr=%q", prepared.EPDGAddr)
+	}
+}
+
 func TestPrepareStartPrefersDomainMatchedSIPIMPU(t *testing.T) {
 	prepared, err := PrepareStart(PrepareStartInput{
 		Profile: Profile{IMSI: "001010123456789"},

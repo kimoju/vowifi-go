@@ -41,6 +41,8 @@ func (f ESPPacketTransportFunc) SendESPPacket(ctx context.Context, packet []byte
 	return f(ctx, packet)
 }
 
+type ChildSARekeyHandler func(context.Context) (ikev2.ChildSAResult, error)
+
 type ESPPacketTransportCloser interface {
 	ESPPacketTransport
 	Close(context.Context) error
@@ -94,6 +96,7 @@ type PacketSessionConfig struct {
 	Transport     ESPPacketTransport
 	Random        io.Reader
 	MOBIKEHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
+	RekeyHandler  ChildSARekeyHandler
 	MOBIKENAT     *MOBIKENATState
 	Liveness      *IKELivenessState
 	DPDHandler    func(context.Context) error
@@ -108,6 +111,7 @@ type PacketSession struct {
 	transport     ESPPacketTransport
 	random        io.Reader
 	mobikeHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
+	rekeyHandler  ChildSARekeyHandler
 	mobikeNAT     *MOBIKENATState
 	liveness      *IKELivenessState
 	dpdHandler    func(context.Context) error
@@ -121,6 +125,7 @@ var (
 	_ PacketTunnelReadSession = (*PacketSession)(nil)
 	_ MOBIKENATObserver       = (*PacketSession)(nil)
 	_ IKELivenessController   = (*PacketSession)(nil)
+	_ ChildSARekeyController  = (*PacketSession)(nil)
 )
 
 func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
@@ -153,6 +158,7 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 		transport:     cfg.Transport,
 		random:        cfg.Random,
 		mobikeHandler: cfg.MOBIKEHandler,
+		rekeyHandler:  cfg.RekeyHandler,
 		mobikeNAT:     cfg.MOBIKENAT,
 		liveness:      cfg.Liveness,
 		dpdHandler:    cfg.DPDHandler,
@@ -181,6 +187,58 @@ func (s *PacketSession) Result() TunnelResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneTunnelResult(s.result)
+}
+
+func (s *PacketSession) RekeyChildSA(ctx context.Context) (TunnelResult, error) {
+	if s == nil {
+		return TunnelResult{}, ErrInvalidPacketTunnel
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := contextReady(ctx); err != nil {
+		return TunnelResult{}, err
+	}
+	s.mu.Lock()
+	closed := s.closed
+	handler := s.rekeyHandler
+	s.mu.Unlock()
+	if closed {
+		return TunnelResult{}, ErrPacketTunnelClosed
+	}
+	if handler == nil {
+		return TunnelResult{}, fmt.Errorf("%w: child sa rekey handler is nil", ErrInvalidPacketTunnel)
+	}
+	child, err := handler(ctx)
+	if err != nil {
+		return TunnelResult{}, err
+	}
+	outbound, inbound, err := packetSAs(PacketSessionConfig{ChildSA: child})
+	if err != nil {
+		return TunnelResult{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return TunnelResult{}, ErrPacketTunnelClosed
+	}
+	s.outbound = outbound
+	s.inbound = inbound
+	s.result.IKEEstablished = true
+	s.result.IPsecEstablished = true
+	s.result.Ready = true
+	s.result.ChildSAIdentifier = childSAIdentifier(child)
+	s.result.Reason = "child sa rekeyed"
+	if local := firstPacketNonEmpty(
+		childConfigurationAddress(child, ikev2.ConfigInternalIPv4Address),
+		childConfigurationAddress(child, ikev2.ConfigInternalIPv6Address),
+	); local != "" {
+		s.result.LocalInnerIP = local
+	}
+	if dns := childConfigurationDNS(child); len(dns) > 0 {
+		s.result.DNSServers = dns
+	}
+	return cloneTunnelResult(s.result), nil
 }
 
 func (s *PacketSession) MOBIKE(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {

@@ -1401,8 +1401,7 @@ func (s *RTPRelaySession) recordRTCPSenderReport(event RTCPFeedbackEvent, observ
 	if s == nil || observedAt.IsZero() {
 		return
 	}
-	sr, ok := event.Packet.(*rtcp.SenderReport)
-	if !ok || sr.NTPTime == 0 {
+	if event.Kind != RTCPFeedbackSenderReport || event.NTPTime == 0 {
 		return
 	}
 	direction, err := normalizeRTCPFeedbackDirection(event.Direction)
@@ -1410,23 +1409,23 @@ func (s *RTPRelaySession) recordRTCPSenderReport(event RTCPFeedbackEvent, observ
 		return
 	}
 	timing := rtpRelayRTCPSenderReportTiming{
-		lastSenderReport: rtcpLastSenderReport(sr.NTPTime),
+		lastSenderReport: rtcpLastSenderReport(event.NTPTime),
 		observedAt:       observedAt,
 	}
 	s.rtcpQualityMu.Lock()
 	if s.rtcpSenderReportTiming == nil {
 		s.rtcpSenderReportTiming = make(map[rtpRelayRTCPSenderReportKey]rtpRelayRTCPSenderReportTiming)
 	}
-	s.rtcpSenderReportTiming[rtpRelayRTCPSenderReportKey{direction: direction, ssrc: sr.SSRC}] = timing
+	s.rtcpSenderReportTiming[rtpRelayRTCPSenderReportKey{direction: direction, ssrc: event.SSRC}] = timing
 	s.rtcpQualityMu.Unlock()
 
 	s.rtpStatsMu.Lock()
 	defer s.rtpStatsMu.Unlock()
 	switch direction {
 	case RTCPFeedbackClientToIMS:
-		_, _ = s.clientToIMSRTPStats.ObserveRTCPSenderReport(sr.SSRC, sr.NTPTime, observedAt)
+		_, _ = s.clientToIMSRTPStats.ObserveRTCPSenderReport(event.SSRC, event.NTPTime, observedAt)
 	case RTCPFeedbackIMSToClient:
-		_, _ = s.imsToClientRTPStats.ObserveRTCPSenderReport(sr.SSRC, sr.NTPTime, observedAt)
+		_, _ = s.imsToClientRTPStats.ObserveRTCPSenderReport(event.SSRC, event.NTPTime, observedAt)
 	}
 }
 

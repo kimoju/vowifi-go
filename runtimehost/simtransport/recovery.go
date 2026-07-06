@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type RecoveryClass string
@@ -32,6 +33,15 @@ type APDURecoveryPlan struct {
 	Le     int
 }
 
+// ATRecoveryStep describes one command in a planned AT control recovery sequence.
+type ATRecoveryStep struct {
+	Command         string
+	Timeout         time.Duration
+	DelayAfter      time.Duration
+	ContinueOnError bool
+	VendorSpecific  bool
+}
+
 type recoveryClassifier interface {
 	RecoveryClass() RecoveryClass
 }
@@ -50,6 +60,49 @@ func (p APDURecoveryPlan) Recoverable() bool {
 
 func (p APDURecoveryPlan) LeByte() (byte, error) {
 	return apduLeByte(p.Le)
+}
+
+// PlanATControlRecovery returns a non-executing recovery sequence for a stuck AT control path.
+func PlanATControlRecovery(class RecoveryClass, attempt int) []ATRecoveryStep {
+	if !needsATControlRecovery(class) {
+		return nil
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+	switch attempt {
+	case 0:
+		return []ATRecoveryStep{
+			{
+				Command:         "AT+CFUN=0",
+				Timeout:         5 * time.Second,
+				DelayAfter:      2 * time.Second,
+				ContinueOnError: true,
+			},
+			{
+				Command:    "AT+CFUN=1",
+				Timeout:    10 * time.Second,
+				DelayAfter: 5 * time.Second,
+			},
+		}
+	case 1:
+		return []ATRecoveryStep{
+			{
+				Command:    "AT+CFUN=1,1",
+				Timeout:    10 * time.Second,
+				DelayAfter: 20 * time.Second,
+			},
+		}
+	default:
+		return []ATRecoveryStep{
+			{
+				Command:        "AT!RESET",
+				Timeout:        10 * time.Second,
+				DelayAfter:     30 * time.Second,
+				VendorSpecific: true,
+			},
+		}
+	}
 }
 
 func PlanAPDUStatusRecovery(sw1, sw2 byte) APDURecoveryPlan {
@@ -166,6 +219,10 @@ func (r APDUResult) RecoveryClass() RecoveryClass {
 
 func (r CRSMResult) RecoveryClass() RecoveryClass {
 	return StatusRecoveryClass(r.SW1, r.SW2)
+}
+
+func needsATControlRecovery(class RecoveryClass) bool {
+	return class == RecoveryClassControlPortHung || class == RecoveryClassATError
 }
 
 func classifyErrorText(text string) RecoveryClass {

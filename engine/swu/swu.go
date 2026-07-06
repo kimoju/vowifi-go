@@ -157,6 +157,10 @@ type IKELivenessController interface {
 	IKELivenessSnapshot() IKELivenessSnapshot
 }
 
+type ChildSARekeyController interface {
+	RekeyChildSA(context.Context) (TunnelResult, error)
+}
+
 type TunnelManager interface {
 	EstablishTunnel(context.Context, TunnelConfig) (TunnelSession, error)
 }

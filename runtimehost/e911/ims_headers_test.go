@@ -1,6 +1,7 @@
 package e911
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,6 +58,79 @@ func TestBuildEmergencySIPRequestInfoUsesIMSHeadersAndGeoURI(t *testing.T) {
 	}
 	if headers["Geolocation-Routing"] != "yes" {
 		t.Fatalf("Geolocation-Routing=%q", headers["Geolocation-Routing"])
+	}
+}
+
+func TestParseGeolocationHeaderParsesMultipleLocationsAndParameters(t *testing.T) {
+	values, err := ParseGeolocationHeader(`<cid:loc-1@example.test>;inserted-by=endpoint;purpose="emergency, callback", <geo:47.6205,-122.3493>;routing-allowed=yes`)
+	if err != nil {
+		t.Fatalf("ParseGeolocationHeader() error = %v", err)
+	}
+	if len(values) != 2 {
+		t.Fatalf("values=%+v", values)
+	}
+	if values[0].URI != "cid:loc-1@example.test" ||
+		values[0].Parameters["inserted-by"] != "endpoint" ||
+		values[0].Parameters["purpose"] != "emergency, callback" {
+		t.Fatalf("first value=%+v", values[0])
+	}
+	if values[1].URI != "geo:47.6205,-122.3493" || values[1].Parameters["routing-allowed"] != "yes" {
+		t.Fatalf("second value=%+v", values[1])
+	}
+}
+
+func TestBuildAndParseEmergencyPIDFLO(t *testing.T) {
+	body, err := BuildEmergencyPIDFLO(EmergencyPIDFLOConfig{
+		Entity:    "pres:device@example.test",
+		TupleID:   "loc-1",
+		Timestamp: time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC),
+		Address: EmergencyAddress{
+			Latitude:            "47.6205",
+			Longitude:           "-122.3493",
+			Country:             "US",
+			State:               "WA",
+			County:              "King",
+			City:                "Seattle",
+			Street:              "5th Ave",
+			HouseNumber:         "100",
+			Unit:                "2A",
+			Floor:               "7",
+			Room:                "701",
+			StreetDirection:     "N",
+			StreetPostDirection: "SW",
+			StreetSuffix:        "St",
+			LocationDescription: "Lobby",
+			PlaceType:           "office",
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildEmergencyPIDFLO() error = %v", err)
+	}
+	xmlBody := string(body)
+	for _, want := range []string{
+		`entity="pres:device@example.test"`,
+		`<gml:pos>47.6205 -122.3493</gml:pos>`,
+		`<cl:HNO>100</cl:HNO>`,
+		`<timestamp>2026-07-07T09:00:00Z</timestamp>`,
+	} {
+		if !strings.Contains(xmlBody, want) {
+			t.Fatalf("PIDF-LO body missing %q:\n%s", want, xmlBody)
+		}
+	}
+
+	address, err := ParseEmergencyPIDFLO(body)
+	if err != nil {
+		t.Fatalf("ParseEmergencyPIDFLO() error = %v", err)
+	}
+	if address.Latitude != "47.6205" || address.Longitude != "-122.3493" ||
+		address.Country != "US" || address.State != "WA" || address.County != "King" ||
+		address.City != "Seattle" || address.Street != "5th Ave" ||
+		address.HouseNumber != "100" || address.Unit != "2A" ||
+		address.Floor != "7" || address.Room != "701" ||
+		address.StreetDirection != "N" || address.StreetPostDirection != "SW" ||
+		address.StreetSuffix != "St" || address.LocationDescription != "Lobby" ||
+		address.PlaceType != "office" {
+		t.Fatalf("address=%+v fields=%+v", address, address.Fields)
 	}
 }
 

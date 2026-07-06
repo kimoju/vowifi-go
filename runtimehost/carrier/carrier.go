@@ -17,9 +17,11 @@ type E911Config struct {
 }
 
 type NetworkConfig struct {
-	IMSRealm string `json:"ims_realm"`
-	NAIRealm string `json:"nai_realm"`
-	EPDGFQDN string `json:"epdg_fqdn"`
+	IMSRealm        string `json:"ims_realm"`
+	NAIRealm        string `json:"nai_realm"`
+	PCSCFFQDN       string `json:"pcscf_fqdn"`
+	EPDGFQDN        string `json:"epdg_fqdn"`
+	EmergencyDomain string `json:"emergency_domain"`
 }
 
 type SubscriberProfileInput struct {
@@ -177,10 +179,10 @@ func NormalizeSubscriberProfile(in SubscriberProfileInput) SubscriberProfile {
 	imsi := strings.TrimSpace(in.IMSI)
 	mcc := normalizeMCC(in.MCC)
 	mnc := normalizeMNC(in.MNC)
-	if mcc == "" && len(imsi) >= 3 {
+	if isDecimalString(imsi) && mcc == "" && len(imsi) >= 3 {
 		mcc = normalizeMCC(imsi[:3])
 	}
-	if mnc == "" {
+	if isDecimalString(imsi) && mnc == "" {
 		switch {
 		case len(imsi) >= 6:
 			mnc = normalizeMNC(imsi[3:6])
@@ -260,6 +262,15 @@ func DefaultNAIRealm(mcc, mnc string) string {
 	return fmt.Sprintf("nai.epc.mnc%s.mcc%s.3gppnetwork.org", mnc, mcc)
 }
 
+func DefaultPCSCFFQDN(mcc, mnc string) string {
+	mcc = normalizeMCC(mcc)
+	mnc = normalizeMNC(mnc)
+	if mcc == "" || mnc == "" {
+		return ""
+	}
+	return fmt.Sprintf("pcscf.ims.mnc%s.mcc%s.3gppnetwork.org", mnc, mcc)
+}
+
 func DefaultEPDGFQDN(mcc, mnc string) string {
 	mcc = normalizeMCC(mcc)
 	mnc = normalizeMNC(mnc)
@@ -269,8 +280,12 @@ func DefaultEPDGFQDN(mcc, mnc string) string {
 	return fmt.Sprintf("epdg.epc.mnc%s.mcc%s.pub.3gppnetwork.org", mnc, mcc)
 }
 
+func DefaultEmergencyDomain(mcc, mnc string) string {
+	return DefaultIMSRealm(mcc, mnc)
+}
+
 func DeriveIMSPrivateIdentity(imsi, mcc, mnc string) string {
-	imsi = strings.TrimSpace(imsi)
+	imsi = normalizeIMSI(imsi)
 	realm := DefaultIMSRealm(mcc, mnc)
 	if imsi == "" || realm == "" {
 		return ""
@@ -279,7 +294,7 @@ func DeriveIMSPrivateIdentity(imsi, mcc, mnc string) string {
 }
 
 func DeriveIMSPublicIdentity(imsi, mcc, mnc string) string {
-	imsi = strings.TrimSpace(imsi)
+	imsi = normalizeIMSI(imsi)
 	realm := DefaultIMSRealm(mcc, mnc)
 	if imsi == "" || realm == "" {
 		return ""
@@ -288,7 +303,7 @@ func DeriveIMSPublicIdentity(imsi, mcc, mnc string) string {
 }
 
 func DerivePermanentNAI(imsi, mcc, mnc string) string {
-	imsi = strings.TrimSpace(imsi)
+	imsi = normalizeIMSI(imsi)
 	realm := DefaultNAIRealm(mcc, mnc)
 	if imsi == "" || realm == "" {
 		return ""
@@ -299,8 +314,13 @@ func DerivePermanentNAI(imsi, mcc, mnc string) string {
 func normalizeNetworkConfig(mcc, mnc string, cfg NetworkConfig) NetworkConfig {
 	cfg.IMSRealm = normalizeDomainName(cfg.IMSRealm)
 	cfg.NAIRealm = normalizeDomainName(cfg.NAIRealm)
+	cfg.PCSCFFQDN = normalizeDomainName(cfg.PCSCFFQDN)
 	cfg.EPDGFQDN = normalizeDomainName(cfg.EPDGFQDN)
+	cfg.EmergencyDomain = normalizeDomainName(cfg.EmergencyDomain)
 	if mcc == "" || mnc == "" {
+		if cfg.EmergencyDomain == "" {
+			cfg.EmergencyDomain = cfg.IMSRealm
+		}
 		return cfg
 	}
 	if cfg.IMSRealm == "" {
@@ -309,20 +329,36 @@ func normalizeNetworkConfig(mcc, mnc string, cfg NetworkConfig) NetworkConfig {
 	if cfg.NAIRealm == "" {
 		cfg.NAIRealm = DefaultNAIRealm(mcc, mnc)
 	}
+	if cfg.PCSCFFQDN == "" {
+		cfg.PCSCFFQDN = DefaultPCSCFFQDN(mcc, mnc)
+	}
 	if cfg.EPDGFQDN == "" {
 		cfg.EPDGFQDN = DefaultEPDGFQDN(mcc, mnc)
+	}
+	if cfg.EmergencyDomain == "" {
+		cfg.EmergencyDomain = DefaultEmergencyDomain(mcc, mnc)
 	}
 	return cfg
 }
 
 func normalizeMCC(mcc string) string {
-	return strings.TrimSpace(mcc)
+	mcc = strings.TrimSpace(mcc)
+	if len(mcc) != 3 || !isDecimalString(mcc) {
+		return ""
+	}
+	return mcc
 }
 
 func normalizeMNC(mnc string) string {
 	mnc = strings.TrimSpace(mnc)
+	if !isDecimalString(mnc) {
+		return ""
+	}
 	if len(mnc) == 2 {
 		return "0" + mnc
+	}
+	if len(mnc) != 3 {
+		return ""
 	}
 	return mnc
 }
@@ -347,4 +383,24 @@ func splitPresetKey(key string) (string, string) {
 		return "", ""
 	}
 	return key[:3], key[3:]
+}
+
+func normalizeIMSI(imsi string) string {
+	imsi = strings.TrimSpace(imsi)
+	if len(imsi) < 5 || len(imsi) > 15 || !isDecimalString(imsi) {
+		return ""
+	}
+	return imsi
+}
+
+func isDecimalString(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

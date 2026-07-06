@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/boa-z/vowifi-go/runtimehost/carrier"
 	"github.com/boa-z/vowifi-go/runtimehost/simauth"
 	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
 )
@@ -91,10 +92,6 @@ func NormalizeProfile(p Profile) Profile {
 	if p.MNC == "" && len(p.IMSI) >= 6 {
 		p.MNC = p.IMSI[3:6]
 	}
-	p.MNC = strings.TrimLeft(p.MNC, "0")
-	if p.MNC == "" && len(p.IMSI) >= 6 {
-		p.MNC = p.IMSI[3:6]
-	}
 	return p
 }
 
@@ -141,9 +138,9 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 			ActualSource:     IMSIdentitySourceProfile,
 			AKAAppPreference: AKAAppPreferenceUSIM,
 			Applied:          true,
-			IMPI:             profile.IMSI,
+			IMPI:             profileIMPI(profile),
 			IMPU:             profileIMPU(profile),
-			Domain:           "",
+			Domain:           profileDomain(profile),
 		},
 		Fallbacks: fallbacks,
 	}
@@ -255,22 +252,29 @@ func profileIMPU(profile Profile) string {
 	if imsi == "" {
 		return ""
 	}
+	if domain := profileDomain(profile); domain != "" {
+		return "sip:" + imsi + "@" + domain
+	}
 	return "sip:" + imsi
 }
 
-func defaultEPDG(p Profile) string {
-	mcc, mnc := strings.TrimSpace(p.MCC), strings.TrimSpace(p.MNC)
-	if mcc == "" || mnc == "" {
+func profileIMPI(profile Profile) string {
+	imsi := strings.TrimSpace(profile.IMSI)
+	if imsi == "" {
 		return ""
 	}
-	return fmt.Sprintf("epdg.epc.mnc%s.mcc%s.pub.3gppnetwork.org", leftPad(mnc, 3), mcc)
+	if domain := profileDomain(profile); domain != "" {
+		return imsi + "@" + domain
+	}
+	return imsi
 }
 
-func leftPad(s string, n int) string {
-	for len(s) < n {
-		s = "0" + s
-	}
-	return s
+func profileDomain(profile Profile) string {
+	return carrier.DefaultIMSRealm(profile.MCC, profile.MNC)
+}
+
+func defaultEPDG(p Profile) string {
+	return carrier.DefaultEPDGFQDN(p.MCC, p.MNC)
 }
 
 func ReadISIMIdentity(access interface {

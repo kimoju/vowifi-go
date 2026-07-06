@@ -21,7 +21,11 @@ func TestInspectRTCPFeedbackReportsReceptionBlocks(t *testing.T) {
 			}},
 		},
 		&rtcp.SenderReport{
-			SSRC: 0x33333333,
+			SSRC:        0x33333333,
+			NTPTime:     0x0102030405060708,
+			RTPTime:     0x11223344,
+			PacketCount: 19,
+			OctetCount:  3040,
 			Reports: []rtcp.ReceptionReport{{
 				SSRC:               0x44444444,
 				FractionLost:       8,
@@ -64,6 +68,9 @@ func TestInspectRTCPFeedbackReportsReceptionBlocks(t *testing.T) {
 	sr := events[1]
 	if sr.Kind != RTCPFeedbackSenderReport || sr.SSRC != 0x33333333 || sr.ReportCount != 1 {
 		t.Fatalf("sender report event=%+v", sr)
+	}
+	if sr.NTPTime != 0x0102030405060708 || sr.RTPTime != 0x11223344 || sr.PacketCount != 19 || sr.OctetCount != 3040 {
+		t.Fatalf("sender report timing/counters=%+v", sr)
 	}
 	if len(sr.Reports) != 1 {
 		t.Fatalf("sender report blocks=%+v", sr.Reports)

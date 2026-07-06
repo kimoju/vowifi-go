@@ -43,6 +43,10 @@ type RTCPFeedbackEvent struct {
 	SenderSSRC       uint32
 	MediaSSRC        uint32
 	SSRC             uint32
+	NTPTime          uint64
+	RTPTime          uint32
+	PacketCount      uint32
+	OctetCount       uint32
 	DestinationSSRCs []uint32
 	ReportCount      int
 	NACKCount        int
@@ -120,6 +124,10 @@ func rtcpFeedbackEvents(direction RTCPFeedbackDirection, packet rtcp.Packet) []R
 	case *rtcp.SenderReport:
 		event.Kind = RTCPFeedbackSenderReport
 		event.SSRC = p.SSRC
+		event.NTPTime = p.NTPTime
+		event.RTPTime = p.RTPTime
+		event.PacketCount = p.PacketCount
+		event.OctetCount = p.OctetCount
 		event.ReportCount = len(p.Reports)
 		event.Reports = rtcpReceptionReports(p.Reports)
 	case *rtcp.ReceiverReport:

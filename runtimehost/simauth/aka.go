@@ -128,32 +128,29 @@ func ParseUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAResult, error) {
 		resp := Response{SW1: sw1, SW2: sw2}
 		return AKAResult{}, newStatusMessageError(fmt.Sprintf("APDU status is not 9000: %02X%02X", sw1, sw2), resp)
 	}
+	body = trimTLVPadding(body)
 	if len(body) < 2 {
 		return AKAResult{}, fmt.Errorf("AKA response body too short: %d", len(body))
 	}
 
-	switch body[0] {
-	case 0xDB:
+	if body[0] == 0xDB {
 		if out, ok := parseUSIMAuthDB(body); ok {
 			return out, nil
 		}
-		if data, err := parseSimpleTLVData(body); err == nil {
-			if out, ok := parseUSIMAuthDB(append([]byte{0xDB}, data...)); ok {
-				return out, nil
-			}
-		}
+	}
+	if tag, data, ok, err := parseUSIMAuthTLV(body); err != nil {
+		return AKAResult{}, err
+	} else if ok {
+		return parseUSIMAuthPayload(tag, data)
+	}
+
+	switch body[0] {
+	case 0xDB:
 		return AKAResult{}, errors.New("parse AKA success response failed")
 	case 0xDC:
-		data, err := parseSimpleTLVData(body)
-		if err != nil {
-			return AKAResult{}, err
-		}
-		if _, err := ParseAUTS(data); err != nil {
-			return AKAResult{}, err
-		}
-		return AKAResult{AUTS: append([]byte(nil), data...)}, swusim.ErrSyncFailure
+		return AKAResult{}, errors.New("parse AKA sync failure response failed")
 	case 0xDD:
-		return AKAResult{}, swusim.ErrAuthFailure
+		return AKAResult{}, errors.New("parse AKA MAC failure response failed")
 	default:
 		return AKAResult{}, fmt.Errorf("unknown AKA response tag: 0x%02X", body[0])
 	}
@@ -205,6 +202,69 @@ func parseSimpleTLVData(body []byte) ([]byte, error) {
 		return nil, fmt.Errorf("response length mismatch: need=%d have=%d", 2+l, len(body))
 	}
 	return append([]byte(nil), body[2:2+l]...), nil
+}
+
+func parseUSIMAuthTLV(body []byte) (int, []byte, bool, error) {
+	return parseUSIMAuthTLVDepth(body, 0)
+}
+
+func parseUSIMAuthTLVDepth(body []byte, depth int) (int, []byte, bool, error) {
+	if depth > 4 {
+		return 0, nil, false, errors.New("AKA response TLV nesting too deep")
+	}
+	body = trimTLVPadding(body)
+	if len(body) == 0 {
+		return 0, nil, false, errors.New("AKA response body empty")
+	}
+	tag, rest, err := readTag(body)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	length, rest, err := readLength(rest)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	if length > len(rest) {
+		return 0, nil, false, fmt.Errorf("AKA response TLV tag 0x%X length %d exceeds remaining %d", tag, length, len(rest))
+	}
+	value := rest[:length]
+	if tail := trimTLVPadding(rest[length:]); len(tail) != 0 {
+		return 0, nil, false, fmt.Errorf("AKA response TLV tag 0x%X has %d trailing bytes", tag, len(tail))
+	}
+	switch tag {
+	case 0xDB, 0xDC, 0xDD:
+		return tag, append([]byte(nil), value...), true, nil
+	default:
+		if isConstructed(tag) {
+			return parseUSIMAuthTLVDepth(value, depth+1)
+		}
+		return tag, nil, false, nil
+	}
+}
+
+func parseUSIMAuthPayload(tag int, data []byte) (AKAResult, error) {
+	switch tag {
+	case 0xDB:
+		body := make([]byte, 0, 1+len(data))
+		body = append(body, 0xDB)
+		body = append(body, data...)
+		if out, ok := parseUSIMAuthDB(body); ok {
+			return out, nil
+		}
+		return AKAResult{}, errors.New("parse AKA success response failed")
+	case 0xDC:
+		if _, err := ParseAUTS(data); err != nil {
+			return AKAResult{}, err
+		}
+		return AKAResult{AUTS: append([]byte(nil), data...)}, swusim.ErrSyncFailure
+	case 0xDD:
+		if len(data) != 0 {
+			return AKAResult{}, fmt.Errorf("AKA MAC failure tag length must be 0 bytes: %d", len(data))
+		}
+		return AKAResult{}, swusim.ErrAuthFailure
+	default:
+		return AKAResult{}, fmt.Errorf("unknown AKA response tag: 0x%02X", tag)
+	}
 }
 
 func parseUSIMAuthDB(body []byte) (AKAResult, bool) {

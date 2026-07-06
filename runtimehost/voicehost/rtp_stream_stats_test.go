@@ -188,6 +188,89 @@ func TestRTPStreamStatsTracksSenderReportDelay(t *testing.T) {
 	}
 }
 
+func TestRTPStreamStatsObservesRTCPSenderReportPacket(t *testing.T) {
+	var tracker RTPStreamStatsTracker
+	base := time.Unix(20, 0)
+	firstSSRC := uint32(0x01020304)
+	secondSSRC := uint32(0x01020305)
+	for i, ssrc := range []uint32{secondSSRC, firstSSRC} {
+		packet := buildRTPStatsPacket(ssrc, uint16(40+i), uint32(4000+i*160))
+		if _, err := tracker.ObserveRTPPacket(packet, base.Add(time.Duration(i)*20*time.Millisecond), 8000); err != nil {
+			t.Fatalf("ObserveRTPPacket(%08x) error = %v", ssrc, err)
+		}
+	}
+
+	firstNTP := rtcpNTPTime(time.Unix(21, int64(250*time.Millisecond)))
+	secondNTP := rtcpNTPTime(time.Unix(22, int64(500*time.Millisecond)))
+	raw, err := rtcp.Marshal([]rtcp.Packet{
+		&rtcp.SenderReport{SSRC: secondSSRC, NTPTime: secondNTP, RTPTime: 0x22222222, PacketCount: 10, OctetCount: 1600},
+		&rtcp.ReceiverReport{SSRC: 0x11111111},
+		&rtcp.SenderReport{SSRC: firstSSRC, NTPTime: firstNTP, RTPTime: 0x11111111, PacketCount: 7, OctetCount: 1120},
+	})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal() error = %v", err)
+	}
+
+	srArrival := base.Add(100 * time.Millisecond)
+	updated, err := tracker.ObserveRTCPPacket(raw, srArrival)
+	if err != nil {
+		t.Fatalf("ObserveRTCPPacket() error = %v", err)
+	}
+	if len(updated) != 2 || updated[0].SSRC != firstSSRC || updated[1].SSRC != secondSSRC {
+		t.Fatalf("updated=%+v", updated)
+	}
+	if updated[0].LastSenderReport != rtcpLastSenderReport(firstNTP) || updated[0].Delay != 0 ||
+		updated[1].LastSenderReport != rtcpLastSenderReport(secondNTP) || updated[1].Delay != 0 {
+		t.Fatalf("updated sender report stats=%+v", updated)
+	}
+
+	now := srArrival.Add(1500 * time.Millisecond)
+	firstStats, ok := tracker.StatsForSSRCAt(firstSSRC, now)
+	if !ok {
+		t.Fatalf("StatsForSSRCAt(%08x) ok=false", firstSSRC)
+	}
+	wantDelay := rtcpCompactDelay(now.Sub(srArrival))
+	if firstStats.LastSenderReport != rtcpLastSenderReport(firstNTP) || firstStats.Delay != wantDelay {
+		t.Fatalf("first stats=%+v want LSR=%08x DLSR=%08x", firstStats, rtcpLastSenderReport(firstNTP), wantDelay)
+	}
+}
+
+func TestRTPStreamStatsCachesRTCPSenderReportBeforeRTP(t *testing.T) {
+	var tracker RTPStreamStatsTracker
+	ssrc := uint32(0x66554433)
+	ntpTime := rtcpNTPTime(time.Unix(30, int64(125*time.Millisecond)))
+	raw, err := rtcp.Marshal([]rtcp.Packet{&rtcp.SenderReport{SSRC: ssrc, NTPTime: ntpTime}})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal() error = %v", err)
+	}
+
+	srArrival := time.Unix(31, 0)
+	updated, err := tracker.ObserveRTCPPacket(raw, srArrival)
+	if err != nil {
+		t.Fatalf("ObserveRTCPPacket() error = %v", err)
+	}
+	if len(updated) != 0 {
+		t.Fatalf("updated=%+v, want no tracked streams", updated)
+	}
+
+	rtpArrival := srArrival.Add(750 * time.Millisecond)
+	stats, err := tracker.ObserveRTPPacket(buildRTPStatsPacket(ssrc, 90, 9000), rtpArrival, 8000)
+	if err != nil {
+		t.Fatalf("ObserveRTPPacket() error = %v", err)
+	}
+	wantDelay := rtcpCompactDelay(rtpArrival.Sub(srArrival))
+	if stats.LastSenderReport != rtcpLastSenderReport(ntpTime) || stats.Delay != wantDelay {
+		t.Fatalf("stats=%+v want LSR=%08x DLSR=%08x", stats, rtcpLastSenderReport(ntpTime), wantDelay)
+	}
+}
+
+func TestRTPStreamStatsObserveRTCPPacketRejectsInvalidPacket(t *testing.T) {
+	var tracker RTPStreamStatsTracker
+	if _, err := tracker.ObserveRTCPPacket([]byte{0x80}, time.Unix(0, 0)); err == nil {
+		t.Fatal("ObserveRTCPPacket(invalid) err=nil, want error")
+	}
+}
+
 func TestBuildReceiverReport(t *testing.T) {
 	var tracker RTPStreamStatsTracker
 	base := time.Unix(0, 0)

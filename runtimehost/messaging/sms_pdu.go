@@ -717,6 +717,132 @@ func ParseSMSStatusReportTPDU(tpdu []byte) (SMSStatusReport, error) {
 	return report, nil
 }
 
+func BuildSMSStatusReportTPDU(report SMSStatusReport) ([]byte, error) {
+	number := normalizeSMSNumber(report.Recipient)
+	if number == "" {
+		return nil, errors.New("SMS-STATUS-REPORT recipient address is empty")
+	}
+	digits, toa, bcd, err := encodeSMSAddress(number)
+	if err != nil {
+		return nil, err
+	}
+	timestamp, err := encodeSMSTimestamp(report.Timestamp)
+	if err != nil {
+		return nil, fmt.Errorf("SMS-STATUS-REPORT timestamp: %w", err)
+	}
+	doneAt, err := encodeSMSTimestamp(report.DoneAt)
+	if err != nil {
+		return nil, fmt.Errorf("SMS-STATUS-REPORT discharge time: %w", err)
+	}
+	firstOctet := smsStatusReportFirstOctet(report)
+	optional, err := encodeSMSStatusReportOptionalParameters(report, &firstOctet)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]byte, 0, 17+len(bcd)+len(optional))
+	out = append(out, firstOctet, report.Reference, byte(digits), toa)
+	out = append(out, bcd...)
+	out = append(out, timestamp...)
+	out = append(out, doneAt...)
+	out = append(out, report.Status)
+	out = append(out, optional...)
+	return out, nil
+}
+
+func smsStatusReportFirstOctet(report SMSStatusReport) byte {
+	if report.FirstOctet != 0 {
+		return (report.FirstOctet &^ 0x03) | 0x02
+	}
+	firstOctet := byte(0x02)
+	if !report.MoreMessagesToSend {
+		firstOctet |= 0x04
+	}
+	if report.StatusReportQualifier {
+		firstOctet |= 0x20
+	}
+	if report.UserDataHeader || len(report.UserDataHeaderInfo.Raw) > 0 {
+		firstOctet |= 0x40
+	}
+	return firstOctet
+}
+
+func encodeSMSStatusReportOptionalParameters(report SMSStatusReport, firstOctet *byte) ([]byte, error) {
+	hasProtocolID := report.HasProtocolID || report.ProtocolID != 0
+	dcs := report.DataCodingScheme
+	if !report.HasDataCodingScheme && dcs == 0 && report.DataCoding.Raw != 0 {
+		dcs = report.DataCoding.Raw
+	}
+	hasDataCodingScheme := report.HasDataCodingScheme || dcs != 0
+
+	udh := append([]byte(nil), report.UserDataHeaderInfo.Raw...)
+	headerInfo := report.UserDataHeaderInfo
+	if len(udh) > 0 {
+		parsedHeader := parseSMSUDHInfo(udh)
+		if !headerInfo.HasLockingShift && parsedHeader.HasLockingShift {
+			headerInfo.HasLockingShift = true
+			headerInfo.LockingShiftLang = parsedHeader.LockingShiftLang
+		}
+		if !headerInfo.HasSingleShift && parsedHeader.HasSingleShift {
+			headerInfo.HasSingleShift = true
+			headerInfo.SingleShiftLang = parsedHeader.SingleShiftLang
+		}
+	}
+	hasUserData := report.HasUserData || report.UserData != "" || report.UserDataLength != 0 || len(udh) > 0
+	if (report.UserDataHeader || firstOctet != nil && *firstOctet&0x40 != 0) && len(udh) == 0 {
+		return nil, errors.New("SMS-STATUS-REPORT user data header is empty")
+	}
+	var userData []byte
+	udl := 0
+	if hasUserData {
+		encoding := smsEncodingForDCS(dcs)
+		if err := validateSMSSubmitDataCodingScheme(dcs, encoding); err != nil {
+			return nil, err
+		}
+		var err error
+		userData, udl, _, err = encodeSMSUserDataWithLanguage(report.UserData, encoding, udh, headerInfo.LockingShiftLang, headerInfo.SingleShiftLang)
+		if err != nil {
+			return nil, err
+		}
+		if udl > 255 {
+			return nil, fmt.Errorf("SMS-STATUS-REPORT user data length too long: %d", udl)
+		}
+		if len(udh) > 0 && firstOctet != nil {
+			*firstOctet |= 0x40
+		}
+	}
+	if firstOctet != nil && *firstOctet&0x40 != 0 && !hasUserData {
+		return nil, errors.New("SMS-STATUS-REPORT user data header requires user data")
+	}
+
+	includePI := report.HasParameterIndicator || hasProtocolID || hasDataCodingScheme || hasUserData
+	if !includePI {
+		return nil, nil
+	}
+	pi := report.ParameterIndicator &^ 0x07
+	if hasProtocolID {
+		pi |= 0x01
+	}
+	if hasDataCodingScheme {
+		pi |= 0x02
+	}
+	if hasUserData {
+		pi |= 0x04
+	}
+	out := []byte{pi}
+	if hasProtocolID {
+		out = append(out, report.ProtocolID)
+	}
+	if hasDataCodingScheme {
+		out = append(out, dcs)
+	}
+	if hasUserData {
+		out = append(out, byte(udl))
+		out = append(out, userData...)
+	}
+	return out, nil
+}
+
 func parseSMSStatusReportOptionalParameters(data []byte, report *SMSStatusReport) error {
 	if len(data) == 0 || report == nil {
 		return nil

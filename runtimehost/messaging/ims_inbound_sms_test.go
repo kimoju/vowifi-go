@@ -60,3 +60,50 @@ func TestHandleIMSMessageAcceptsCPIMIMDNDeliveryReport(t *testing.T) {
 		t.Fatalf("recomputedMessageID=%q", store.recomputedMessageID)
 	}
 }
+
+func TestHandleIMSMessageAcceptsRPACKStatusReportBuiltFromStruct(t *testing.T) {
+	store := &fakeDeliveryStore{match: DeliveryPartMatch{MessageID: "msg-456", PartNo: 1, State: "failed"}}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	sentAt := time.Date(2026, 7, 5, 12, 34, 56, 0, time.FixedZone("", 0))
+	doneAt := time.Date(2026, 7, 5, 12, 44, 0, 0, time.FixedZone("", 0))
+	tpdu, err := BuildSMSStatusReportTPDU(SMSStatusReport{
+		FirstOctet: 0x02,
+		Reference:  7,
+		Recipient:  "+18005551212",
+		Timestamp:  sentAt,
+		DoneAt:     doneAt,
+		Status:     0x46,
+	})
+	if err != nil {
+		t.Fatalf("BuildSMSStatusReportTPDU() error = %v", err)
+	}
+	body, err := BuildSMSRPAckWithTPDU(0x55, tpdu)
+	if err != nil {
+		t.Fatalf("BuildSMSRPAckWithTPDU() error = %v", err)
+	}
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		CallID:      "status-report-call",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        body,
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.StatusCode != 200 || result.DeliveryReport == nil || result.RPDU.Kind != SMSRPDUKindAck {
+		t.Fatalf("result=%+v", result)
+	}
+	report := result.DeliveryReport
+	if report.CallID != "status-report-call" || report.RPMR != 7 || report.State != "failed" || report.RPCause != 0x46 {
+		t.Fatalf("report=%+v", report)
+	}
+	if report.Recipient != "+18005551212" || !report.SentAt.Equal(sentAt) || !report.ReportAt.Equal(doneAt) || !strings.Contains(report.ErrorText, "validity period expired") {
+		t.Fatalf("report fields=%+v", report)
+	}
+	if store.reportCallID != "status-report-call" || store.reportRPMR != 7 || store.reportState != "failed" || store.reportRPCause != 0x46 {
+		t.Fatalf("store report=%+v", store)
+	}
+	if store.recomputedMessageID != "msg-456" {
+		t.Fatalf("recomputedMessageID=%q", store.recomputedMessageID)
+	}
+}

@@ -200,7 +200,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		return nil, err
 	}
 	result := tunnelResultFromIKE(cfg, epdg, init, child)
-	closeHandler, mobikeHandler, dpdHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
+	closeHandler, mobikeHandler, rekeyHandler, dpdHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
 	livenessCfg := m.Config.Liveness
 	if dpdHandler == nil {
 		livenessCfg.DisableDPD = true
@@ -224,6 +224,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		Transport:     espTransport,
 		Random:        random,
 		MOBIKEHandler: mobikeHandler,
+		RekeyHandler:  rekeyHandler,
 		MOBIKENAT: NewMOBIKENATState(MOBIKENATStateConfig{
 			MOBIKESupported: result.MOBIKESupported,
 			LocalIP:         transportCfg.LocalIP,
@@ -378,9 +379,9 @@ func (m *IKEPacketTunnelManager) childSPI(random io.Reader) ([]byte, error) {
 	return spi, nil
 }
 
-func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, init ikev2.InitResult, auth ikev2.FullAuthResult, child ikev2.ChildSAResult, result TunnelResult, transportCfg IKETransportConfig) (func(context.Context) error, func(context.Context, MOBIKERequest) (MOBIKEResult, error), func(context.Context) error) {
+func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, init ikev2.InitResult, auth ikev2.FullAuthResult, child ikev2.ChildSAResult, result TunnelResult, transportCfg IKETransportConfig) (func(context.Context) error, func(context.Context, MOBIKERequest) (MOBIKEResult, error), ChildSARekeyHandler, func(context.Context) error) {
 	if m.Config.DisableControlPlaneHooks || auth.NextMessageID == 0 || !ikeKeysUsable(init.Keys) {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	control := &ikePacketTunnelControl{
 		transport:             transport,
@@ -402,7 +403,7 @@ func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, 
 	if init.MOBIKESupported {
 		mobikeHandler = control.mobike
 	}
-	return closeHandler, mobikeHandler, control.dpd
+	return closeHandler, mobikeHandler, control.rekeyChildSA, control.dpd
 }
 
 type ikePacketTunnelControl struct {
@@ -443,6 +444,40 @@ func (c *ikePacketTunnelControl) close(ctx context.Context) error {
 		Random:    c.random,
 	})
 	return err
+}
+
+func (c *ikePacketTunnelControl) rekeyChildSA(ctx context.Context) (ikev2.ChildSAResult, error) {
+	if c == nil {
+		return ikev2.ChildSAResult{}, ErrInvalidIKEControl
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.nextMessageID == 0 {
+		return ikev2.ChildSAResult{}, fmt.Errorf("%w: next message_id is zero", ErrInvalidIKEControl)
+	}
+	messageID := c.nextMessageID
+	c.nextMessageID++
+	res, err := ikev2.RunCREATE_CHILD_SARekey(ctx, ikev2.ChildSARekeyConfig{
+		Transport:  c.transport,
+		Init:       c.init,
+		Keys:       c.keys,
+		MessageID:  messageID,
+		OldChildSA: c.child,
+		Random:     c.random,
+	})
+	if err != nil {
+		return ikev2.ChildSAResult{}, err
+	}
+	if res.NextMessageID != 0 {
+		c.nextMessageID = res.NextMessageID
+	}
+	c.child = res.ChildSA
+	c.result.ChildSAIdentifier = childSAIdentifier(res.ChildSA)
+	c.result.IKEEstablished = true
+	c.result.IPsecEstablished = true
+	c.result.Ready = true
+	c.result.Reason = "child sa rekeyed"
+	return res.ChildSA, nil
 }
 
 func (c *ikePacketTunnelControl) dpd(ctx context.Context) error {

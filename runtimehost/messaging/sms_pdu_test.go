@@ -696,6 +696,37 @@ func TestParseSMSStatusReportTPDU(t *testing.T) {
 	}
 }
 
+func TestBuildSMSStatusReportTPDURoundTrip(t *testing.T) {
+	sentAt := time.Date(2026, 7, 5, 12, 34, 56, 0, time.FixedZone("", 0))
+	doneAt := time.Date(2026, 7, 5, 12, 44, 0, 0, time.FixedZone("", 0))
+	tpdu, err := BuildSMSStatusReportTPDU(SMSStatusReport{
+		FirstOctet: 0x02,
+		Reference:  7,
+		Recipient:  "+18005551212",
+		Timestamp:  sentAt,
+		DoneAt:     doneAt,
+		Status:     0x00,
+	})
+	if err != nil {
+		t.Fatalf("BuildSMSStatusReportTPDU() error = %v", err)
+	}
+	got := strings.ToUpper(hex.EncodeToString(tpdu))
+	want := "02070B918100551512F2627050214365006270502144000000"
+	if got != want {
+		t.Fatalf("TPDU=%s want %s", got, want)
+	}
+	report, err := ParseSMSStatusReportTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSStatusReportTPDU() error = %v", err)
+	}
+	if report.Reference != 7 || report.Recipient != "+18005551212" || report.Status != 0x00 || report.State != "delivered" {
+		t.Fatalf("report=%+v", report)
+	}
+	if !report.Timestamp.Equal(sentAt) || !report.DoneAt.Equal(doneAt) {
+		t.Fatalf("timestamps=%s/%s want %s/%s", report.Timestamp, report.DoneAt, sentAt, doneAt)
+	}
+}
+
 func TestParseSMSStatusReportTPDUPreservesOptionalParameters(t *testing.T) {
 	tpdu := mustHex(t, "26070B918100551512F2627050214365006270502144000000077F0005E8329BFD06")
 	report, err := ParseSMSStatusReportTPDU(tpdu)
@@ -716,6 +747,82 @@ func TestParseSMSStatusReportTPDUPreservesOptionalParameters(t *testing.T) {
 	}
 	if !report.HasUserData || report.UserDataLength != 5 || report.UserData != "hello" {
 		t.Fatalf("report user data=%+v", report)
+	}
+}
+
+func TestBuildSMSStatusReportTPDUOptionalParameters(t *testing.T) {
+	sentAt := time.Date(2026, 7, 5, 12, 34, 56, 0, time.FixedZone("", 0))
+	doneAt := time.Date(2026, 7, 5, 12, 44, 0, 0, time.FixedZone("", 0))
+	tpdu, err := BuildSMSStatusReportTPDU(SMSStatusReport{
+		FirstOctet:          0x26,
+		Reference:           7,
+		Recipient:           "+18005551212",
+		Timestamp:           sentAt,
+		DoneAt:              doneAt,
+		Status:              0x00,
+		ProtocolID:          0x7f,
+		HasProtocolID:       true,
+		DataCodingScheme:    0x00,
+		HasDataCodingScheme: true,
+		UserData:            "hello",
+		HasUserData:         true,
+	})
+	if err != nil {
+		t.Fatalf("BuildSMSStatusReportTPDU() error = %v", err)
+	}
+	got := strings.ToUpper(hex.EncodeToString(tpdu))
+	want := "26070B918100551512F2627050214365006270502144000000077F0005E8329BFD06"
+	if got != want {
+		t.Fatalf("TPDU=%s want %s", got, want)
+	}
+
+	rpAck, err := BuildSMSRPAckWithTPDU(0x55, tpdu)
+	if err != nil {
+		t.Fatalf("BuildSMSRPAckWithTPDU() error = %v", err)
+	}
+	rpdu, err := ParseSMSRPDU(rpAck)
+	if err != nil {
+		t.Fatalf("ParseSMSRPDU() error = %v", err)
+	}
+	if rpdu.Kind != SMSRPDUKindAck || rpdu.MR != 0x55 || string(rpdu.TPDU) != string(tpdu) {
+		t.Fatalf("rpdu=%+v", rpdu)
+	}
+	report, err := ParseSMSStatusReportTPDU(rpdu.TPDU)
+	if err != nil {
+		t.Fatalf("ParseSMSStatusReportTPDU() error = %v", err)
+	}
+	if !report.HasProtocolID || report.ProtocolID != 0x7f || !report.HasDataCodingScheme || !report.HasUserData || report.UserData != "hello" {
+		t.Fatalf("report optional fields=%+v", report)
+	}
+}
+
+func TestBuildSMSStatusReportTPDUWithNationalLanguageUDH(t *testing.T) {
+	sentAt := time.Date(2026, 7, 5, 12, 34, 56, 0, time.FixedZone("", 0))
+	doneAt := time.Date(2026, 7, 5, 12, 44, 0, 0, time.FixedZone("", 0))
+	tpdu, err := BuildSMSStatusReportTPDU(SMSStatusReport{
+		Reference: 7,
+		Recipient: "10086",
+		Timestamp: sentAt,
+		DoneAt:    doneAt,
+		Status:    0x20,
+		UserDataHeaderInfo: SMSUserDataHeaderInfo{
+			Raw: []byte{0x03, 0x24, 0x01, byte(SMSNationalLanguageTurkish)},
+		},
+		UserData:    "\u011e",
+		HasUserData: true,
+	})
+	if err != nil {
+		t.Fatalf("BuildSMSStatusReportTPDU() error = %v", err)
+	}
+	report, err := ParseSMSStatusReportTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSStatusReportTPDU() error = %v tpdu=%x", err, tpdu)
+	}
+	if report.FirstOctet&0x40 == 0 || !report.UserDataHeader || report.UserData != "\u011e" || report.UserDataLength != 7 {
+		t.Fatalf("report user data=%+v", report)
+	}
+	if !report.UserDataHeaderInfo.HasSingleShift || report.UserDataHeaderInfo.SingleShiftLang != SMSNationalLanguageTurkish {
+		t.Fatalf("report UDH=%+v", report.UserDataHeaderInfo)
 	}
 }
 

@@ -28,7 +28,9 @@ func TestResolveEffectiveCarrierConfigNormalizesTwoDigitMNC(t *testing.T) {
 	}
 	if cfg.Network.IMSRealm != "ims.mnc028.mcc310.3gppnetwork.org" ||
 		cfg.Network.NAIRealm != "nai.epc.mnc028.mcc310.3gppnetwork.org" ||
-		cfg.Network.EPDGFQDN != "epdg.epc.mnc028.mcc310.pub.3gppnetwork.org" {
+		cfg.Network.PCSCFFQDN != "pcscf.ims.mnc028.mcc310.3gppnetwork.org" ||
+		cfg.Network.EPDGFQDN != "epdg.epc.mnc028.mcc310.pub.3gppnetwork.org" ||
+		cfg.Network.EmergencyDomain != "ims.mnc028.mcc310.3gppnetwork.org" {
 		t.Fatalf("Network=%+v, want derived 3GPP defaults", cfg.Network)
 	}
 }
@@ -40,7 +42,9 @@ func TestNormalizeSubscriberProfileDerivesRealmsAndNAI(t *testing.T) {
 	}
 	if profile.Network.IMSRealm != "ims.mnc010.mcc001.3gppnetwork.org" ||
 		profile.Network.NAIRealm != "nai.epc.mnc010.mcc001.3gppnetwork.org" ||
-		profile.Network.EPDGFQDN != "epdg.epc.mnc010.mcc001.pub.3gppnetwork.org" {
+		profile.Network.PCSCFFQDN != "pcscf.ims.mnc010.mcc001.3gppnetwork.org" ||
+		profile.Network.EPDGFQDN != "epdg.epc.mnc010.mcc001.pub.3gppnetwork.org" ||
+		profile.Network.EmergencyDomain != "ims.mnc010.mcc001.3gppnetwork.org" {
 		t.Fatalf("Network=%+v, want derived 3GPP defaults", profile.Network)
 	}
 	if profile.IMSPrivateIdentity != "001010123456789@ims.mnc010.mcc001.3gppnetwork.org" ||
@@ -97,7 +101,9 @@ func TestLoadCarrierOverridesNormalizesShortKeyAndNetworkPolicy(t *testing.T) {
 		"31028": {
 			"network": {
 				"ims_realm": " IMS.OVERRIDE.EXAMPLE. ",
-				"epdg_fqdn": " EPDG.OVERRIDE.EXAMPLE. "
+				"pcscf_fqdn": " PCSCF.OVERRIDE.EXAMPLE. ",
+				"epdg_fqdn": " EPDG.OVERRIDE.EXAMPLE. ",
+				"emergency_domain": " SOS.OVERRIDE.EXAMPLE. "
 			}
 		}
 	}`), 0600); err != nil {
@@ -116,8 +122,28 @@ func TestLoadCarrierOverridesNormalizesShortKeyAndNetworkPolicy(t *testing.T) {
 	}
 	if cfg.Network.IMSRealm != "ims.override.example" ||
 		cfg.Network.NAIRealm != "nai.epc.mnc028.mcc310.3gppnetwork.org" ||
-		cfg.Network.EPDGFQDN != "epdg.override.example" {
+		cfg.Network.PCSCFFQDN != "pcscf.override.example" ||
+		cfg.Network.EPDGFQDN != "epdg.override.example" ||
+		cfg.Network.EmergencyDomain != "sos.override.example" {
 		t.Fatalf("Network=%+v, want override plus fallback defaults", cfg.Network)
 	}
 	ClearCarrierOverrides()
+}
+
+func TestDeriveIdentitiesRejectInvalidSubscriberData(t *testing.T) {
+	if got := DeriveIMSPrivateIdentity("001010123456789", "001", "01"); got != "001010123456789@ims.mnc001.mcc001.3gppnetwork.org" {
+		t.Fatalf("DeriveIMSPrivateIdentity()=%q", got)
+	}
+	if got := DeriveIMSPublicIdentity("001010123456789", "001", "001"); got != "sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org" {
+		t.Fatalf("DeriveIMSPublicIdentity()=%q", got)
+	}
+	if got := DerivePermanentNAI("001010123456789", "001", "001"); got != "0001010123456789@nai.epc.mnc001.mcc001.3gppnetwork.org" {
+		t.Fatalf("DerivePermanentNAI()=%q", got)
+	}
+	if got := DeriveIMSPrivateIdentity("imsi", "001", "001"); got != "" {
+		t.Fatalf("DeriveIMSPrivateIdentity(invalid IMSI)=%q, want empty", got)
+	}
+	if got := DefaultIMSRealm("31x", "001"); got != "" {
+		t.Fatalf("DefaultIMSRealm(invalid MCC)=%q, want empty", got)
+	}
 }

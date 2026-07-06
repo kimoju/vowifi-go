@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"github.com/pion/rtcp"
 )
 
 var ErrRTPStreamStats = errors.New("invalid rtp stream stats")
@@ -83,6 +85,20 @@ func (t *RTPStreamStatsTracker) ObserveRTCPSenderReport(ssrc uint32, ntpTime uin
 	}
 	state.senderReport = report
 	return state.snapshotAt(arrival), true
+}
+
+// ObserveRTCPPacket parses one RTCP datagram and records any Sender Reports it
+// contains. Snapshots are returned only for SSRCs whose RTP stream is already
+// being tracked; Sender Reports for future streams are still remembered.
+func (t *RTPStreamStatsTracker) ObserveRTCPPacket(packet []byte, arrival time.Time) ([]RTPStreamStats, error) {
+	if t == nil {
+		return nil, fmt.Errorf("%w: tracker is nil", ErrRTPStreamStats)
+	}
+	packets, err := rtcp.Unmarshal(packet)
+	if err != nil {
+		return nil, err
+	}
+	return t.observeRTCPPackets(packets, arrival), nil
 }
 
 // Stats returns deterministic snapshots ordered by SSRC.
@@ -219,6 +235,43 @@ func (s *rtpStreamStatsState) snapshotAt(now time.Time) RTPStreamStats {
 		stats.Delay = 0
 	}
 	return stats
+}
+
+func (t *RTPStreamStatsTracker) observeRTCPPackets(packets []rtcp.Packet, arrival time.Time) []RTPStreamStats {
+	if len(packets) == 0 {
+		return nil
+	}
+	if arrival.IsZero() {
+		arrival = time.Now()
+	}
+	updated := make(map[uint32]RTPStreamStats)
+	var observe func(rtcp.Packet)
+	observe = func(packet rtcp.Packet) {
+		switch p := packet.(type) {
+		case *rtcp.SenderReport:
+			if stats, ok := t.ObserveRTCPSenderReport(p.SSRC, p.NTPTime, arrival); ok {
+				updated[stats.SSRC] = stats
+			}
+		case *rtcp.CompoundPacket:
+			for _, inner := range *p {
+				observe(inner)
+			}
+		}
+	}
+	for _, packet := range packets {
+		observe(packet)
+	}
+	if len(updated) == 0 {
+		return nil
+	}
+	out := make([]RTPStreamStats, 0, len(updated))
+	for _, stats := range updated {
+		out = append(out, stats)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].SSRC < out[j].SSRC
+	})
+	return out
 }
 
 func extendRTPSequence(maxSeq uint32, seq uint16) uint32 {
