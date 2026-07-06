@@ -319,6 +319,23 @@ func TestParseSMSDeliverTPDUUCS2WithConcatUDH(t *testing.T) {
 	}
 }
 
+func TestParseSMSDeliverTPDUPreservesProtocolMetadata(t *testing.T) {
+	tpdu := mustHex(t, "E405810180F67F0862705021436500080500037A02014F60")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	if deliver.FirstOctet != 0xe4 || deliver.ProtocolID != 0x7f || deliver.DataCodingScheme != 0x08 || deliver.UserDataLength != 8 {
+		t.Fatalf("deliver metadata=%+v", deliver)
+	}
+	if !deliver.UserDataHeader || !deliver.StatusReportIndication || !deliver.ReplyPath || deliver.MoreMessagesToSend {
+		t.Fatalf("deliver flags=%+v", deliver)
+	}
+	if deliver.Text != "你" || !deliver.Concat.IsConcat {
+		t.Fatalf("deliver content=%+v", deliver)
+	}
+}
+
 func TestParseSMSDeliverTPDUUCS2With16BitConcatUDH(t *testing.T) {
 	tpdu := mustHex(t, "4005810180F600086270502143650009060804123402014F60")
 	deliver, err := ParseSMSDeliverTPDU(tpdu)

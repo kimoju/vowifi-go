@@ -61,10 +61,16 @@ type USSDResult struct {
 }
 
 type IncomingSMS struct {
-	Sender    string
-	Recipient string
-	Content   string
-	Timestamp time.Time
+	Sender                 string
+	Recipient              string
+	Content                string
+	Timestamp              time.Time
+	ProtocolID             byte
+	DataCodingScheme       byte
+	UserDataHeader         bool
+	MoreMessagesToSend     bool
+	StatusReportIndication bool
+	ReplyPath              bool
 }
 
 type SMSDeliveryReport struct {

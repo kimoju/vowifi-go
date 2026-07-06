@@ -410,6 +410,34 @@ func TestHandleIMSMessageDispatchesRPDataAndReturnsAck(t *testing.T) {
 	}
 }
 
+func TestHandleIMSMessagePreservesDeliverProtocolMetadata(t *testing.T) {
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	tpdu := mustHex(t, "A405810180F67F006270502143650005E8329BFD06")
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x36, tpdu),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.Incoming == nil || result.Incoming.Content != "hello" {
+		t.Fatalf("result=%+v", result)
+	}
+	incoming := result.Incoming
+	if incoming.ProtocolID != 0x7f || incoming.DataCodingScheme != 0x00 {
+		t.Fatalf("incoming metadata=%+v", incoming)
+	}
+	if incoming.UserDataHeader || !incoming.StatusReportIndication || !incoming.ReplyPath || incoming.MoreMessagesToSend {
+		t.Fatalf("incoming flags=%+v", incoming)
+	}
+	if string(result.ReplyBody) != string(BuildSMSRPAck(0x36)) {
+		t.Fatalf("reply=%x", result.ReplyBody)
+	}
+}
+
 func TestHandleIMSMessageReassemblesConcatSMSBeforeDispatch(t *testing.T) {
 	dispatch := &fakeDispatcher{}
 	svc := NewService("dev-1", "310280233641503", nil, dispatch)

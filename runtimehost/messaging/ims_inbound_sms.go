@@ -42,10 +42,16 @@ type smsConcatKey struct {
 }
 
 type smsConcatState struct {
-	parts     map[int]string
-	timestamp time.Time
-	firstSeen time.Time
-	updatedAt time.Time
+	parts                  map[int]string
+	timestamp              time.Time
+	protocolID             byte
+	dataCodingScheme       byte
+	userDataHeader         bool
+	moreMessagesToSend     bool
+	statusReportIndication bool
+	replyPath              bool
+	firstSeen              time.Time
+	updatedAt              time.Time
 }
 
 func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {
@@ -143,10 +149,16 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 			return out, err
 		}
 		incoming := IncomingSMS{
-			Sender:    firstNonEmpty(deliver.Sender, rpdu.Originator, msg.FromURI),
-			Recipient: firstNonEmpty(deliver.Recipient, rpdu.Destination, msg.ToURI),
-			Content:   deliver.Text,
-			Timestamp: deliver.Timestamp,
+			Sender:                 firstNonEmpty(deliver.Sender, rpdu.Originator, msg.FromURI),
+			Recipient:              firstNonEmpty(deliver.Recipient, rpdu.Destination, msg.ToURI),
+			Content:                deliver.Text,
+			Timestamp:              deliver.Timestamp,
+			ProtocolID:             deliver.ProtocolID,
+			DataCodingScheme:       deliver.DataCodingScheme,
+			UserDataHeader:         deliver.UserDataHeader,
+			MoreMessagesToSend:     deliver.MoreMessagesToSend,
+			StatusReportIndication: deliver.StatusReportIndication,
+			ReplyPath:              deliver.ReplyPath,
 		}
 		if deliver.Concat.IsConcat {
 			assembled, ready := s.collectSMSConcatPart(incoming, deliver.Concat, time.Now())
@@ -244,6 +256,14 @@ func (s *Service) collectSMSConcatPart(incoming IncomingSMS, concat SMSConcatInf
 	if !incoming.Timestamp.IsZero() && (state.timestamp.IsZero() || concat.Seq == 1) {
 		state.timestamp = incoming.Timestamp
 	}
+	if concat.Seq == 1 || len(state.parts) == 0 {
+		state.protocolID = incoming.ProtocolID
+		state.dataCodingScheme = incoming.DataCodingScheme
+		state.userDataHeader = incoming.UserDataHeader
+		state.moreMessagesToSend = incoming.MoreMessagesToSend
+		state.statusReportIndication = incoming.StatusReportIndication
+		state.replyPath = incoming.ReplyPath
+	}
 	if _, exists := state.parts[concat.Seq]; !exists {
 		state.parts[concat.Seq] = incoming.Content
 	}
@@ -265,6 +285,12 @@ func (s *Service) collectSMSConcatPart(incoming IncomingSMS, concat SMSConcatInf
 	if !state.timestamp.IsZero() {
 		incoming.Timestamp = state.timestamp
 	}
+	incoming.ProtocolID = state.protocolID
+	incoming.DataCodingScheme = state.dataCodingScheme
+	incoming.UserDataHeader = state.userDataHeader
+	incoming.MoreMessagesToSend = state.moreMessagesToSend
+	incoming.StatusReportIndication = state.statusReportIndication
+	incoming.ReplyPath = state.replyPath
 	return incoming, true
 }
 

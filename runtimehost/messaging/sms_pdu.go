@@ -40,12 +40,20 @@ type SMSConcatInfo struct {
 }
 
 type SMSDeliver struct {
-	Sender    string
-	Recipient string
-	Text      string
-	Timestamp time.Time
-	Concat    SMSConcatInfo
-	RawTPDU   []byte
+	Sender                 string
+	Recipient              string
+	Text                   string
+	Timestamp              time.Time
+	Concat                 SMSConcatInfo
+	FirstOctet             byte
+	ProtocolID             byte
+	DataCodingScheme       byte
+	UserDataLength         int
+	UserDataHeader         bool
+	MoreMessagesToSend     bool
+	StatusReportIndication bool
+	ReplyPath              bool
+	RawTPDU                []byte
 }
 
 type SMSStatusReport struct {
@@ -437,7 +445,8 @@ func ParseSMSDeliverTPDU(tpdu []byte) (SMSDeliver, error) {
 	if i+10 > len(tpdu) {
 		return SMSDeliver{}, errors.New("SMS-DELIVER fields truncated")
 	}
-	i++ // PID
+	pid := tpdu[i]
+	i++
 	dcs := tpdu[i]
 	i++
 	ts, err := decodeSMSTimestamp(tpdu[i : i+7])
@@ -455,11 +464,19 @@ func ParseSMSDeliverTPDU(tpdu []byte) (SMSDeliver, error) {
 		return SMSDeliver{}, err
 	}
 	return SMSDeliver{
-		Sender:    sender,
-		Text:      text,
-		Timestamp: ts,
-		Concat:    concat,
-		RawTPDU:   raw,
+		Sender:                 sender,
+		Text:                   text,
+		Timestamp:              ts,
+		Concat:                 concat,
+		FirstOctet:             firstOctet,
+		ProtocolID:             pid,
+		DataCodingScheme:       dcs,
+		UserDataLength:         udl,
+		UserDataHeader:         firstOctet&0x40 != 0,
+		MoreMessagesToSend:     firstOctet&0x04 == 0,
+		StatusReportIndication: firstOctet&0x20 != 0,
+		ReplyPath:              firstOctet&0x80 != 0,
+		RawTPDU:                raw,
 	}, nil
 }
 
