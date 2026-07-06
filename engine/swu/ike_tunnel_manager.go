@@ -212,7 +212,16 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		Transport:     espTransport,
 		Random:        random,
 		MOBIKEHandler: mobikeHandler,
-		CloseHandler:  closeHandler,
+		MOBIKENAT: NewMOBIKENATState(MOBIKENATStateConfig{
+			MOBIKESupported: result.MOBIKESupported,
+			LocalIP:         transportCfg.LocalIP,
+			RemoteIP:        transportCfg.RemoteIP,
+			LocalPort:       transportCfg.LocalPort,
+			RemotePort:      transportCfg.RemotePort,
+			NATDetected:     init.NATDetected,
+			UpdatedAt:       result.EstablishedAt,
+		}),
+		CloseHandler: closeHandler,
 	})
 	if err != nil {
 		if closer, ok := espTransport.(ESPPacketTransportCloser); ok {

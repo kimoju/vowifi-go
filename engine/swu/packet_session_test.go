@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/boa-z/vowifi-go/engine/swu/esp"
 	"github.com/boa-z/vowifi-go/engine/swu/ikev2"
@@ -247,6 +249,93 @@ func TestPacketSessionCountsTransportFailure(t *testing.T) {
 	stats := session.PacketStats()
 	if stats.OutboundErrors != 1 || stats.OutboundInnerPackets != 0 || stats.OutboundESPPackets != 0 {
 		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+func TestPacketSessionObserveMOBIKENATTriggersMOBIKE(t *testing.T) {
+	start := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	var requests []MOBIKERequest
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: &captureESPPacketTransport{},
+		Result: TunnelResult{
+			Ready:            true,
+			IKEEstablished:   true,
+			IPsecEstablished: true,
+			MOBIKESupported:  true,
+			LocalInnerIP:     "10.0.0.2",
+			RemoteInnerIP:    "0.0.0.0/0",
+			DNSServers:       []string{"10.0.0.1"},
+		},
+		MOBIKENAT: NewMOBIKENATState(MOBIKENATStateConfig{
+			MOBIKESupported: true,
+			LocalIP:         net.IPv4(192, 0, 2, 10),
+			RemoteIP:        net.IPv4(198, 51, 100, 7),
+			LocalPort:       4500,
+			RemotePort:      4500,
+			NATDetected:     true,
+			UpdatedAt:       start,
+		}),
+		MOBIKEHandler: func(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
+			requests = append(requests, req)
+			return MOBIKEResult{
+				IKEEstablished:   true,
+				IPsecEstablished: true,
+				LocalInnerIP:     "10.0.0.2",
+				RemoteInnerIP:    "0.0.0.0/0",
+				DNSServers:       []string{"10.0.0.1"},
+				Reason:           "mobike updated from observation",
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+
+	change, result, err := session.ObserveMOBIKENAT(context.Background(), MOBIKENATObservation{
+		DeviceID:         "dev-1",
+		TraceID:          "trace-1",
+		LocalIP:          net.IPv4(192, 0, 2, 20),
+		RemoteIP:         net.IPv4(198, 51, 100, 7),
+		LocalPort:        4500,
+		RemotePort:       4500,
+		NATDetected:      true,
+		NATDetectedKnown: true,
+		At:               start.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ObserveMOBIKENAT() error = %v", err)
+	}
+	if !change.Changed || !change.RequiresMOBIKEUpdate || !change.LocalAddressChanged || change.RemoteAddressChanged {
+		t.Fatalf("change=%+v", change)
+	}
+	if len(requests) != 1 || requests[0].DeviceID != "dev-1" || requests[0].OldIP != "192.0.2.10" || requests[0].NewIP != "192.0.2.20" {
+		t.Fatalf("MOBIKE requests=%+v", requests)
+	}
+	if result.Reason != "mobike updated from observation" || session.Result().Reason != "mobike updated from observation" {
+		t.Fatalf("MOBIKE result=%+v session=%+v", result, session.Result())
+	}
+	endpoint, updatedAt := session.MOBIKENATSnapshot()
+	if !endpoint.LocalIP.Equal(net.IPv4(192, 0, 2, 20)) || !updatedAt.Equal(start.Add(time.Minute)) {
+		t.Fatalf("snapshot endpoint=%+v updatedAt=%v", endpoint, updatedAt)
+	}
+
+	change, result, err = session.ObserveMOBIKENAT(context.Background(), MOBIKENATObservation{
+		DeviceID:         "dev-1",
+		TraceID:          "trace-1",
+		LocalIP:          net.IPv4(192, 0, 2, 20),
+		RemoteIP:         net.IPv4(198, 51, 100, 7),
+		LocalPort:        4500,
+		RemotePort:       4500,
+		NATDetected:      true,
+		NATDetectedKnown: true,
+		At:               start.Add(2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ObserveMOBIKENAT(unchanged) error = %v", err)
+	}
+	if change.Changed || result.Reason != "" || len(requests) != 1 {
+		t.Fatalf("unchanged change=%+v result=%+v requests=%+v", change, result, requests)
 	}
 }
 

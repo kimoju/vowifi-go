@@ -144,6 +144,11 @@ type TunnelSession interface {
 	Close(context.Context) error
 }
 
+type MOBIKENATObserver interface {
+	ObserveMOBIKENAT(context.Context, MOBIKENATObservation) (MOBIKENATChange, MOBIKEResult, error)
+	MOBIKENATSnapshot() (MOBIKENATEndpoint, time.Time)
+}
+
 type TunnelManager interface {
 	EstablishTunnel(context.Context, TunnelConfig) (TunnelSession, error)
 }

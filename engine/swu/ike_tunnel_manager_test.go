@@ -19,10 +19,12 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	var gotAuth ikev2.FullAuthConfig
 	var gotIKETransport IKETransportConfig
 	var gotESPTransport ESPTransportConfig
+	var gotPacketConfig PacketSessionConfig
 
 	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
-		SIM:    ikeTunnelAKAProvider{},
-		Random: bytes.NewReader(append([]byte{0xca, 0xfe, 0xba, 0xbe}, bytes.Repeat([]byte{0x55}, 64)...)),
+		SIM:      ikeTunnelAKAProvider{},
+		Random:   bytes.NewReader(append([]byte{0xca, 0xfe, 0xba, 0xbe}, bytes.Repeat([]byte{0x55}, 64)...)),
+		RemoteIP: net.IPv4(198, 51, 100, 7),
 		IKETransportFactory: func(cfg TunnelConfig, transport IKETransportConfig) (ikev2.InitTransport, error) {
 			gotIKETransport = transport
 			return ikeTransport, nil
@@ -33,7 +35,7 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 		},
 		InitRunner: func(ctx context.Context, cfg ikev2.InitConfig) (ikev2.InitResult, error) {
 			gotInit = cfg
-			return ikev2.InitResult{MOBIKESupported: true}, nil
+			return ikev2.InitResult{MOBIKESupported: true, NATDetected: true}, nil
 		},
 		AuthRunner: func(ctx context.Context, cfg ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
 			gotAuth = cfg
@@ -48,6 +50,10 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 				},
 			}
 			return ikev2.FullAuthResult{ChildSA: &child, NextMessageID: 3}, nil
+		},
+		PacketSessionFactory: func(cfg PacketSessionConfig) (TunnelSession, error) {
+			gotPacketConfig = cfg
+			return NewPacketSession(cfg)
 		},
 	})
 
@@ -98,6 +104,17 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	}
 	if !bytes.Equal(gotAuth.ChildSPI, []byte{0xca, 0xfe, 0xba, 0xbe}) {
 		t.Fatalf("child SPI=%x", gotAuth.ChildSPI)
+	}
+	if gotPacketConfig.MOBIKENAT == nil {
+		t.Fatal("packet session config missing MOBIKE NAT state")
+	}
+	natEndpoint, _ := gotPacketConfig.MOBIKENAT.Snapshot()
+	if !natEndpoint.LocalIP.Equal(net.IPv4(192, 0, 2, 10)) ||
+		!natEndpoint.RemoteIP.Equal(net.IPv4(198, 51, 100, 7)) ||
+		natEndpoint.LocalPort != 4500 ||
+		natEndpoint.RemotePort != 4500 ||
+		!natEndpoint.NATDetected {
+		t.Fatalf("MOBIKE NAT endpoint=%+v", natEndpoint)
 	}
 
 	packetSession, ok := session.(PacketTunnelSession)

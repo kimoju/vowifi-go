@@ -90,6 +90,7 @@ type PacketSessionConfig struct {
 	Transport     ESPPacketTransport
 	Random        io.Reader
 	MOBIKEHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
+	MOBIKENAT     *MOBIKENATState
 	CloseHandler  func(context.Context) error
 }
 
@@ -101,6 +102,7 @@ type PacketSession struct {
 	transport     ESPPacketTransport
 	random        io.Reader
 	mobikeHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
+	mobikeNAT     *MOBIKENATState
 	closeHandler  func(context.Context) error
 	stats         PacketTunnelStats
 	closed        bool
@@ -109,6 +111,7 @@ type PacketSession struct {
 var (
 	_ PacketTunnelSession     = (*PacketSession)(nil)
 	_ PacketTunnelReadSession = (*PacketSession)(nil)
+	_ MOBIKENATObserver       = (*PacketSession)(nil)
 )
 
 func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
@@ -141,6 +144,7 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 		transport:     cfg.Transport,
 		random:        cfg.Random,
 		mobikeHandler: cfg.MOBIKEHandler,
+		mobikeNAT:     cfg.MOBIKENAT,
 		closeHandler:  cfg.CloseHandler,
 	}, nil
 }
@@ -206,6 +210,45 @@ func (s *PacketSession) MOBIKE(ctx context.Context, req MOBIKERequest) (MOBIKERe
 		Reason:           "mobike unsupported",
 		UpdatedAt:        time.Now(),
 	}, nil
+}
+
+func (s *PacketSession) ObserveMOBIKENAT(ctx context.Context, obs MOBIKENATObservation) (MOBIKENATChange, MOBIKEResult, error) {
+	if s == nil {
+		return MOBIKENATChange{}, MOBIKEResult{}, ErrInvalidPacketTunnel
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := contextReady(ctx); err != nil {
+		return MOBIKENATChange{}, MOBIKEResult{}, err
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return MOBIKENATChange{}, MOBIKEResult{}, ErrPacketTunnelClosed
+	}
+	if s.mobikeNAT == nil {
+		s.mobikeNAT = NewMOBIKENATState(MOBIKENATStateConfig{MOBIKESupported: s.result.MOBIKESupported})
+	}
+	change := s.mobikeNAT.Observe(obs)
+	s.mu.Unlock()
+	if !change.RequiresMOBIKEUpdate {
+		return change, MOBIKEResult{}, nil
+	}
+	res, err := s.MOBIKE(ctx, change.Request)
+	return change, res, err
+}
+
+func (s *PacketSession) MOBIKENATSnapshot() (MOBIKENATEndpoint, time.Time) {
+	if s == nil {
+		return MOBIKENATEndpoint{}, time.Time{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mobikeNAT == nil {
+		return MOBIKENATEndpoint{}, time.Time{}
+	}
+	return s.mobikeNAT.Snapshot()
 }
 
 func completeMOBIKEResult(res MOBIKEResult, req MOBIKERequest, current TunnelResult, fallbackReason string) MOBIKEResult {
