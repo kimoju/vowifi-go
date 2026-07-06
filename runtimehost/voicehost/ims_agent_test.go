@@ -294,9 +294,9 @@ func TestIMSOutboundAgentSendsInDialogMessage(t *testing.T) {
 	message := transport.requests[1]
 	if message.URI != "sip:carrier@198.51.100.1:5060" || message.Headers["CSeq"] != "2 MESSAGE" ||
 		message.Headers["Content-Type"] != "text/plain" ||
-		message.Headers["Accept"] != "text/plain, application/vnd.3gpp.sms" ||
-		message.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.sms" ||
-		message.Headers["Accept-Contact"] != "*;+g.3gpp.smsip" ||
+		message.Headers["Accept"] != voiceclient.DefaultDialogMessageAccept ||
+		message.Headers["P-Preferred-Service"] != "" ||
+		message.Headers["Accept-Contact"] != "" ||
 		message.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" ||
 		message.Headers["X-Test"] != "message" ||
 		message.Headers["Route"] != "<sip:pcscf-dialog2.ims.example;lr>, <sip:pcscf-dialog1.ims.example;lr>" ||

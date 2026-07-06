@@ -10,11 +10,12 @@ import (
 var ErrInvalidDialogConfig = errors.New("invalid IMS dialog config")
 
 const (
-	imsMMTelService         = "urn:urn-7:3gpp-service.ims.icsi.mmtel"
-	imsMMTelContactFeature  = `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
-	imsMMTelAcceptContact   = "*;" + imsMMTelContactFeature
-	DefaultSubscribeExpires = "3600"
-	DefaultReferSub         = "false"
+	imsMMTelService            = "urn:urn-7:3gpp-service.ims.icsi.mmtel"
+	imsMMTelContactFeature     = `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
+	imsMMTelAcceptContact      = "*;" + imsMMTelContactFeature
+	DefaultDialogMessageAccept = "text/plain, application/vnd.3gpp.sms, message/cpim"
+	DefaultSubscribeExpires    = "3600"
+	DefaultReferSub            = "false"
 )
 
 type SIPRequestMessage struct {
@@ -301,6 +302,21 @@ func BuildMessageRequest(cfg DialogRequestConfig, contentType string, body []byt
 	msg.Headers["Accept"] = "text/plain, application/vnd.3gpp.sms"
 	msg.Headers["P-Preferred-Service"] = "urn:urn-7:3gpp-service.ims.icsi.sms"
 	msg.Headers["Accept-Contact"] = "*;+g.3gpp.smsip"
+	if contactURI := firstNonEmpty(cfg.ContactURI, cfg.Registration.ContactURI); contactURI != "" {
+		msg.Headers["Contact"] = "<" + contactURI + ">"
+	}
+	return msg, nil
+}
+
+func BuildDialogMessageRequest(cfg DialogRequestConfig, contentType string, body []byte) (SIPRequestMessage, error) {
+	msg, err := buildDialogRequest("MESSAGE", cfg, body)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	if len(body) > 0 {
+		msg.Headers["Content-Type"] = firstNonEmpty(contentType, "text/plain;charset=UTF-8")
+	}
+	msg.Headers["Accept"] = DefaultDialogMessageAccept
 	if contactURI := firstNonEmpty(cfg.ContactURI, cfg.Registration.ContactURI); contactURI != "" {
 		msg.Headers["Contact"] = "<" + contactURI + ">"
 	}

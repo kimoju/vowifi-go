@@ -474,7 +474,7 @@ func (a *IMSOutboundAgent) SendDialogMessage(ctx context.Context, req DialogMess
 	var resp voiceclient.SIPResponse
 	redirectRetries := 0
 	for {
-		msg, err := voiceclient.BuildMessageRequest(cfg, req.ContentType, req.Body)
+		msg, err := voiceclient.BuildDialogMessageRequest(cfg, req.ContentType, req.Body)
 		if err != nil {
 			return DialogMessageResult{Accepted: false, StatusCode: 500, Reason: "build IMS MESSAGE failed"}, err
 		}

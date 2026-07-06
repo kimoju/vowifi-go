@@ -251,8 +251,9 @@ protocol layers needed by VoHive:
   propagation, response body/header mapping, and dialog CSeq advancement
 - IMS in-dialog SIP MESSAGE forwarding for outbound and inbound voice dialogs,
   including text/plain or IMS SMS-style bodies, response body/header mapping,
-  remote Contact refresh, dialog CSeq advancement, and preservation of the
-  existing out-of-dialog SMS `MESSAGE` handler path
+  remote Contact refresh, dialog CSeq advancement, dialog-specific MESSAGE
+  request construction without SMS-only service feature tags, and preservation
+  of the existing out-of-dialog SMS `MESSAGE` handler path
 - IMS in-dialog SIP REFER forwarding for outbound voice dialogs, including
   structured `Refer-To`/`Referred-By` handling, explicit `Refer-Sub`
   subscription negotiation, Contact target-refresh advertisement, response

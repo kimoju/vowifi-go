@@ -1421,6 +1421,19 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if !strings.Contains(message.Headers["Security-Verify"], "spi-c=111") {
 		t.Fatalf("message Security-Verify=%q", message.Headers["Security-Verify"])
 	}
+	dialogMessage, err := BuildDialogMessageRequest(cfg, "message/cpim", []byte("cpim"))
+	if err != nil {
+		t.Fatalf("BuildDialogMessageRequest() error = %v", err)
+	}
+	if dialogMessage.Method != "MESSAGE" || dialogMessage.Headers["CSeq"] != "3 MESSAGE" ||
+		dialogMessage.Headers["Content-Type"] != "message/cpim" ||
+		dialogMessage.Headers["Accept"] != DefaultDialogMessageAccept ||
+		dialogMessage.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" ||
+		dialogMessage.Headers["P-Preferred-Service"] != "" ||
+		dialogMessage.Headers["Accept-Contact"] != "" ||
+		string(dialogMessage.Body) != "cpim" {
+		t.Fatalf("dialog MESSAGE=%+v body=%q", dialogMessage, dialogMessage.Body)
+	}
 	refer, err := BuildReferRequest(cfg, "sip:+18005551313@ims.example", "sip:user@example")
 	if err != nil {
 		t.Fatalf("BuildReferRequest() error = %v", err)

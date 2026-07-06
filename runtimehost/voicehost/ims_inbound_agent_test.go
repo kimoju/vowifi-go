@@ -1208,8 +1208,8 @@ func TestIMSInboundAgentHandlesMessage(t *testing.T) {
 	if message.URI != "sip:client@192.0.2.50:5060" || message.Headers["CSeq"] != "2 MESSAGE" ||
 		message.Headers["Content-Type"] != "text/plain" ||
 		message.Headers["Accept"] != "message/cpim" ||
-		message.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.sms" ||
-		message.Headers["Accept-Contact"] != "*;+g.3gpp.smsip" ||
+		message.Headers["P-Preferred-Service"] != "" ||
+		message.Headers["Accept-Contact"] != "" ||
 		message.Headers["X-IMS"] != "message" ||
 		message.Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" ||
 		string(message.Body) != "hello" {

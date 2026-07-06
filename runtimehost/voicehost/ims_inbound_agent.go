@@ -940,7 +940,7 @@ func (a *IMSInboundAgent) HandleInboundMessage(ctx context.Context, req IMSMessa
 	var err error
 	redirectRetries := 0
 	for {
-		msg, err = voiceclient.BuildMessageRequest(cfg, req.ContentType, req.Body)
+		msg, err = voiceclient.BuildDialogMessageRequest(cfg, req.ContentType, req.Body)
 		if err != nil {
 			return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client MESSAGE failed"}, err
 		}
