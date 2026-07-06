@@ -506,6 +506,9 @@ func (g *Gateway) HandleClientCancel(deviceID string, req *sip.Request, tx sip.S
 	}
 	dialog := g.dialog(callID)
 	dialog.DeviceID = firstVoiceNonEmpty(dialog.DeviceID, strings.TrimSpace(deviceID))
+	dialog.ContentType = sipHeaderValue(req, "Content-Type")
+	dialog.Body = append([]byte(nil), req.Body()...)
+	dialog.Headers = sipRequestHeaderMap(req)
 	dialog.State = DialogStateTerminated
 	g.recordDialog(dialog)
 	if canceller, ok := g.GetAgent(deviceID).(DialogCanceller); ok {

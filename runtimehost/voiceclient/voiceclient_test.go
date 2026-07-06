@@ -1217,6 +1217,15 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if byeBody.Method != "BYE" || byeBody.Headers["Content-Type"] != "application/vnd.3gpp.ussd+xml" || string(byeBody.Body) != "<ussd-data/>" {
 		t.Fatalf("bye with body=%+v body=%q", byeBody, byeBody.Body)
 	}
+	cancelBody, err := BuildCancelRequestWithBody(cfg, "message/sipfrag", []byte("SIP/2.0 487 Request Terminated\r\n"))
+	if err != nil {
+		t.Fatalf("BuildCancelRequestWithBody() error = %v", err)
+	}
+	if cancelBody.Method != "CANCEL" || cancelBody.Headers["CSeq"] != "3 CANCEL" ||
+		cancelBody.Headers["Content-Type"] != "message/sipfrag" ||
+		string(cancelBody.Body) != "SIP/2.0 487 Request Terminated\r\n" {
+		t.Fatalf("cancel with body=%+v body=%q", cancelBody, cancelBody.Body)
+	}
 	update, err := BuildUpdateRequest(cfg, []byte("v=0\r\n"))
 	if err != nil {
 		t.Fatalf("BuildUpdateRequest() error = %v", err)

@@ -1113,10 +1113,11 @@ func (a *IMSOutboundAgent) CancelVoiceCall(ctx context.Context, info DialogInfo)
 	if !ok || !state.early {
 		return nil
 	}
-	cancel, err := voiceclient.BuildCancelRequest(state.cfg)
+	cancel, err := voiceclient.BuildCancelRequestWithBody(state.cfg, info.ContentType, info.Body)
 	if err != nil {
 		return err
 	}
+	applyDialogUpdateHeaders(cancel.Headers, info.Headers)
 	copyDialogHeader(cancel.Headers, state.invite.Headers, "Via")
 	resp, err := a.Transport.RoundTripRequest(ctx, cancel)
 	if err != nil {

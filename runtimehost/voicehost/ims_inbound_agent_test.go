@@ -173,11 +173,26 @@ func TestIMSInboundAgentCancelEarlyInviteTerminatesRequest(t *testing.T) {
 	}
 	cancelCh := make(chan error, 1)
 	go func() {
-		cancelCh <- agent.CancelInboundCall(context.Background(), DialogInfo{CallID: "in-call-cancel"})
+		cancelCh <- agent.CancelInboundCall(context.Background(), DialogInfo{
+			CallID:      "in-call-cancel",
+			ContentType: "message/sipfrag",
+			Body:        []byte("SIP/2.0 487 Request Terminated\r\n"),
+			Headers: map[string]string{
+				"Reason": "SIP;cause=487;text=\"IMS canceled\"",
+				"X-IMS":  "cancel",
+				"Via":    "SIP/2.0/UDP 198.51.100.20:5060;branch=z9hG4bK-bad",
+			},
+		})
 	}()
 	cancel := transport.readCancel(t)
 	if cancel.Method != "CANCEL" || cancel.Headers["CSeq"] != "1 CANCEL" || cancel.Headers["Via"] != invite.Headers["Via"] {
 		t.Fatalf("client CANCEL=%+v INVITE Via=%q", cancel, invite.Headers["Via"])
+	}
+	if cancel.Headers["Reason"] != "SIP;cause=487;text=\"IMS canceled\"" ||
+		cancel.Headers["X-IMS"] != "cancel" ||
+		cancel.Headers["Content-Type"] != "message/sipfrag" ||
+		string(cancel.Body) != "SIP/2.0 487 Request Terminated\r\n" {
+		t.Fatalf("client CANCEL payload=%+v body=%q", cancel, cancel.Body)
 	}
 	transport.respondCancel(voiceclient.SIPResponse{StatusCode: 200, Reason: "OK"})
 	select {

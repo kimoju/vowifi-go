@@ -311,13 +311,25 @@ func TestGatewayHandleClientCancelCancelsEarlyDialog(t *testing.T) {
 	g.recordDialog(DialogInfo{DeviceID: "dev-1", CallID: "call-cancel", Callee: "18005551212", State: DialogStateEarly})
 
 	tx := &fakeServerTransaction{}
-	g.HandleClientCancel("dev-1", newCancelRequest("call-cancel"), tx)
+	cancelReq := newCancelRequest("call-cancel")
+	cancelReq.AppendHeader(sip.NewHeader("Reason", "SIP;cause=487;text=\"client canceled\""))
+	cancelReq.AppendHeader(sip.NewHeader("X-Client", "cancel"))
+	cancelReq.AppendHeader(sip.NewHeader("Content-Type", "message/sipfrag"))
+	cancelReq.SetBody([]byte("SIP/2.0 487 Request Terminated\r\n"))
+	g.HandleClientCancel("dev-1", cancelReq, tx)
 
 	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 {
 		t.Fatalf("CANCEL responses=%v", responseCodes(tx.responses))
 	}
 	if len(agent.canceled) != 1 || agent.canceled[0].CallID != "call-cancel" || agent.canceled[0].State != DialogStateTerminated {
 		t.Fatalf("canceled=%+v", agent.canceled)
+	}
+	canceled := agent.canceled[0]
+	if canceled.ContentType != "message/sipfrag" || string(canceled.Body) != "SIP/2.0 487 Request Terminated\r\n" ||
+		canceled.Headers["Reason"] != "SIP;cause=487;text=\"client canceled\"" ||
+		canceled.Headers["X-Client"] != "cancel" ||
+		canceled.Headers["Content-Type"] != "" {
+		t.Fatalf("canceled payload=%+v body=%q", canceled, canceled.Body)
 	}
 	if status := g.DeviceStatus("dev-1"); status["active_dialogs"] != 0 {
 		t.Fatalf("DeviceStatus=%+v, want no active dialog", status)

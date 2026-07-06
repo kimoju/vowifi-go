@@ -1654,7 +1654,16 @@ func TestIMSOutboundAgentCancelVoiceCallSendsCancelForEarlyDialog(t *testing.T) 
 		},
 	})
 
-	if err := agent.CancelVoiceCall(context.Background(), DialogInfo{CallID: "call-cancel"}); err != nil {
+	if err := agent.CancelVoiceCall(context.Background(), DialogInfo{
+		CallID:      "call-cancel",
+		ContentType: "message/sipfrag",
+		Body:        []byte("SIP/2.0 487 Request Terminated\r\n"),
+		Headers: map[string]string{
+			"Reason": "SIP;cause=487;text=\"client canceled\"",
+			"X-Test": "cancel",
+			"Via":    "SIP/2.0/UDP 198.51.100.20:5060;branch=z9hG4bK-bad",
+		},
+	}); err != nil {
 		t.Fatalf("CancelVoiceCall() error = %v", err)
 	}
 	if len(transport.requests) != 1 || transport.requests[0].Method != "CANCEL" {
@@ -1666,6 +1675,12 @@ func TestIMSOutboundAgentCancelVoiceCallSendsCancelForEarlyDialog(t *testing.T) 
 	}
 	if cancel.Headers["Via"] != inviteVia {
 		t.Fatalf("CANCEL Via=%q, want original INVITE Via %q", cancel.Headers["Via"], inviteVia)
+	}
+	if cancel.Headers["Reason"] != "SIP;cause=487;text=\"client canceled\"" ||
+		cancel.Headers["X-Test"] != "cancel" ||
+		cancel.Headers["Content-Type"] != "message/sipfrag" ||
+		string(cancel.Body) != "SIP/2.0 487 Request Terminated\r\n" {
+		t.Fatalf("CANCEL payload=%+v body=%q", cancel, cancel.Body)
 	}
 	if _, ok := agent.dialogs["call-cancel"]; ok {
 		t.Fatal("early dialog still stored after successful CANCEL")

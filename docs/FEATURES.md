@@ -89,7 +89,7 @@ protocol layers needed by VoHive:
 - outbound voice dialog bridging helpers, SDP parsing/building, IMS INVITE/ACK/
   BYE/CANCEL request construction with MMTel service identification headers,
   route-set application, UDP/TCP SIP request transport, outbound IMS voice
-  agent, ACK/BYE dialog handling with release Reason/body forwarding,
+  agent, ACK/BYE/CANCEL dialog handling with release Reason/body forwarding,
   RTP/RTCP media relay endpoint allocation, SDP media/RTCP rewriting, packet
   forwarding, and dialog termination hooks
 - SWu tunnel manager/session contracts with startup validation, tunnel readiness
@@ -176,12 +176,12 @@ protocol layers needed by VoHive:
 - inbound IMS voice agent helpers that bridge IMS-originated INVITEs to a local
   SIP client, parse SDP answers, forward ACK/BYE/CANCEL dialog requests, and
   support RTP relay allocation with IMS-offer/client-answer SDP rewriting,
-  including BYE CSeq/Reason/body preservation, early-dialog CANCEL forwarding
-  with original INVITE Via reuse and 487 Request Terminated mapping for the
-  canceled INVITE transaction, plus local 18x provisional response forwarding
-  with early SDP/RTP relay rewriting and early-dialog To-tag, Contact, and
-  Record-Route state capture for PRACK, while preserving bodyless final 2xx
-  responses after a reliable provisional SDP answer
+  including BYE CSeq/Reason/body preservation, early-dialog CANCEL Reason/body
+  preservation with original INVITE Via reuse and 487 Request Terminated
+  mapping for the canceled INVITE transaction, plus local 18x provisional
+  response forwarding with early SDP/RTP relay rewriting and early-dialog
+  To-tag, Contact, and Record-Route state capture for PRACK, while preserving
+  bodyless final 2xx responses after a reliable provisional SDP answer
 - wire-level inbound IMS SIP adapters for UDP/TCP listeners, SIP request
   parsing, provisional/final response construction, incoming INVITE/ACK/BYE/
   CANCEL dispatch, response To-tagging, transaction response caching for

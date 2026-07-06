@@ -86,7 +86,18 @@ func BuildByeRequestWithBody(cfg DialogRequestConfig, contentType string, body [
 }
 
 func BuildCancelRequest(cfg DialogRequestConfig) (SIPRequestMessage, error) {
-	return buildDialogRequest("CANCEL", cfg, nil)
+	return BuildCancelRequestWithBody(cfg, "", nil)
+}
+
+func BuildCancelRequestWithBody(cfg DialogRequestConfig, contentType string, body []byte) (SIPRequestMessage, error) {
+	msg, err := buildDialogRequest("CANCEL", cfg, body)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	if len(body) > 0 {
+		msg.Headers["Content-Type"] = firstNonEmpty(contentType, "application/octet-stream")
+	}
+	return msg, nil
 }
 
 func BuildUpdateRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage, error) {

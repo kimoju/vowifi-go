@@ -782,12 +782,26 @@ func TestIMSInboundWireServerCancelsPendingInvite(t *testing.T) {
 		t.Fatalf("client INVITE=%+v", clientInvite)
 	}
 
-	if _, err := client.Write(wireIMSInvite("wire-call-cancel", "CANCEL", 1, nil)); err != nil {
+	if _, err := client.Write(wireIMSRequest(
+		"wire-call-cancel",
+		"CANCEL",
+		1,
+		[]byte("SIP/2.0 487 Request Terminated\r\n"),
+		"Reason: SIP;cause=487;text=\"client canceled\"\r\n",
+		"X-IMS: cancel\r\n",
+		"Content-Type: message/sipfrag\r\n",
+	)); err != nil {
 		t.Fatalf("client CANCEL Write() error = %v", err)
 	}
 	clientCancel := transport.readCancel(t)
 	if clientCancel.Method != "CANCEL" || clientCancel.Headers["Via"] != clientInvite.Headers["Via"] {
 		t.Fatalf("client CANCEL=%+v INVITE Via=%q", clientCancel, clientInvite.Headers["Via"])
+	}
+	if clientCancel.Headers["Reason"] != "SIP;cause=487;text=\"client canceled\"" ||
+		clientCancel.Headers["X-Ims"] != "cancel" ||
+		clientCancel.Headers["Content-Type"] != "message/sipfrag" ||
+		string(clientCancel.Body) != "SIP/2.0 487 Request Terminated\r\n" {
+		t.Fatalf("client CANCEL payload=%+v body=%q", clientCancel, clientCancel.Body)
 	}
 	transport.respondCancel(voiceclient.SIPResponse{StatusCode: 200, Reason: "OK"})
 	cancelOK := readUDPWireResponse(t, client)

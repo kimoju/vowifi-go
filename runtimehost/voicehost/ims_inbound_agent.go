@@ -905,10 +905,11 @@ func (a *IMSInboundAgent) CancelInboundCall(ctx context.Context, info DialogInfo
 	if !state.early || state.canceled {
 		return nil
 	}
-	cancel, err := voiceclient.BuildCancelRequest(state.clientCfg)
+	cancel, err := voiceclient.BuildCancelRequestWithBody(state.clientCfg, info.ContentType, info.Body)
 	if err != nil {
 		return err
 	}
+	applyDialogUpdateHeaders(cancel.Headers, info.Headers)
 	copyDialogHeader(cancel.Headers, state.invite.Headers, "Via")
 	resp, err := a.ClientTransport.RoundTripRequest(ctx, cancel)
 	if err != nil {
