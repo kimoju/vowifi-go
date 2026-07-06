@@ -231,7 +231,8 @@ protocol layers needed by VoHive:
   existing out-of-dialog SMS `MESSAGE` handler path
 - IMS in-dialog SIP REFER forwarding for outbound voice dialogs, including
   structured `Refer-To`/`Referred-By` handling, `Refer-Sub` negotiation headers,
-  response header/body mapping, and dialog CSeq advancement
+  Contact target-refresh advertisement, response header/body mapping, and
+  dialog CSeq advancement
 - IMS-originated in-dialog SIP REFER forwarding to the local softphone, including
   `norefersub` option-tag support, `Refer-Sub` propagation, response mapping,
   remote Contact refresh, and dialog CSeq tracking

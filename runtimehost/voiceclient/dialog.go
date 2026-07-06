@@ -282,7 +282,7 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 		"P-Preferred-Identity":  "<" + localURI + ">",
 		"P-Access-Network-Info": "IEEE-802.11",
 	}
-	if contactURI != "" && (method == "INVITE" || method == "UPDATE" || method == "INFO" || method == "NOTIFY" || method == "SUBSCRIBE") {
+	if contactURI != "" && (method == "INVITE" || method == "UPDATE" || method == "INFO" || method == "REFER" || method == "NOTIFY" || method == "SUBSCRIBE") {
 		headers["Contact"] = "<" + contactURI + ">"
 	}
 	if route := routeHeader(firstNonEmptySlice(cfg.RouteSet, cfg.Registration.ServiceRoutes)); route != "" {

@@ -1428,6 +1428,7 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if refer.Method != "REFER" || refer.Headers["CSeq"] != "3 REFER" ||
 		refer.Headers["Refer-To"] != "<sip:+18005551313@ims.example>" ||
 		refer.Headers["Referred-By"] != "<sip:user@example>" ||
+		refer.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" ||
 		refer.Headers["Refer-Sub"] != "false" || refer.Headers["Supported"] == "" {
 		t.Fatalf("refer=%+v", refer)
 	}
