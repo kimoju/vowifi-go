@@ -135,6 +135,27 @@ func TestSendSMSWithOptionsPropagatesValidityPeriod(t *testing.T) {
 	}
 }
 
+func TestSendSMSWithOptionsPropagatesSubmitProtocolFields(t *testing.T) {
+	transport := &fakeSMSTransport{}
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	svc.SetSMSTransport(transport)
+
+	_, err := svc.SendSMSWithOptions(context.Background(), "+18005551212", "flash", SendOptions{
+		ProtocolID:       0x7f,
+		DataCodingScheme: 0x10,
+	})
+	if err != nil {
+		t.Fatalf("SendSMSWithOptions() error = %v", err)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	part := transport.requests[0].Part
+	if part.ProtocolID != 0x7f || part.DataCodingScheme != 0x10 {
+		t.Fatalf("part=%+v", part)
+	}
+}
+
 func TestSendSMSWithTransportFailureMarksDeliveryFailed(t *testing.T) {
 	store := &fakeDeliveryStore{}
 	transport := &fakeSMSTransport{failPart: 2}

@@ -66,7 +66,11 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	encoding := normalizeEncoding(part.Text, part.Encoding)
+	dcsOverride, hasDCSOverride := smsSubmitDataCodingScheme(part)
+	encoding, err := normalizeSMSSubmitEncoding(part.Text, part.Encoding, dcsOverride, hasDCSOverride)
+	if err != nil {
+		return nil, err
+	}
 	udh := append([]byte(nil), part.UDH...)
 	firstOctet := byte(0x01)
 	if part.RequestStatusReport {
@@ -86,16 +90,77 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if hasDCSOverride {
+		dcs = dcsOverride
+	}
 	out := make([]byte, 0, 8+len(bcd)+len(userData))
 	out = append(out, firstOctet, mr, byte(digits), toa)
 	out = append(out, bcd...)
-	out = append(out, 0x00, dcs)
+	out = append(out, smsSubmitProtocolID(part), dcs)
 	if hasValidityPeriod {
 		out = append(out, vp)
 	}
 	out = append(out, byte(udl))
 	out = append(out, userData...)
 	return out, nil
+}
+
+func smsSubmitProtocolID(part SMSPart) byte {
+	if part.UseProtocolID || part.ProtocolID != 0 {
+		return part.ProtocolID
+	}
+	return 0
+}
+
+func smsSubmitDataCodingScheme(part SMSPart) (byte, bool) {
+	if part.UseDataCodingScheme || part.DataCodingScheme != 0 {
+		return part.DataCodingScheme, true
+	}
+	return 0, false
+}
+
+func normalizeSMSSubmitEncoding(text, requested string, dcs byte, hasDCS bool) (string, error) {
+	encodingRequested := strings.TrimSpace(requested) != ""
+	encoding := normalizeEncoding(text, requested)
+	if !hasDCS {
+		return encoding, nil
+	}
+	if !encodingRequested {
+		encoding = smsEncodingForDCS(dcs)
+	}
+	if err := validateSMSSubmitDataCodingScheme(dcs, encoding); err != nil {
+		return "", err
+	}
+	return encoding, nil
+}
+
+func smsEncodingForDCS(dcs byte) string {
+	switch smsDCSAlphabet(dcs) {
+	case "ucs2":
+		return "ucs2"
+	case "8bit":
+		return "utf8"
+	default:
+		return "gsm7"
+	}
+}
+
+func validateSMSSubmitDataCodingScheme(dcs byte, encoding string) error {
+	if dcs&0xc0 == 0 && dcs&0x20 != 0 {
+		return fmt.Errorf("sms compressed data coding scheme is unsupported: 0x%02x", dcs)
+	}
+	want := smsDCSAlphabet(dcs)
+	got := "gsm7"
+	switch encoding {
+	case "ucs2":
+		got = "ucs2"
+	case "utf8":
+		got = "8bit"
+	}
+	if want != got {
+		return fmt.Errorf("sms data coding scheme 0x%02x expects %s user data, got %s", dcs, want, got)
+	}
+	return nil
 }
 
 func encodeSMSRelativeValidityPeriod(validity time.Duration) (byte, bool, error) {

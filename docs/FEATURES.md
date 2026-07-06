@@ -87,8 +87,9 @@ protocol layers needed by VoHive:
   redirect retries, TP-SRR delivery-status requests, SMS RP-ERROR/
   STATUS-REPORT cause mapping, per-message SMS concatenation references with
   8-bit and 16-bit UDH support, SMS-SUBMIT relative validity-period encoding,
-  USSD dialog target refresh, and recoverable IMS registration/route failure
-  signals for MESSAGE, USSD INVITE/INFO, and USSD BYE failures
+  SMS-SUBMIT TP-PID/TP-DCS overrides with alphabet validation, USSD dialog
+  target refresh, and recoverable IMS registration/route failure signals for
+  MESSAGE, USSD INVITE/INFO, and USSD BYE failures
 - outbound voice dialog bridging helpers, SDP parsing/building, IMS INVITE/ACK/
   BYE/CANCEL request construction with MMTel service identification headers,
   route-set application, UDP/TCP SIP request transport, outbound IMS voice

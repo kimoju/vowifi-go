@@ -34,6 +34,47 @@ func TestBuildSMSSubmitTPDURelativeValidityPeriod(t *testing.T) {
 	}
 }
 
+func TestBuildSMSSubmitTPDUCustomProtocolIDAndDCS(t *testing.T) {
+	tpdu, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "flash", ProtocolID: 0x7f, DataCodingScheme: 0x10}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU() error = %v", err)
+	}
+	if tpdu[10] != 0x7f || tpdu[11] != 0x10 || tpdu[12] != 5 {
+		t.Fatalf("PID=0x%02x DCS=0x%02x UDL=%d TPDU=%x", tpdu[10], tpdu[11], tpdu[12], tpdu)
+	}
+	textOut, _, err := decodeSMSUserData(tpdu[13:], int(tpdu[12]), tpdu[11], false)
+	if err != nil {
+		t.Fatalf("decodeSMSUserData() error = %v", err)
+	}
+	if textOut != "flash" {
+		t.Fatalf("decoded TPDU text=%q", textOut)
+	}
+}
+
+func TestBuildSMSSubmitTPDUDCSSelectsUCS2Encoding(t *testing.T) {
+	tpdu, err := BuildSMSSubmitTPDU("10086", SMSPart{Text: "OK", DataCodingScheme: 0x18}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU() error = %v", err)
+	}
+	if tpdu[8] != 0x18 || tpdu[9] != 4 {
+		t.Fatalf("DCS=0x%02x UDL=%d TPDU=%x", tpdu[8], tpdu[9], tpdu)
+	}
+	if got := strings.ToUpper(hex.EncodeToString(tpdu[10:])); got != "004F004B" {
+		t.Fatalf("user data=%s want 004F004B", got)
+	}
+}
+
+func TestBuildSMSSubmitTPDURejectsConflictingDCS(t *testing.T) {
+	_, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", Encoding: "ucs2", UseDataCodingScheme: true}, 1)
+	if err == nil || !strings.Contains(err.Error(), "data coding scheme") {
+		t.Fatalf("BuildSMSSubmitTPDU() err=%v, want data coding scheme mismatch", err)
+	}
+	_, err = BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", DataCodingScheme: 0x20}, 1)
+	if err == nil || !strings.Contains(err.Error(), "compressed") {
+		t.Fatalf("BuildSMSSubmitTPDU() err=%v, want compressed DCS rejection", err)
+	}
+}
+
 func TestEncodeSMSRelativeValidityPeriod(t *testing.T) {
 	tests := []struct {
 		name     string
