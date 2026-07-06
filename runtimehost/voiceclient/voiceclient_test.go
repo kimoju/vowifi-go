@@ -1619,6 +1619,87 @@ func TestRoundTripRequestWithDigestAuthRetriesChallenge(t *testing.T) {
 	}
 }
 
+func TestRoundTripRequestWithDigestAuthRecomputesAKAChallenge(t *testing.T) {
+	registerNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	dialogNonce := append(bytesFrom(0x60, 16), bytesFrom(0x80, 16)...)
+	registerChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(registerNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	dialogChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(dialogNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	aka := &sequenceAKAProvider{results: []sim.AKAResult{
+		{RES: []byte{0xAA, 0xBB, 0xCC, 0xDD}},
+		{RES: []byte{0x11, 0x22, 0x33, 0x44}},
+	}}
+	registered, err := RegisterSession{
+		Transport: &fakeRegisterTransport{responses: []RegisterResponse{
+			{
+				StatusCode: 401,
+				Reason:     "Unauthorized",
+				Headers:    map[string][]string{"WWW-Authenticate": {registerChallenge}},
+			},
+			{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers:    map[string][]string{"Contact": {`<sip:user@192.0.2.10:5060>;expires=1800`}},
+			},
+		}},
+		AKAProvider:  aka,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "register-aka-dialog",
+		CNonce:       "cnonce",
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !registered.Registered || registered.Binding.AuthSession == nil || len(aka.rands) != 1 {
+		t.Fatalf("registered=%+v AKA rands=%x", registered, aka.rands)
+	}
+	msg, err := BuildMessageRequest(DialogRequestConfig{
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: registered.Binding,
+		RemoteURI:    "sip:+18005551212@ims.example",
+		CallID:       "message-aka-dialog",
+		CSeq:         2,
+	}, "text/plain;charset=UTF-8", []byte("hello"))
+	if err != nil {
+		t.Fatalf("BuildMessageRequest() error = %v", err)
+	}
+	transport := &fakeSIPRequestRoundTripTransport{responses: []SIPResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers:    map[string][]string{"WWW-Authenticate": {dialogChallenge}},
+		},
+		{StatusCode: 202, Reason: "Accepted"},
+	}}
+	resp, err := RoundTripRequestWithDigestAuth(context.Background(), transport, msg)
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequestWithDigestAuth() resp=%+v err=%v", resp, err)
+	}
+	if len(aka.rands) != 2 || !bytesEqual(aka.rands[1], bytesFrom(0x60, 16)) {
+		t.Fatalf("AKA rands=%x", aka.rands)
+	}
+	ch, err := ParseWWWAuthenticate(dialogChallenge)
+	if err != nil {
+		t.Fatalf("ParseWWWAuthenticate() error = %v", err)
+	}
+	want, err := BuildDigestAuthorization(ch, DigestAuthInput{
+		Method:   "MESSAGE",
+		URI:      msg.URI,
+		Username: "impi@example",
+		Password: string([]byte{0x11, 0x22, 0x33, 0x44}),
+		CNonce:   "cnonce",
+		NC:       1,
+		Body:     msg.Body,
+	})
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization() error = %v", err)
+	}
+	if got := transport.requests[1].Headers["Authorization"]; got != want {
+		t.Fatalf("retry Authorization=%s, want %s", got, want)
+	}
+}
+
 func TestDigestChallengeRetryRequestSkipsInvite(t *testing.T) {
 	retry, ok, err := DigestChallengeRetryRequest(SIPRequestMessage{
 		Method:      "INVITE",
@@ -1698,6 +1779,27 @@ func (p *registerAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult
 	p.rand = append([]byte(nil), rand16...)
 	p.autn = append([]byte(nil), autn16...)
 	return sim.AKAResult{RES: []byte{0xAA, 0xBB, 0xCC, 0xDD}}, nil
+}
+
+type sequenceAKAProvider struct {
+	results []sim.AKAResult
+	rands   [][]byte
+	autns   [][]byte
+}
+
+func (p *sequenceAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, error) {
+	p.rands = append(p.rands, append([]byte(nil), rand16...))
+	p.autns = append(p.autns, append([]byte(nil), autn16...))
+	if len(p.results) == 0 {
+		return sim.AKAResult{RES: []byte{0xAA, 0xBB, 0xCC, 0xDD}}, nil
+	}
+	result := p.results[0]
+	p.results = p.results[1:]
+	result.RES = append([]byte(nil), result.RES...)
+	result.CK = append([]byte(nil), result.CK...)
+	result.IK = append([]byte(nil), result.IK...)
+	result.AUTS = append([]byte(nil), result.AUTS...)
+	return result, nil
 }
 
 type syncFailureAKAProvider struct {

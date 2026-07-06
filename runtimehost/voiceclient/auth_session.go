@@ -11,18 +11,26 @@ var ErrSIPTransportUnavailable = errors.New("sip transport unavailable")
 
 // DigestAuthSession keeps SIP Digest state shared across IMS dialog requests.
 type DigestAuthSession struct {
-	mu         sync.Mutex
-	headerName string
-	header     string
-	state      DigestAuthState
+	mu             sync.Mutex
+	headerName     string
+	header         string
+	state          DigestAuthState
+	challengeInput DigestChallengeInputFunc
 }
 
+type DigestChallengeInputFunc func(DigestChallenge, string) (DigestAuthInput, error)
+
 func NewDigestAuthSession(headerName, header string, state DigestAuthState) *DigestAuthSession {
+	return NewDigestAuthSessionWithChallengeInput(headerName, header, state, nil)
+}
+
+func NewDigestAuthSessionWithChallengeInput(headerName, header string, state DigestAuthState, input DigestChallengeInputFunc) *DigestAuthSession {
 	headerName = firstNonEmpty(headerName, state.headerName, "Authorization")
 	return &DigestAuthSession{
-		headerName: headerName,
-		header:     firstNonEmpty(header),
-		state:      state.clone(),
+		headerName:     headerName,
+		header:         firstNonEmpty(header),
+		state:          state.clone(),
+		challengeInput: input,
 	}
 }
 
@@ -96,6 +104,9 @@ func (s *DigestAuthSession) AuthorizeChallenge(resp SIPResponse, method, uri str
 	if err != nil {
 		return authHeaderName, "", false, err
 	}
+	if s.challengeInput != nil {
+		return s.authorizeChallengeWithInput(ch, authHeaderName, method, uri, body)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.state.Usable() {
@@ -114,6 +125,30 @@ func (s *DigestAuthSession) AuthorizeChallenge(resp SIPResponse, method, uri str
 	s.headerName = authHeaderName
 	s.header = authz
 	s.state = next
+	return authHeaderName, authz, true, nil
+}
+
+func (s *DigestAuthSession) authorizeChallengeWithInput(ch DigestChallenge, authHeaderName, method, uri string, body []byte) (headerName, header string, ok bool, err error) {
+	input, err := s.challengeInput(ch, uri)
+	if err != nil {
+		return authHeaderName, "", false, err
+	}
+	input.Method = strings.ToUpper(strings.TrimSpace(method))
+	input.URI = strings.TrimSpace(uri)
+	input.NC = 1
+	input.Body = append([]byte(nil), body...)
+	authz, err := BuildDigestAuthorization(ch, input)
+	if err != nil {
+		return authHeaderName, "", false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.headerName = authHeaderName
+	s.header = authz
+	if len(input.AUTS) == 0 {
+		s.state = newDigestAuthState(authHeaderName, ch, input, authz)
+	}
 	return authHeaderName, authz, true, nil
 }
 
@@ -183,10 +218,14 @@ func methodAllowsDigestChallengeRetry(method string) bool {
 }
 
 func bindDigestAuth(binding RegistrationBinding, headerName, header string, state DigestAuthState) RegistrationBinding {
+	return bindDigestAuthWithChallengeInput(binding, headerName, header, state, nil)
+}
+
+func bindDigestAuthWithChallengeInput(binding RegistrationBinding, headerName, header string, state DigestAuthState, input DigestChallengeInputFunc) RegistrationBinding {
 	binding.AuthHeaderName = firstNonEmpty(headerName, state.headerName, binding.AuthHeaderName)
 	binding.AuthHeader = firstNonEmpty(header, binding.AuthHeader)
 	if state.Usable() || binding.AuthHeader != "" {
-		binding.AuthSession = NewDigestAuthSession(binding.AuthHeaderName, binding.AuthHeader, state)
+		binding.AuthSession = NewDigestAuthSessionWithChallengeInput(binding.AuthHeaderName, binding.AuthHeader, state, input)
 	}
 	return binding
 }

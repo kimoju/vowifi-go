@@ -522,7 +522,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		if isSIPSuccess(resp2.StatusCode) {
 			authState := newDigestAuthState(authzHeader, ch, currentAuthInput, authz)
 			authState, err = updateDigestAuthStateFromInfo(authState, resp2.Headers, authzHeader, resp2.Body)
-			binding := bindDigestAuth(buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders), authzHeader, authz, authState)
+			binding := bindDigestAuthWithChallengeInput(buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders), authzHeader, authz, authState, s.digestChallengeInputFunc())
 			result := RegisterResult{
 				Registered:     true,
 				StatusCode:     resp2.StatusCode,
@@ -602,7 +602,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		result.Registered = false
 		return result, err
 	}
-	result.Binding = bindDigestAuth(result.Binding, authzHeader, authz, result.AuthState)
+	result.Binding = bindDigestAuthWithChallengeInput(result.Binding, authzHeader, authz, result.AuthState, s.digestChallengeInputFunc())
 	return result, nil
 }
 
@@ -779,7 +779,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if isSIPSuccess(resp.StatusCode) {
 		binding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp, expires, securityClientFromBinding(req.Binding), nil))
 		authState, err = updateDigestAuthStateFromInfo(authState, resp.Headers, authHeaderName, resp.Body)
-		binding = bindDigestAuth(binding, authHeaderName, authz, authState)
+		binding = bindDigestAuthWithChallengeInput(binding, authHeaderName, authz, authState, s.digestChallengeInputFunc())
 		result := RefreshResult{
 			Refreshed:      true,
 			StatusCode:     resp.StatusCode,
@@ -853,7 +853,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		result.Refreshed = false
 		return result, err
 	}
-	result.Binding = bindDigestAuth(result.Binding, authHeaderName, authz, result.AuthState)
+	result.Binding = bindDigestAuthWithChallengeInput(result.Binding, authHeaderName, authz, result.AuthState, s.digestChallengeInputFunc())
 	return result, nil
 }
 
@@ -1057,6 +1057,20 @@ func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registr
 	}
 	input.Password = password
 	return input, false, nil
+}
+
+func (s RegisterSession) digestChallengeInputFunc() DigestChallengeInputFunc {
+	profile := s.Profile
+	akaProvider := s.AKAProvider
+	cnonce := s.CNonce
+	return func(ch DigestChallenge, uri string) (DigestAuthInput, error) {
+		input, _, err := (RegisterSession{
+			AKAProvider: akaProvider,
+			Profile:     profile,
+			CNonce:      cnonce,
+		}).digestAuthInputForChallenge(ch, uri)
+		return input, err
+	}
 }
 
 func SelectDigestChallenge(headers map[string][]string, name string) (DigestChallenge, error) {
