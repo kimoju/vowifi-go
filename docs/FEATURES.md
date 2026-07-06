@@ -178,8 +178,9 @@ protocol layers needed by VoHive:
   and `RSeq`, in-progress INVITE transaction caching while local client final
   responses are pending, UDP final INVITE response retransmission until the
   matching ACK arrives or the transaction expires, UDP reliable provisional
-  response retransmission until matching PRACK receipt, and loopback-tested
-  socket handling
+  response retransmission until matching PRACK receipt, `481 Call/Transaction
+  Does Not Exist` handling for CANCELs without a matching pending INVITE
+  transaction, and loopback-tested socket handling
 - IMS in-dialog interworking for UPDATE, PRACK, and OPTIONS, including SDP
   session refresh forwarding, RAck propagation, RTP relay endpoint rewriting
   for UPDATE offers/answers, and local OPTIONS capability responses

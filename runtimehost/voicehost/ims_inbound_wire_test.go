@@ -564,6 +564,28 @@ func TestIMSInboundWireServerCancelsPendingInvite(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerRejectsCancelWithoutPendingInvite(t *testing.T) {
+	transport := newWireInboundTransport(nil)
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport: transport,
+		},
+	}
+	cancel := parseWireIncoming(t, wireIMSInvite("wire-call-stray-cancel", "CANCEL", 1, nil))
+	responses, err := server.HandleRequest(context.Background(), cancel)
+	if err != nil {
+		t.Fatalf("HandleRequest(CANCEL) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 481 {
+		t.Fatalf("CANCEL responses=%+v, want 481", responses)
+	}
+	select {
+	case req := <-transport.requests:
+		t.Fatalf("unexpected client request for stray CANCEL=%+v", req)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestIMSInboundWireServerForwardsProvisionalInviteResponses(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{
 		provisionals: []voiceclient.SIPResponse{
@@ -1278,12 +1300,15 @@ func TestIMSInboundWireServerReturnsAgentByeCancelErrors(t *testing.T) {
 		t.Fatalf("client BYE request=%+v", req)
 	}
 
+	pendingInvite := parseWireIncoming(t, wireIMSInvite("wire-error-call", "INVITE", 1, nil))
+	server.storeTransaction(wireTransactionKey(pendingInvite), []IMSInboundWireResponse{wireResponse(100, "Trying")})
 	responses, err = server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
 		Method: "CANCEL",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
 			"Call-ID": {"wire-error-call"},
-			"CSeq":    {"3 CANCEL"},
+			"CSeq":    {"1 CANCEL"},
+			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-INVITE"},
 		},
 	})
 	if err == nil || !strings.Contains(err.Error(), "client CANCEL rejected") {
@@ -1541,9 +1566,13 @@ func wireIMSRequest(callID, method string, cseq int, body []byte, extraHeaders .
 	if method == "" {
 		method = "INVITE"
 	}
+	branchMethod := method
+	if method == "CANCEL" {
+		branchMethod = "INVITE"
+	}
 	var b strings.Builder
 	b.WriteString(method + " sip:user@ims.example SIP/2.0\r\n")
-	b.WriteString("Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-" + method + "\r\n")
+	b.WriteString("Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-" + branchMethod + "\r\n")
 	b.WriteString("From: <sip:+18005551212@ims.example>;tag=ims-tag\r\n")
 	b.WriteString("To: <sip:user@ims.example>\r\n")
 	b.WriteString("Call-ID: " + callID + "\r\n")

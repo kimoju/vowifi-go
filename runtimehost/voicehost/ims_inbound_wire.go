@@ -167,6 +167,10 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
 			break
 		}
+		if !s.hasPendingInviteTransactionForCancel(req) {
+			responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(481, "Call/Transaction Does Not Exist"))}
+			break
+		}
 		if callErr := s.Agent.CancelInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); callErr != nil {
 			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, callErr.Error()))}, callErr
 			break
@@ -889,6 +893,28 @@ func (s *IMSInboundWireServer) storeTransaction(key string, responses []IMSInbou
 	s.mu.Unlock()
 }
 
+func (s *IMSInboundWireServer) hasPendingInviteTransactionForCancel(req voiceclient.SIPIncomingRequest) bool {
+	key := wireCancelInviteTransactionKey(req)
+	if s == nil || key == "" {
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneWireStateLocked(now)
+	tx, ok := s.transactions[key]
+	if !ok || (!tx.expires.IsZero() && now.After(tx.expires)) {
+		return false
+	}
+	for i := len(tx.responses) - 1; i >= 0; i-- {
+		if tx.responses[i].NoResponse {
+			continue
+		}
+		return tx.responses[i].StatusCode > 0 && tx.responses[i].StatusCode < 200
+	}
+	return false
+}
+
 func (s *IMSInboundWireServer) pruneWireStateLocked(now time.Time) {
 	for cachedKey, tx := range s.transactions {
 		if !tx.expires.IsZero() && now.After(tx.expires) {
@@ -959,6 +985,22 @@ func wireInviteRetransmissionKey(req voiceclient.SIPIncomingRequest) string {
 		return ""
 	}
 	return callID + "|" + strconv.Itoa(cseq) + "|" + fromTag
+}
+
+func wireCancelInviteTransactionKey(req voiceclient.SIPIncomingRequest) string {
+	if !strings.EqualFold(strings.TrimSpace(req.Method), "CANCEL") {
+		return ""
+	}
+	callID := strings.TrimSpace(wireCallID(req))
+	cseq := wireCSeq(req)
+	branch := wireViaBranch(firstVoiceHeader(req.Headers, "Via"))
+	if callID == "" || cseq <= 0 {
+		return ""
+	}
+	if branch == "" {
+		branch = firstVoiceHeader(req.Headers, "Via")
+	}
+	return "INVITE|" + callID + "|" + strconv.Itoa(cseq) + " INVITE|" + branch
 }
 
 func wireReliableProvisionalKey(req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) string {
