@@ -79,7 +79,7 @@ func TestIMSInboundWireServerServesUDPInviteAckAndBye(t *testing.T) {
 		t.Fatalf("client ACK=%+v", ack)
 	}
 
-	if _, err := client.Write(wireIMSInvite("wire-call-1", "BYE", 2, nil)); err != nil {
+	if _, err := client.Write(wireIMSRequest("wire-call-1", "BYE", 9, nil, "Reason: SIP;cause=200;text=\"completed\"\r\n")); err != nil {
 		t.Fatalf("client BYE Write() error = %v", err)
 	}
 	byeOK := readUDPWireResponse(t, client)
@@ -87,7 +87,8 @@ func TestIMSInboundWireServerServesUDPInviteAckAndBye(t *testing.T) {
 		t.Fatalf("BYE response=%+v", byeOK)
 	}
 	bye := transport.readRequest(t)
-	if bye.Method != "BYE" || bye.Headers["CSeq"] != "2 BYE" {
+	if bye.Method != "BYE" || bye.Headers["CSeq"] != "9 BYE" ||
+		bye.Headers["Reason"] != "SIP;cause=200;text=\"completed\"" {
 		t.Fatalf("client BYE=%+v", bye)
 	}
 

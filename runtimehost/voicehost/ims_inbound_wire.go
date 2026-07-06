@@ -188,7 +188,13 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
 			break
 		}
-		if callErr := s.Agent.EndInboundCall(ctx, DialogInfo{CallID: wireCallID(req)}); callErr != nil {
+		if callErr := s.Agent.EndInboundCall(ctx, DialogInfo{
+			CallID:      wireCallID(req),
+			CSeq:        wireCSeq(req),
+			ContentType: firstVoiceHeader(req.Headers, "Content-Type"),
+			Body:        append([]byte(nil), req.Body...),
+			Headers:     firstValueSIPHeaders(req.Headers),
+		}); callErr != nil {
 			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, callErr.Error()))}, callErr
 			break
 		}

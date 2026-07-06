@@ -75,14 +75,24 @@ func TestIMSInboundAgentInviteAckAndBye(t *testing.T) {
 		t.Fatalf("ACK Route=%q", transport.writes[0].Headers["Route"])
 	}
 
-	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-1"}); err != nil {
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{
+		CallID:      "in-call-1",
+		CSeq:        9,
+		ContentType: "message/sipfrag",
+		Body:        []byte("SIP/2.0 200 OK\r\n"),
+		Headers:     map[string]string{"Reason": "SIP;cause=200;text=\"completed\"", "X-IMS": "bye"},
+	}); err != nil {
 		t.Fatalf("EndInboundCall() error = %v", err)
 	}
 	if len(transport.requests) != 2 || transport.requests[1].Method != "BYE" {
 		t.Fatalf("requests=%+v", transport.requests)
 	}
 	bye := transport.requests[1]
-	if bye.URI != "sip:client@192.0.2.50:5060" || bye.Headers["CSeq"] != "2 BYE" {
+	if bye.URI != "sip:client@192.0.2.50:5060" || bye.Headers["CSeq"] != "9 BYE" ||
+		bye.Headers["Content-Type"] != "message/sipfrag" ||
+		bye.Headers["Reason"] != "SIP;cause=200;text=\"completed\"" ||
+		bye.Headers["X-IMS"] != "bye" ||
+		string(bye.Body) != "SIP/2.0 200 OK\r\n" {
 		t.Fatalf("BYE=%+v", bye)
 	}
 	if bye.Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" {

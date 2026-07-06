@@ -77,14 +77,23 @@ func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {
 		t.Fatalf("ACK Route=%q", route)
 	}
 
-	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-1"}); err != nil {
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{
+		CallID:      "call-1",
+		ContentType: "message/sipfrag",
+		Body:        []byte("SIP/2.0 200 OK\r\n"),
+		Headers:     map[string]string{"Reason": "SIP;cause=200;text=\"completed\"", "X-Test": "bye", "Content-Type": "ignored"},
+	}); err != nil {
 		t.Fatalf("EndVoiceCall() error = %v", err)
 	}
 	if len(transport.requests) != 2 || transport.requests[1].Method != "BYE" {
 		t.Fatalf("requests=%+v", transport.requests)
 	}
 	bye := transport.requests[1]
-	if bye.URI != "sip:carrier@198.51.100.1:5060" || bye.Headers["CSeq"] != "2 BYE" {
+	if bye.URI != "sip:carrier@198.51.100.1:5060" || bye.Headers["CSeq"] != "2 BYE" ||
+		bye.Headers["Content-Type"] != "message/sipfrag" ||
+		bye.Headers["Reason"] != "SIP;cause=200;text=\"completed\"" ||
+		bye.Headers["X-Test"] != "bye" ||
+		string(bye.Body) != "SIP/2.0 200 OK\r\n" {
 		t.Fatalf("BYE=%+v", bye)
 	}
 	if route := bye.Headers["Route"]; route != "<sip:pcscf-dialog2.ims.example;lr>, <sip:pcscf-dialog1.ims.example;lr>" {

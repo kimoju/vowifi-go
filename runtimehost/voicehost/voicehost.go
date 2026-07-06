@@ -98,10 +98,14 @@ type OutboundCallResult struct {
 }
 
 type DialogInfo struct {
-	DeviceID string
-	CallID   string
-	Callee   string
-	State    DialogState
+	DeviceID    string
+	CallID      string
+	Callee      string
+	State       DialogState
+	CSeq        int
+	ContentType string
+	Body        []byte
+	Headers     map[string]string
 }
 
 type DialogState string
@@ -923,6 +927,9 @@ func (g *Gateway) HandleClientBye(deviceID string, req *sip.Request, tx sip.Serv
 	}
 	dialog := g.dialog(callID)
 	dialog.State = DialogStateTerminated
+	dialog.ContentType = sipHeaderValue(req, "Content-Type")
+	dialog.Body = append([]byte(nil), req.Body()...)
+	dialog.Headers = sipRequestHeaderMap(req)
 	g.recordDialog(dialog)
 	if terminator, ok := g.GetAgent(deviceID).(DialogTerminator); ok {
 		_ = terminator.EndVoiceCall(context.Background(), dialog)

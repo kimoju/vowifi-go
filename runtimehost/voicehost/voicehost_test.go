@@ -279,13 +279,25 @@ func TestGatewayHandleClientByeTerminatesDialog(t *testing.T) {
 	g.HandleClientInvite("dev-1", newInviteRequest("call-1", "18005551212", sampleSDP("198.51.100.10", 4002)), &fakeServerTransaction{})
 
 	tx := &fakeServerTransaction{}
-	g.HandleClientBye("dev-1", newByeRequest("call-1"), tx)
+	byeReq := newByeRequest("call-1")
+	byeReq.AppendHeader(sip.NewHeader("Reason", "SIP;cause=200;text=\"completed\""))
+	byeReq.AppendHeader(sip.NewHeader("X-Client", "bye"))
+	byeReq.AppendHeader(sip.NewHeader("Content-Type", "message/sipfrag"))
+	byeReq.SetBody([]byte("SIP/2.0 200 OK\r\n"))
+	g.HandleClientBye("dev-1", byeReq, tx)
 
 	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 {
 		t.Fatalf("BYE responses=%v", responseCodes(tx.responses))
 	}
 	if len(agent.terminated) != 1 || agent.terminated[0].State != DialogStateTerminated {
 		t.Fatalf("terminated=%+v", agent.terminated)
+	}
+	terminated := agent.terminated[0]
+	if terminated.ContentType != "message/sipfrag" || string(terminated.Body) != "SIP/2.0 200 OK\r\n" ||
+		terminated.Headers["Reason"] != "SIP;cause=200;text=\"completed\"" ||
+		terminated.Headers["X-Client"] != "bye" ||
+		terminated.Headers["Content-Type"] != "" {
+		t.Fatalf("terminated BYE payload=%+v body=%q", terminated, terminated.Body)
 	}
 	if status := g.DeviceStatus("dev-1"); status["active_dialogs"] != 0 {
 		t.Fatalf("DeviceStatus=%+v, want no active dialog", status)

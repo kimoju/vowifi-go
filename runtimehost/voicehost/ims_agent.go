@@ -292,11 +292,12 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 		return nil
 	}
 	cfg := state.cfg
-	bye, err := voiceclient.BuildByeRequest(cfg)
+	bye, err := voiceclient.BuildByeRequestWithBody(cfg, info.ContentType, info.Body)
 	if err != nil {
 		a.mu.Unlock()
 		return err
 	}
+	applyDialogUpdateHeaders(bye.Headers, info.Headers)
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()

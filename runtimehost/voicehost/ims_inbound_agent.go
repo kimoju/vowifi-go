@@ -934,11 +934,16 @@ func (a *IMSInboundAgent) EndInboundCall(ctx context.Context, info DialogInfo) e
 		return nil
 	}
 	cfg := state.clientCfg
-	cfg.CSeq = nextInboundClientCSeq(cfg.CSeq)
-	bye, err := voiceclient.BuildByeRequest(cfg)
+	if info.CSeq > 0 {
+		cfg.CSeq = info.CSeq
+	} else {
+		cfg.CSeq = nextInboundClientCSeq(cfg.CSeq)
+	}
+	bye, err := voiceclient.BuildByeRequestWithBody(cfg, info.ContentType, info.Body)
 	if err != nil {
 		return err
 	}
+	applyDialogUpdateHeaders(bye.Headers, info.Headers)
 	state.clientCfg = cfg
 	a.storeInboundDialog(strings.TrimSpace(info.CallID), state)
 	resp, err := a.ClientTransport.RoundTripRequest(ctx, bye)
