@@ -1217,7 +1217,7 @@ func TestIMSInboundWireServerRetransmitsInviteFinalUntilAck(t *testing.T) {
 	}
 }
 
-func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeAndOptions(t *testing.T) {
+func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeMessageAndOptions(t *testing.T) {
 	transport := newWireInboundTransport([]voiceclient.SIPResponse{
 		{
 			StatusCode: 200,
@@ -1235,6 +1235,7 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeAndOptions
 		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"X-Client": {"refer-ok"}}},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-Client": {"notify-ok"}}},
 		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"Expires": {"300"}, "X-Client": {"subscribe-ok"}}},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"Content-Type": {"text/plain"}, "X-Client": {"message-ok"}}, Body: []byte("delivered")},
 	})
 	server := &IMSInboundWireServer{
 		Agent: &IMSInboundAgent{
@@ -1352,6 +1353,30 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeAndOptions
 		t.Fatalf("client SUBSCRIBE=%+v body=%q", subscribeReq, subscribeReq.Body)
 	}
 
+	message := parseWireIncoming(t, wireIMSRequest("wire-call-dialog", "MESSAGE", 7, []byte("hello"),
+		"Content-Type: text/plain\r\n",
+		"Accept: message/cpim\r\n",
+		"X-IMS: message\r\n",
+	))
+	responses, err = server.HandleRequest(context.Background(), message)
+	if err != nil {
+		t.Fatalf("HandleRequest(MESSAGE) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 ||
+		responses[0].Headers["Content-Type"] != "text/plain" ||
+		responses[0].Headers["X-Client"] != "message-ok" ||
+		string(responses[0].Body) != "delivered" {
+		t.Fatalf("MESSAGE responses=%+v", responses)
+	}
+	messageReq := transport.readRequest(t)
+	if messageReq.Method != "MESSAGE" || messageReq.Headers["CSeq"] != "7 MESSAGE" ||
+		messageReq.Headers["Content-Type"] != "text/plain" ||
+		messageReq.Headers["Accept"] != "message/cpim" ||
+		messageReq.Headers["X-Ims"] != "message" ||
+		string(messageReq.Body) != "hello" {
+		t.Fatalf("client MESSAGE=%+v body=%q", messageReq, messageReq.Body)
+	}
+
 	options := parseWireIncoming(t, wireIMSRequest("wire-options", "OPTIONS", 1, nil))
 	responses, err = server.HandleRequest(context.Background(), options)
 	if err != nil {
@@ -1361,6 +1386,7 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeAndOptions
 		!strings.Contains(responses[0].Headers["Allow"], "REFER") ||
 		!strings.Contains(responses[0].Headers["Allow"], "NOTIFY") ||
 		!strings.Contains(responses[0].Headers["Allow"], "SUBSCRIBE") ||
+		!strings.Contains(responses[0].Headers["Allow"], "MESSAGE") ||
 		!strings.Contains(responses[0].Headers["Supported"], "norefersub") ||
 		responses[0].Headers["Allow-Events"] != "refer" ||
 		responses[0].Headers["Contact"] == "" {
@@ -1529,6 +1555,7 @@ func TestIMSInboundWireServerRejectsUnsupportedMethod(t *testing.T) {
 func TestIMSInboundWireServerDispatchesMessage(t *testing.T) {
 	var handled IMSMessageRequest
 	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{},
 		MessageHandler: IMSMessageHandlerFunc(func(ctx context.Context, req IMSMessageRequest) (IMSMessageResult, error) {
 			handled = req
 			return IMSMessageResult{

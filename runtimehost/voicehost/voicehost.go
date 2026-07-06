@@ -41,6 +41,10 @@ type DialogInfoSender interface {
 	SendDialogInfo(context.Context, DialogInfoRequest) (DialogInfoResult, error)
 }
 
+type DialogMessageSender interface {
+	SendDialogMessage(context.Context, DialogMessageRequest) (DialogMessageResult, error)
+}
+
 type DialogPrackSender interface {
 	SendDialogPrack(context.Context, DialogPrackRequest) (DialogPrackResult, error)
 }
@@ -127,6 +131,16 @@ type DialogInfoResult struct {
 	Body                       []byte
 	Headers                    map[string]string
 }
+
+type DialogMessageRequest struct {
+	DeviceID    string
+	CallID      string
+	ContentType string
+	Body        []byte
+	Headers     map[string]string
+}
+
+type DialogMessageResult = DialogInfoResult
 
 type DialogPrackRequest struct {
 	DeviceID    string
@@ -776,6 +790,49 @@ func (g *Gateway) HandleClientInfo(deviceID string, req *sip.Request, tx sip.Ser
 	})
 	if err != nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi INFO failed", nil))
+		return
+	}
+	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)
+	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	body := append([]byte(nil), result.Body...)
+	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
+	if strings.TrimSpace(result.ContentType) != "" && len(body) > 0 {
+		res.AppendHeader(sip.NewHeader("Content-Type", strings.TrimSpace(result.ContentType)))
+	}
+	for key, value := range result.Headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
+	_ = tx.Respond(res)
+}
+
+func (g *Gateway) HandleClientMessage(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
+	if tx == nil || req == nil {
+		return
+	}
+	sender, _ := g.GetAgent(deviceID).(DialogMessageSender)
+	if sender == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
+		return
+	}
+	callID := sipCallID(req)
+	if callID == "" {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
+		return
+	}
+	result, err := sender.SendDialogMessage(context.Background(), DialogMessageRequest{
+		DeviceID:    strings.TrimSpace(deviceID),
+		CallID:      callID,
+		ContentType: sipHeaderValue(req, "Content-Type"),
+		Body:        append([]byte(nil), req.Body()...),
+		Headers:     sipRequestHeaderMap(req),
+	})
+	if err != nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi MESSAGE failed", nil))
 		return
 	}
 	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)

@@ -359,6 +359,60 @@ func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoReq
 	}, nil
 }
 
+func (a *IMSOutboundAgent) SendDialogMessage(ctx context.Context, req DialogMessageRequest) (DialogMessageResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.Transport == nil {
+		return DialogMessageResult{Accepted: false, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return DialogMessageResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		a.mu.Unlock()
+		return DialogMessageResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.cfg
+	msg, err := voiceclient.BuildMessageRequest(cfg, req.ContentType, req.Body)
+	if err != nil {
+		a.mu.Unlock()
+		return DialogMessageResult{Accepted: false, StatusCode: 500, Reason: "build IMS MESSAGE failed"}, err
+	}
+	applyDialogUpdateHeaders(msg.Headers, req.Headers)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+	resp, err := a.Transport.RoundTripRequest(ctx, msg)
+	if err != nil {
+		return DialogMessageResult{Accepted: false, Reason: "IMS MESSAGE failed", RegistrationRecoveryNeeded: true}, err
+	}
+	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if accepted {
+		a.mu.Lock()
+		if latest, ok := a.dialogs[callID]; ok {
+			if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+				latest.cfg.RemoteTargetURI = contact
+			}
+			a.dialogs[callID] = latest
+		}
+		a.mu.Unlock()
+	}
+	return DialogMessageResult{
+		Accepted:                   accepted,
+		StatusCode:                 outboundStatusCode(resp.StatusCode, 500),
+		Reason:                     firstVoiceNonEmpty(resp.Reason, "OK"),
+		RegistrationRecoveryNeeded: imsRegistrationRecoveryNeededStatus(resp.StatusCode),
+		RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+		ContentType:                firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:                       append([]byte(nil), resp.Body...),
+		Headers:                    firstValueSIPHeaders(resp.Headers),
+	}, nil
+}
+
 func (a *IMSOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrackRequest) (DialogPrackResult, error) {
 	if ctx == nil {
 		ctx = context.Background()

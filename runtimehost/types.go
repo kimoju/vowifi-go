@@ -596,6 +596,20 @@ func (i *Instance) SendDialogInfo(ctx context.Context, req voicehost.DialogInfoR
 	return result, err
 }
 
+func (i *Instance) SendDialogMessage(ctx context.Context, req voicehost.DialogMessageRequest) (voicehost.DialogMessageResult, error) {
+	agent := i.dialogMessageSender()
+	if agent == nil {
+		return voicehost.DialogMessageResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
+	}
+	result, err := agent.SendDialogMessage(ctx, req)
+	if result.RegistrationRecoveryNeeded {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter); recoveryErr != nil {
+			return result, runtimeOperationRecoveryError(err, recoveryErr)
+		}
+	}
+	return result, err
+}
+
 func (i *Instance) SendDialogPrack(ctx context.Context, req voicehost.DialogPrackRequest) (voicehost.DialogPrackResult, error) {
 	agent := i.dialogPrackSender()
 	if agent == nil {
@@ -1022,6 +1036,20 @@ func (i *Instance) dialogInfoSender() voicehost.DialogInfoSender {
 	}
 	i.mu.RLock()
 	agent, _ := i.voice.(voicehost.DialogInfoSender)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogMessageSender() voicehost.DialogMessageSender {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogMessageSender)
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {

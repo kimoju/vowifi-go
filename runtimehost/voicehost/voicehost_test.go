@@ -12,6 +12,7 @@ import (
 type fakeOutboundAgent struct {
 	requests        []OutboundCallRequest
 	infos           []DialogInfoRequest
+	messages        []DialogMessageRequest
 	pracks          []DialogPrackRequest
 	options         []DialogOptionsRequest
 	refers          []DialogReferRequest
@@ -23,6 +24,7 @@ type fakeOutboundAgent struct {
 	canceled        []DialogInfo
 	result          OutboundCallResult
 	infoResult      DialogInfoResult
+	messageResult   DialogMessageResult
 	prackResult     DialogPrackResult
 	optionsResult   DialogOptionsResult
 	referResult     DialogReferResult
@@ -32,6 +34,7 @@ type fakeOutboundAgent struct {
 	reinviteResult  DialogReinviteResult
 	err             error
 	infoErr         error
+	messageErr      error
 	prackErr        error
 	optionsErr      error
 	referErr        error
@@ -68,6 +71,14 @@ func (a *fakeOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoRe
 		return DialogInfoResult{}, a.infoErr
 	}
 	return a.infoResult, nil
+}
+
+func (a *fakeOutboundAgent) SendDialogMessage(ctx context.Context, req DialogMessageRequest) (DialogMessageResult, error) {
+	a.messages = append(a.messages, req)
+	if a.messageErr != nil {
+		return DialogMessageResult{}, a.messageErr
+	}
+	return a.messageResult, nil
 }
 
 func (a *fakeOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrackRequest) (DialogPrackResult, error) {
@@ -329,6 +340,40 @@ func TestGatewayHandleClientInfoSendsDialogInfo(t *testing.T) {
 	}
 	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 202 || tx.responses[0].Reason != "Accepted" ||
 		string(tx.responses[0].Body()) != "ok" || tx.responses[0].GetHeader("X-IMS").Value() != "info-ok" {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
+func TestGatewayHandleClientMessageSendsDialogMessage(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{messageResult: DialogMessageResult{
+		Accepted:    true,
+		StatusCode:  200,
+		Reason:      "OK",
+		ContentType: "text/plain",
+		Body:        []byte("ack"),
+		Headers:     map[string]string{"X-IMS": "message-ok"},
+	}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newMessageRequest("call-message", "text/plain", "hello")
+	req.AppendHeader(sip.NewHeader("X-Client", "message"))
+
+	g.HandleClientMessage("dev-1", req, tx)
+
+	if len(agent.messages) != 1 {
+		t.Fatalf("messages=%d", len(agent.messages))
+	}
+	got := agent.messages[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-message" ||
+		got.ContentType != "text/plain" || got.Headers["X-Client"] != "message" ||
+		string(got.Body) != "hello" {
+		t.Fatalf("DialogMessageRequest=%+v body=%q", got, got.Body)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "text/plain" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "message-ok" ||
+		string(tx.responses[0].Body()) != "ack" {
 		t.Fatalf("responses=%+v", tx.responses)
 	}
 }
@@ -656,6 +701,18 @@ func newInfoRequest(callID, contentType, body string) *sip.Request {
 	req := sip.NewRequest(sip.INFO, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
 	appendCommonHeaders(req, callID, "18005551212")
 	req.SetBody([]byte(body))
+	if strings.TrimSpace(contentType) != "" {
+		req.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	}
+	return req
+}
+
+func newMessageRequest(callID, contentType, body string) *sip.Request {
+	req := sip.NewRequest(sip.MESSAGE, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
+	appendCommonHeaders(req, callID, "18005551212")
+	if strings.TrimSpace(body) != "" {
+		req.SetBody([]byte(body))
+	}
 	if strings.TrimSpace(contentType) != "" {
 		req.AppendHeader(sip.NewHeader("Content-Type", contentType))
 	}

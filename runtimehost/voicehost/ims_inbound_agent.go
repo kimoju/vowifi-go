@@ -801,6 +801,51 @@ func (a *IMSInboundAgent) HandleInboundSubscribe(ctx context.Context, req Inboun
 	}, nil
 }
 
+func (a *IMSInboundAgent) HandleInboundMessage(ctx context.Context, req IMSMessageRequest) (IMSInfoResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.ClientTransport == nil {
+		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return IMSInfoResult{Handled: true, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	state, ok := a.inboundDialog(callID)
+	if !ok {
+		return IMSInfoResult{Handled: true, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.clientCfg
+	messageCSeq := inboundCSeq(req.CSeq)
+	cfg.CSeq = messageCSeq
+	msg, err := voiceclient.BuildMessageRequest(cfg, req.ContentType, req.Body)
+	if err != nil {
+		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client MESSAGE failed"}, err
+	}
+	applyIncomingInfoHeaders(msg.Headers, "", req.Headers)
+	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, messageCSeq)
+	a.storeInboundDialog(callID, state)
+	resp, err := a.ClientTransport.RoundTripRequest(ctx, msg)
+	if err != nil {
+		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client MESSAGE failed"}, err
+	}
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
+		cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, messageCSeq)
+		state.clientCfg = cfg
+		a.storeInboundDialog(callID, state)
+	}
+	return IMSInfoResult{
+		Handled:     true,
+		StatusCode:  inboundStatusCode(resp.StatusCode, 500),
+		Reason:      firstVoiceNonEmpty(resp.Reason, "OK"),
+		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:        append([]byte(nil), resp.Body...),
+		Headers:     firstValueSIPHeaders(resp.Headers),
+	}, nil
+}
+
 func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequest) (IMSInfoResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -987,6 +1032,11 @@ func (a *IMSInboundAgent) inboundDialog(callID string) (imsInboundDialogState, b
 	defer a.mu.Unlock()
 	state, ok := a.dialogs[strings.TrimSpace(callID)]
 	return state, ok
+}
+
+func (a *IMSInboundAgent) hasInboundDialog(callID string) bool {
+	_, ok := a.inboundDialog(callID)
+	return ok
 }
 
 func (a *IMSInboundAgent) inboundDialogCanceled(callID string) bool {

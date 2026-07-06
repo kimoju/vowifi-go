@@ -308,6 +308,19 @@ func (s *IMSInboundWireServer) tryHandleBye(ctx context.Context, req voiceclient
 }
 
 func (s *IMSInboundWireServer) handleMessage(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	if s != nil && s.Agent != nil && s.Agent.hasInboundDialog(wireCallID(req)) {
+		result, err := s.Agent.HandleInboundMessage(ctx, IMSMessageRequest{
+			URI:         strings.TrimSpace(req.URI),
+			FromURI:     wireHeaderURI(req, "From"),
+			ToURI:       wireCalleeURI(req),
+			CallID:      wireCallID(req),
+			CSeq:        wireCSeq(req),
+			ContentType: firstVoiceHeader(req.Headers, "Content-Type"),
+			Body:        append([]byte(nil), req.Body...),
+			Headers:     cloneSIPHeaders(req.Headers),
+		})
+		return s.infoResultResponse(result, err), err
+	}
 	if s == nil || s.MessageHandler == nil {
 		resp := wireResponse(405, "Method Not Allowed")
 		resp.Headers["Allow"] = s.allowHeader()
@@ -637,12 +650,12 @@ func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 	resp.Headers["Supported"] = wireSupportedOptionsHeader()
 	resp.Headers["Allow-Events"] = "refer"
 	resp.Headers["Accept"] = "application/sdp"
-	if s != nil && (s.MessageHandler != nil || s.InfoHandler != nil) {
+	if s != nil && (s.MessageHandler != nil || s.InfoHandler != nil || s.Agent != nil) {
 		accept := []string{"application/sdp"}
 		if s.InfoHandler != nil {
 			accept = append(accept, "application/vnd.3gpp.ussd+xml")
 		}
-		if s.MessageHandler != nil {
+		if s.MessageHandler != nil || s.Agent != nil {
 			accept = append(accept, "application/vnd.3gpp.sms", "text/plain")
 		}
 		resp.Headers["Accept"] = strings.Join(accept, ", ")
@@ -656,7 +669,7 @@ func (s *IMSInboundWireServer) allowHeader() string {
 	if s != nil && s.InfoHandler != nil {
 		allow += ", INFO"
 	}
-	if s != nil && s.MessageHandler != nil {
+	if s != nil && (s.MessageHandler != nil || s.Agent != nil) {
 		allow += ", MESSAGE"
 	}
 	return allow

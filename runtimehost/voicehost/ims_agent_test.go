@@ -152,6 +152,81 @@ func TestIMSOutboundAgentSendsInDialogInfoAndAdvancesCSeq(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentSendsInDialogMessage(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":           {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact":      {"<sip:carrier@198.51.100.1:5060>"},
+				"Record-Route": {"<sip:pcscf-dialog1.ims.example;lr>, <sip:pcscf-dialog2.ims.example;lr>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact":      {"<sip:carrier@198.51.100.9:5060>"},
+				"Content-Type": {"text/plain"},
+				"X-IMS":        {"message-ok"},
+			},
+			Body: []byte("delivered"),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-message",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogMessage(context.Background(), DialogMessageRequest{
+		CallID:      "call-message",
+		ContentType: "text/plain",
+		Body:        []byte("hello"),
+		Headers:     map[string]string{"X-Test": "message", "Content-Type": "application/ignored"},
+	})
+	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "message-ok" ||
+		result.ContentType != "text/plain" || string(result.Body) != "delivered" {
+		t.Fatalf("SendDialogMessage() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "MESSAGE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	message := transport.requests[1]
+	if message.URI != "sip:carrier@198.51.100.1:5060" || message.Headers["CSeq"] != "2 MESSAGE" ||
+		message.Headers["Content-Type"] != "text/plain" ||
+		message.Headers["Accept"] != "text/plain, application/vnd.3gpp.sms" ||
+		message.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.sms" ||
+		message.Headers["Accept-Contact"] != "*;+g.3gpp.smsip" ||
+		message.Headers["Contact"] != "<sip:user@192.0.2.10:5060>" ||
+		message.Headers["X-Test"] != "message" ||
+		message.Headers["Route"] != "<sip:pcscf-dialog2.ims.example;lr>, <sip:pcscf-dialog1.ims.example;lr>" ||
+		string(message.Body) != "hello" {
+		t.Fatalf("MESSAGE=%+v body=%q", message, message.Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-message"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
+		transport.requests[2].URI != "sip:carrier@198.51.100.9:5060" ||
+		transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after MESSAGE=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentSendsDialogPrack(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

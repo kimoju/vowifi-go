@@ -708,6 +708,82 @@ func TestIMSInboundAgentHandlesSubscribe(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentHandlesMessage(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":           {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact":      {"<sip:client@192.0.2.50:5060>"},
+				"Record-Route": {"<sip:client-proxy1.example;lr>, <sip:client-proxy2.example;lr>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact":      {"<sip:client@192.0.2.90:5060>"},
+				"Content-Type": {"text/plain"},
+				"X-Client":     {"message-ok"},
+			},
+			Body: []byte("delivered"),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-message",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	result, err := agent.HandleInboundMessage(context.Background(), IMSMessageRequest{
+		CallID:      "in-call-message",
+		CSeq:        2,
+		ContentType: "text/plain",
+		Body:        []byte("hello"),
+		Headers: map[string][]string{
+			"Content-Type": {"application/ignored"},
+			"Accept":       {"message/cpim"},
+			"X-IMS":        {"message"},
+		},
+	})
+	if err != nil || result.StatusCode != 200 || result.ContentType != "text/plain" ||
+		result.Headers["X-Client"] != "message-ok" || string(result.Body) != "delivered" {
+		t.Fatalf("HandleInboundMessage() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "MESSAGE" {
+		t.Fatalf("MESSAGE requests=%+v", transport.requests)
+	}
+	message := transport.requests[1]
+	if message.URI != "sip:client@192.0.2.50:5060" || message.Headers["CSeq"] != "2 MESSAGE" ||
+		message.Headers["Content-Type"] != "text/plain" ||
+		message.Headers["Accept"] != "message/cpim" ||
+		message.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.sms" ||
+		message.Headers["Accept-Contact"] != "*;+g.3gpp.smsip" ||
+		message.Headers["X-IMS"] != "message" ||
+		message.Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" ||
+		string(message.Body) != "hello" {
+		t.Fatalf("MESSAGE=%+v body=%q", message, message.Body)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-message"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
+		transport.requests[2].URI != "sip:client@192.0.2.90:5060" ||
+		transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after MESSAGE=%+v", transport.requests)
+	}
+}
+
 func TestIMSInboundAgentPropagatesSessionTimerHeaders(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
