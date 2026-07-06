@@ -127,6 +127,11 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		if code, reason, reject := wireMaxForwardsRejection(req); reject {
 			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(code, reason))}, nil
 		}
+		if unsupported := wireUnsupportedRequiredOptions(req); len(unsupported) > 0 {
+			resp := wireResponse(420, "Bad Extension")
+			resp.Headers["Unsupported"] = strings.Join(unsupported, ", ")
+			return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, nil
+		}
 	}
 	key := wireTransactionKey(req)
 	if method != "ACK" && key != "" {
@@ -549,10 +554,16 @@ func wireResponse(statusCode int, reason string) IMSInboundWireResponse {
 	return IMSInboundWireResponse{StatusCode: statusCode, Reason: reason, Headers: make(map[string]string)}
 }
 
+var wireSupportedOptionTags = []string{"100rel", "timer", "replaces", "outbound"}
+
+func wireSupportedOptionsHeader() string {
+	return strings.Join(wireSupportedOptionTags, ", ")
+}
+
 func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 	resp := wireResponse(200, "OK")
 	resp.Headers["Allow"] = s.allowHeader()
-	resp.Headers["Supported"] = "100rel, timer, replaces, outbound"
+	resp.Headers["Supported"] = wireSupportedOptionsHeader()
 	resp.Headers["Accept"] = "application/sdp"
 	if s != nil && (s.MessageHandler != nil || s.InfoHandler != nil) {
 		accept := []string{"application/sdp"}
@@ -1133,6 +1144,44 @@ func wireMaxForwardsRejection(req voiceclient.SIPIncomingRequest) (int, string, 
 		return 483, "Too Many Hops", true
 	}
 	return 0, "", false
+}
+
+func wireUnsupportedRequiredOptions(req voiceclient.SIPIncomingRequest) []string {
+	var unsupported []string
+	seen := make(map[string]struct{})
+	for key, values := range req.Headers {
+		if !strings.EqualFold(key, "Require") {
+			continue
+		}
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				tag := strings.TrimSpace(part)
+				if tag == "" || wireOptionTagSupported(tag) {
+					continue
+				}
+				lower := strings.ToLower(tag)
+				if _, ok := seen[lower]; ok {
+					continue
+				}
+				seen[lower] = struct{}{}
+				unsupported = append(unsupported, tag)
+			}
+		}
+	}
+	return unsupported
+}
+
+func wireOptionTagSupported(tag string) bool {
+	tag = strings.ToLower(strings.TrimSpace(tag))
+	if tag == "" {
+		return false
+	}
+	for _, supported := range wireSupportedOptionTags {
+		if tag == supported {
+			return true
+		}
+	}
+	return false
 }
 
 func wireFirstHeader(headers map[string][]string, name string) (string, bool) {

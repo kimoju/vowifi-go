@@ -630,6 +630,65 @@ func TestIMSInboundWireServerRejectsBadMaxForwards(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerRejectsUnsupportedRequireOptions(t *testing.T) {
+	handled := false
+	server := &IMSInboundWireServer{
+		MessageHandler: IMSMessageHandlerFunc(func(ctx context.Context, req IMSMessageRequest) (IMSMessageResult, error) {
+			handled = true
+			return IMSMessageResult{StatusCode: 200, Reason: "OK"}, nil
+		}),
+	}
+	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+		Method: "MESSAGE",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID": {"bad-require-options"},
+			"CSeq":    {"1 MESSAGE"},
+			"Require": {"100rel, unknown-feature", "timer, another-feature, unknown-feature"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleRequest() error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 420 || responses[0].Reason != "Bad Extension" {
+		t.Fatalf("responses=%+v, want 420 Bad Extension", responses)
+	}
+	if responses[0].Headers["Unsupported"] != "unknown-feature, another-feature" {
+		t.Fatalf("Unsupported=%q", responses[0].Headers["Unsupported"])
+	}
+	if handled {
+		t.Fatal("unsupported Require reached message handler")
+	}
+}
+
+func TestIMSInboundWireServerAllowsSupportedRequireOptions(t *testing.T) {
+	var handled IMSMessageRequest
+	server := &IMSInboundWireServer{
+		MessageHandler: IMSMessageHandlerFunc(func(ctx context.Context, req IMSMessageRequest) (IMSMessageResult, error) {
+			handled = req
+			return IMSMessageResult{StatusCode: 202, Reason: "Accepted"}, nil
+		}),
+	}
+	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+		Method: "MESSAGE",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Call-ID": {"supported-require-options"},
+			"CSeq":    {"1 MESSAGE"},
+			"Require": {"100REL, timer, replaces, outbound"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleRequest() error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 202 {
+		t.Fatalf("responses=%+v, want 202", responses)
+	}
+	if handled.CallID != "supported-require-options" || handled.CSeq != 1 {
+		t.Fatalf("handled=%+v", handled)
+	}
+}
+
 func TestIMSInboundWireServerCancelsPendingInvite(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
