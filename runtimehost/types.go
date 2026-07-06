@@ -596,6 +596,24 @@ func (i *Instance) SendDialogInfo(ctx context.Context, req voicehost.DialogInfoR
 	return result, err
 }
 
+func (i *Instance) SendDialogDTMF(ctx context.Context, req voicehost.DialogDTMFRequest) (voicehost.DialogDTMFResult, error) {
+	if agent := i.dialogDTMFSender(); agent != nil {
+		result, err := agent.SendDialogDTMF(ctx, req)
+		if result.RegistrationRecoveryNeeded {
+			if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter); recoveryErr != nil {
+				return result, runtimeOperationRecoveryError(err, recoveryErr)
+			}
+		}
+		return result, err
+	}
+	infoReq, buildErr := voicehost.BuildDialogDTMFInfoRequest(req)
+	if buildErr != nil {
+		return voicehost.DialogDTMFResult{Accepted: false, StatusCode: 400, Reason: buildErr.Error()}, buildErr
+	}
+	result, err := i.SendDialogInfo(ctx, infoReq)
+	return voicehost.DialogDTMFResult(result), err
+}
+
 func (i *Instance) SendDialogUpdate(ctx context.Context, req voicehost.DialogUpdateRequest) (voicehost.DialogUpdateResult, error) {
 	agent := i.dialogUpdater()
 	if agent == nil {
@@ -906,6 +924,20 @@ func (i *Instance) dialogInfoSender() voicehost.DialogInfoSender {
 	}
 	i.mu.RLock()
 	agent, _ := i.voice.(voicehost.DialogInfoSender)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogDTMFSender() voicehost.DialogDTMFSender {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogDTMFSender)
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {

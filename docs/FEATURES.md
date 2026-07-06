@@ -200,8 +200,8 @@ protocol layers needed by VoHive:
   session refresh forwarding, RAck propagation, RTP relay endpoint rewriting
   for UPDATE offers/answers, and local OPTIONS capability responses
 - IMS in-dialog SIP INFO forwarding for outbound and inbound voice dialogs,
-  including DTMF-style payloads, Info-Package propagation, response body/header
-  mapping, and dialog CSeq advancement
+  including DTMF relay body construction/parsing helpers, Info-Package
+  propagation, response body/header mapping, and dialog CSeq advancement
 - runtime voice operations consume recoverable registration or route failures
   such as 481, 503, transport errors, and other transient IMS 5xx responses to
   trigger IMS re-registration, refresh voice/SMS/USSD transports, and retry an
