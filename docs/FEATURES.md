@@ -198,8 +198,8 @@ protocol layers needed by VoHive:
   socket handling
 - IMS in-dialog interworking for UPDATE, PRACK, and OPTIONS, including SDP
   session refresh forwarding, RAck propagation, RTP relay endpoint rewriting
-  for PRACK/UPDATE offers and answers, outbound OPTIONS capability probes, and
-  local OPTIONS capability responses
+  for PRACK/UPDATE offers and answers, softphone-originated and outbound
+  OPTIONS capability probes, and local OPTIONS capability responses
 - IMS in-dialog SIP INFO forwarding for outbound and inbound voice dialogs,
   including DTMF relay body construction/parsing helpers, Info-Package
   propagation, response body/header mapping, and dialog CSeq advancement

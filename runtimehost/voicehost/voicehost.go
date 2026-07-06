@@ -510,6 +510,47 @@ func (g *Gateway) HandleClientPrack(deviceID string, req *sip.Request, tx sip.Se
 	_ = tx.Respond(res)
 }
 
+func (g *Gateway) HandleClientOptions(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
+	if tx == nil || req == nil {
+		return
+	}
+	sender, _ := g.GetAgent(deviceID).(DialogOptionsSender)
+	if sender == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
+		return
+	}
+	callID := sipCallID(req)
+	if callID == "" {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
+		return
+	}
+	result, err := sender.SendDialogOptions(context.Background(), DialogOptionsRequest{
+		DeviceID: strings.TrimSpace(deviceID),
+		CallID:   callID,
+		Headers:  sipRequestHeaderMap(req),
+	})
+	if err != nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi OPTIONS failed", nil))
+		return
+	}
+	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)
+	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	body := append([]byte(nil), result.Body...)
+	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
+	if strings.TrimSpace(result.ContentType) != "" && len(body) > 0 {
+		res.AppendHeader(sip.NewHeader("Content-Type", strings.TrimSpace(result.ContentType)))
+	}
+	for key, value := range result.Headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
+	_ = tx.Respond(res)
+}
+
 func (g *Gateway) HandleClientInfo(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
 	if tx == nil || req == nil {
 		return

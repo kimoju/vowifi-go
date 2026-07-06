@@ -13,6 +13,7 @@ type fakeOutboundAgent struct {
 	requests       []OutboundCallRequest
 	infos          []DialogInfoRequest
 	pracks         []DialogPrackRequest
+	options        []DialogOptionsRequest
 	updates        []DialogUpdateRequest
 	reinvites      []DialogReinviteRequest
 	terminated     []DialogInfo
@@ -20,11 +21,13 @@ type fakeOutboundAgent struct {
 	result         OutboundCallResult
 	infoResult     DialogInfoResult
 	prackResult    DialogPrackResult
+	optionsResult  DialogOptionsResult
 	updateResult   DialogUpdateResult
 	reinviteResult DialogReinviteResult
 	err            error
 	infoErr        error
 	prackErr       error
+	optionsErr     error
 	updateErr      error
 	reinviteErr    error
 }
@@ -64,6 +67,14 @@ func (a *fakeOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrack
 		return DialogPrackResult{}, a.prackErr
 	}
 	return a.prackResult, nil
+}
+
+func (a *fakeOutboundAgent) SendDialogOptions(ctx context.Context, req DialogOptionsRequest) (DialogOptionsResult, error) {
+	a.options = append(a.options, req)
+	if a.optionsErr != nil {
+		return DialogOptionsResult{}, a.optionsErr
+	}
+	return a.optionsResult, nil
 }
 
 func (a *fakeOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdateRequest) (DialogUpdateResult, error) {
@@ -336,6 +347,41 @@ func TestGatewayHandleClientPrackRequiresRAck(t *testing.T) {
 	}
 }
 
+func TestGatewayHandleClientOptionsSendsDialogOptions(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{optionsResult: DialogOptionsResult{
+		Accepted:    true,
+		StatusCode:  200,
+		Reason:      "OK",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("203.0.113.46", 49184)),
+		Headers:     map[string]string{"Allow": "INVITE, UPDATE, INFO", "X-IMS": "options-ok"},
+	}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newOptionsRequest("call-options")
+	req.AppendHeader(sip.NewHeader("Accept", "application/sdp"))
+	req.AppendHeader(sip.NewHeader("X-Client", "options"))
+
+	g.HandleClientOptions("dev-1", req, tx)
+
+	if len(agent.options) != 1 {
+		t.Fatalf("options=%d", len(agent.options))
+	}
+	got := agent.options[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-options" ||
+		got.Headers["Accept"] != "application/sdp" || got.Headers["X-Client"] != "options" {
+		t.Fatalf("DialogOptionsRequest=%+v", got)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "application/sdp" ||
+		tx.responses[0].GetHeader("Allow").Value() != "INVITE, UPDATE, INFO" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "options-ok" ||
+		!strings.Contains(string(tx.responses[0].Body()), "m=audio 49184") {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
 func TestGatewayHandleClientUpdateSendsDialogUpdate(t *testing.T) {
 	g := NewGateway()
 	agent := &fakeOutboundAgent{updateResult: DialogUpdateResult{
@@ -460,6 +506,12 @@ func newPrackRequest(callID, rack, sdp string) *sip.Request {
 		req.SetBody([]byte(sdp))
 		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	}
+	return req
+}
+
+func newOptionsRequest(callID string) *sip.Request {
+	req := sip.NewRequest(sip.OPTIONS, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
+	appendCommonHeaders(req, callID, "18005551212")
 	return req
 }
 
