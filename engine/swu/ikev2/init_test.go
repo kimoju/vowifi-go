@@ -208,6 +208,39 @@ func TestRunIKESAInitRejectsUnsupportedSelectedSA(t *testing.T) {
 	}
 }
 
+func TestRunIKESAInitClassifiesResponseNotifyError(t *testing.T) {
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		req, err := ParseMessage(request)
+		if err != nil {
+			return nil, err
+		}
+		notifyPayload, err := NotifyPayload(Notify{NotifyType: NotifyNoProposalChosen})
+		if err != nil {
+			return nil, err
+		}
+		resp := Message{
+			Header: Header{
+				InitiatorSPI: req.Header.InitiatorSPI,
+				ExchangeType: ExchangeIKE_SA_INIT,
+				Flags:        FlagResponse,
+			},
+			Payloads: []Payload{notifyPayload},
+		}
+		return resp.MarshalBinary()
+	})
+	_, err := RunIKE_SA_INIT(context.Background(), InitConfig{
+		Transport:        transport,
+		InitiatorSPI:     1,
+		NonceI:           bytes.Repeat([]byte{0x01}, 32),
+		X25519PrivateKey: bytes.Repeat([]byte{0x02}, 32),
+	})
+	if !errors.Is(err, ErrInvalidInitResponse) ||
+		!errors.Is(err, ErrIKEv2NotifyError) ||
+		!errors.Is(err, ErrNotifyNoProposalChosen) {
+		t.Fatalf("RunIKE_SA_INIT() err=%v, want init response no-proposal notify", err)
+	}
+}
+
 func TestUDPTransportExchangesWithNonESPMarker(t *testing.T) {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

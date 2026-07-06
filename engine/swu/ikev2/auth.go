@@ -930,6 +930,9 @@ func unprotectAuthResponse(raw []byte, init InitResult, keys IKEKeys, messageID 
 		h.ExchangeType != ExchangeIKE_AUTH || h.MessageID != messageID || h.Flags&FlagResponse == 0 {
 		return Message{}, nil, fmt.Errorf("%w: unexpected IKE_AUTH response header", ErrInvalidAuthResponse)
 	}
+	if err := FirstNotifyError(inner); err != nil {
+		return Message{}, nil, fmt.Errorf("%w: %w", ErrInvalidAuthResponse, err)
+	}
 	return msg, inner, nil
 }
 

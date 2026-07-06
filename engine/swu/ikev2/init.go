@@ -255,11 +255,14 @@ func parseInitResponse(resp Message, spiI uint64) (parsedInitResponse, error) {
 	if h.InitiatorSPI != spiI {
 		return parsedInitResponse{}, fmt.Errorf("%w: initiator SPI mismatch", ErrInvalidInitResponse)
 	}
-	if h.ResponderSPI == 0 {
-		return parsedInitResponse{}, fmt.Errorf("%w: responder SPI is zero", ErrInvalidInitResponse)
-	}
 	if h.ExchangeType != ExchangeIKE_SA_INIT || h.MessageID != 0 || h.Flags&FlagResponse == 0 {
 		return parsedInitResponse{}, fmt.Errorf("%w: unexpected header", ErrInvalidInitResponse)
+	}
+	if err := FirstNotifyError(resp.Payloads); err != nil {
+		return parsedInitResponse{}, fmt.Errorf("%w: %w", ErrInvalidInitResponse, err)
+	}
+	if h.ResponderSPI == 0 {
+		return parsedInitResponse{}, fmt.Errorf("%w: responder SPI is zero", ErrInvalidInitResponse)
 	}
 	var out parsedInitResponse
 	for _, p := range resp.Payloads {

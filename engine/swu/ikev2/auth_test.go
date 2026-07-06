@@ -156,6 +156,37 @@ func TestRunIKEAuthEAPIdentity(t *testing.T) {
 	}
 }
 
+func TestUnprotectIKEAuthResponseClassifiesNotifyError(t *testing.T) {
+	init := fakeInitResult(t)
+	notifyPayload, err := NotifyPayload(Notify{
+		NotifyType:       NotifyUnsupportedCriticalPayload,
+		NotificationData: []byte{PayloadVendorID},
+	})
+	if err != nil {
+		t.Fatalf("NotifyPayload() error = %v", err)
+	}
+	_, raw, err := ProtectMessage(
+		authHeader(init, 1, false),
+		init.Keys,
+		false,
+		[]Payload{notifyPayload},
+		bytes.Repeat([]byte{0x61}, init.Keys.Profile.EncryptionBlockSize),
+	)
+	if err != nil {
+		t.Fatalf("ProtectMessage() error = %v", err)
+	}
+	_, _, err = unprotectAuthResponse(raw, init, init.Keys, 1)
+	if !errors.Is(err, ErrInvalidAuthResponse) ||
+		!errors.Is(err, ErrIKEv2NotifyError) ||
+		!errors.Is(err, ErrNotifyUnsupportedCriticalPayload) {
+		t.Fatalf("unprotectAuthResponse() err=%v, want auth notify error", err)
+	}
+	var notifyErr *NotifyError
+	if !errors.As(err, &notifyErr) || notifyErr.Notify.NotifyType != NotifyUnsupportedCriticalPayload {
+		t.Fatalf("unprotectAuthResponse() notifyErr=%+v err=%v", notifyErr, err)
+	}
+}
+
 func TestRunIKEAuthEAPIdentityUsesPseudonymForFullAuthRequest(t *testing.T) {
 	init := fakeInitResult(t)
 	transport := &authFakeTransport{t: t, init: init, keys: init.Keys}
