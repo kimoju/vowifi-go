@@ -15,6 +15,7 @@ import (
 	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
 	"github.com/boa-z/vowifi-go/runtimehost/identity"
 	"github.com/boa-z/vowifi-go/runtimehost/messaging"
+	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
 	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 	"github.com/boa-z/vowifi-go/runtimehost/voicehost"
 )
@@ -46,6 +47,181 @@ func (r *testIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationC
 		return IMSRegistrationResult{}, r.err
 	}
 	return r.result, nil
+}
+
+type runtimeIdentityReaderModem struct {
+	testModem
+	id identity.Identity
+}
+
+func (m runtimeIdentityReaderModem) GetISIMIdentity() (identity.Identity, error) {
+	return m.id, nil
+}
+
+type runtimeAPDUIdentityModem struct {
+	testModem
+	opened    string
+	closed    []int
+	calls     []string
+	responses []string
+}
+
+func (m *runtimeAPDUIdentityModem) OpenLogicalChannel(aid string) (int, error) {
+	m.opened = aid
+	return 3, nil
+}
+
+func (m *runtimeAPDUIdentityModem) CloseLogicalChannel(channel int) error {
+	m.closed = append(m.closed, channel)
+	return nil
+}
+
+func (m *runtimeAPDUIdentityModem) TransmitAPDU(channel int, hexAPDU string) (string, error) {
+	m.calls = append(m.calls, hexAPDU)
+	if len(m.responses) == 0 {
+		return "6A82", nil
+	}
+	resp := m.responses[0]
+	m.responses = m.responses[1:]
+	return resp, nil
+}
+
+type runtimeCRSMFallbackModem struct {
+	testModem
+	binary  []simtransport.CRSMResult
+	records []simtransport.CRSMResult
+}
+
+func (m *runtimeCRSMFallbackModem) ReadCRSMBinary(fileID uint16, offset, length int, pathID string) (simtransport.CRSMResult, error) {
+	if len(m.binary) == 0 {
+		return simtransport.CRSMResult{SW1: 0x6A, SW2: 0x82}, nil
+	}
+	resp := m.binary[0]
+	m.binary = m.binary[1:]
+	return resp, nil
+}
+
+func (m *runtimeCRSMFallbackModem) ReadCRSMRecord(fileID uint16, record, length int, pathID string) (simtransport.CRSMResult, error) {
+	if len(m.records) == 0 {
+		return simtransport.CRSMResult{SW1: 0x6A, SW2: 0x82}, nil
+	}
+	resp := m.records[0]
+	m.records = m.records[1:]
+	return resp, nil
+}
+
+type runtimeATCRSMModem struct {
+	testModem
+	responses []string
+	calls     []string
+}
+
+func (m *runtimeATCRSMModem) OpenLogicalChannel(aid string) (int, error) {
+	return 0, errors.New("logical channel unavailable")
+}
+
+func (m *runtimeATCRSMModem) ExecuteATSilent(cmd string, timeout time.Duration) (string, error) {
+	m.calls = append(m.calls, cmd)
+	if len(m.responses) == 0 {
+		return "\r\n+CRSM: 106,130\r\n\r\nOK\r\n", nil
+	}
+	resp := m.responses[0]
+	m.responses = m.responses[1:]
+	return resp, nil
+}
+
+func TestModemAccessAdapterReadsISIMIdentity(t *testing.T) {
+	direct := identity.Identity{
+		IMPI:   "001010123456789@private.example.test",
+		Domain: "ims.example.test",
+		IMPU:   []string{"sip:001010123456789@ims.example.test"},
+	}
+	id, err := NewModemAccessAdapter(runtimeIdentityReaderModem{id: direct}).GetISIMIdentity()
+	if err != nil {
+		t.Fatalf("GetISIMIdentity(direct) error = %v", err)
+	}
+	if id.IMPI != direct.IMPI || id.Domain != direct.Domain || len(id.IMPU) != 1 || id.IMPU[0] != direct.IMPU[0] {
+		t.Fatalf("direct identity=%+v, want %+v", id, direct)
+	}
+
+	apdu := &runtimeAPDUIdentityModem{responses: []string{
+		"9000",
+		runtimeIdentityHexResponse(runtimeISIMTLVString("001010123456789@private.example.test")),
+		"9000",
+		runtimeIdentityHexResponse(runtimeISIMLengthString("ims.example.test")),
+		"9000",
+		runtimeIdentityHexResponse(runtimeIdentityPadRecord(runtimeISIMTLVString("sip:001010123456789@ims.example.test"), 48)),
+	}}
+	id, err = NewModemAccessAdapter(apdu).GetISIMIdentity()
+	if err != nil {
+		t.Fatalf("GetISIMIdentity(APDU) error = %v", err)
+	}
+	if apdu.opened == "" || len(apdu.closed) != 1 || id.Domain != "ims.example.test" || len(id.IMPU) != 1 {
+		t.Fatalf("APDU identity=%+v opened=%q closed=%+v", id, apdu.opened, apdu.closed)
+	}
+
+	crsm := &runtimeCRSMFallbackModem{
+		binary: []simtransport.CRSMResult{
+			runtimeCRSMOK(runtimeISIMTLVString("001010123456789@private.example.test")),
+			runtimeCRSMOK(runtimeISIMLengthString("ims.example.test")),
+		},
+		records: []simtransport.CRSMResult{
+			runtimeCRSMOK(runtimeIdentityPadRecord(runtimeISIMTLVString("sip:001010123456789@ims.example.test"), 48)),
+			{SW1: 0x6A, SW2: 0x83},
+		},
+	}
+	id, err = NewModemAccessAdapter(crsm).GetISIMIdentity()
+	if err != nil {
+		t.Fatalf("GetISIMIdentity(CRSM fallback) error = %v", err)
+	}
+	if id.IMPI == "" || id.Domain != "ims.example.test" || len(id.IMPU) != 1 {
+		t.Fatalf("CRSM fallback identity=%+v", id)
+	}
+}
+
+func TestModemAccessAdapterFallsBackToATCRSM(t *testing.T) {
+	at := &runtimeATCRSMModem{responses: []string{
+		"\r\n+CRSM: 144,0,\"" + strings.ToUpper(hex.EncodeToString(runtimeISIMTLVString("001010123456789@private.example.test"))) + "\"\r\n\r\nOK\r\n",
+		"\r\n+CRSM: 144,0,\"" + strings.ToUpper(hex.EncodeToString(runtimeISIMLengthString("ims.example.test"))) + "\"\r\n\r\nOK\r\n",
+		"\r\n+CRSM: 144,0,\"" + strings.ToUpper(hex.EncodeToString(runtimeIdentityPadRecord(runtimeISIMTLVString("sip:001010123456789@ims.example.test"), 48))) + "\"\r\n\r\nOK\r\n",
+		"\r\n+CRSM: 106,131\r\n\r\nOK\r\n",
+	}}
+	id, err := NewModemAccessAdapter(at).GetISIMIdentity()
+	if err != nil {
+		t.Fatalf("GetISIMIdentity(AT+CRSM) error = %v", err)
+	}
+	if id.IMPI == "" || id.Domain != "ims.example.test" || len(id.IMPU) != 1 {
+		t.Fatalf("AT+CRSM identity=%+v", id)
+	}
+	if len(at.calls) < 3 || !strings.HasPrefix(at.calls[0], "AT+CRSM=176,28418") {
+		t.Fatalf("AT calls=%+v", at.calls)
+	}
+}
+
+func runtimeISIMTLVString(s string) []byte {
+	return append([]byte{0x80, byte(len(s))}, []byte(s)...)
+}
+
+func runtimeISIMLengthString(s string) []byte {
+	return append([]byte{byte(len(s))}, []byte(s)...)
+}
+
+func runtimeIdentityHexResponse(body []byte) string {
+	out := append(append([]byte(nil), body...), 0x90, 0x00)
+	return strings.ToUpper(hex.EncodeToString(out))
+}
+
+func runtimeIdentityPadRecord(body []byte, n int) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = 0xFF
+	}
+	copy(out, body)
+	return out
+}
+
+func runtimeCRSMOK(body []byte) simtransport.CRSMResult {
+	return simtransport.CRSMResult{Data: strings.ToUpper(hex.EncodeToString(body)), SW1: 0x90, SW2: 0x00}
 }
 
 func TestStartUsesIMSRegistrarResult(t *testing.T) {

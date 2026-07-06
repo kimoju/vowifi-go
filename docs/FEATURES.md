@@ -31,7 +31,9 @@ protocol layers needed by VoHive:
 
 - logical-channel SIM/ISIM APDU helpers, AT `CCHO`/`CGLA`/`CCHC` and basic
   `CSIM`/`CRSM` transport helpers, FCP/TLV parsing, ISIM identity EF reading
-  over logical-channel APDUs or CRSM, and USIM/ISIM AKA AUTHENTICATE primitives
+  over logical-channel APDUs or CRSM, runtime modem-access fallback from
+  explicit identity readers to APDU/CRSM/AT+CRSM identity reads, and USIM/ISIM
+  AKA AUTHENTICATE primitives
 - carrier presets and JSON carrier overrides, including AT&T TS.43/E911
   configuration for native `310/280` and `310/410` profiles
 - TS.43-style E911 entitlement bootstrap, JSON/XML response parsing for common

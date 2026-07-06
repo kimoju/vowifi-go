@@ -257,7 +257,7 @@ func ReadISIMIdentity(access interface {
 	if strings.TrimSpace(id.IMPI) != "" || strings.TrimSpace(id.Domain) != "" || len(id.IMPU) > 0 {
 		return id, nil
 	}
-	return Identity{}, errors.Join(readErrs...)
+	return Identity{}, emptyISIMIdentityError(readErrs)
 }
 
 func ReadISIMIdentityCRSM(access interface {
@@ -293,7 +293,14 @@ func ReadISIMIdentityCRSM(access interface {
 	if strings.TrimSpace(id.IMPI) != "" || strings.TrimSpace(id.Domain) != "" || len(id.IMPU) > 0 {
 		return id, nil
 	}
-	return Identity{}, errors.Join(readErrs...)
+	return Identity{}, emptyISIMIdentityError(readErrs)
+}
+
+func emptyISIMIdentityError(readErrs []error) error {
+	if err := errors.Join(readErrs...); err != nil {
+		return err
+	}
+	return errors.New("ISIM identity data empty")
 }
 
 func readCRSMTransparentEF(access interface {

@@ -233,6 +233,23 @@ func TestReadISIMIdentityCRSMReturnsErrorWhenNoEFCanBeRead(t *testing.T) {
 	}
 }
 
+func TestReadISIMIdentityReturnsErrorWhenEFDataIsEmpty(t *testing.T) {
+	ft := &isimTransportFake{responses: []string{"9000", "9000", "9000", "9000", "9000", "9000"}}
+	_, err := ReadISIMIdentity(ft)
+	if err == nil || !strings.Contains(err.Error(), "ISIM identity data empty") {
+		t.Fatalf("ReadISIMIdentity(empty) err=%v, want empty identity error", err)
+	}
+
+	crsm := &crsmIdentityFake{
+		binary:  []simtransport.CRSMResult{{SW1: 0x90, SW2: 0x00}, {SW1: 0x90, SW2: 0x00}},
+		records: []simtransport.CRSMResult{{SW1: 0x90, SW2: 0x00}},
+	}
+	_, err = ReadISIMIdentityCRSM(crsm, "")
+	if err == nil || !strings.Contains(err.Error(), "ISIM identity data empty") {
+		t.Fatalf("ReadISIMIdentityCRSM(empty) err=%v, want empty identity error", err)
+	}
+}
+
 func TestReadISIMIdentityReturnsErrorWhenNoEFCanBeRead(t *testing.T) {
 	ft := &isimTransportFake{responses: []string{"6A82", "6A82", "6A82"}}
 	_, err := ReadISIMIdentity(ft)

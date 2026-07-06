@@ -15,6 +15,7 @@ import (
 	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
 	"github.com/boa-z/vowifi-go/runtimehost/identity"
 	"github.com/boa-z/vowifi-go/runtimehost/messaging"
+	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
 	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 	"github.com/boa-z/vowifi-go/runtimehost/voicehost"
 )
@@ -107,6 +108,11 @@ type IdentityReader interface {
 	GetISIMIdentity() (identity.Identity, error)
 }
 
+type CRSMAccess interface {
+	ReadCRSMBinary(fileID uint16, offset, length int, pathID string) (simtransport.CRSMResult, error)
+	ReadCRSMRecord(fileID uint16, record, length int, pathID string) (simtransport.CRSMResult, error)
+}
+
 type ModemAccess interface {
 	GetISIMIdentity() (identity.Identity, error)
 	RuntimeModem() Modem
@@ -136,6 +142,38 @@ func (a *modemAccessAdapter) GetISIMIdentity() (identity.Identity, error) {
 	}
 	if r, ok := a.modem.(IdentityReader); ok {
 		return r.GetISIMIdentity()
+	}
+	var errs []error
+	if apdu, ok := a.modem.(interface {
+		OpenLogicalChannel(aid string) (int, error)
+		CloseLogicalChannel(channel int) error
+		TransmitAPDU(channel int, hexAPDU string) (string, error)
+	}); ok {
+		if id, err := identity.ReadISIMIdentity(apdu); err == nil {
+			return id, nil
+		} else {
+			errs = append(errs, fmt.Errorf("logical-channel ISIM identity: %w", err))
+		}
+	}
+	if crsm, ok := a.modem.(CRSMAccess); ok {
+		if id, err := identity.ReadISIMIdentityCRSM(crsm, "7FFF"); err == nil {
+			return id, nil
+		} else {
+			errs = append(errs, fmt.Errorf("CRSM ISIM identity: %w", err))
+		}
+	}
+	if at, ok := a.modem.(interface {
+		ExecuteATSilent(cmd string, timeout time.Duration) (string, error)
+	}); ok {
+		adapter := simtransport.NewAdapter(at)
+		if id, err := identity.ReadISIMIdentityCRSM(adapter, "7FFF"); err == nil {
+			return id, nil
+		} else {
+			errs = append(errs, fmt.Errorf("AT+CRSM ISIM identity: %w", err))
+		}
+	}
+	if len(errs) > 0 {
+		return identity.Identity{}, errors.Join(errs...)
 	}
 	return identity.Identity{}, errors.New("modem does not expose ISIM identity")
 }
