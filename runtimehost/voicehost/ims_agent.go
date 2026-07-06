@@ -1809,6 +1809,9 @@ func retryDialogConfigForMinExpires(cfg voiceclient.DialogRequestConfig, sentHea
 	}
 	retry := cfg
 	retry.CSeq = outboundNextCSeq(cfg.CSeq)
+	if contact := sipHeaderURI(firstVoiceHeader(responseHeaders, "Contact")); contact != "" {
+		retry.RemoteTargetURI = contact
+	}
 	return retry, strconv.Itoa(minExpires), true
 }
 

@@ -100,6 +100,43 @@ func TestReadISIMIdentityReturnsPartialIdentityForStrictPrepare(t *testing.T) {
 	}
 }
 
+func TestPrepareStartPrefersSIPIMPUOverTEL(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		Profile: Profile{IMSI: "001010123456789"},
+		Access: partialAccess{id: Identity{
+			IMPI:   "001010123456789@private.example.test",
+			IMPU:   []string{"tel:+15550101000", "sip:001010123456789@ims.example.test"},
+			Domain: "ims.example.test",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if got := prepared.IMSIdentity.IMPU; got != "sip:001010123456789@ims.example.test" {
+		t.Fatalf("IMPU = %q, want SIP identity", got)
+	}
+}
+
+func TestPrepareStartPrefersDomainMatchedSIPIMPU(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		Profile: Profile{IMSI: "001010123456789"},
+		Access: partialAccess{id: Identity{
+			IMPI: "001010123456789@private.example.test",
+			IMPU: []string{
+				"sip:001010123456789@visited.example.test",
+				"sip:001010123456789@ims.example.test;user=phone",
+			},
+			Domain: "ims.example.test",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if got := prepared.IMSIdentity.IMPU; got != "sip:001010123456789@ims.example.test;user=phone" {
+		t.Fatalf("IMPU = %q, want domain-matched SIP identity", got)
+	}
+}
+
 type partialAccess struct {
 	id Identity
 }

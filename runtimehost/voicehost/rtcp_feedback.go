@@ -51,7 +51,18 @@ type RTCPFeedbackEvent struct {
 	REMBBitrate      float64
 	REMBSSRCs        []uint32
 	TransportCCCount int
+	Reports          []RTCPReceptionReport
 	Packet           rtcp.Packet
+}
+
+type RTCPReceptionReport struct {
+	SSRC               uint32
+	FractionLost       uint8
+	TotalLost          uint32
+	LastSequenceNumber uint32
+	Jitter             uint32
+	LastSenderReport   uint32
+	Delay              uint32
 }
 
 type RTCPFeedbackSummary struct {
@@ -110,10 +121,12 @@ func rtcpFeedbackEvents(direction RTCPFeedbackDirection, packet rtcp.Packet) []R
 		event.Kind = RTCPFeedbackSenderReport
 		event.SSRC = p.SSRC
 		event.ReportCount = len(p.Reports)
+		event.Reports = rtcpReceptionReports(p.Reports)
 	case *rtcp.ReceiverReport:
 		event.Kind = RTCPFeedbackReceiverReport
 		event.SSRC = p.SSRC
 		event.ReportCount = len(p.Reports)
+		event.Reports = rtcpReceptionReports(p.Reports)
 	case *rtcp.PictureLossIndication:
 		event.Kind = RTCPFeedbackPictureLossIndication
 		event.SenderSSRC = p.SenderSSRC
@@ -162,6 +175,25 @@ func rtcpFeedbackEvents(direction RTCPFeedbackDirection, packet rtcp.Packet) []R
 		event.Kind = RTCPFeedbackUnknown
 	}
 	return []RTCPFeedbackEvent{event}
+}
+
+func rtcpReceptionReports(in []rtcp.ReceptionReport) []RTCPReceptionReport {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]RTCPReceptionReport, 0, len(in))
+	for _, report := range in {
+		out = append(out, RTCPReceptionReport{
+			SSRC:               report.SSRC,
+			FractionLost:       report.FractionLost,
+			TotalLost:          report.TotalLost,
+			LastSequenceNumber: report.LastSequenceNumber,
+			Jitter:             report.Jitter,
+			LastSenderReport:   report.LastSenderReport,
+			Delay:              report.Delay,
+		})
+	}
+	return out
 }
 
 func (s *RTCPFeedbackSummary) add(kind RTCPFeedbackKind) {

@@ -67,6 +67,7 @@ type RegistrationBinding struct {
 	SecurityServer    []string
 	SecurityVerify    []string
 	SecurityAgreement SecurityAgreement
+	SecurityPlan      IMSSecurityAssociationPlan
 	Expires           int
 	RegistrarContact  string
 	AuthHeader        string
@@ -481,7 +482,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		}, nil
 	}
 	if resp.StatusCode != 401 && resp.StatusCode != 407 {
-		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
+		return registerFailureResult(resp, attempts, DigestChallenge{}, ""), fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
 	}
 
 	headerName := "WWW-Authenticate"
@@ -494,18 +495,18 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	}
 	ch, err := SelectDigestChallenge(resp.Headers, headerName)
 	if err != nil {
-		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp)}, err
+		return registerFailureResult(resp, attempts, DigestChallenge{}, ""), err
 	}
 	securityHeaders := resp.Headers
 
 	authzInput, syncFailure, err := s.digestAuthInputForChallenge(ch, registrarURI)
 	if err != nil {
-		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp), Challenge: ch}, err
+		return registerFailureResult(resp, attempts, ch, ""), err
 	}
 	currentAuthInput := authzInput
 	authz, err := BuildDigestAuthorization(ch, authzInput)
 	if err != nil {
-		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp), Challenge: ch}, err
+		return registerFailureResult(resp, attempts, ch, ""), err
 	}
 
 	cseq++
@@ -542,7 +543,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 			return result, nil
 		}
 		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
-			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), Challenge: ch, AuthHeader: authz}, fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
+			return registerFailureResult(resp2, attempts, ch, authz), fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 		}
 		nextHeaderName := "WWW-Authenticate"
 		nextAuthzHeader := "Authorization"
@@ -552,14 +553,14 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		}
 		nextChallenge, err := SelectDigestChallenge(resp2.Headers, nextHeaderName)
 		if err != nil {
-			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), Challenge: ch, AuthHeader: authz}, err
+			return registerFailureResult(resp2, attempts, ch, authz), err
 		}
 		nextAuthInput, nextSyncFailure, err := s.digestAuthInputForChallenge(nextChallenge, registrarURI)
 		if err != nil {
-			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), Challenge: nextChallenge, AuthHeader: authz}, err
+			return registerFailureResult(resp2, attempts, nextChallenge, authz), err
 		}
 		if nextSyncFailure {
-			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, RetryAfter: SIPResponseRetryAfter(resp2), Challenge: nextChallenge, AuthHeader: authz}, sim.ErrSyncFailure
+			return registerFailureResult(resp2, attempts, nextChallenge, authz), sim.ErrSyncFailure
 		}
 		authz, err = BuildDigestAuthorization(nextChallenge, nextAuthInput)
 		if err != nil {
@@ -604,6 +605,17 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	}
 	result.Binding = bindDigestAuthWithChallengeInput(result.Binding, authzHeader, authz, result.AuthState, s.digestChallengeInputFunc())
 	return result, nil
+}
+
+func registerFailureResult(resp RegisterResponse, attempts int, ch DigestChallenge, authHeader string) RegisterResult {
+	return RegisterResult{
+		StatusCode: resp.StatusCode,
+		Reason:     resp.Reason,
+		Attempts:   attempts,
+		RetryAfter: SIPResponseRetryAfter(resp),
+		Challenge:  ch,
+		AuthHeader: authHeader,
+	}
 }
 
 func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) (DeregisterResult, error) {
@@ -1056,6 +1068,9 @@ func mergeRefreshBinding(previous, next RegistrationBinding) RegistrationBinding
 	if isZeroSecurityAgreement(next.SecurityAgreement) {
 		next.SecurityAgreement = previous.SecurityAgreement
 	}
+	if isZeroIMSSecurityAssociationPlan(next.SecurityPlan) {
+		next.SecurityPlan = previous.SecurityPlan
+	}
 	if next.Expires <= 0 {
 		next.Expires = previous.Expires
 	}
@@ -1212,6 +1227,9 @@ func buildRegistrationBinding(profile IMSProfile, contactURI string, resp Regist
 	}
 	if selected, ok := SelectSecurityAgreement(binding.SecurityServer, securityClient); ok {
 		binding.SecurityAgreement = selected
+		if plan, ok := BuildIMSSecurityAssociationPlan(selected); ok {
+			binding.SecurityPlan = plan
+		}
 	}
 	if len(binding.AssociatedURIs) == 0 && binding.PublicIdentity != "" {
 		binding.AssociatedURIs = []string{binding.PublicIdentity}

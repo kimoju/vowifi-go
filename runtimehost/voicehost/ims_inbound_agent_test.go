@@ -762,15 +762,28 @@ func TestIMSInboundAgentHandlesRefer(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("HandleInboundInvite() error = %v", err)
 	}
+	invalid, err := agent.HandleInboundRefer(context.Background(), InboundDialogRequest{
+		CallID:   "in-call-refer",
+		CSeq:     2,
+		ReferTo:  "<sip:+18005551313@ims.example>",
+		ReferSub: "sometimes",
+	})
+	if err == nil || invalid.StatusCode != 400 || invalid.Accepted {
+		t.Fatalf("HandleInboundRefer(invalid Refer-Sub) result=%+v err=%v", invalid, err)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("invalid Refer-Sub forwarded request: requests=%+v", transport.requests)
+	}
 	result, err := agent.HandleInboundRefer(context.Background(), InboundDialogRequest{
 		CallID:     "in-call-refer",
 		CSeq:       2,
 		ReferTo:    "<sip:+18005551313@ims.example>",
 		ReferredBy: "<sip:+18005551212@ims.example>",
+		ReferSub:   "true",
 		Headers: map[string][]string{
 			"Refer-To":    {"<sip:wrong@ims.example>"},
 			"Referred-By": {"<sip:wrong-referrer@ims.example>"},
-			"Refer-Sub":   {"true"},
+			"Refer-Sub":   {"false"},
 			"X-IMS":       {"refer"},
 		},
 	})
@@ -951,7 +964,10 @@ func TestIMSInboundAgentRetriesSubscribeMinExpires(t *testing.T) {
 		{
 			StatusCode: 423,
 			Reason:     "Interval Too Brief",
-			Headers:    map[string][]string{"Min-Expires": {"900"}},
+			Headers: map[string][]string{
+				"Contact":     {"<sip:client-subscribe@192.0.2.80:5060>"},
+				"Min-Expires": {"900"},
+			},
 		},
 		{
 			StatusCode: 202,
@@ -989,7 +1005,8 @@ func TestIMSInboundAgentRetriesSubscribeMinExpires(t *testing.T) {
 	if first.Headers["CSeq"] != "7 SUBSCRIBE" || first.Headers["Expires"] != "300" {
 		t.Fatalf("first SUBSCRIBE=%+v", first)
 	}
-	if retry.Headers["CSeq"] != "8 SUBSCRIBE" || retry.Headers["Expires"] != "900" || retry.Headers["Event"] != "refer" {
+	if retry.URI != "sip:client-subscribe@192.0.2.80:5060" ||
+		retry.Headers["CSeq"] != "8 SUBSCRIBE" || retry.Headers["Expires"] != "900" || retry.Headers["Event"] != "refer" {
 		t.Fatalf("retry SUBSCRIBE=%+v", retry)
 	}
 }

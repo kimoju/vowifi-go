@@ -106,7 +106,7 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 			AKAAppPreference: AKAAppPreferenceUSIM,
 			Applied:          true,
 			IMPI:             profile.IMSI,
-			IMPU:             "sip:" + profile.IMSI,
+			IMPU:             profileIMPU(profile),
 			Domain:           "",
 		},
 	}
@@ -127,12 +127,71 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 				AKAAppPreference: AKAAppPreferenceISIMStrict,
 				Applied:          true,
 				IMPI:             strings.TrimSpace(id.IMPI),
-				IMPU:             strings.TrimSpace(id.IMPU[0]),
+				IMPU:             selectISIMIMPU(id.IMPU, id.Domain, profile),
 				Domain:           strings.TrimSpace(id.Domain),
 			}
 		}
 	}
 	return prepared, nil
+}
+
+func selectISIMIMPU(impus []string, domain string, profile Profile) string {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	var firstSIP, firstAny string
+	for _, impu := range impus {
+		impu = strings.TrimSpace(impu)
+		if impu == "" {
+			continue
+		}
+		if firstAny == "" {
+			firstAny = impu
+		}
+		if isSIPURI(impu) {
+			if firstSIP == "" {
+				firstSIP = impu
+			}
+			if domain != "" && strings.EqualFold(sipURIDomain(impu), domain) {
+				return impu
+			}
+		}
+	}
+	if firstSIP != "" {
+		return firstSIP
+	}
+	if firstAny != "" {
+		return firstAny
+	}
+	return profileIMPU(profile)
+}
+
+func isSIPURI(uri string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(uri)), "sip:")
+}
+
+func sipURIDomain(uri string) string {
+	uri = strings.TrimSpace(uri)
+	if !isSIPURI(uri) {
+		return ""
+	}
+	uri = uri[4:]
+	if _, host, ok := strings.Cut(uri, "@"); ok {
+		uri = host
+	}
+	if host, _, ok := strings.Cut(uri, ";"); ok {
+		uri = host
+	}
+	if host, _, ok := strings.Cut(uri, ":"); ok {
+		uri = host
+	}
+	return strings.ToLower(strings.TrimSpace(uri))
+}
+
+func profileIMPU(profile Profile) string {
+	imsi := strings.TrimSpace(profile.IMSI)
+	if imsi == "" {
+		return ""
+	}
+	return "sip:" + imsi
 }
 
 func defaultEPDG(p Profile) string {

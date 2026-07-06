@@ -29,6 +29,19 @@ type SecurityAgreement struct {
 	Raw                 string
 }
 
+type IMSSecurityAssociationPlan struct {
+	Protocol            string
+	Mode                string
+	Algorithm           string
+	EncryptionAlgorithm string
+	SPIClient           uint32
+	SPIServer           uint32
+	PortClient          int
+	PortServer          int
+	QValue              string
+	Source              string
+}
+
 func DefaultSecurityClientAgreement(random io.Reader) SecurityAgreement {
 	if random == nil {
 		random = cryptorand.Reader
@@ -87,6 +100,29 @@ func SelectSecurityAgreement(values []string, client SecurityAgreement) (Securit
 		return SecurityAgreement{}, false
 	}
 	return best, true
+}
+
+func BuildIMSSecurityAssociationPlan(agreement SecurityAgreement) (IMSSecurityAssociationPlan, bool) {
+	if isZeroSecurityAgreement(agreement) {
+		return IMSSecurityAssociationPlan{}, false
+	}
+	agreement = completeSecurityAgreement(agreement)
+	if agreement.SPIClient == 0 || agreement.SPIServer == 0 || agreement.PortClient == 0 || agreement.PortServer == 0 {
+		return IMSSecurityAssociationPlan{}, false
+	}
+	mode := firstNonEmpty(agreement.Parameters["mode"], agreement.Parameters["mod"], "trans")
+	return IMSSecurityAssociationPlan{
+		Protocol:            agreement.Protocol,
+		Mode:                strings.ToLower(strings.TrimSpace(mode)),
+		Algorithm:           agreement.Algorithm,
+		EncryptionAlgorithm: agreement.EncryptionAlgorithm,
+		SPIClient:           agreement.SPIClient,
+		SPIServer:           agreement.SPIServer,
+		PortClient:          agreement.PortClient,
+		PortServer:          agreement.PortServer,
+		QValue:              strings.TrimSpace(agreement.Parameters["q"]),
+		Source:              agreement.Raw,
+	}, true
 }
 
 func (a SecurityAgreement) HeaderValue() string {
@@ -148,6 +184,10 @@ func isZeroSecurityAgreement(a SecurityAgreement) bool {
 		a.PortServer == 0 &&
 		len(a.Parameters) == 0 &&
 		strings.TrimSpace(a.Raw) == ""
+}
+
+func isZeroIMSSecurityAssociationPlan(plan IMSSecurityAssociationPlan) bool {
+	return plan == IMSSecurityAssociationPlan{}
 }
 
 func parseSecurityAgreement(value string) (SecurityAgreement, bool) {

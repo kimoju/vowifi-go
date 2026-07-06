@@ -212,6 +212,53 @@ func TestSelectSecurityAgreementSkipsIncompatibleOffers(t *testing.T) {
 	}
 }
 
+func TestSelectSecurityAgreementPrefersHigherQValue(t *testing.T) {
+	selected, ok := SelectSecurityAgreement([]string{
+		`ipsec-3gpp;q=0.2;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`,
+		`ipsec-3gpp;q=0.8;alg=hmac-sha-1-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065;mod=trans`,
+	}, SecurityAgreement{
+		Protocol:            "ipsec-3gpp",
+		Algorithm:           "hmac-sha-1-96",
+		EncryptionAlgorithm: "null",
+	})
+	if !ok {
+		t.Fatal("SelectSecurityAgreement() ok=false")
+	}
+	if selected.SPIClient != 333 || selected.SPIServer != 444 || selected.Parameters["q"] != "0.8" {
+		t.Fatalf("selected=%+v", selected)
+	}
+	plan, ok := BuildIMSSecurityAssociationPlan(selected)
+	if !ok {
+		t.Fatal("BuildIMSSecurityAssociationPlan() ok=false")
+	}
+	if plan.SPIClient != 333 || plan.SPIServer != 444 || plan.PortClient != 5064 || plan.PortServer != 5065 ||
+		plan.Protocol != "ipsec-3gpp" || plan.Algorithm != "hmac-sha-1-96" || plan.EncryptionAlgorithm != "null" ||
+		plan.Mode != "trans" || plan.QValue != "0.8" {
+		t.Fatalf("plan=%+v", plan)
+	}
+}
+
+func TestBuildIMSSecurityAssociationPlanRequiresPortsAndSPIs(t *testing.T) {
+	if plan, ok := BuildIMSSecurityAssociationPlan(SecurityAgreement{
+		Protocol:            "ipsec-3gpp",
+		Algorithm:           "hmac-sha-1-96",
+		EncryptionAlgorithm: "null",
+		SPIClient:           111,
+		SPIServer:           222,
+	}); ok || !isZeroIMSSecurityAssociationPlan(plan) {
+		t.Fatalf("BuildIMSSecurityAssociationPlan() plan=%+v ok=%v, want empty", plan, ok)
+	}
+	if plan, ok := BuildIMSSecurityAssociationPlan(SecurityAgreement{
+		Protocol:            "ipsec-3gpp",
+		Algorithm:           "hmac-sha-1-96",
+		EncryptionAlgorithm: "null",
+		PortClient:          5062,
+		PortServer:          5063,
+	}); ok || !isZeroIMSSecurityAssociationPlan(plan) {
+		t.Fatalf("BuildIMSSecurityAssociationPlan() plan=%+v ok=%v, want empty", plan, ok)
+	}
+}
+
 func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
@@ -289,7 +336,13 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 		result.Binding.SecurityAgreement.SPIClient != 111 ||
 		result.Binding.SecurityAgreement.SPIServer != 222 ||
 		result.Binding.SecurityAgreement.PortClient != 5062 ||
-		result.Binding.SecurityAgreement.PortServer != 5063 {
+		result.Binding.SecurityAgreement.PortServer != 5063 ||
+		result.Binding.SecurityPlan.SPIClient != 111 ||
+		result.Binding.SecurityPlan.SPIServer != 222 ||
+		result.Binding.SecurityPlan.PortClient != 5062 ||
+		result.Binding.SecurityPlan.PortServer != 5063 ||
+		result.Binding.SecurityPlan.Mode != "trans" ||
+		result.Binding.SecurityPlan.Protocol != "ipsec-3gpp" {
 		t.Fatalf("security binding=%+v", result.Binding)
 	}
 	if got := strings.ToUpper(hex.EncodeToString(aka.rand)); got != strings.ToUpper(hex.EncodeToString(bytesFrom(0x10, 16))) {
@@ -462,6 +515,120 @@ func TestRegisterSessionRetriesAuthenticatedMinExpires(t *testing.T) {
 	}
 	if got := transport.requests[2].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=555") {
 		t.Fatalf("Security-Verify=%q", got)
+	}
+}
+
+func TestRegisterSessionClassifiesRegisterFailures(t *testing.T) {
+	tests := []struct {
+		name             string
+		responses        []RegisterResponse
+		expires          int
+		wantErr          error
+		wantStatus       int
+		wantAttempts     int
+		wantRetryAfter   time.Duration
+		wantRegistered   bool
+		wantRequests     int
+		wantAuthHeader   bool
+		wantChallengeSet bool
+	}{
+		{
+			name: "401 without valid challenge",
+			responses: []RegisterResponse{{
+				StatusCode: 401,
+				Reason:     "Unauthorized",
+			}},
+			wantErr:        ErrInvalidChallenge,
+			wantStatus:     401,
+			wantAttempts:   1,
+			wantRegistered: false,
+			wantRequests:   1,
+		},
+		{
+			name: "403 forbidden with retry-after",
+			responses: []RegisterResponse{{
+				StatusCode: 403,
+				Reason:     "Forbidden",
+				Headers:    map[string][]string{"Retry-After": {"7"}},
+			}},
+			wantErr:        ErrRegistrationRejected,
+			wantStatus:     403,
+			wantAttempts:   1,
+			wantRetryAfter: 7 * time.Second,
+			wantRegistered: false,
+			wantRequests:   1,
+		},
+		{
+			name: "423 invalid min-expires",
+			responses: []RegisterResponse{{
+				StatusCode: 423,
+				Reason:     "Interval Too Brief",
+				Headers:    map[string][]string{"Min-Expires": {"300"}},
+			}},
+			expires:        600,
+			wantErr:        ErrRegistrationRejected,
+			wantStatus:     423,
+			wantAttempts:   1,
+			wantRegistered: false,
+			wantRequests:   1,
+		},
+		{
+			name: "503 retry-after after challenge",
+			responses: []RegisterResponse{
+				{
+					StatusCode: 401,
+					Reason:     "Unauthorized",
+					Headers: map[string][]string{
+						"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-retry", algorithm=MD5, qop="auth"`},
+					},
+				},
+				{
+					StatusCode: 503,
+					Reason:     "Service Unavailable",
+					Headers:    map[string][]string{"Retry-After": {"11"}},
+				},
+			},
+			wantErr:          ErrRegistrationRejected,
+			wantStatus:       503,
+			wantAttempts:     2,
+			wantRetryAfter:   11 * time.Second,
+			wantRegistered:   false,
+			wantRequests:     2,
+			wantAuthHeader:   true,
+			wantChallengeSet: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := &fakeRegisterTransport{responses: tc.responses}
+			result, err := RegisterSession{
+				Transport:    transport,
+				Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+				RegistrarURI: "sip:ims.example",
+				ContactURI:   "sip:user@192.0.2.10:5060",
+				CallID:       "call-register-failure",
+				CNonce:       "cnonce",
+				Expires:      tc.expires,
+			}.Register(context.Background())
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Register() err=%v, want %v", err, tc.wantErr)
+			}
+			if result.Registered != tc.wantRegistered || result.StatusCode != tc.wantStatus ||
+				result.Attempts != tc.wantAttempts || result.RetryAfter != tc.wantRetryAfter {
+				t.Fatalf("Register() result=%+v, want status=%d attempts=%d retryAfter=%v registered=%v",
+					result, tc.wantStatus, tc.wantAttempts, tc.wantRetryAfter, tc.wantRegistered)
+			}
+			if (result.AuthHeader != "") != tc.wantAuthHeader {
+				t.Fatalf("AuthHeader present=%v, want %v: %q", result.AuthHeader != "", tc.wantAuthHeader, result.AuthHeader)
+			}
+			if (result.Challenge.Nonce != "") != tc.wantChallengeSet {
+				t.Fatalf("Challenge=%+v, want set=%v", result.Challenge, tc.wantChallengeSet)
+			}
+			if len(transport.requests) != tc.wantRequests {
+				t.Fatalf("requests=%d, want %d", len(transport.requests), tc.wantRequests)
+			}
+		})
 	}
 }
 
@@ -1287,6 +1454,20 @@ func TestBuildRegistrationBindingParsesIMSHeaders(t *testing.T) {
 	}
 	if binding.Expires != 777 || len(binding.SecurityVerify) != 1 || !strings.Contains(binding.RegistrarContact, "transport=udp") {
 		t.Fatalf("binding=%+v", binding)
+	}
+}
+
+func TestBuildRegistrationBindingLeavesPlanEmptyWithoutCompleteSA(t *testing.T) {
+	binding := BuildRegistrationBinding(IMSProfile{IMPU: "sip:fallback@example"}, "sip:user@192.0.2.10:5060", RegisterResponse{
+		Headers: map[string][]string{
+			"Security-Server": {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=1;spi-s=2`},
+		},
+	}, 3600)
+	if binding.SecurityAgreement.SPIClient != 1 || binding.SecurityAgreement.SPIServer != 2 {
+		t.Fatalf("security agreement=%+v", binding.SecurityAgreement)
+	}
+	if !isZeroIMSSecurityAssociationPlan(binding.SecurityPlan) {
+		t.Fatalf("security plan=%+v, want empty", binding.SecurityPlan)
 	}
 }
 

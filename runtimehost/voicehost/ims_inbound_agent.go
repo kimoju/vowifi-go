@@ -64,6 +64,7 @@ type InboundDialogRequest struct {
 	RAck              string
 	ReferTo           string
 	ReferredBy        string
+	ReferSub          string
 	Event             string
 	Expires           string
 	SubscriptionState string
@@ -717,7 +718,7 @@ func (a *IMSInboundAgent) HandleInboundRefer(ctx context.Context, req InboundDia
 	if strings.TrimSpace(referTo) == "" {
 		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "Refer-To empty"}, errors.New("Refer-To is empty")
 	}
-	referSub, ok := normalizeReferSub(firstVoiceHeader(req.Headers, "Refer-Sub"))
+	referSub, ok := normalizeReferSub(firstVoiceNonEmpty(req.ReferSub, firstVoiceHeader(req.Headers, "Refer-Sub")))
 	if !ok {
 		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "Refer-Sub invalid"}, errors.New("Refer-Sub must be true or false")
 	}

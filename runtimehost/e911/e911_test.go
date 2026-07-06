@@ -345,6 +345,40 @@ func TestParseEntitlementResponseCapturesTS43RoutesAddressAndExpiryJSON(t *testi
 	}
 }
 
+func TestParseEntitlementResponseNormalizesRegisteredEmergencyServiceAliases(t *testing.T) {
+	body := []byte(`{
+		"status": 1000,
+		"emergencyServiceRoutes": [
+			{"service": "poison", "endpoint": "sip:poison@example.test"},
+			{"service": "physician", "endpoint": "sip:physician@example.test"},
+			{"service": "animal-control", "endpoint": "sip:animal@example.test"},
+			{"service": "gas", "endpoint": "sip:gas@example.test"}
+		]
+	}`)
+
+	info, err := ParseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("ParseEntitlementResponse() error = %v", err)
+	}
+	wantURNs := []string{
+		"urn:service:sos.poison",
+		"urn:service:sos.physician",
+		"urn:service:sos.animal-control",
+		"urn:service:sos.gas",
+	}
+	if !sameStrings(info.ServiceURNs, wantURNs) {
+		t.Fatalf("service URNs=%+v, want %+v", info.ServiceURNs, wantURNs)
+	}
+	if len(info.Routes) != len(wantURNs) {
+		t.Fatalf("routes=%+v", info.Routes)
+	}
+	for i, wantURN := range wantURNs {
+		if info.Routes[i].ServiceURN != wantURN {
+			t.Fatalf("route[%d].ServiceURN=%q, want %q", i, info.Routes[i].ServiceURN, wantURN)
+		}
+	}
+}
+
 func TestParseEntitlementResponseCapturesTS43RoutesAndCacheXML(t *testing.T) {
 	body := []byte(`
 		<ts43:response xmlns:ts43="urn:test">

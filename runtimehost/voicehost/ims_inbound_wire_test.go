@@ -1344,6 +1344,29 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeMessageAnd
 		t.Fatalf("client REFER=%+v", referReq)
 	}
 
+	invalidRefer := voiceclient.SIPIncomingRequest{
+		Method: "REFER",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Via":       {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-invalid-refer-sub"},
+			"From":      {"<sip:+18005551212@ims.example>;tag=ims-tag"},
+			"To":        {"<sip:user@ims.example>;tag=ue-tag"},
+			"Call-ID":   {"wire-call-dialog"},
+			"CSeq":      {"8 REFER"},
+			"Refer-To":  {"<sip:+18005551313@ims.example>"},
+			"Refer-Sub": {"sometimes"},
+		},
+	}
+	responses, err = server.HandleRequest(context.Background(), invalidRefer)
+	if err == nil || len(responses) != 1 || responses[0].StatusCode != 400 {
+		t.Fatalf("HandleRequest(invalid REFER) responses=%+v err=%v", responses, err)
+	}
+	select {
+	case req := <-transport.requests:
+		t.Fatalf("invalid REFER forwarded to client: %+v", req)
+	default:
+	}
+
 	notify := parseWireIncoming(t, wireIMSRequest("wire-call-dialog", "NOTIFY", 5, []byte("SIP/2.0 200 OK\r\n"),
 		"Event: refer\r\n",
 		"Subscription-State: terminated;reason=noresource\r\n",
@@ -1588,6 +1611,48 @@ func TestIMSInboundWireServerRejectsUnsupportedMethod(t *testing.T) {
 	}
 	if len(responses) != 1 || responses[0].StatusCode != 405 || !strings.Contains(responses[0].Headers["Allow"], "UPDATE") {
 		t.Fatalf("responses=%+v", responses)
+	}
+}
+
+func TestIMSInboundWireServerOptionsAdvertisesCapabilities(t *testing.T) {
+	server := &IMSInboundWireServer{
+		ContactURI: "sip:vowifi@127.0.0.1:5060",
+		UserAgent:  "VoHive",
+	}
+	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+		Method: "OPTIONS",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-OPTIONS"},
+			"Call-ID": {"capability-options"},
+			"CSeq":    {"1 OPTIONS"},
+			"From":    {"<sip:network@ims.example>;tag=ims-tag"},
+			"To":      {"<sip:user@ims.example>"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleRequest(OPTIONS) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 200 {
+		t.Fatalf("responses=%+v", responses)
+	}
+	headers := responses[0].Headers
+	for _, method := range []string{"INVITE", "ACK", "CANCEL", "BYE", "PRACK", "UPDATE", "REFER", "NOTIFY", "SUBSCRIBE", "OPTIONS"} {
+		if !strings.Contains(headers["Allow"], method) {
+			t.Fatalf("Allow missing %s: %q", method, headers["Allow"])
+		}
+	}
+	for _, optionTag := range []string{"100rel", "timer", "replaces", "outbound", "norefersub"} {
+		if !strings.Contains(headers["Supported"], optionTag) {
+			t.Fatalf("Supported missing %s: %q", optionTag, headers["Supported"])
+		}
+	}
+	if headers["Accept"] != "application/sdp" ||
+		headers["Accept-Contact"] != wireMMTelAcceptContact ||
+		headers["Allow-Events"] != "refer" ||
+		headers["User-Agent"] != "VoHive" ||
+		headers["Contact"] != "<sip:vowifi@127.0.0.1:5060>" {
+		t.Fatalf("OPTIONS capability headers=%+v", headers)
 	}
 }
 

@@ -1316,10 +1316,18 @@ func normalizeEmergencyServiceURN(s string) string {
 		return "urn:service:sos.fire"
 	case "ambulance", "medical", "ems":
 		return "urn:service:sos.ambulance"
+	case "animal-control", "animalcontrol":
+		return "urn:service:sos.animal-control"
+	case "gas":
+		return "urn:service:sos.gas"
 	case "marine":
 		return "urn:service:sos.marine"
 	case "mountain":
 		return "urn:service:sos.mountain"
+	case "physician":
+		return "urn:service:sos.physician"
+	case "poison":
+		return "urn:service:sos.poison"
 	default:
 		return ""
 	}

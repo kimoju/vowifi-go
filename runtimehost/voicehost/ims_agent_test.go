@@ -904,7 +904,10 @@ func TestIMSOutboundAgentRetriesDialogSubscribeMinExpires(t *testing.T) {
 		{
 			StatusCode: 423,
 			Reason:     "Interval Too Brief",
-			Headers:    map[string][]string{"Min-Expires": {"900"}},
+			Headers: map[string][]string{
+				"Contact":     {"<sip:carrier-subscribe@198.51.100.40:5060>"},
+				"Min-Expires": {"900"},
+			},
 		},
 		{
 			StatusCode: 202,
@@ -943,7 +946,8 @@ func TestIMSOutboundAgentRetriesDialogSubscribeMinExpires(t *testing.T) {
 	if first.Headers["CSeq"] != "2 SUBSCRIBE" || first.Headers["Expires"] != "300" {
 		t.Fatalf("first SUBSCRIBE=%+v", first)
 	}
-	if retry.Headers["CSeq"] != "3 SUBSCRIBE" || retry.Headers["Expires"] != "900" || retry.Headers["Event"] != "refer" {
+	if retry.URI != "sip:carrier-subscribe@198.51.100.40:5060" ||
+		retry.Headers["CSeq"] != "3 SUBSCRIBE" || retry.Headers["Expires"] != "900" || retry.Headers["Event"] != "refer" {
 		t.Fatalf("retry SUBSCRIBE=%+v", retry)
 	}
 }

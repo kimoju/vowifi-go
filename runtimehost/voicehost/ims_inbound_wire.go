@@ -435,6 +435,7 @@ func (s *IMSInboundWireServer) handleRefer(ctx context.Context, req voiceclient.
 		Headers:    cloneSIPHeaders(req.Headers),
 		ReferTo:    firstVoiceHeader(req.Headers, "Refer-To"),
 		ReferredBy: firstVoiceHeader(req.Headers, "Referred-By"),
+		ReferSub:   firstVoiceHeader(req.Headers, "Refer-Sub"),
 	})
 	final := wireResponse(inboundStatusCode(result.StatusCode, 500), firstVoiceNonEmpty(result.Reason, "Server Internal Error"))
 	if result.Accepted {
@@ -693,6 +694,8 @@ func wireResponse(statusCode int, reason string) IMSInboundWireResponse {
 
 var wireSupportedOptionTags = []string{"100rel", "timer", "replaces", "outbound", "norefersub"}
 
+const wireMMTelAcceptContact = `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
+
 func wireSupportedOptionsHeader() string {
 	return strings.Join(wireSupportedOptionTags, ", ")
 }
@@ -703,6 +706,8 @@ func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 	resp.Headers["Supported"] = wireSupportedOptionsHeader()
 	resp.Headers["Allow-Events"] = "refer"
 	resp.Headers["Accept"] = "application/sdp"
+	resp.Headers["Accept-Contact"] = wireMMTelAcceptContact
+	resp.Headers["User-Agent"] = "vowifi-go"
 	if s != nil && (s.MessageHandler != nil || s.InfoHandler != nil || s.Agent != nil) {
 		accept := []string{"application/sdp"}
 		if s.InfoHandler != nil {
@@ -712,6 +717,9 @@ func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 			accept = append(accept, "application/vnd.3gpp.sms", "text/plain")
 		}
 		resp.Headers["Accept"] = strings.Join(accept, ", ")
+	}
+	if s != nil && strings.TrimSpace(s.UserAgent) != "" {
+		resp.Headers["User-Agent"] = strings.TrimSpace(s.UserAgent)
 	}
 	resp.Headers["Contact"] = "<" + s.contactURI() + ">"
 	return resp
