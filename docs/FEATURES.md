@@ -104,8 +104,10 @@ protocol layers needed by VoHive:
   SMS-SUBMIT Reply-Path and Reject-Duplicates first-octet flags, USSD dialog
   target refresh, and recoverable IMS registration/route failure signals for
   MESSAGE, USSD INVITE/INFO, and USSD BYE failures
-- outbound voice dialog bridging helpers, SDP parsing/building, IMS INVITE/ACK/
-  BYE/CANCEL request construction with MMTel service identification headers,
+- outbound voice dialog bridging helpers, SDP parsing/building, optional SDP
+  security parsing/building for RTP/SAVP/SAVPF, SDES crypto, DTLS fingerprint/
+  setup attributes, IMS INVITE/ACK/BYE/CANCEL request construction with MMTel
+  service identification headers,
   route-set application, UDP/TCP SIP request transport, outbound IMS voice
   agent, ACK/BYE/CANCEL dialog handling with release Reason/body forwarding,
   IMS BYE/CANCEL response status/body/header capture and local softphone
