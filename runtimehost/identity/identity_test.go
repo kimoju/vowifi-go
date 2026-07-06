@@ -2,6 +2,7 @@ package identity
 
 import (
 	"encoding/hex"
+	"errors"
 	"reflect"
 	"strconv"
 	"strings"
@@ -239,6 +240,10 @@ func TestReadISIMIdentityReturnsErrorWhenEFDataIsEmpty(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "ISIM identity data empty") {
 		t.Fatalf("ReadISIMIdentity(empty) err=%v, want empty identity error", err)
 	}
+	var readErr *ISIMIdentityReadError
+	if !errors.As(err, &readErr) || readErr.Class != simtransport.RecoveryClassEmptyEF || !errors.Is(err, ErrISIMIdentityDataEmpty) {
+		t.Fatalf("ReadISIMIdentity(empty) readErr=%+v err=%v, want empty EF class", readErr, err)
+	}
 
 	crsm := &crsmIdentityFake{
 		binary:  []simtransport.CRSMResult{{SW1: 0x90, SW2: 0x00}, {SW1: 0x90, SW2: 0x00}},
@@ -247,6 +252,10 @@ func TestReadISIMIdentityReturnsErrorWhenEFDataIsEmpty(t *testing.T) {
 	_, err = ReadISIMIdentityCRSM(crsm, "")
 	if err == nil || !strings.Contains(err.Error(), "ISIM identity data empty") {
 		t.Fatalf("ReadISIMIdentityCRSM(empty) err=%v, want empty identity error", err)
+	}
+	readErr = nil
+	if !errors.As(err, &readErr) || readErr.Class != simtransport.RecoveryClassEmptyEF || !IsISIMIdentityDataEmpty(err) {
+		t.Fatalf("ReadISIMIdentityCRSM(empty) readErr=%+v err=%v, want empty EF class", readErr, err)
 	}
 }
 

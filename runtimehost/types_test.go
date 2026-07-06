@@ -58,6 +58,26 @@ func (m runtimeIdentityReaderModem) GetISIMIdentity() (identity.Identity, error)
 	return m.id, nil
 }
 
+type runtimeRecoveringIdentityModem struct {
+	testModem
+	attempts int
+	requests []SIMAccessRecoveryRequest
+	id       identity.Identity
+}
+
+func (m *runtimeRecoveringIdentityModem) GetISIMIdentity() (identity.Identity, error) {
+	m.attempts++
+	if m.attempts == 1 {
+		return identity.Identity{}, context.DeadlineExceeded
+	}
+	return m.id, nil
+}
+
+func (m *runtimeRecoveringIdentityModem) RecoverSIMAccess(req SIMAccessRecoveryRequest) error {
+	m.requests = append(m.requests, req)
+	return nil
+}
+
 type runtimeAPDUIdentityModem struct {
 	testModem
 	opened    string
@@ -176,6 +196,37 @@ func TestModemAccessAdapterReadsISIMIdentity(t *testing.T) {
 	}
 	if id.IMPI == "" || id.Domain != "ims.example.test" || len(id.IMPU) != 1 {
 		t.Fatalf("CRSM fallback identity=%+v", id)
+	}
+}
+
+func TestModemAccessAdapterRetriesAfterOptInSIMRecovery(t *testing.T) {
+	want := identity.Identity{
+		IMPI:   "001010123456789@private.example.test",
+		Domain: "ims.example.test",
+		IMPU:   []string{"sip:001010123456789@ims.example.test"},
+	}
+	modem := &runtimeRecoveringIdentityModem{id: want}
+
+	got, err := NewModemAccessAdapter(modem).GetISIMIdentity()
+	if err != nil {
+		t.Fatalf("GetISIMIdentity() error = %v", err)
+	}
+	if got.IMPI != want.IMPI || got.Domain != want.Domain || len(got.IMPU) != 1 {
+		t.Fatalf("identity = %+v, want %+v", got, want)
+	}
+	if modem.attempts != 2 {
+		t.Fatalf("attempts = %d, want retry after recovery", modem.attempts)
+	}
+	if len(modem.requests) != 1 {
+		t.Fatalf("recovery requests = %d, want 1", len(modem.requests))
+	}
+	req := modem.requests[0]
+	if req.Operation != SIMAccessRecoveryOperationISIMIdentity ||
+		req.Attempt != 1 ||
+		req.Class != simtransport.RecoveryClassControlPortHung ||
+		req.Err == nil ||
+		req.DestructiveAllowed {
+		t.Fatalf("recovery request = %+v, want non-destructive control-port recovery", req)
 	}
 }
 

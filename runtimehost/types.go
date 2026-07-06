@@ -113,6 +113,20 @@ type CRSMAccess interface {
 	ReadCRSMRecord(fileID uint16, record, length int, pathID string) (simtransport.CRSMResult, error)
 }
 
+const SIMAccessRecoveryOperationISIMIdentity = "isim_identity"
+
+type SIMAccessRecoveryRequest struct {
+	Operation          string
+	Attempt            int
+	Class              simtransport.RecoveryClass
+	Err                error
+	DestructiveAllowed bool
+}
+
+type SIMAccessRecoveryHook interface {
+	RecoverSIMAccess(req SIMAccessRecoveryRequest) error
+}
+
 type ModemAccess interface {
 	GetISIMIdentity() (identity.Identity, error)
 	RuntimeModem() Modem
@@ -140,6 +154,29 @@ func (a *modemAccessAdapter) GetISIMIdentity() (identity.Identity, error) {
 	if a == nil || a.modem == nil {
 		return identity.Identity{}, errors.New("modem is nil")
 	}
+	id, err := a.getISIMIdentityOnce()
+	if err == nil {
+		return id, nil
+	}
+	req, ok := newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationISIMIdentity, 1, err)
+	if !ok {
+		return identity.Identity{}, err
+	}
+	hook, ok := a.modem.(SIMAccessRecoveryHook)
+	if !ok {
+		return identity.Identity{}, err
+	}
+	if recoveryErr := hook.RecoverSIMAccess(req); recoveryErr != nil {
+		return identity.Identity{}, errors.Join(err, fmt.Errorf("SIM access recovery: %w", recoveryErr))
+	}
+	id, retryErr := a.getISIMIdentityOnce()
+	if retryErr == nil {
+		return id, nil
+	}
+	return identity.Identity{}, errors.Join(err, fmt.Errorf("SIM access recovery retry: %w", retryErr))
+}
+
+func (a *modemAccessAdapter) getISIMIdentityOnce() (identity.Identity, error) {
 	if r, ok := a.modem.(IdentityReader); ok {
 		return r.GetISIMIdentity()
 	}
@@ -176,6 +213,20 @@ func (a *modemAccessAdapter) GetISIMIdentity() (identity.Identity, error) {
 		return identity.Identity{}, errors.Join(errs...)
 	}
 	return identity.Identity{}, errors.New("modem does not expose ISIM identity")
+}
+
+func newSIMAccessRecoveryRequest(operation string, attempt int, err error) (SIMAccessRecoveryRequest, bool) {
+	class := simtransport.ClassifyError(err)
+	if !class.Recoverable() {
+		return SIMAccessRecoveryRequest{}, false
+	}
+	return SIMAccessRecoveryRequest{
+		Operation:          operation,
+		Attempt:            attempt,
+		Class:              class,
+		Err:                err,
+		DestructiveAllowed: false,
+	}, true
 }
 
 type SIMAdapter interface {

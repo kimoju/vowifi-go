@@ -298,9 +298,9 @@ func ReadISIMIdentityCRSM(access interface {
 
 func emptyISIMIdentityError(readErrs []error) error {
 	if err := errors.Join(readErrs...); err != nil {
-		return err
+		return newISIMIdentityReadError(simtransport.ClassifyError(err), err)
 	}
-	return errors.New("ISIM identity data empty")
+	return newISIMIdentityReadError(simtransport.RecoveryClassEmptyEF, ErrISIMIdentityDataEmpty)
 }
 
 func readCRSMTransparentEF(access interface {
