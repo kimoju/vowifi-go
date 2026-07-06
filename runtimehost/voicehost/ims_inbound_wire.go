@@ -188,17 +188,14 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
 			break
 		}
-		if callErr := s.Agent.EndInboundCall(ctx, DialogInfo{
+		result, callErr := s.Agent.EndInboundCallWithResult(ctx, DialogInfo{
 			CallID:      wireCallID(req),
 			CSeq:        wireCSeq(req),
 			ContentType: firstVoiceHeader(req.Headers, "Content-Type"),
 			Body:        append([]byte(nil), req.Body...),
 			Headers:     firstValueSIPHeaders(req.Headers),
-		}); callErr != nil {
-			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(500, callErr.Error()))}, callErr
-			break
-		}
-		responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(200, "OK"))}
+		})
+		responses, err = s.dialogInfoResultResponse(result, callErr), callErr
 	case "CANCEL":
 		if s == nil || s.Agent == nil {
 			responses, err = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
@@ -264,6 +261,23 @@ func (s *IMSInboundWireServer) handleInfo(ctx context.Context, req voiceclient.S
 }
 
 func (s *IMSInboundWireServer) infoResultResponse(result IMSInfoResult, err error) []IMSInboundWireResponse {
+	resp := wireResponse(inboundStatusCode(result.StatusCode, 200), firstVoiceNonEmpty(result.Reason, "OK"))
+	if err != nil && result.StatusCode <= 0 {
+		resp = wireResponse(500, firstVoiceNonEmpty(result.Reason, err.Error(), "Server Internal Error"))
+	}
+	for key, value := range result.Headers {
+		if strings.TrimSpace(key) != "" && strings.TrimSpace(value) != "" {
+			resp.Headers[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+	}
+	if len(result.Body) > 0 {
+		resp.Body = append([]byte(nil), result.Body...)
+		resp.Headers["Content-Type"] = firstVoiceNonEmpty(result.ContentType, "application/octet-stream")
+	}
+	return []IMSInboundWireResponse{s.withResponseHeaders(resp)}
+}
+
+func (s *IMSInboundWireServer) dialogInfoResultResponse(result DialogInfoResult, err error) []IMSInboundWireResponse {
 	resp := wireResponse(inboundStatusCode(result.StatusCode, 200), firstVoiceNonEmpty(result.Reason, "OK"))
 	if err != nil && result.StatusCode <= 0 {
 		resp = wireResponse(500, firstVoiceNonEmpty(result.Reason, err.Error(), "Server Internal Error"))

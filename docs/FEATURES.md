@@ -176,12 +176,13 @@ protocol layers needed by VoHive:
 - inbound IMS voice agent helpers that bridge IMS-originated INVITEs to a local
   SIP client, parse SDP answers, forward ACK/BYE/CANCEL dialog requests, and
   support RTP relay allocation with IMS-offer/client-answer SDP rewriting,
-  including BYE CSeq/Reason/body preservation, early-dialog CANCEL Reason/body
-  preservation with original INVITE Via reuse and 487 Request Terminated
-  mapping for the canceled INVITE transaction, plus local 18x provisional
-  response forwarding with early SDP/RTP relay rewriting and early-dialog
-  To-tag, Contact, and Record-Route state capture for PRACK, while preserving
-  bodyless final 2xx responses after a reliable provisional SDP answer
+  including BYE CSeq/Reason/body preservation, local BYE response
+  status/body/header mapping, early-dialog CANCEL Reason/body preservation with
+  original INVITE Via reuse and 487 Request Terminated mapping for the canceled
+  INVITE transaction, plus local 18x provisional response forwarding with early
+  SDP/RTP relay rewriting and early-dialog To-tag, Contact, and Record-Route
+  state capture for PRACK, while preserving bodyless final 2xx responses after
+  a reliable provisional SDP answer
 - wire-level inbound IMS SIP adapters for UDP/TCP listeners, SIP request
   parsing, provisional/final response construction, incoming INVITE/ACK/BYE/
   CANCEL dispatch, response To-tagging, transaction response caching for
@@ -194,9 +195,9 @@ protocol layers needed by VoHive:
   PRACK receipt, mandatory RAck validation and reliable provisional state
   matching for inbound PRACK, core header and strict CSeq number/method
   validation, Max-Forwards loop rejection, and unsupported `Require` option-tag
-  rejection for non-ACK requests, `481 Call/Transaction Does Not Exist` handling
-  for CANCELs without a matching pending INVITE transaction, and loopback-tested
-  socket handling
+  rejection for non-ACK requests, local softphone BYE response mapping back to
+  IMS, `481 Call/Transaction Does Not Exist` handling for CANCELs without a
+  matching pending INVITE transaction, and loopback-tested socket handling
 - IMS in-dialog interworking for UPDATE, PRACK, and OPTIONS, including SDP
   session refresh forwarding, RAck propagation, RTP relay endpoint rewriting
   for PRACK/UPDATE offers and answers, softphone-originated and outbound

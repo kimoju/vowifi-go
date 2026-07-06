@@ -856,6 +856,28 @@ func TestIMSInboundWireServerRejectsCancelWithoutPendingInvite(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerRejectsByeWithoutDialog(t *testing.T) {
+	transport := newWireInboundTransport(nil)
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport: transport,
+		},
+	}
+	bye := parseWireIncoming(t, wireIMSRequest("wire-call-stray-bye", "BYE", 3, nil))
+	responses, err := server.HandleRequest(context.Background(), bye)
+	if err != nil {
+		t.Fatalf("HandleRequest(BYE) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 481 {
+		t.Fatalf("BYE responses=%+v, want 481", responses)
+	}
+	select {
+	case req := <-transport.requests:
+		t.Fatalf("unexpected client request for stray BYE=%+v", req)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestIMSInboundWireServerForwardsProvisionalInviteResponses(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{
 		provisionals: []voiceclient.SIPResponse{
@@ -1704,7 +1726,15 @@ func TestIMSInboundWireServerDispatchesInfoAndUSSDBye(t *testing.T) {
 
 func TestIMSInboundWireServerReturnsAgentByeCancelErrors(t *testing.T) {
 	transport := newWireInboundTransport([]voiceclient.SIPResponse{
-		{StatusCode: 503, Reason: "client bye failed"},
+		{
+			StatusCode: 503,
+			Reason:     "client bye failed",
+			Headers: map[string][]string{
+				"Content-Type": {"message/sipfrag"},
+				"X-Client":     {"bye-failed"},
+			},
+			Body: []byte("SIP/2.0 503 client bye failed\r\n"),
+		},
 		{StatusCode: 503, Reason: "client cancel failed"},
 	})
 	agent := &IMSInboundAgent{ClientTransport: transport}
@@ -1738,7 +1768,11 @@ func TestIMSInboundWireServerReturnsAgentByeCancelErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "client BYE rejected") {
 		t.Fatalf("HandleRequest(BYE) err=%v, want client BYE rejection", err)
 	}
-	if len(responses) != 1 || responses[0].StatusCode != 500 || !strings.Contains(responses[0].Reason, "client BYE rejected") {
+	if len(responses) != 1 || responses[0].StatusCode != 503 ||
+		responses[0].Reason != "client bye failed" ||
+		responses[0].Headers["Content-Type"] != "message/sipfrag" ||
+		responses[0].Headers["X-Client"] != "bye-failed" ||
+		string(responses[0].Body) != "SIP/2.0 503 client bye failed\r\n" {
 		t.Fatalf("BYE responses=%+v", responses)
 	}
 	if req := transport.readRequest(t); req.Method != "BYE" {

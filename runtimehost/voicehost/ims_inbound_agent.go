@@ -930,9 +930,37 @@ func (a *IMSInboundAgent) EndInboundCall(ctx context.Context, info DialogInfo) e
 	if a == nil || a.ClientTransport == nil {
 		return ErrIMSInboundAgentNotReady
 	}
-	state, ok := a.inboundDialog(info.CallID)
-	if !ok {
+	callID := strings.TrimSpace(info.CallID)
+	if callID == "" {
 		return nil
+	}
+	if _, ok := a.inboundDialog(callID); !ok {
+		return nil
+	}
+	result, err := a.EndInboundCallWithResult(ctx, info)
+	if err != nil {
+		return err
+	}
+	if result.StatusCode > 0 && (result.StatusCode < 200 || result.StatusCode >= 300) {
+		return fmt.Errorf("client BYE rejected: %d %s", result.StatusCode, strings.TrimSpace(result.Reason))
+	}
+	return nil
+}
+
+func (a *IMSInboundAgent) EndInboundCallWithResult(ctx context.Context, info DialogInfo) (DialogInfoResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.ClientTransport == nil {
+		return DialogInfoResult{Accepted: false, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
+	}
+	callID := strings.TrimSpace(info.CallID)
+	if callID == "" {
+		return DialogInfoResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	state, ok := a.inboundDialog(callID)
+	if !ok {
+		return DialogInfoResult{Accepted: false, StatusCode: 481, Reason: "Call/Transaction Does Not Exist"}, nil
 	}
 	cfg := state.clientCfg
 	if info.CSeq > 0 {
@@ -942,20 +970,32 @@ func (a *IMSInboundAgent) EndInboundCall(ctx context.Context, info DialogInfo) e
 	}
 	bye, err := voiceclient.BuildByeRequestWithBody(cfg, info.ContentType, info.Body)
 	if err != nil {
-		return err
+		return DialogInfoResult{Accepted: false, StatusCode: 500, Reason: "build client BYE failed"}, err
 	}
 	applyDialogUpdateHeaders(bye.Headers, info.Headers)
 	state.clientCfg = cfg
-	a.storeInboundDialog(strings.TrimSpace(info.CallID), state)
+	a.storeInboundDialog(callID, state)
 	resp, err := a.ClientTransport.RoundTripRequest(ctx, bye)
 	if err != nil {
-		return err
+		return DialogInfoResult{Accepted: false, StatusCode: 503, Reason: "client BYE failed"}, err
+	}
+	defaultReason := "OK"
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defaultReason = "Client BYE Rejected"
+	}
+	result := DialogInfoResult{
+		Accepted:    resp.StatusCode >= 200 && resp.StatusCode < 300,
+		StatusCode:  inboundStatusCode(resp.StatusCode, 500),
+		Reason:      firstVoiceNonEmpty(resp.Reason, defaultReason),
+		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:        append([]byte(nil), resp.Body...),
+		Headers:     firstValueSIPHeaders(resp.Headers),
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("client BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
+		return result, fmt.Errorf("client BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
-	a.closeInboundDialog(strings.TrimSpace(info.CallID))
-	return nil
+	a.closeInboundDialog(callID)
+	return result, nil
 }
 
 func inboundOfferSDP(req InboundCallRequest) (SDPInfo, []byte, error) {

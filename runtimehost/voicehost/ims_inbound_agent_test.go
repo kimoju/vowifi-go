@@ -1285,6 +1285,62 @@ func TestIMSInboundAgentAdvancesByeCSeqAfterFailure(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentEndInboundCallWithResultReturnsClientResponse(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 486,
+			Reason:     "Busy Here",
+			Headers: map[string][]string{
+				"Content-Type": {"message/sipfrag"},
+				"X-Client":     {"busy"},
+			},
+			Body: []byte("SIP/2.0 486 Busy Here\r\n"),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-bye-result",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	result, err := agent.EndInboundCallWithResult(context.Background(), DialogInfo{CallID: "in-call-bye-result"})
+	if err == nil || !strings.Contains(err.Error(), "client BYE rejected") {
+		t.Fatalf("EndInboundCallWithResult() err=%v, want client BYE rejection", err)
+	}
+	if result.Accepted || result.StatusCode != 486 || result.Reason != "Busy Here" ||
+		result.ContentType != "message/sipfrag" ||
+		string(result.Body) != "SIP/2.0 486 Busy Here\r\n" ||
+		result.Headers["X-Client"] != "busy" {
+		t.Fatalf("result=%+v body=%q", result, result.Body)
+	}
+	if _, ok := agent.inboundDialog("in-call-bye-result"); !ok {
+		t.Fatal("dialog should remain after rejected local BYE")
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-bye-result"}); err != nil {
+		t.Fatalf("EndInboundCall() retry error = %v", err)
+	}
+	if _, ok := agent.inboundDialog("in-call-bye-result"); ok {
+		t.Fatal("dialog should close after accepted local BYE")
+	}
+}
+
 func TestIMSInboundAgentUsesRTPRelay(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
