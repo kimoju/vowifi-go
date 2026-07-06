@@ -36,7 +36,8 @@ protocol layers needed by VoHive:
 - TS.43-style E911 entitlement bootstrap, token/websheet handling, RAND/AUTN
   challenge response through the AKA provider, and EAP-AKA/AKA' relay packet
   response generation with Identity/KDF negotiation, Notification ACK, and
-  Client-Error handling for entitlement challenges
+  terminal Success/Failure handling, plus Client-Error handling for entitlement
+  challenges
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
   AKA nonce extraction, Digest/AKAv1-MD5 and AKAv2-MD5 authorization material,
   IMS `Security-Client` proposal generation, `Security-Server` parsing/

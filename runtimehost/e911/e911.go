@@ -262,6 +262,9 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 		"terminal-imei": req.Identity.IMEI,
 	}
 	nextIdentityTranscript := cloneByteSlices(identityTranscript)
+	if isEAPRelayTerminalPacket(result) {
+		return answerBody, nil, nextIdentityTranscript, eapaka.EncryptedIdentityState{}, reauthState, false, nil
+	}
 	if relay, raw, ok, err := buildEAPRelayIdentityAnswer(result, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI)); err != nil {
 		return nil, nil, nil, eapaka.EncryptedIdentityState{}, swu.EAPReauthenticationState{}, false, err
 	} else if ok {
@@ -345,6 +348,18 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 		}
 	}
 	return answerBody, nextEAPKeys, nextIdentityTranscript, nextEAPIdentityState, reauthState, false, nil
+}
+
+func isEAPRelayTerminalPacket(result entitlementResult) bool {
+	if result.EAPPacket == nil {
+		return false
+	}
+	switch result.EAPPacket.Code {
+	case eapaka.CodeSuccess, eapaka.CodeFailure:
+		return true
+	default:
+		return false
+	}
 }
 
 func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req *HTTPRequest) (*HTTPResponse, error) {

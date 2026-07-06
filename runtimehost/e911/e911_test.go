@@ -492,6 +492,57 @@ func TestStartEmergencyAddressUpdateHandlesAuthenticatedEAPRelayNotification(t *
 	}
 }
 
+func TestStartEmergencyAddressUpdateHandlesEAPRelaySuccessTerminal(t *testing.T) {
+	identity := "310280233641503@private.att.net"
+	challenge := signedEAPRelayChallenge(t, identity, e911AKAResult())
+	success := eapRelayTerminalPacket(t, eapaka.CodeSuccess, 22)
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":22,"eap-relay-packet":"` + challenge + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":23,"eap-relay-packet":"` + success + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+	aka := &fakeAKAProvider{}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity:    Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280", SIPUsername: identity},
+		AKAProvider: aka,
+		Client:      client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=1" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	if len(client.requests) != 3 {
+		t.Fatalf("requests=%d, want challenge response, terminal ack, websheet", len(client.requests))
+	}
+	challengeAnswer := decodeEntitlementAnswer(t, client.requests[1].Body)
+	if _, ok := challengeAnswer["eap-relay-packet"]; !ok {
+		t.Fatalf("challenge answer missing relay packet: %s", client.requests[1].Body)
+	}
+	terminalAnswer := decodeEntitlementAnswer(t, client.requests[2].Body)
+	if _, ok := terminalAnswer["eap-relay-packet"]; ok {
+		t.Fatalf("terminal EAP-Success must not send relay response: %s", client.requests[2].Body)
+	}
+	if _, ok := terminalAnswer["aka-res"]; ok {
+		t.Fatalf("terminal EAP-Success must not send AKA material: %s", client.requests[2].Body)
+	}
+	if terminalAnswer["response-id"].(float64) != 23 {
+		t.Fatalf("terminal answer=%+v", terminalAnswer)
+	}
+	if aka.calls != 1 {
+		t.Fatalf("AKA calls=%d, want only challenge to use SIM", aka.calls)
+	}
+}
+
 func TestStartEmergencyAddressUpdateHandlesEAPRelayReauthentication(t *testing.T) {
 	fullIdentity := "310280233641503@private.att.net"
 	reauthIdentity := "reauth-e911"
@@ -781,6 +832,15 @@ func eapRelayNotificationRequest(t *testing.T, code uint16) string {
 	raw, err := packet.MarshalBinary()
 	if err != nil {
 		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func eapRelayTerminalPacket(t *testing.T, code uint8, identifier uint8) string {
+	t.Helper()
+	raw, err := (eapaka.Packet{Code: code, Identifier: identifier}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(terminal EAP) error = %v", err)
 	}
 	return base64.StdEncoding.EncodeToString(raw)
 }
