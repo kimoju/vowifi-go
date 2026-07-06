@@ -38,7 +38,8 @@ protocol layers needed by VoHive:
   configuration for native `310/280` and `310/410` profiles
 - TS.43-style E911 entitlement bootstrap, JSON/XML response parsing for common
   emergency address, PDN/APN/realm, service URN/route, endpoint, expiry/cache,
-  and location validation status variants, public entitlement parsing helpers,
+  and location validation status variants, entitlement cache snapshots with
+  refresh-window and route/service selection helpers, public entitlement parsing helpers,
   emergency service-category URN mapping, IMS emergency SIP Request-URI,
   `P-Access-Network-Info`, `Geolocation`, and MMTel service header helpers,
   token/websheet handling, RAND/AUTN challenge response through the AKA
