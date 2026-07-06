@@ -57,12 +57,26 @@ type SMSDeliver struct {
 }
 
 type SMSStatusReport struct {
-	Reference byte
-	Recipient string
-	Timestamp time.Time
-	DoneAt    time.Time
-	Status    byte
-	State     string
+	Reference             byte
+	Recipient             string
+	Timestamp             time.Time
+	DoneAt                time.Time
+	Status                byte
+	State                 string
+	FirstOctet            byte
+	MoreMessagesToSend    bool
+	StatusReportQualifier bool
+	UserDataHeader        bool
+	ParameterIndicator    byte
+	HasParameterIndicator bool
+	ProtocolID            byte
+	HasProtocolID         bool
+	DataCodingScheme      byte
+	HasDataCodingScheme   bool
+	UserDataLength        int
+	UserData              string
+	HasUserData           bool
+	RawTPDU               []byte
 }
 
 func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
@@ -481,6 +495,7 @@ func ParseSMSDeliverTPDU(tpdu []byte) (SMSDeliver, error) {
 }
 
 func ParseSMSStatusReportTPDU(tpdu []byte) (SMSStatusReport, error) {
+	raw := append([]byte(nil), tpdu...)
 	if len(tpdu) < 17 {
 		return SMSStatusReport{}, errors.New("SMS-STATUS-REPORT TPDU too short")
 	}
@@ -488,7 +503,14 @@ func ParseSMSStatusReportTPDU(tpdu []byte) (SMSStatusReport, error) {
 		return SMSStatusReport{}, fmt.Errorf("not SMS-STATUS-REPORT TPDU: 0x%02x", tpdu[0]&0x03)
 	}
 	i := 1
-	report := SMSStatusReport{Reference: tpdu[i]}
+	report := SMSStatusReport{
+		FirstOctet:            tpdu[0],
+		MoreMessagesToSend:    tpdu[0]&0x04 == 0,
+		StatusReportQualifier: tpdu[0]&0x20 != 0,
+		UserDataHeader:        tpdu[0]&0x40 != 0,
+		Reference:             tpdu[i],
+		RawTPDU:               raw,
+	}
 	i++
 	raDigits := int(tpdu[i])
 	i++
@@ -522,7 +544,58 @@ func ParseSMSStatusReportTPDU(tpdu []byte) (SMSStatusReport, error) {
 	i += 7
 	report.Status = tpdu[i]
 	report.State = smsStatusReportState(report.Status)
+	i++
+	if i < len(tpdu) {
+		if err := parseSMSStatusReportOptionalParameters(tpdu[i:], &report); err != nil {
+			return SMSStatusReport{}, err
+		}
+	}
 	return report, nil
+}
+
+func parseSMSStatusReportOptionalParameters(data []byte, report *SMSStatusReport) error {
+	if len(data) == 0 || report == nil {
+		return nil
+	}
+	i := 0
+	report.ParameterIndicator = data[i]
+	report.HasParameterIndicator = true
+	i++
+	if report.ParameterIndicator&0x01 != 0 {
+		if i >= len(data) {
+			return errors.New("SMS-STATUS-REPORT PID missing")
+		}
+		report.ProtocolID = data[i]
+		report.HasProtocolID = true
+		i++
+	}
+	if report.ParameterIndicator&0x02 != 0 {
+		if i >= len(data) {
+			return errors.New("SMS-STATUS-REPORT DCS missing")
+		}
+		report.DataCodingScheme = data[i]
+		report.HasDataCodingScheme = true
+		i++
+	}
+	if report.ParameterIndicator&0x04 != 0 {
+		if i >= len(data) {
+			return errors.New("SMS-STATUS-REPORT UDL missing")
+		}
+		udl := int(data[i])
+		i++
+		if i > len(data) {
+			return errors.New("SMS-STATUS-REPORT user data missing")
+		}
+		dcs := report.DataCodingScheme
+		text, _, err := decodeSMSUserData(data[i:], udl, dcs, report.UserDataHeader)
+		if err != nil {
+			return err
+		}
+		report.UserDataLength = udl
+		report.UserData = text
+		report.HasUserData = true
+	}
+	return nil
 }
 
 func encodeSMSUserData(text, encoding string, udh []byte) ([]byte, int, byte, error) {

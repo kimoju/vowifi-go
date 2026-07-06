@@ -191,13 +191,23 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 			return out, err
 		}
 		report := SMSDeliveryReport{
-			CallID:    msg.CallID,
-			RPMR:      int(reportTPDU.Reference),
-			State:     reportTPDU.State,
-			SIPCode:   200,
-			RPCause:   int(reportTPDU.Status),
-			ReportAt:  reportTPDU.DoneAt,
-			ErrorText: smsStatusReportError(reportTPDU),
+			CallID:                msg.CallID,
+			RPMR:                  int(reportTPDU.Reference),
+			State:                 reportTPDU.State,
+			SIPCode:               200,
+			RPCause:               int(reportTPDU.Status),
+			ReportAt:              reportTPDU.DoneAt,
+			ErrorText:             smsStatusReportError(reportTPDU),
+			Recipient:             reportTPDU.Recipient,
+			SentAt:                reportTPDU.Timestamp,
+			FirstOctet:            reportTPDU.FirstOctet,
+			MoreMessagesToSend:    reportTPDU.MoreMessagesToSend,
+			StatusReportQualifier: reportTPDU.StatusReportQualifier,
+			UserDataHeader:        reportTPDU.UserDataHeader,
+			ParameterIndicator:    reportTPDU.ParameterIndicator,
+			ProtocolID:            reportTPDU.ProtocolID,
+			DataCodingScheme:      reportTPDU.DataCodingScheme,
+			UserData:              reportTPDU.UserData,
 		}
 		_, err = s.HandleSMSDeliveryReport(ctx, report)
 		out.DeliveryReport = &report

@@ -587,6 +587,33 @@ func TestHandleIMSMessageMarksStatusReportFailureText(t *testing.T) {
 	}
 }
 
+func TestHandleIMSMessagePreservesStatusReportOptionalParameters(t *testing.T) {
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	tpdu := mustHex(t, "26070B918100551512F2627050214365006270502144000000077F0005E8329BFD06")
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		CallID:      "status-report-optional",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x45, tpdu),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.StatusCode != 200 || result.DeliveryReport == nil || string(result.ReplyBody) != string(BuildSMSRPAck(0x45)) {
+		t.Fatalf("result=%+v", result)
+	}
+	report := result.DeliveryReport
+	if report.RPMR != 7 || report.State != "delivered" || report.Recipient != "+18005551212" || report.FirstOctet != 0x26 {
+		t.Fatalf("report=%+v", report)
+	}
+	if report.MoreMessagesToSend || !report.StatusReportQualifier || report.UserDataHeader {
+		t.Fatalf("report flags=%+v", report)
+	}
+	if report.ParameterIndicator != 0x07 || report.ProtocolID != 0x7f || report.DataCodingScheme != 0x00 || report.UserData != "hello" {
+		t.Fatalf("report optional fields=%+v", report)
+	}
+}
+
 type fakeSMSTransport struct {
 	requests []SMSSendRequest
 	failPart int

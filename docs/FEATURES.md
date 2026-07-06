@@ -86,8 +86,9 @@ protocol layers needed by VoHive:
   report matching, and USSD session transport hooks, including 3xx Contact
   redirect retries, TP-SRR delivery-status requests, SMS RP-ERROR/
   STATUS-REPORT cause mapping, SMS-DELIVER TP-PID/TP-DCS and first-octet
-  metadata preservation, per-message SMS concatenation references with 8-bit
-  and 16-bit UDH support, SMS-SUBMIT relative and absolute validity-period
+  metadata preservation, SMS-STATUS-REPORT TP-PI/PID/DCS/user-data optional
+  parameter parsing, per-message SMS concatenation references with 8-bit and
+  16-bit UDH support, SMS-SUBMIT relative and absolute validity-period
   encoding, SMS-SUBMIT TP-PID/TP-DCS overrides with alphabet validation,
   SMS-SUBMIT Reply-Path and Reject-Duplicates first-octet flags, USSD dialog
   target refresh, and recoverable IMS registration/route failure signals for

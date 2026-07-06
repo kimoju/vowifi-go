@@ -361,6 +361,26 @@ func TestParseSMSStatusReportTPDU(t *testing.T) {
 	}
 }
 
+func TestParseSMSStatusReportTPDUPreservesOptionalParameters(t *testing.T) {
+	tpdu := mustHex(t, "26070B918100551512F2627050214365006270502144000000077F0005E8329BFD06")
+	report, err := ParseSMSStatusReportTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSStatusReportTPDU() error = %v", err)
+	}
+	if report.FirstOctet != 0x26 || report.Reference != 7 || report.Status != 0 || report.State != "delivered" {
+		t.Fatalf("report metadata=%+v", report)
+	}
+	if report.MoreMessagesToSend || !report.StatusReportQualifier || report.UserDataHeader {
+		t.Fatalf("report flags=%+v", report)
+	}
+	if !report.HasParameterIndicator || report.ParameterIndicator != 0x07 || !report.HasProtocolID || report.ProtocolID != 0x7f || !report.HasDataCodingScheme || report.DataCodingScheme != 0x00 {
+		t.Fatalf("report optional fields=%+v", report)
+	}
+	if !report.HasUserData || report.UserDataLength != 5 || report.UserData != "hello" {
+		t.Fatalf("report user data=%+v", report)
+	}
+}
+
 func TestParseSMSStatusReportTPDUStatesAndText(t *testing.T) {
 	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000020")
 	report, err := ParseSMSStatusReportTPDU(tpdu)

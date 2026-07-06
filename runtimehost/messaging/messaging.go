@@ -74,14 +74,24 @@ type IncomingSMS struct {
 }
 
 type SMSDeliveryReport struct {
-	InReplyTo string
-	CallID    string
-	RPMR      int
-	State     string
-	SIPCode   int
-	RPCause   int
-	ErrorText string
-	ReportAt  time.Time
+	InReplyTo             string
+	CallID                string
+	RPMR                  int
+	State                 string
+	SIPCode               int
+	RPCause               int
+	ErrorText             string
+	ReportAt              time.Time
+	Recipient             string
+	SentAt                time.Time
+	FirstOctet            byte
+	MoreMessagesToSend    bool
+	StatusReportQualifier bool
+	UserDataHeader        bool
+	ParameterIndicator    byte
+	ProtocolID            byte
+	DataCodingScheme      byte
+	UserData              string
 }
 
 type SMSPart struct {
