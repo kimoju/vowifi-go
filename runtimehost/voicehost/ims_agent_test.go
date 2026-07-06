@@ -101,6 +101,83 @@ func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentFollowsInviteRedirectContact(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=redirect-tag"},
+				"Contact": {"<sip:redirect@198.51.100.30:5060>"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+
+	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-redirect",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("StartOutboundCall() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[0].Method != "INVITE" || transport.requests[1].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	firstInvite := transport.requests[0]
+	redirectInvite := transport.requests[1]
+	if firstInvite.URI != "sip:+18005551212@ims.example" || firstInvite.Headers["CSeq"] != "1 INVITE" {
+		t.Fatalf("first INVITE=%+v", firstInvite)
+	}
+	if redirectInvite.URI != "sip:redirect@198.51.100.30:5060" ||
+		redirectInvite.Headers["CSeq"] != "2 INVITE" ||
+		redirectInvite.Headers["To"] != firstInvite.Headers["To"] ||
+		redirectInvite.Headers["Route"] != "<sip:pcscf.ims.example;lr>" {
+		t.Fatalf("redirect INVITE=%+v first=%+v", redirectInvite, firstInvite)
+	}
+	if len(transport.writes) != 2 || transport.writes[0].Method != "ACK" || transport.writes[1].Method != "ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+	if transport.writes[0].Headers["CSeq"] != "1 ACK" ||
+		transport.writes[0].Headers["Via"] != firstInvite.Headers["Via"] ||
+		!strings.Contains(transport.writes[0].Headers["To"], "redirect-tag") {
+		t.Fatalf("redirect ACK=%+v first=%+v", transport.writes[0], firstInvite)
+	}
+	if transport.writes[1].Headers["CSeq"] != "2 ACK" ||
+		transport.writes[1].URI != "sip:carrier@198.51.100.1:5060" ||
+		!strings.Contains(transport.writes[1].Headers["To"], "remote-tag") {
+		t.Fatalf("final ACK=%+v", transport.writes[1])
+	}
+
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-redirect"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
+		transport.requests[2].URI != "sip:carrier@198.51.100.1:5060" ||
+		transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after redirect=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentSendsInDialogInfoAndAdvancesCSeq(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
@@ -1206,6 +1283,108 @@ func TestIMSOutboundAgentSendsInDialogReinviteAndAdvancesCSeq(t *testing.T) {
 		transport.requests[2].URI != "sip:updated@198.51.100.2:5060" ||
 		transport.requests[2].Headers["CSeq"] != "3 BYE" {
 		t.Fatalf("BYE after re-INVITE=%+v", transport.requests)
+	}
+}
+
+func TestIMSOutboundAgentFollowsDialogReinviteRedirectContact(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:redirect@198.51.100.30:5060>"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":           {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact":      {"<sip:updated@198.51.100.2:5060>"},
+				"Content-Type": {"application/sdp"},
+				"X-IMS":        {"reinvite-redirect-ok"},
+			},
+			Body: []byte(sampleSDP("203.0.113.20", 49180)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-reinvite-redirect",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+
+	result, err := agent.SendDialogReinvite(context.Background(), DialogReinviteRequest{
+		CallID:      "call-reinvite-redirect",
+		ContentType: "application/sdp",
+		Body:        []byte(sampleSDP("192.0.2.60", 4010)),
+		Headers:     map[string]string{"Session-Expires": "1800"},
+	})
+	if err != nil || !result.Accepted || result.Headers["X-IMS"] != "reinvite-redirect-ok" {
+		t.Fatalf("SendDialogReinvite() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 3 ||
+		transport.requests[0].Method != "INVITE" ||
+		transport.requests[1].Method != "INVITE" ||
+		transport.requests[2].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	firstReinvite := transport.requests[1]
+	redirectReinvite := transport.requests[2]
+	if firstReinvite.URI != "sip:carrier@198.51.100.1:5060" ||
+		firstReinvite.Headers["CSeq"] != "2 INVITE" {
+		t.Fatalf("first re-INVITE=%+v", firstReinvite)
+	}
+	if redirectReinvite.URI != "sip:redirect@198.51.100.30:5060" ||
+		redirectReinvite.Headers["CSeq"] != "3 INVITE" ||
+		redirectReinvite.Headers["To"] != firstReinvite.Headers["To"] ||
+		redirectReinvite.Headers["Session-Expires"] != "1800" {
+		t.Fatalf("redirect re-INVITE=%+v first=%+v", redirectReinvite, firstReinvite)
+	}
+	if len(transport.writes) != 3 ||
+		transport.writes[0].Method != "ACK" ||
+		transport.writes[1].Method != "ACK" ||
+		transport.writes[2].Method != "ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+	if transport.writes[1].Headers["CSeq"] != "2 ACK" ||
+		transport.writes[1].Headers["Via"] != firstReinvite.Headers["Via"] ||
+		transport.writes[1].URI != "sip:carrier@198.51.100.1:5060" {
+		t.Fatalf("redirect ACK=%+v first=%+v", transport.writes[1], firstReinvite)
+	}
+	if transport.writes[2].Headers["CSeq"] != "3 ACK" ||
+		transport.writes[2].URI != "sip:updated@198.51.100.2:5060" {
+		t.Fatalf("final ACK=%+v", transport.writes[2])
+	}
+
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-reinvite-redirect"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 4 || transport.requests[3].Method != "BYE" ||
+		transport.requests[3].URI != "sip:updated@198.51.100.2:5060" ||
+		transport.requests[3].Headers["CSeq"] != "4 BYE" {
+		t.Fatalf("BYE after re-INVITE redirect=%+v", transport.requests)
 	}
 }
 
