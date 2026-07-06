@@ -42,6 +42,8 @@ type SendOptions struct {
 	ApplicationDestPort   int
 	ApplicationSourcePort int
 	ApplicationPortBits   int
+	SingleShiftLang       int
+	LockingShiftLang      int
 }
 
 type SendOutcome struct {
@@ -120,6 +122,8 @@ type SMSPart struct {
 	ApplicationDestPort   int
 	ApplicationSourcePort int
 	ApplicationPortBits   int
+	SingleShiftLang       int
+	LockingShiftLang      int
 	RequestStatusReport   bool
 }
 
@@ -497,7 +501,10 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	if _, _, err := encodeSMSSubmitValidityPeriod(opts.ValidityPeriod, opts.ValidityDeadline); err != nil {
 		return nil, err
 	}
-	enc, err := normalizeSMSSubmitEncoding(text, opts.Encoding, opts.DataCodingScheme, opts.UseDataCodingScheme || opts.DataCodingScheme != 0)
+	if err := validateSMSNationalLanguageOptions(opts.SingleShiftLang, opts.LockingShiftLang); err != nil {
+		return nil, err
+	}
+	enc, err := normalizeSMSSubmitEncodingWithLanguage(text, opts.Encoding, opts.DataCodingScheme, opts.UseDataCodingScheme || opts.DataCodingScheme != 0, opts.LockingShiftLang, opts.SingleShiftLang)
 	if err != nil {
 		return nil, err
 	}
@@ -505,14 +512,14 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	if err != nil {
 		return nil, err
 	}
-	singleUDHLen := smsSubmitUDHLength(hasPorts, portBits, false, 0)
+	singleUDHLen := smsSubmitUDHLength(hasPorts, portBits, false, 0, opts.SingleShiftLang, opts.LockingShiftLang)
 	singleLimit := smsPartLimitForUDH(enc, singleUDHLen)
-	if messageLen(text, enc) <= singleLimit {
-		udh, err := buildSMSSubmitUDH(hasPorts, opts.ApplicationDestPort, opts.ApplicationSourcePort, portBits, 0, 0, 1, 1)
+	if messageLenWithLanguage(text, enc, opts.LockingShiftLang, opts.SingleShiftLang) <= singleLimit {
+		udh, err := buildSMSSubmitUDH(hasPorts, opts.ApplicationDestPort, opts.ApplicationSourcePort, portBits, 0, 0, 1, 1, opts.SingleShiftLang, opts.LockingShiftLang)
 		if err != nil {
 			return nil, err
 		}
-		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates, ApplicationDestPort: opts.ApplicationDestPort, ApplicationSourcePort: opts.ApplicationSourcePort, ApplicationPortBits: portBits}}, nil
+		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates, ApplicationDestPort: opts.ApplicationDestPort, ApplicationSourcePort: opts.ApplicationSourcePort, ApplicationPortBits: portBits, SingleShiftLang: opts.SingleShiftLang, LockingShiftLang: opts.LockingShiftLang}}, nil
 	}
 	refBits, err := validateSMSConcatOptions(opts.ConcatRef, opts.ConcatRefBits)
 	if err != nil {
@@ -522,12 +529,12 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	if ref == 0 {
 		ref = nextSMSConcatRef(refBits)
 	}
-	concatUDHLen := smsSubmitUDHLength(hasPorts, portBits, true, refBits)
+	concatUDHLen := smsSubmitUDHLength(hasPorts, portBits, true, refBits, opts.SingleShiftLang, opts.LockingShiftLang)
 	concat := smsPartLimitForUDH(enc, concatUDHLen)
 	if concat <= 0 {
 		return nil, fmt.Errorf("sms UDH leaves no room for %s payload", enc)
 	}
-	total := int(math.Ceil(float64(messageLen(text, enc)) / float64(concat)))
+	total := int(math.Ceil(float64(messageLenWithLanguage(text, enc, opts.LockingShiftLang, opts.SingleShiftLang)) / float64(concat)))
 	if total <= 0 {
 		total = 1
 	}
@@ -537,17 +544,17 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	out := make([]SMSPart, 0, total)
 	remaining := text
 	for partNo := 1; remaining != ""; partNo++ {
-		chunk, rest := takeSMSChunk(remaining, enc, concat)
-		udh, err := buildSMSSubmitUDH(hasPorts, opts.ApplicationDestPort, opts.ApplicationSourcePort, portBits, ref, refBits, total, partNo)
+		chunk, rest := takeSMSChunkWithLanguage(remaining, enc, concat, opts.LockingShiftLang, opts.SingleShiftLang)
+		udh, err := buildSMSSubmitUDH(hasPorts, opts.ApplicationDestPort, opts.ApplicationSourcePort, portBits, ref, refBits, total, partNo, opts.SingleShiftLang, opts.LockingShiftLang)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates, ConcatRef: ref, ConcatRefBits: refBits, ApplicationDestPort: opts.ApplicationDestPort, ApplicationSourcePort: opts.ApplicationSourcePort, ApplicationPortBits: portBits})
+		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates, ConcatRef: ref, ConcatRefBits: refBits, ApplicationDestPort: opts.ApplicationDestPort, ApplicationSourcePort: opts.ApplicationSourcePort, ApplicationPortBits: portBits, SingleShiftLang: opts.SingleShiftLang, LockingShiftLang: opts.LockingShiftLang})
 		remaining = rest
 	}
 	for i := range out {
 		out[i].TotalParts = len(out)
-		udh, err := buildSMSSubmitUDH(hasPorts, opts.ApplicationDestPort, opts.ApplicationSourcePort, portBits, ref, refBits, len(out), out[i].PartNo)
+		udh, err := buildSMSSubmitUDH(hasPorts, opts.ApplicationDestPort, opts.ApplicationSourcePort, portBits, ref, refBits, len(out), out[i].PartNo, opts.SingleShiftLang, opts.LockingShiftLang)
 		if err != nil {
 			return nil, err
 		}
@@ -570,6 +577,17 @@ func normalizeEncoding(text, requested string) string {
 		return "gsm7"
 	}
 	return "ucs2"
+}
+
+func normalizeSMSSubmitEncodingWithLanguage(text, requested string, dcs byte, hasDCS bool, lockingLang, singleLang int) (string, error) {
+	encodingRequested := strings.TrimSpace(requested) != ""
+	if encodingRequested || hasDCS {
+		return normalizeSMSSubmitEncoding(text, requested, dcs, hasDCS)
+	}
+	if _, ok := gsm7SeptetLenWithLanguage(text, lockingLang, singleLang); ok {
+		return "gsm7", nil
+	}
+	return normalizeSMSSubmitEncoding(text, requested, dcs, hasDCS)
 }
 
 func smsPartLimits(encoding string) (single int, concat int) {
@@ -603,11 +621,15 @@ func smsPartLimitForUDH(encoding string, udhBytes int) int {
 }
 
 func messageLen(text, encoding string) int {
+	return messageLenWithLanguage(text, encoding, 0, 0)
+}
+
+func messageLenWithLanguage(text, encoding string, lockingLang, singleLang int) int {
 	if encoding == "utf8" {
 		return len([]byte(text))
 	}
 	if encoding == "gsm7" {
-		if septets, ok := gsm7SeptetLen(text); ok {
+		if septets, ok := gsm7SeptetLenWithLanguage(text, lockingLang, singleLang); ok {
 			return septets
 		}
 		return utf8.RuneCountInString(text)
@@ -616,6 +638,10 @@ func messageLen(text, encoding string) int {
 }
 
 func takeSMSChunk(text, encoding string, limit int) (string, string) {
+	return takeSMSChunkWithLanguage(text, encoding, limit, 0, 0)
+}
+
+func takeSMSChunkWithLanguage(text, encoding string, limit int, lockingLang, singleLang int) (string, string) {
 	if encoding == "utf8" {
 		if len(text) <= limit {
 			return text, ""
@@ -634,7 +660,7 @@ func takeSMSChunk(text, encoding string, limit int) (string, string) {
 		return text[:i], text[i:]
 	}
 	if encoding == "gsm7" {
-		return takeGSM7Chunk(text, limit)
+		return takeGSM7ChunkWithLanguage(text, limit, lockingLang, singleLang)
 	}
 	runes := []rune(text)
 	if len(runes) <= limit {
@@ -699,15 +725,30 @@ func smsUDHFromElements(elements ...[]byte) []byte {
 }
 
 func buildSMSSubmitUDHForPart(part SMSPart) ([]byte, error) {
-	portBits, hasPorts, err := validateSMSApplicationPortOptions(part.ApplicationDestPort, part.ApplicationSourcePort, part.ApplicationPortBits)
-	if err != nil || !hasPorts {
+	if err := validateSMSNationalLanguageOptions(part.SingleShiftLang, part.LockingShiftLang); err != nil {
 		return nil, err
 	}
-	return buildSMSSubmitUDH(hasPorts, part.ApplicationDestPort, part.ApplicationSourcePort, portBits, 0, 0, 1, 1)
+	portBits, hasPorts, err := validateSMSApplicationPortOptions(part.ApplicationDestPort, part.ApplicationSourcePort, part.ApplicationPortBits)
+	if err != nil {
+		return nil, err
+	}
+	if !hasPorts && part.SingleShiftLang == 0 && part.LockingShiftLang == 0 {
+		return nil, nil
+	}
+	return buildSMSSubmitUDH(hasPorts, part.ApplicationDestPort, part.ApplicationSourcePort, portBits, 0, 0, 1, 1, part.SingleShiftLang, part.LockingShiftLang)
 }
 
-func buildSMSSubmitUDH(hasPorts bool, destPort, sourcePort, portBits, ref, refBits, total, partNo int) ([]byte, error) {
+func buildSMSSubmitUDH(hasPorts bool, destPort, sourcePort, portBits, ref, refBits, total, partNo, singleLang, lockingLang int) ([]byte, error) {
 	var elements [][]byte
+	if err := validateSMSNationalLanguageOptions(singleLang, lockingLang); err != nil {
+		return nil, err
+	}
+	if singleLang != 0 {
+		elements = append(elements, []byte{smsUDHIEINationalLanguageSingleShift, 0x01, byte(singleLang)})
+	}
+	if lockingLang != 0 {
+		elements = append(elements, []byte{smsUDHIEINationalLanguageLockingShift, 0x01, byte(lockingLang)})
+	}
 	if hasPorts {
 		elem, err := smsApplicationPortUDHElement(destPort, sourcePort, portBits)
 		if err != nil {
@@ -725,8 +766,14 @@ func buildSMSSubmitUDH(hasPorts bool, destPort, sourcePort, portBits, ref, refBi
 	return smsUDHFromElements(elements...), nil
 }
 
-func smsSubmitUDHLength(hasPorts bool, portBits int, hasConcat bool, concatRefBits int) int {
+func smsSubmitUDHLength(hasPorts bool, portBits int, hasConcat bool, concatRefBits, singleLang, lockingLang int) int {
 	bodyLen := 0
+	if singleLang != 0 {
+		bodyLen += 3
+	}
+	if lockingLang != 0 {
+		bodyLen += 3
+	}
 	if hasPorts {
 		if portBits == 8 {
 			bodyLen += 4
@@ -745,6 +792,19 @@ func smsSubmitUDHLength(hasPorts bool, portBits int, hasConcat bool, concatRefBi
 		return 0
 	}
 	return 1 + bodyLen
+}
+
+func validateSMSNationalLanguageOptions(singleLang, lockingLang int) error {
+	if singleLang < 0 || lockingLang < 0 {
+		return fmt.Errorf("sms national language identifier out of range: single=%d locking=%d", singleLang, lockingLang)
+	}
+	if singleLang != 0 && !smsNationalLanguageIdentifierKnown(singleLang) {
+		return fmt.Errorf("unsupported sms national single shift language identifier: %d", singleLang)
+	}
+	if lockingLang != 0 && !smsNationalLanguageIdentifierKnown(lockingLang) {
+		return fmt.Errorf("unsupported sms national locking shift language identifier: %d", lockingLang)
+	}
+	return nil
 }
 
 func smsApplicationPortUDHElement(destPort, sourcePort, portBits int) ([]byte, error) {

@@ -46,13 +46,17 @@ type SMSUDHElement struct {
 }
 
 type SMSUserDataHeaderInfo struct {
-	Raw             []byte
-	Elements        []SMSUDHElement
-	Concat          SMSConcatInfo
-	HasPorts        bool
-	DestinationPort int
-	SourcePort      int
-	PortBits        int
+	Raw              []byte
+	Elements         []SMSUDHElement
+	Concat           SMSConcatInfo
+	HasPorts         bool
+	DestinationPort  int
+	SourcePort       int
+	PortBits         int
+	HasSingleShift   bool
+	SingleShiftLang  int
+	HasLockingShift  bool
+	LockingShiftLang int
 }
 
 type SMSDataCodingInfo struct {
@@ -123,7 +127,7 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 		return nil, err
 	}
 	dcsOverride, hasDCSOverride := smsSubmitDataCodingScheme(part)
-	encoding, err := normalizeSMSSubmitEncoding(part.Text, part.Encoding, dcsOverride, hasDCSOverride)
+	encoding, err := normalizeSMSSubmitEncodingWithLanguage(part.Text, part.Encoding, dcsOverride, hasDCSOverride, part.LockingShiftLang, part.SingleShiftLang)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +157,7 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 		return nil, err
 	}
 	firstOctet |= vpf
-	userData, udl, dcs, err := encodeSMSUserData(part.Text, encoding, udh)
+	userData, udl, dcs, err := encodeSMSUserDataWithLanguage(part.Text, encoding, udh, part.LockingShiftLang, part.SingleShiftLang)
 	if err != nil {
 		return nil, err
 	}
@@ -695,9 +699,13 @@ func parseSMSStatusReportOptionalParameters(data []byte, report *SMSStatusReport
 }
 
 func encodeSMSUserData(text, encoding string, udh []byte) ([]byte, int, byte, error) {
+	return encodeSMSUserDataWithLanguage(text, encoding, udh, 0, 0)
+}
+
+func encodeSMSUserDataWithLanguage(text, encoding string, udh []byte, lockingLang, singleLang int) ([]byte, int, byte, error) {
 	switch encoding {
 	case "gsm7":
-		septets, err := encodeGSM7(text)
+		septets, err := encodeGSM7WithLanguage(text, lockingLang, singleLang)
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -726,14 +734,17 @@ func encodeSMSUserData(text, encoding string, udh []byte) ([]byte, int, byte, er
 }
 
 func encodeGSM7(text string) ([]byte, error) {
+	return encodeGSM7WithLanguage(text, 0, 0)
+}
+
+func encodeGSM7WithLanguage(text string, lockingLang, singleLang int) ([]byte, error) {
 	out := make([]byte, 0, len(text))
 	for _, r := range text {
-		idx := gsm7Code(r)
-		if idx >= 0 {
-			out = append(out, byte(idx))
+		if idx, ok := gsm7LockingCode(r, lockingLang); ok {
+			out = append(out, idx)
 			continue
 		}
-		ext, ok := gsm7ExtensionCode(r)
+		ext, ok := gsm7SingleShiftCode(r, singleLang)
 		if !ok {
 			return nil, fmt.Errorf("character %q is not in GSM 7-bit alphabet", r)
 		}
@@ -743,13 +754,17 @@ func encodeGSM7(text string) ([]byte, error) {
 }
 
 func gsm7SeptetLen(text string) (int, bool) {
+	return gsm7SeptetLenWithLanguage(text, 0, 0)
+}
+
+func gsm7SeptetLenWithLanguage(text string, lockingLang, singleLang int) (int, bool) {
 	septets := 0
 	for _, r := range text {
-		if gsm7Code(r) >= 0 {
+		if _, ok := gsm7LockingCode(r, lockingLang); ok {
 			septets++
 			continue
 		}
-		if _, ok := gsm7ExtensionCode(r); ok {
+		if _, ok := gsm7SingleShiftCode(r, singleLang); ok {
 			septets += 2
 			continue
 		}
@@ -759,6 +774,10 @@ func gsm7SeptetLen(text string) (int, bool) {
 }
 
 func takeGSM7Chunk(text string, limit int) (string, string) {
+	return takeGSM7ChunkWithLanguage(text, limit, 0, 0)
+}
+
+func takeGSM7ChunkWithLanguage(text string, limit int, lockingLang, singleLang int) (string, string) {
 	if text == "" || limit <= 0 {
 		return "", text
 	}
@@ -767,10 +786,10 @@ func takeGSM7Chunk(text string, limit int) (string, string) {
 	for pos, r := range text {
 		charSeptets := 0
 		switch {
-		case gsm7Code(r) >= 0:
+		case gsm7CanEncodeLocking(r, lockingLang):
 			charSeptets = 1
 		default:
-			if _, ok := gsm7ExtensionCode(r); ok {
+			if _, ok := gsm7SingleShiftCode(r, singleLang); ok {
 				charSeptets = 2
 			} else {
 				charSeptets = 1
@@ -793,6 +812,11 @@ func takeGSM7Chunk(text string, limit int) (string, string) {
 	return text[:end], text[end:]
 }
 
+func gsm7CanEncodeLocking(r rune, lockingLang int) bool {
+	_, ok := gsm7LockingCode(r, lockingLang)
+	return ok
+}
+
 func gsm7Code(r rune) int {
 	for i, candidate := range gsm7BasicAlphabet {
 		if candidate == r {
@@ -803,30 +827,7 @@ func gsm7Code(r rune) int {
 }
 
 func gsm7ExtensionCode(r rune) (byte, bool) {
-	switch r {
-	case '\f':
-		return 0x0a, true
-	case '^':
-		return 0x14, true
-	case '{':
-		return 0x28, true
-	case '}':
-		return 0x29, true
-	case '\\':
-		return 0x2f, true
-	case '[':
-		return 0x3c, true
-	case '~':
-		return 0x3d, true
-	case ']':
-		return 0x3e, true
-	case '|':
-		return 0x40, true
-	case '€':
-		return 0x65, true
-	default:
-		return 0, false
-	}
+	return gsm7SingleShiftCode(r, 0)
 }
 
 var gsm7BasicAlphabet = []rune{
@@ -1104,7 +1105,7 @@ func decodeSMSUserDataWithHeader(data []byte, udl int, dcs byte, hasUDH bool) (s
 		if hasUDH {
 			fillBits = (7 - ((len(udh) * 8) % 7)) % 7
 		}
-		return decodeGSM7(unpackSeptets(payload, septets, fillBits)), headerInfo, nil
+		return decodeGSM7WithLanguage(unpackSeptets(payload, septets, fillBits), headerInfo.LockingShiftLang, headerInfo.SingleShiftLang), headerInfo, nil
 	}
 }
 
@@ -1165,6 +1166,16 @@ func parseSMSUDHInfo(udh []byte) SMSUserDataHeaderInfo {
 		case 0x08:
 			if len(ie) == 4 && ie[2] > 1 {
 				info.Concat = SMSConcatInfo{IsConcat: true, Ref: int(ie[0])<<8 | int(ie[1]), RefBits: 16, Total: int(ie[2]), Seq: int(ie[3])}
+			}
+		case smsUDHIEINationalLanguageSingleShift:
+			if len(ie) == 1 && smsNationalLanguageIdentifierKnown(int(ie[0])) {
+				info.HasSingleShift = true
+				info.SingleShiftLang = int(ie[0])
+			}
+		case smsUDHIEINationalLanguageLockingShift:
+			if len(ie) == 1 && smsNationalLanguageIdentifierKnown(int(ie[0])) {
+				info.HasLockingShift = true
+				info.LockingShiftLang = int(ie[0])
 			}
 		}
 		i += iedl
@@ -1235,48 +1246,37 @@ func smsMessageWaitingType(dcs byte) string {
 }
 
 func decodeGSM7(septets []byte) string {
+	return decodeGSM7WithLanguage(septets, 0, 0)
+}
+
+func decodeGSM7WithLanguage(septets []byte, lockingLang, singleLang int) string {
 	var b strings.Builder
 	for i := 0; i < len(septets); i++ {
-		code := int(septets[i] & 0x7f)
+		code := septets[i] & 0x7f
 		if code == 0x1b && i+1 < len(septets) {
-			if r, ok := gsm7ExtensionRune(septets[i+1] & 0x7f); ok {
+			shiftCode := septets[i+1] & 0x7f
+			if r, ok := gsm7SingleShiftRune(shiftCode, singleLang); ok {
 				b.WriteRune(r)
 				i++
 				continue
 			}
+			if lockingLang != 0 || singleLang != 0 {
+				if r, ok := gsm7LockingRune(shiftCode, lockingLang); ok {
+					b.WriteRune(r)
+					i++
+					continue
+				}
+			}
 		}
-		if code >= 0 && code < len(gsm7BasicAlphabet) {
-			b.WriteRune(gsm7BasicAlphabet[code])
+		if r, ok := gsm7LockingRune(code, lockingLang); ok {
+			b.WriteRune(r)
 		}
 	}
 	return b.String()
 }
 
 func gsm7ExtensionRune(code byte) (rune, bool) {
-	switch code {
-	case 0x0a:
-		return '\f', true
-	case 0x14:
-		return '^', true
-	case 0x28:
-		return '{', true
-	case 0x29:
-		return '}', true
-	case 0x2f:
-		return '\\', true
-	case 0x3c:
-		return '[', true
-	case 0x3d:
-		return '~', true
-	case 0x3e:
-		return ']', true
-	case 0x40:
-		return '|', true
-	case 0x65:
-		return '€', true
-	default:
-		return 0, false
-	}
+	return gsm7SingleShiftRune(code, 0)
 }
 
 func decodeUCS2(data []byte) (string, error) {

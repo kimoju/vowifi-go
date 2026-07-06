@@ -93,6 +93,8 @@ protocol layers needed by VoHive:
   and reserved coding fallback, SMS-STATUS-REPORT TP-PI/PID/DCS/user-data optional parameter parsing,
   raw UDH IE preservation, inbound parsing and outbound construction of
   8-bit/16-bit application port addressing UDH, per-message SMS concatenation references with 8-bit and 16-bit UDH support,
+  TS 23.038 national language single-shift and locking-shift table support via
+  SMS UDH NLI IEs,
   SMS-SUBMIT relative and absolute validity-period
   encoding, SMS-SUBMIT TP-PID/TP-DCS overrides with alphabet validation,
   SMS-SUBMIT Reply-Path and Reject-Duplicates first-octet flags, USSD dialog

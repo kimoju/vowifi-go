@@ -111,6 +111,36 @@ func TestSegmentSMSGSM7ExtendedCharacters(t *testing.T) {
 	}
 }
 
+func TestSegmentSMSGSM7NationalLanguageSingleShift(t *testing.T) {
+	single := SegmentSMSWithOptions(strings.Repeat("\u011e", 77), SendOptions{SingleShiftLang: SMSNationalLanguageTurkish})
+	if len(single) != 1 {
+		t.Fatalf("single parts=%d, want 1", len(single))
+	}
+	wantSingleUDH := []byte{0x03, 0x24, 0x01, 0x01}
+	if single[0].Encoding != "gsm7" || string(single[0].UDH) != string(wantSingleUDH) || single[0].SingleShiftLang != SMSNationalLanguageTurkish {
+		t.Fatalf("single part=%+v UDH=%x want %x", single[0], single[0].UDH, wantSingleUDH)
+	}
+	if messageLenWithLanguage(single[0].Text, "gsm7", 0, SMSNationalLanguageTurkish) != 154 {
+		t.Fatalf("single septets=%d want 154", messageLenWithLanguage(single[0].Text, "gsm7", 0, SMSNationalLanguageTurkish))
+	}
+
+	parts := SegmentSMSWithOptions(strings.Repeat("\u011e", 78), SendOptions{
+		SingleShiftLang: SMSNationalLanguageTurkish,
+		ConcatRef:       0x44,
+		ConcatRefBits:   8,
+	})
+	if len(parts) != 2 {
+		t.Fatalf("parts=%d, want 2", len(parts))
+	}
+	wantFirstUDH := []byte{0x08, 0x24, 0x01, 0x01, 0x00, 0x03, 0x44, 0x02, 0x01}
+	if string(parts[0].UDH) != string(wantFirstUDH) || parts[0].ConcatRef != 0x44 || parts[0].SingleShiftLang != SMSNationalLanguageTurkish {
+		t.Fatalf("first part=%+v UDH=%x want %x", parts[0], parts[0].UDH, wantFirstUDH)
+	}
+	if len([]rune(parts[0].Text)) != 74 || messageLenWithLanguage(parts[0].Text, "gsm7", 0, SMSNationalLanguageTurkish) != 148 {
+		t.Fatalf("first part text runes=%d septets=%d", len([]rune(parts[0].Text)), messageLenWithLanguage(parts[0].Text, "gsm7", 0, SMSNationalLanguageTurkish))
+	}
+}
+
 func TestSegmentSMSUCS2(t *testing.T) {
 	parts := SegmentSMS(strings.Repeat("你", 71), "")
 	if len(parts) != 2 {
@@ -288,6 +318,16 @@ func TestSendSMSWithOptionsRejectsInvalidApplicationPort(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "8-bit application port") {
 		t.Fatalf("SendSMSWithOptions() err=%v, want 8-bit application port error", err)
+	}
+}
+
+func TestSendSMSWithOptionsRejectsInvalidNationalLanguage(t *testing.T) {
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	_, err := svc.SendSMSWithOptions(context.Background(), "+18005551212", "hello", SendOptions{
+		SingleShiftLang: 14,
+	})
+	if err == nil || !strings.Contains(err.Error(), "national single shift") {
+		t.Fatalf("SendSMSWithOptions() err=%v, want national single shift error", err)
 	}
 }
 

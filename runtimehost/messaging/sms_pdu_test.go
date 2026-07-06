@@ -264,6 +264,53 @@ func TestBuildSMSSubmitTPDUGSM7ExtendedCharacters(t *testing.T) {
 	}
 }
 
+func TestGSM7NationalLanguageTurkishTables(t *testing.T) {
+	singleText := "\u011e\u0130\u015e\u00e7\u20ac\u011f\u0131\u015f"
+	septets, err := encodeGSM7WithLanguage(singleText, 0, SMSNationalLanguageTurkish)
+	if err != nil {
+		t.Fatalf("encodeGSM7WithLanguage(single shift) error = %v", err)
+	}
+	if got, want := strings.ToUpper(hex.EncodeToString(septets)), "1B471B491B531B631B651B671B691B73"; got != want {
+		t.Fatalf("single shift septets=%s want %s", got, want)
+	}
+	if decoded := decodeGSM7WithLanguage(septets, 0, SMSNationalLanguageTurkish); decoded != singleText {
+		t.Fatalf("single shift decoded=%q want %q", decoded, singleText)
+	}
+
+	lockingText := "\u011e\u011f\u0130\u015e\u015f\u00e7\u0131\u20ac"
+	septets, err = encodeGSM7WithLanguage(lockingText, SMSNationalLanguageTurkish, 0)
+	if err != nil {
+		t.Fatalf("encodeGSM7WithLanguage(locking shift) error = %v", err)
+	}
+	if got, want := strings.ToUpper(hex.EncodeToString(septets)), "0B0C401C1D600704"; got != want {
+		t.Fatalf("locking shift septets=%s want %s", got, want)
+	}
+	if decoded := decodeGSM7WithLanguage(septets, SMSNationalLanguageTurkish, 0); decoded != lockingText {
+		t.Fatalf("locking shift decoded=%q want %q", decoded, lockingText)
+	}
+}
+
+func TestBuildSMSSubmitTPDUGSM7NationalLanguageUDH(t *testing.T) {
+	tpdu, err := BuildSMSSubmitTPDU("10086", SMSPart{Text: "\u011e", SingleShiftLang: SMSNationalLanguageTurkish}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU() error = %v", err)
+	}
+	if tpdu[0] != 0x41 || tpdu[8] != 0x00 || tpdu[9] != 7 {
+		t.Fatalf("TPDU header first=0x%02x dcs=0x%02x udl=%d tpdu=%x", tpdu[0], tpdu[8], tpdu[9], tpdu)
+	}
+	wantUDH := []byte{0x03, 0x24, 0x01, 0x01}
+	if string(tpdu[10:14]) != string(wantUDH) {
+		t.Fatalf("UDH=%x want %x", tpdu[10:14], wantUDH)
+	}
+	text, header, err := decodeSMSUserDataWithHeader(tpdu[10:], int(tpdu[9]), tpdu[8], true)
+	if err != nil {
+		t.Fatalf("decodeSMSUserDataWithHeader() error = %v", err)
+	}
+	if text != "\u011e" || !header.HasSingleShift || header.SingleShiftLang != SMSNationalLanguageTurkish {
+		t.Fatalf("text=%q header=%+v", text, header)
+	}
+}
+
 func TestBuildSMSSubmitTPDUUCS2(t *testing.T) {
 	tpdu, err := BuildSMSSubmitTPDU("10086", SMSPart{Text: "你", Encoding: "ucs2"}, 1)
 	if err != nil {
@@ -463,6 +510,31 @@ func TestParseSMSDeliverTPDUPreservesProtocolMetadata(t *testing.T) {
 	}
 }
 
+func TestParseSMSDeliverTPDUGSM7WithNationalLanguageLockingShift(t *testing.T) {
+	tpdu := deliverTPDUWithUserData(t, []byte{0x03, 0x25, 0x01, 0x01}, "\u011e\u011f\u0130", SMSNationalLanguageTurkish, 0)
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	header := deliver.UserDataHeaderInfo
+	if deliver.Text != "\u011e\u011f\u0130" || !header.HasLockingShift || header.LockingShiftLang != SMSNationalLanguageTurkish {
+		t.Fatalf("deliver=%+v header=%+v", deliver, header)
+	}
+	if len(header.Elements) != 1 || header.Elements[0].Identifier != 0x25 {
+		t.Fatalf("UDH elements=%+v", header.Elements)
+	}
+}
+
+func TestParseSMSUDHInfoIgnoresReservedNationalLanguage(t *testing.T) {
+	header := parseSMSUDHInfo([]byte{0x06, 0x24, 0x01, 0x0e, 0x25, 0x01, 0x00})
+	if header.HasSingleShift || header.SingleShiftLang != 0 || header.HasLockingShift || header.LockingShiftLang != 0 {
+		t.Fatalf("reserved NLI header=%+v", header)
+	}
+	if len(header.Elements) != 2 || header.Elements[0].Identifier != 0x24 || header.Elements[1].Identifier != 0x25 {
+		t.Fatalf("reserved NLI elements=%+v", header.Elements)
+	}
+}
+
 func TestParseSMSDeliverTPDUWith16BitPortUDH(t *testing.T) {
 	tpdu := mustHex(t, "4005810180F6000462705021436500090605040B8423F06869")
 	deliver, err := ParseSMSDeliverTPDU(tpdu)
@@ -585,4 +657,17 @@ func mustHex(tb testing.TB, s string) []byte {
 		tb.Fatalf("DecodeString(%q) error = %v", s, err)
 	}
 	return out
+}
+
+func deliverTPDUWithUserData(tb testing.TB, udh []byte, text string, lockingLang, singleLang int) []byte {
+	tb.Helper()
+	userData, udl, dcs, err := encodeSMSUserDataWithLanguage(text, "gsm7", udh, lockingLang, singleLang)
+	if err != nil {
+		tb.Fatalf("encodeSMSUserDataWithLanguage() error = %v", err)
+	}
+	tpdu := mustHex(tb, "4005810180F6000062705021436500")
+	tpdu[7] = dcs
+	tpdu = append(tpdu, byte(udl))
+	tpdu = append(tpdu, userData...)
+	return tpdu
 }
