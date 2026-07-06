@@ -69,6 +69,9 @@ type RegistrationBinding struct {
 	SecurityAgreement SecurityAgreement
 	Expires           int
 	RegistrarContact  string
+	AuthHeader        string
+	AuthHeaderName    string
+	AuthSession       *DigestAuthSession
 }
 
 type RegisterMessage struct {
@@ -284,6 +287,10 @@ func (s DigestAuthState) Usable() bool {
 }
 
 func (s DigestAuthState) Build(method, uri string) (string, DigestAuthState, error) {
+	return s.BuildWithBody(method, uri, nil)
+}
+
+func (s DigestAuthState) BuildWithBody(method, uri string, body []byte) (string, DigestAuthState, error) {
 	if !s.Usable() {
 		return "", s, ErrInvalidChallenge
 	}
@@ -295,6 +302,7 @@ func (s DigestAuthState) Build(method, uri string) (string, DigestAuthState, err
 	if strings.TrimSpace(uri) != "" {
 		input.URI = strings.TrimSpace(uri)
 	}
+	input.Body = append([]byte(nil), body...)
 	nc := next.nextNC
 	if nc <= 0 {
 		nc = input.NC
@@ -514,13 +522,14 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		if isSIPSuccess(resp2.StatusCode) {
 			authState := newDigestAuthState(authzHeader, ch, currentAuthInput, authz)
 			authState, err = updateDigestAuthStateFromInfo(authState, resp2.Headers, authzHeader, resp2.Body)
+			binding := bindDigestAuth(buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders), authzHeader, authz, authState)
 			result := RegisterResult{
 				Registered:     true,
 				StatusCode:     resp2.StatusCode,
 				Reason:         resp2.Reason,
 				Attempts:       attempts,
 				Challenge:      ch,
-				Binding:        buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders),
+				Binding:        binding,
 				AuthHeader:     authz,
 				AuthHeaderName: authzHeader,
 				AuthState:      authState,
@@ -593,6 +602,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		result.Registered = false
 		return result, err
 	}
+	result.Binding = bindDigestAuth(result.Binding, authzHeader, authz, result.AuthState)
 	return result, nil
 }
 
@@ -769,6 +779,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if isSIPSuccess(resp.StatusCode) {
 		binding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp, expires, securityClientFromBinding(req.Binding), nil))
 		authState, err = updateDigestAuthStateFromInfo(authState, resp.Headers, authHeaderName, resp.Body)
+		binding = bindDigestAuth(binding, authHeaderName, authz, authState)
 		result := RefreshResult{
 			Refreshed:      true,
 			StatusCode:     resp.StatusCode,
@@ -842,6 +853,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		result.Refreshed = false
 		return result, err
 	}
+	result.Binding = bindDigestAuth(result.Binding, authHeaderName, authz, result.AuthState)
 	return result, nil
 }
 
@@ -853,9 +865,13 @@ func (s RegisterSession) securityClientAgreement() SecurityAgreement {
 }
 
 func nextDigestAuthorization(state DigestAuthState, method, uri, fallbackName, fallbackHeader string) (string, string, DigestAuthState, error) {
+	return nextDigestAuthorizationWithBody(state, method, uri, nil, fallbackName, fallbackHeader)
+}
+
+func nextDigestAuthorizationWithBody(state DigestAuthState, method, uri string, body []byte, fallbackName, fallbackHeader string) (string, string, DigestAuthState, error) {
 	headerName := firstNonEmpty(state.headerName, fallbackName, "Authorization")
 	if state.Usable() {
-		authz, next, err := state.Build(method, uri)
+		authz, next, err := state.BuildWithBody(method, uri, body)
 		if err != nil {
 			return headerName, "", state, err
 		}
@@ -993,6 +1009,15 @@ func mergeRefreshBinding(previous, next RegistrationBinding) RegistrationBinding
 	}
 	if strings.TrimSpace(next.RegistrarContact) == "" {
 		next.RegistrarContact = previous.RegistrarContact
+	}
+	if strings.TrimSpace(next.AuthHeader) == "" {
+		next.AuthHeader = previous.AuthHeader
+	}
+	if strings.TrimSpace(next.AuthHeaderName) == "" {
+		next.AuthHeaderName = previous.AuthHeaderName
+	}
+	if next.AuthSession == nil {
+		next.AuthSession = previous.AuthSession
 	}
 	return next
 }

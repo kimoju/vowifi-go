@@ -45,6 +45,9 @@ type DialogRequestConfig struct {
 	SessionExpires   int
 	SessionRefresher string
 	MinSE            int
+	AuthHeader       string
+	AuthHeaderName   string
+	AuthSession      *DigestAuthSession
 }
 
 func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage, error) {
@@ -287,12 +290,43 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 	if securityVerify := routeHeader(cfg.Registration.SecurityVerify); securityVerify != "" {
 		headers["Security-Verify"] = securityVerify
 	}
+	authHeaderName, authHeader, err := dialogDigestAuthorization(cfg, method, targetURI, body)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	if authHeaderName != "" && authHeader != "" {
+		headers[authHeaderName] = authHeader
+	}
 	return SIPRequestMessage{
 		Method:  method,
 		URI:     targetURI,
 		Headers: headers,
 		Body:    append([]byte(nil), body...),
 	}, nil
+}
+
+func dialogDigestAuthorization(cfg DialogRequestConfig, method, targetURI string, body []byte) (string, string, error) {
+	session := cfg.AuthSession
+	if session == nil {
+		session = cfg.Registration.AuthSession
+	}
+	fallbackName := firstNonEmpty(cfg.AuthHeaderName, cfg.Registration.AuthHeaderName)
+	fallbackHeader := firstNonEmpty(cfg.AuthHeader, cfg.Registration.AuthHeader)
+	if session == nil {
+		if fallbackHeader == "" {
+			return "", "", nil
+		}
+		return firstNonEmpty(fallbackName, "Authorization"), fallbackHeader, nil
+	}
+	headerName, header, err := session.NextWithBody(method, targetURI, body)
+	if err != nil {
+		return "", "", err
+	}
+	if header == "" && fallbackHeader != "" {
+		headerName = firstNonEmpty(headerName, fallbackName, "Authorization")
+		header = fallbackHeader
+	}
+	return headerName, header, nil
 }
 
 func applySessionIntervalHeaders(headers map[string]string, cfg DialogRequestConfig) {

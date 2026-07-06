@@ -281,6 +281,9 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 	if result.Binding.PublicIdentity != "sip:user@example" || result.Binding.Expires != 1800 || len(result.Binding.ServiceRoutes) != 2 {
 		t.Fatalf("binding=%+v", result.Binding)
 	}
+	if result.Binding.AuthSession == nil || result.Binding.AuthHeaderName != "Authorization" || result.Binding.AuthHeader != result.AuthHeader {
+		t.Fatalf("auth binding headerName=%q header=%q session=%v", result.Binding.AuthHeaderName, result.Binding.AuthHeader, result.Binding.AuthSession)
+	}
 	if result.Binding.SecurityClient != transport.requests[0].Headers["Security-Client"] ||
 		len(result.Binding.SecurityServer) != 1 ||
 		result.Binding.SecurityAgreement.SPIClient != 111 ||
@@ -1350,6 +1353,87 @@ func TestBuildIMSDialogRequestsIncludeSessionRefresher(t *testing.T) {
 	}
 	if update.Headers["Session-Expires"] != "1800" {
 		t.Fatalf("UPDATE Session-Expires=%q", update.Headers["Session-Expires"])
+	}
+}
+
+func TestBuildIMSDialogRequestsUseRegistrationDigestAuthSession(t *testing.T) {
+	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-dialog", Algorithm: "MD5", QOP: "auth"}
+	state := newDigestAuthState("Proxy-Authorization", ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, "")
+	cfg := DialogRequestConfig{
+		Profile: IMSProfile{IMPU: "sip:user@ims.example", UserAgent: "VoHive"},
+		Registration: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			AuthHeaderName: "Proxy-Authorization",
+			AuthSession:    NewDigestAuthSession("Proxy-Authorization", "", state),
+		},
+		RemoteURI:       "sip:+18005551212@ims.example",
+		RemoteTargetURI: "sip:+18005551212@pcscf.example",
+		CallID:          "call-auth-dialog",
+		LocalTag:        "ltag",
+		RemoteTag:       "rtag",
+		CSeq:            7,
+	}
+	invite, err := BuildInviteRequest(cfg, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatalf("BuildInviteRequest() error = %v", err)
+	}
+	auth := invite.Headers["Proxy-Authorization"]
+	if auth == "" || invite.Headers["Authorization"] != "" ||
+		!strings.Contains(auth, `uri="sip:+18005551212@pcscf.example"`) ||
+		!strings.Contains(auth, `nc=00000002`) {
+		t.Fatalf("INVITE auth headers=%+v", invite.Headers)
+	}
+	bye, err := BuildByeRequest(cfg)
+	if err != nil {
+		t.Fatalf("BuildByeRequest() error = %v", err)
+	}
+	if auth := bye.Headers["Proxy-Authorization"]; !strings.Contains(auth, `nc=00000003`) ||
+		!strings.Contains(auth, `uri="sip:+18005551212@pcscf.example"`) {
+		t.Fatalf("BYE auth=%q headers=%+v", auth, bye.Headers)
+	}
+}
+
+func TestBuildIMSDialogRequestsDigestAuthIntUsesBody(t *testing.T) {
+	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-dialog-int", Algorithm: "MD5", QOP: "auth-int"}
+	state := newDigestAuthState("Authorization", ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, "")
+	body := []byte("hello over IMS")
+	cfg := DialogRequestConfig{
+		Profile: IMSProfile{IMPU: "sip:user@ims.example"},
+		Registration: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			AuthSession:    NewDigestAuthSession("Authorization", "", state),
+		},
+		RemoteURI:       "sip:+18005551212@ims.example",
+		RemoteTargetURI: "sip:+18005551212@pcscf.example",
+		CallID:          "call-auth-int-dialog",
+		CSeq:            2,
+	}
+	msg, err := BuildMessageRequest(cfg, "text/plain;charset=UTF-8", body)
+	if err != nil {
+		t.Fatalf("BuildMessageRequest() error = %v", err)
+	}
+	want, _, err := state.BuildWithBody("MESSAGE", "sip:+18005551212@pcscf.example", body)
+	if err != nil {
+		t.Fatalf("BuildWithBody() error = %v", err)
+	}
+	if got := msg.Headers["Authorization"]; got != want {
+		t.Fatalf("MESSAGE Authorization=%s, want %s", got, want)
 	}
 }
 
