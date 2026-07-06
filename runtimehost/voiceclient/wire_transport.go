@@ -126,7 +126,14 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return RegisterResponse{}, err
 	}
-	wire, err := buildRegisterWire(msg, "UDP", conn.LocalAddr())
+	attempt := SIPRequestMessage{
+		Method:  "REGISTER",
+		URI:     msg.URI,
+		Headers: cloneStringMap(msg.Headers),
+		Body:    append([]byte(nil), msg.Body...),
+	}
+	ensureSIPRequestVia(&attempt, "UDP", conn.LocalAddr())
+	wire, err := buildSIPRequestWire(attempt, "UDP", conn.LocalAddr())
 	if err != nil {
 		return RegisterResponse{}, err
 	}
@@ -147,7 +154,14 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 			if !isSIPResponseWire(buf[:n]) {
 				continue
 			}
-			return ParseSIPResponse(buf[:n])
+			resp, err := ParseSIPResponse(buf[:n])
+			if err != nil {
+				return RegisterResponse{}, err
+			}
+			if !sipResponseMatchesRequest(resp, attempt) {
+				continue
+			}
+			return resp, nil
 		}
 		if ctx.Err() != nil {
 			return RegisterResponse{}, ctx.Err()
@@ -176,27 +190,34 @@ func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return RegisterResponse{}, err
 	}
-	wire, err := buildRegisterWire(msg, "TCP", conn.LocalAddr())
+	attempt := SIPRequestMessage{
+		Method:  "REGISTER",
+		URI:     msg.URI,
+		Headers: cloneStringMap(msg.Headers),
+		Body:    append([]byte(nil), msg.Body...),
+	}
+	ensureSIPRequestVia(&attempt, "TCP", conn.LocalAddr())
+	wire, err := buildSIPRequestWire(attempt, "TCP", conn.LocalAddr())
 	if err != nil {
 		return RegisterResponse{}, err
 	}
 	if _, err := conn.Write(wire); err != nil {
 		return RegisterResponse{}, err
 	}
-	raw, err := readSIPStreamMessage(bufio.NewReader(conn))
-	if err != nil {
-		return RegisterResponse{}, err
+	reader := bufio.NewReader(conn)
+	for {
+		raw, err := readSIPStreamMessage(reader)
+		if err != nil {
+			return RegisterResponse{}, err
+		}
+		resp, err := ParseSIPResponse(raw)
+		if err != nil {
+			return RegisterResponse{}, err
+		}
+		if sipResponseMatchesRequest(resp, attempt) {
+			return resp, nil
+		}
 	}
-	return ParseSIPResponse(raw)
-}
-
-func buildRegisterWire(msg RegisterMessage, transport string, localAddr net.Addr) ([]byte, error) {
-	return buildSIPRequestWire(SIPRequestMessage{
-		Method:  "REGISTER",
-		URI:     msg.URI,
-		Headers: msg.Headers,
-		Body:    msg.Body,
-	}, transport, localAddr)
 }
 
 func buildSIPRequestWire(msg SIPRequestMessage, transport string, localAddr net.Addr) ([]byte, error) {
@@ -410,6 +431,87 @@ parse:
 		return 0, false
 	}
 	return time.Duration(seconds) * time.Second, true
+}
+
+func sipResponseMatchesRequest(resp RegisterResponse, req SIPRequestMessage) bool {
+	if !sipResponseHeaderMatchesRequest(resp.Headers, req.Headers, "Call-ID") {
+		return false
+	}
+	if !sipResponseCSeqMatchesRequest(resp, req) {
+		return false
+	}
+	if !sipResponseViaMatchesRequest(resp, req) {
+		return false
+	}
+	return true
+}
+
+func sipResponseHeaderMatchesRequest(respHeaders map[string][]string, reqHeaders map[string]string, name string) bool {
+	respValue := firstHeader(respHeaders, name)
+	if respValue == "" {
+		return true
+	}
+	reqValue := firstHeaderValue(reqHeaders, name)
+	return reqValue != "" && strings.TrimSpace(respValue) == strings.TrimSpace(reqValue)
+}
+
+func sipResponseCSeqMatchesRequest(resp RegisterResponse, req SIPRequestMessage) bool {
+	respValue := firstHeader(resp.Headers, "CSeq")
+	if respValue == "" {
+		return true
+	}
+	respSeq, respMethod, ok := sipCSeqParts(respValue)
+	if !ok {
+		return false
+	}
+	reqSeq, reqMethod, ok := sipCSeqParts(firstHeaderValue(req.Headers, "CSeq"))
+	if !ok {
+		return false
+	}
+	return respSeq == reqSeq && strings.EqualFold(respMethod, reqMethod)
+}
+
+func sipCSeqParts(value string) (int, string, bool) {
+	fields := strings.Fields(value)
+	if len(fields) < 2 {
+		return 0, "", false
+	}
+	seq, err := strconv.Atoi(fields[0])
+	if err != nil || seq <= 0 {
+		return 0, "", false
+	}
+	method := strings.ToUpper(strings.TrimSpace(fields[1]))
+	if method == "" {
+		return 0, "", false
+	}
+	return seq, method, true
+}
+
+func sipResponseViaMatchesRequest(resp RegisterResponse, req SIPRequestMessage) bool {
+	respVia := firstHeader(resp.Headers, "Via")
+	if respVia == "" {
+		return true
+	}
+	reqVia := firstHeaderValue(req.Headers, "Via")
+	if reqVia == "" {
+		return false
+	}
+	respBranch := sipViaBranch(respVia)
+	reqBranch := sipViaBranch(reqVia)
+	if respBranch != "" || reqBranch != "" {
+		return respBranch != "" && reqBranch != "" && respBranch == reqBranch
+	}
+	return true
+}
+
+func sipViaBranch(via string) string {
+	for _, part := range strings.Split(via, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(key), "branch") {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func ParseSIPRequest(raw []byte) (SIPIncomingRequest, error) {

@@ -377,6 +377,100 @@ func TestWireSIPFlowRegisterFailsOverRecoverableResponse(t *testing.T) {
 	}
 }
 
+func TestWireSIPFlowIgnoresStaleMatchedHeadersOnReusedUDPFlow(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		firstReq, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			return
+		}
+		firstOK := strings.Join([]string{
+			"SIP/2.0 200 OK",
+			"Via: " + firstHeader(firstReq.Headers, "Via"),
+			"Call-ID: " + firstHeader(firstReq.Headers, "Call-ID"),
+			"CSeq: " + firstHeader(firstReq.Headers, "CSeq"),
+			"Content-Length: 0",
+			"",
+			"",
+		}, "\r\n")
+		_, _ = pc.WriteTo([]byte(firstOK), addr)
+
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err = pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		secondReq, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			return
+		}
+		stale := strings.Join([]string{
+			"SIP/2.0 486 Busy Here",
+			"Via: " + firstHeader(firstReq.Headers, "Via"),
+			"Call-ID: " + firstHeader(firstReq.Headers, "Call-ID"),
+			"CSeq: " + firstHeader(firstReq.Headers, "CSeq"),
+			"Content-Length: 0",
+			"",
+			"",
+		}, "\r\n")
+		matched := strings.Join([]string{
+			"SIP/2.0 202 Accepted",
+			"Via: " + firstHeader(secondReq.Headers, "Via"),
+			"Call-ID: " + firstHeader(secondReq.Headers, "Call-ID"),
+			"CSeq: " + firstHeader(secondReq.Headers, "CSeq"),
+			"Content-Length: 0",
+			"",
+			"",
+		}, "\r\n")
+		_, _ = pc.WriteTo([]byte(stale), addr)
+		_, _ = pc.WriteTo([]byte(matched), addr)
+	}()
+
+	flow := &WireSIPFlow{Network: "udp", ServerAddr: pc.LocalAddr().String(), Timeout: time.Second}
+	defer flow.Close()
+	resp, err := flow.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-stale-register",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("RoundTripRegister() response=%+v err=%v", resp, err)
+	}
+	resp, err = flow.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sip:+18005551212@example",
+		Headers: map[string]string{
+			"To":           "<sip:+18005551212@example>",
+			"From":         "<sip:user@example>;tag=sms",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-stale-message",
+			"CSeq":         "1 MESSAGE",
+			"Max-Forwards": "70",
+		},
+		Body: []byte("hello"),
+	})
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequest() response=%+v err=%v", resp, err)
+	}
+}
+
 func TestWireSIPFlowResetToNextTargetPreservesCandidates(t *testing.T) {
 	first, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

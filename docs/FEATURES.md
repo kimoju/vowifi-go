@@ -44,8 +44,9 @@ protocol layers needed by VoHive:
   Content-Length body and duplicate-length validation, wire-level UDP/TCP
   REGISTER transport, and IMS registration binding parsing
 - SIP UDP client transaction retransmission for REGISTER and IMS dialog
-  requests, with configurable T1/T2-style backoff and INVITE provisional
-  response handling
+  requests, with configurable T1/T2-style backoff, INVITE provisional response
+  handling, and response correlation filtering for `Call-ID`, `CSeq`, and Via
+  branch headers when peers include transaction identifiers
 - reusable SIP flow transport for REGISTER, MESSAGE, USSD, and voice dialog
   requests, preserving the REGISTER socket/local port for IMS NAT pinholes and
   offering explicit CRLF keepalive support, including sticky reuse of the

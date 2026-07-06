@@ -452,6 +452,68 @@ func TestWireRegisterTransportRetransmitsUDPRegister(t *testing.T) {
 	}
 }
 
+func TestWireRegisterTransportIgnoresMismatchedUDPResponse(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		req, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			return
+		}
+		via := firstHeader(req.Headers, "Via")
+		cseq := firstHeader(req.Headers, "CSeq")
+		bad := strings.Join([]string{
+			"SIP/2.0 503 Service Unavailable",
+			"Via: " + via,
+			"Call-ID: unrelated-register",
+			"CSeq: " + cseq,
+			"Content-Length: 0",
+			"",
+			"",
+		}, "\r\n")
+		good := strings.Join([]string{
+			"SIP/2.0 200 OK",
+			"Via: " + via,
+			"Call-ID: " + firstHeader(req.Headers, "Call-ID"),
+			"CSeq: " + cseq,
+			"Content-Length: 0",
+			"",
+			"",
+		}, "\r\n")
+		_, _ = pc.WriteTo([]byte(bad), addr)
+		_, _ = pc.WriteTo([]byte(good), addr)
+	}()
+
+	resp, err := WireRegisterTransport{
+		Network:    "udp",
+		ServerAddr: pc.LocalAddr().String(),
+		Timeout:    time.Second,
+	}.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "matched-register",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("RoundTripRegister() response=%+v err=%v", resp, err)
+	}
+}
+
 func TestWireRegisterTransportFailsOverResolvedUDPTargets(t *testing.T) {
 	dead, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -739,6 +801,69 @@ func TestWireSIPTransportRetransmitsUDPInvite(t *testing.T) {
 	requests := <-seen
 	if len(requests) != 2 || !strings.Contains(requests[0], "INVITE sip:callee@example") || requests[0] != requests[1] {
 		t.Fatalf("requests=%d %v", len(requests), requests)
+	}
+}
+
+func TestWireSIPTransportIgnoresMismatchedUDPResponse(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		req, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			return
+		}
+		via := firstHeader(req.Headers, "Via")
+		cseq := firstHeader(req.Headers, "CSeq")
+		bad := strings.Join([]string{
+			"SIP/2.0 486 Busy Here",
+			"Via: " + via,
+			"Call-ID: unrelated-message",
+			"CSeq: " + cseq,
+			"Content-Length: 0",
+			"",
+			"",
+		}, "\r\n")
+		good := strings.Join([]string{
+			"SIP/2.0 202 Accepted",
+			"Via: " + via,
+			"Call-ID: " + firstHeader(req.Headers, "Call-ID"),
+			"CSeq: " + cseq,
+			"Content-Length: 0",
+			"",
+			"",
+		}, "\r\n")
+		_, _ = pc.WriteTo([]byte(bad), addr)
+		_, _ = pc.WriteTo([]byte(good), addr)
+	}()
+
+	resp, err := WireSIPTransport{
+		Network:    "udp",
+		ServerAddr: pc.LocalAddr().String(),
+		Timeout:    time.Second,
+	}.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"To":           "<sip:callee@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Call-ID":      "matched-message",
+			"CSeq":         "1 MESSAGE",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequest() response=%+v err=%v", resp, err)
 	}
 }
 

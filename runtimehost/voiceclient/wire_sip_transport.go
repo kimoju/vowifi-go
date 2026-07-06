@@ -143,6 +143,9 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 		if err != nil {
 			return SIPResponse{}, err
 		}
+		if !sipResponseMatchesRequest(resp, attempt) {
+			continue
+		}
 		if !isProvisionalResponse(resp.StatusCode, attempt.Method) {
 			return resp, nil
 		}
@@ -230,6 +233,9 @@ func readFinalSIPResponse(ctx context.Context, reader *bufio.Reader, msg SIPRequ
 		resp, err := ParseSIPResponse(raw)
 		if err != nil {
 			return SIPResponse{}, err
+		}
+		if !sipResponseMatchesRequest(resp, msg) {
+			continue
 		}
 		if !isProvisionalResponse(resp.StatusCode, msg.Method) {
 			return resp, nil
