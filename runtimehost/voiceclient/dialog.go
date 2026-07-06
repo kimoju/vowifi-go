@@ -155,6 +155,24 @@ func BuildMessageRequest(cfg DialogRequestConfig, contentType string, body []byt
 	return msg, nil
 }
 
+func BuildReferRequest(cfg DialogRequestConfig, referTo, referredBy string) (SIPRequestMessage, error) {
+	referTo = strings.TrimSpace(referTo)
+	if referTo == "" {
+		return SIPRequestMessage{}, fmt.Errorf("%w: Refer-To is empty", ErrInvalidDialogConfig)
+	}
+	msg, err := buildDialogRequest("REFER", cfg, nil)
+	if err != nil {
+		return SIPRequestMessage{}, err
+	}
+	msg.Headers["Refer-To"] = formatReferHeader(referTo)
+	if referredBy = strings.TrimSpace(referredBy); referredBy != "" {
+		msg.Headers["Referred-By"] = formatReferHeader(referredBy)
+	}
+	msg.Headers["Refer-Sub"] = "false"
+	msg.Headers["Supported"] = "replaces, norefersub, outbound"
+	return msg, nil
+}
+
 func BuildOptionsRequest(cfg DialogRequestConfig) (SIPRequestMessage, error) {
 	msg, err := buildDialogRequest("OPTIONS", cfg, nil)
 	if err != nil {
@@ -202,7 +220,7 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 		"CSeq":                  strconv.Itoa(cseq) + " " + method,
 		"Max-Forwards":          "70",
 		"User-Agent":            firstNonEmpty(cfg.UserAgent, cfg.Profile.UserAgent, "vowifi-go"),
-		"Allow":                 "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, OPTIONS",
+		"Allow":                 "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, OPTIONS",
 		"P-Preferred-Identity":  "<" + localURI + ">",
 		"P-Access-Network-Info": "IEEE-802.11",
 	}
@@ -266,4 +284,16 @@ func formatNameAddr(uri, tag string) string {
 		out += ";tag=" + tag
 	}
 	return out
+}
+
+func formatReferHeader(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.Contains(value, "<") {
+		return value
+	}
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") || strings.HasPrefix(lower, "tel:") {
+		return "<" + value + ">"
+	}
+	return value
 }

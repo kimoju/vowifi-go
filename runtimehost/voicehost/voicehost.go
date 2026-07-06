@@ -49,6 +49,10 @@ type DialogOptionsSender interface {
 	SendDialogOptions(context.Context, DialogOptionsRequest) (DialogOptionsResult, error)
 }
 
+type DialogReferSender interface {
+	SendDialogRefer(context.Context, DialogReferRequest) (DialogReferResult, error)
+}
+
 type DialogUpdater interface {
 	SendDialogUpdate(context.Context, DialogUpdateRequest) (DialogUpdateResult, error)
 }
@@ -134,6 +138,16 @@ type DialogOptionsRequest struct {
 }
 
 type DialogOptionsResult = DialogInfoResult
+
+type DialogReferRequest struct {
+	DeviceID   string
+	CallID     string
+	ReferTo    string
+	ReferredBy string
+	Headers    map[string]string
+}
+
+type DialogReferResult = DialogInfoResult
 
 type DialogUpdateRequest struct {
 	DeviceID    string
@@ -535,6 +549,54 @@ func (g *Gateway) HandleClientOptions(deviceID string, req *sip.Request, tx sip.
 	}
 	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)
 	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	body := append([]byte(nil), result.Body...)
+	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
+	if strings.TrimSpace(result.ContentType) != "" && len(body) > 0 {
+		res.AppendHeader(sip.NewHeader("Content-Type", strings.TrimSpace(result.ContentType)))
+	}
+	for key, value := range result.Headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
+	_ = tx.Respond(res)
+}
+
+func (g *Gateway) HandleClientRefer(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
+	if tx == nil || req == nil {
+		return
+	}
+	sender, _ := g.GetAgent(deviceID).(DialogReferSender)
+	if sender == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
+		return
+	}
+	callID := sipCallID(req)
+	if callID == "" {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
+		return
+	}
+	referTo := sipHeaderValue(req, "Refer-To")
+	if strings.TrimSpace(referTo) == "" {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Refer-To", nil))
+		return
+	}
+	result, err := sender.SendDialogRefer(context.Background(), DialogReferRequest{
+		DeviceID:   strings.TrimSpace(deviceID),
+		CallID:     callID,
+		ReferTo:    referTo,
+		ReferredBy: sipHeaderValue(req, "Referred-By"),
+		Headers:    sipRequestHeaderMap(req),
+	})
+	if err != nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi REFER failed", nil))
+		return
+	}
+	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)
+	reason := firstVoiceNonEmpty(result.Reason, "Accepted")
 	body := append([]byte(nil), result.Body...)
 	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
 	if strings.TrimSpace(result.ContentType) != "" && len(body) > 0 {

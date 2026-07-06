@@ -203,6 +203,9 @@ protocol layers needed by VoHive:
 - IMS in-dialog SIP INFO forwarding for outbound and inbound voice dialogs,
   including DTMF relay body construction/parsing helpers, Info-Package
   propagation, response body/header mapping, and dialog CSeq advancement
+- IMS in-dialog SIP REFER forwarding for outbound voice dialogs, including
+  structured `Refer-To`/`Referred-By` handling, `Refer-Sub` negotiation headers,
+  response header/body mapping, and dialog CSeq advancement
 - runtime voice operations consume recoverable registration or route failures
   such as 481, 503, transport errors, and other transient IMS 5xx responses to
   trigger IMS re-registration, refresh voice/SMS/USSD transports, and retry an

@@ -319,6 +319,64 @@ func TestIMSOutboundAgentSendsDialogOptions(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentSendsDialogRefer(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"Refer-Sub": {"false"}, "X-IMS": {"refer-ok"}}},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-refer",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogRefer(context.Background(), DialogReferRequest{
+		CallID:     "call-refer",
+		ReferTo:    "sip:+18005551313@ims.example",
+		ReferredBy: "sip:user@ims.example",
+		Headers:    map[string]string{"X-Test": "refer", "Refer-To": "<sip:wrong@ims.example>"},
+	})
+	if err != nil || !result.Accepted || result.StatusCode != 202 || result.Headers["X-IMS"] != "refer-ok" {
+		t.Fatalf("SendDialogRefer() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "REFER" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	refer := transport.requests[1]
+	if refer.URI != "sip:carrier@198.51.100.1:5060" || refer.Headers["CSeq"] != "2 REFER" ||
+		refer.Headers["Refer-To"] != "<sip:+18005551313@ims.example>" ||
+		refer.Headers["Referred-By"] != "<sip:user@ims.example>" ||
+		refer.Headers["Refer-Sub"] != "false" || refer.Headers["Supported"] == "" ||
+		refer.Headers["X-Test"] != "refer" || len(refer.Body) != 0 {
+		t.Fatalf("REFER=%+v body=%q", refer, refer.Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-refer"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" || transport.requests[2].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after REFER=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentSendsDialogHoldAndResume(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

@@ -14,6 +14,7 @@ type fakeOutboundAgent struct {
 	infos          []DialogInfoRequest
 	pracks         []DialogPrackRequest
 	options        []DialogOptionsRequest
+	refers         []DialogReferRequest
 	updates        []DialogUpdateRequest
 	reinvites      []DialogReinviteRequest
 	terminated     []DialogInfo
@@ -22,12 +23,14 @@ type fakeOutboundAgent struct {
 	infoResult     DialogInfoResult
 	prackResult    DialogPrackResult
 	optionsResult  DialogOptionsResult
+	referResult    DialogReferResult
 	updateResult   DialogUpdateResult
 	reinviteResult DialogReinviteResult
 	err            error
 	infoErr        error
 	prackErr       error
 	optionsErr     error
+	referErr       error
 	updateErr      error
 	reinviteErr    error
 }
@@ -75,6 +78,14 @@ func (a *fakeOutboundAgent) SendDialogOptions(ctx context.Context, req DialogOpt
 		return DialogOptionsResult{}, a.optionsErr
 	}
 	return a.optionsResult, nil
+}
+
+func (a *fakeOutboundAgent) SendDialogRefer(ctx context.Context, req DialogReferRequest) (DialogReferResult, error) {
+	a.refers = append(a.refers, req)
+	if a.referErr != nil {
+		return DialogReferResult{}, a.referErr
+	}
+	return a.referResult, nil
 }
 
 func (a *fakeOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdateRequest) (DialogUpdateResult, error) {
@@ -382,6 +393,50 @@ func TestGatewayHandleClientOptionsSendsDialogOptions(t *testing.T) {
 	}
 }
 
+func TestGatewayHandleClientReferSendsDialogRefer(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{referResult: DialogReferResult{
+		Accepted:   true,
+		StatusCode: 202,
+		Reason:     "Accepted",
+		Headers:    map[string]string{"Refer-Sub": "false", "X-IMS": "refer-ok"},
+	}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newReferRequest("call-refer", "<sip:+18005551313@ims.example>", "<sip:user@example>")
+	req.AppendHeader(sip.NewHeader("X-Client", "refer"))
+
+	g.HandleClientRefer("dev-1", req, tx)
+
+	if len(agent.refers) != 1 {
+		t.Fatalf("refers=%d", len(agent.refers))
+	}
+	got := agent.refers[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-refer" ||
+		got.ReferTo != "<sip:+18005551313@ims.example>" || got.ReferredBy != "<sip:user@example>" ||
+		got.Headers["X-Client"] != "refer" || got.Headers["Refer-To"] != "" || got.Headers["Referred-By"] != "" {
+		t.Fatalf("DialogReferRequest=%+v", got)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 202 ||
+		tx.responses[0].GetHeader("Refer-Sub").Value() != "false" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "refer-ok" {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
+func TestGatewayHandleClientReferRequiresReferTo(t *testing.T) {
+	g := NewGateway()
+	g.RegisterAgent("dev-1", &fakeOutboundAgent{})
+	tx := &fakeServerTransaction{}
+	req := newReferRequest("call-refer", "", "")
+
+	g.HandleClientRefer("dev-1", req, tx)
+
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 400 {
+		t.Fatalf("REFER responses=%v", responseCodes(tx.responses))
+	}
+}
+
 func TestGatewayHandleClientUpdateSendsDialogUpdate(t *testing.T) {
 	g := NewGateway()
 	agent := &fakeOutboundAgent{updateResult: DialogUpdateResult{
@@ -512,6 +567,18 @@ func newPrackRequest(callID, rack, sdp string) *sip.Request {
 func newOptionsRequest(callID string) *sip.Request {
 	req := sip.NewRequest(sip.OPTIONS, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
 	appendCommonHeaders(req, callID, "18005551212")
+	return req
+}
+
+func newReferRequest(callID, referTo, referredBy string) *sip.Request {
+	req := sip.NewRequest(sip.REFER, sip.Uri{Scheme: "sip", User: "18005551212", Host: "ims.example"})
+	appendCommonHeaders(req, callID, "18005551212")
+	if strings.TrimSpace(referTo) != "" {
+		req.AppendHeader(sip.NewHeader("Refer-To", referTo))
+	}
+	if strings.TrimSpace(referredBy) != "" {
+		req.AppendHeader(sip.NewHeader("Referred-By", referredBy))
+	}
 	return req
 }
 
