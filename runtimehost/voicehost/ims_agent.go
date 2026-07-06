@@ -143,7 +143,8 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	inviteCSeq := cfg.CSeq
 	nextCSeq := inviteCSeq + 1
 	retriedSessionInterval := false
-	retriedDigestChallenge := false
+	digestChallengeRetries := 0
+	allowDigestChallengeRetry := true
 	var pendingInvite *voiceclient.SIPRequestMessage
 	var provisionalSDP SDPInfo
 	var provisionalAnswer []byte
@@ -186,15 +187,16 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 			a.deleteDialog(strings.TrimSpace(req.CallID))
 			return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed", RegistrationRecoveryNeeded: true}, err
 		}
-		if isInviteDigestChallenge(resp) && !retriedDigestChallenge && invite.AuthSession != nil {
-			retryCfg, retryInvite, ok, err := a.buildInviteDigestChallengeRetry(ctx, cfg, invite, resp, nextCSeq, inviteBody)
+		if isInviteDigestChallenge(resp) && invite.AuthSession != nil && allowDigestChallengeRetry && digestChallengeRetries < 2 {
+			retryCfg, retryInvite, retryResult, ok, err := a.buildInviteDigestChallengeRetry(ctx, cfg, invite, resp, nextCSeq, inviteBody)
 			if err != nil {
 				a.deleteDialog(strings.TrimSpace(req.CallID))
 				return OutboundCallResult{Accepted: false, Reason: "IMS INVITE digest challenge failed", RegistrationRecoveryNeeded: true}, err
 			}
 			if ok {
 				cfg = retryCfg
-				retriedDigestChallenge = true
+				digestChallengeRetries++
+				allowDigestChallengeRetry = retryResult.Authorization.SyncFailure
 				inviteCSeq = retryCfg.CSeq
 				nextCSeq = outboundNextCSeq(inviteCSeq)
 				pendingInvite = &retryInvite
@@ -981,51 +983,54 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 	if err != nil {
 		return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE failed", RegistrationRecoveryNeeded: true}, err
 	}
-	if isInviteDigestChallenge(resp) && invite.AuthSession != nil {
-		retryCfg, retryInvite, ok, err := a.buildInviteDigestChallengeRetry(ctx, cfg, invite, resp, nextCSeq, body)
+	digestChallengeRetries := 0
+	allowDigestChallengeRetry := true
+	for isInviteDigestChallenge(resp) && invite.AuthSession != nil && allowDigestChallengeRetry && digestChallengeRetries < 2 {
+		retryCfg, retryInvite, retryResult, ok, err := a.buildInviteDigestChallengeRetry(ctx, cfg, invite, resp, nextCSeq, body)
 		if err != nil {
 			return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "IMS re-INVITE digest challenge failed"}, err
 		}
-		if ok {
-			if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
-				retryInvite.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
+		if !ok {
+			break
+		}
+		if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
+			retryInvite.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
+		}
+		applyDialogUpdateHeaders(retryInvite.Headers, req.Headers)
+		cfg = retryCfg
+		invite = retryInvite
+		activeCfg = retryCfg
+		activeInvite = retryInvite
+		nextCSeq = outboundNextCSeq(retryCfg.CSeq)
+		digestChallengeRetries++
+		allowDigestChallengeRetry = retryResult.Authorization.SyncFailure
+		a.mu.Lock()
+		if latest, ok := a.dialogs[callID]; ok {
+			latest.cfg.CSeq = nextCSeq
+			a.dialogs[callID] = latest
+		}
+		a.mu.Unlock()
+		resp, err = a.roundTripInvite(ctx, retryInvite, func(provisional voiceclient.SIPResponse) error {
+			prack, ok, err := buildReliableProvisionalPRACK(retryCfg, provisional, nextCSeq)
+			if err != nil || !ok {
+				return err
 			}
-			applyDialogUpdateHeaders(retryInvite.Headers, req.Headers)
-			cfg = retryCfg
-			invite = retryInvite
-			activeCfg = retryCfg
-			activeInvite = retryInvite
-			nextCSeq = outboundNextCSeq(retryCfg.CSeq)
+			if prackResp, err := a.roundTripRequest(ctx, prack); err != nil {
+				return fmt.Errorf("IMS re-INVITE digest retry PRACK failed: %w", err)
+			} else if prackResp.StatusCode < 200 || prackResp.StatusCode >= 300 {
+				return fmt.Errorf("IMS re-INVITE digest retry PRACK rejected: %d %s", prackResp.StatusCode, strings.TrimSpace(prackResp.Reason))
+			}
+			nextCSeq++
 			a.mu.Lock()
 			if latest, ok := a.dialogs[callID]; ok {
 				latest.cfg.CSeq = nextCSeq
 				a.dialogs[callID] = latest
 			}
 			a.mu.Unlock()
-			resp, err = a.roundTripInvite(ctx, retryInvite, func(provisional voiceclient.SIPResponse) error {
-				prack, ok, err := buildReliableProvisionalPRACK(retryCfg, provisional, nextCSeq)
-				if err != nil || !ok {
-					return err
-				}
-				prackResp, err := a.roundTripRequest(ctx, prack)
-				if err != nil {
-					return fmt.Errorf("IMS re-INVITE digest retry PRACK failed: %w", err)
-				}
-				if prackResp.StatusCode < 200 || prackResp.StatusCode >= 300 {
-					return fmt.Errorf("IMS re-INVITE digest retry PRACK rejected: %d %s", prackResp.StatusCode, strings.TrimSpace(prackResp.Reason))
-				}
-				nextCSeq++
-				a.mu.Lock()
-				if latest, ok := a.dialogs[callID]; ok {
-					latest.cfg.CSeq = nextCSeq
-					a.dialogs[callID] = latest
-				}
-				a.mu.Unlock()
-				return nil
-			})
-			if err != nil {
-				return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE digest retry failed", RegistrationRecoveryNeeded: true}, err
-			}
+			return nil
+		})
+		if err != nil {
+			return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE digest retry failed", RegistrationRecoveryNeeded: true}, err
 		}
 	}
 	if resp.StatusCode == 422 {
@@ -1193,30 +1198,30 @@ func (a *IMSOutboundAgent) ackRejectedInvite(ctx context.Context, cfg voiceclien
 	return a.Transport.WriteRequest(ctx, ack)
 }
 
-func (a *IMSOutboundAgent) buildInviteDigestChallengeRetry(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse, cseq int, body []byte) (voiceclient.DialogRequestConfig, voiceclient.SIPRequestMessage, bool, error) {
+func (a *IMSOutboundAgent) buildInviteDigestChallengeRetry(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse, cseq int, body []byte) (voiceclient.DialogRequestConfig, voiceclient.SIPRequestMessage, voiceclient.DigestChallengeRetryResult, bool, error) {
 	if invite.AuthSession == nil || !isInviteDigestChallenge(resp) {
-		return voiceclient.DialogRequestConfig{}, voiceclient.SIPRequestMessage{}, false, nil
+		return voiceclient.DialogRequestConfig{}, voiceclient.SIPRequestMessage{}, voiceclient.DigestChallengeRetryResult{}, false, nil
 	}
 	if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
-		return voiceclient.DialogRequestConfig{}, voiceclient.SIPRequestMessage{}, false, err
+		return voiceclient.DialogRequestConfig{}, voiceclient.SIPRequestMessage{}, voiceclient.DigestChallengeRetryResult{}, false, err
 	}
-	authHeaderName, authHeader, ok, err := invite.AuthSession.AuthorizeChallenge(resp, "INVITE", invite.URI, invite.Body)
+	authz, ok, err := invite.AuthSession.AuthorizeChallengeWithResult(resp, "INVITE", invite.URI, invite.Body)
 	if err != nil || !ok {
-		return voiceclient.DialogRequestConfig{}, voiceclient.SIPRequestMessage{}, false, err
+		return voiceclient.DialogRequestConfig{}, voiceclient.SIPRequestMessage{}, voiceclient.DigestChallengeRetryResult{Authorization: authz}, false, err
 	}
 	retryCfg := cfg
 	retryCfg.CSeq = cseq
 	wireCfg := retryCfg
 	wireCfg.AuthSession = nil
-	wireCfg.AuthHeaderName = authHeaderName
-	wireCfg.AuthHeader = authHeader
+	wireCfg.AuthHeaderName = authz.HeaderName
+	wireCfg.AuthHeader = authz.Header
 	wireCfg.Registration.AuthSession = nil
 	retryInvite, err := voiceclient.BuildInviteRequest(wireCfg, body)
 	if err != nil {
-		return voiceclient.DialogRequestConfig{}, voiceclient.SIPRequestMessage{}, false, err
+		return voiceclient.DialogRequestConfig{}, voiceclient.SIPRequestMessage{}, voiceclient.DigestChallengeRetryResult{Authorization: authz}, false, err
 	}
 	retryInvite.AuthSession = invite.AuthSession
-	return retryCfg, retryInvite, true, nil
+	return retryCfg, retryInvite, voiceclient.DigestChallengeRetryResult{Authorization: authz}, true, nil
 }
 
 func isInviteDigestChallenge(resp voiceclient.SIPResponse) bool {

@@ -20,6 +20,16 @@ type DigestAuthSession struct {
 
 type DigestChallengeInputFunc func(DigestChallenge, string) (DigestAuthInput, error)
 
+type DigestChallengeAuthorization struct {
+	HeaderName  string
+	Header      string
+	SyncFailure bool
+}
+
+type DigestChallengeRetryResult struct {
+	Authorization DigestChallengeAuthorization
+}
+
 func NewDigestAuthSession(headerName, header string, state DigestAuthState) *DigestAuthSession {
 	return NewDigestAuthSessionWithChallengeInput(headerName, header, state, nil)
 }
@@ -96,13 +106,21 @@ func (s *DigestAuthSession) UpdateFromAuthenticationInfo(headers map[string][]st
 }
 
 func (s *DigestAuthSession) AuthorizeChallenge(resp SIPResponse, method, uri string, body []byte) (headerName, header string, ok bool, err error) {
+	authz, ok, err := s.AuthorizeChallengeWithResult(resp, method, uri, body)
+	if err != nil || !ok {
+		return authz.HeaderName, "", ok, err
+	}
+	return authz.HeaderName, authz.Header, true, nil
+}
+
+func (s *DigestAuthSession) AuthorizeChallengeWithResult(resp SIPResponse, method, uri string, body []byte) (DigestChallengeAuthorization, bool, error) {
 	if s == nil || !isSIPDigestChallengeStatus(resp.StatusCode) {
-		return "", "", false, nil
+		return DigestChallengeAuthorization{}, false, nil
 	}
 	challengeHeader, authHeaderName := digestChallengeHeaders(resp.StatusCode)
 	ch, err := SelectDigestChallenge(resp.Headers, challengeHeader)
 	if err != nil {
-		return authHeaderName, "", false, err
+		return DigestChallengeAuthorization{HeaderName: authHeaderName}, false, err
 	}
 	if s.challengeInput != nil {
 		return s.authorizeChallengeWithInput(ch, authHeaderName, method, uri, body)
@@ -110,7 +128,7 @@ func (s *DigestAuthSession) AuthorizeChallenge(resp SIPResponse, method, uri str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.state.Usable() {
-		return authHeaderName, "", false, ErrInvalidChallenge
+		return DigestChallengeAuthorization{HeaderName: authHeaderName}, false, ErrInvalidChallenge
 	}
 	next := s.state.clone()
 	next.challenge = ch
@@ -120,18 +138,18 @@ func (s *DigestAuthSession) AuthorizeChallenge(resp SIPResponse, method, uri str
 	next.lastHeader = ""
 	authz, next, err := next.BuildWithBody(method, uri, body)
 	if err != nil {
-		return authHeaderName, "", false, err
+		return DigestChallengeAuthorization{HeaderName: authHeaderName}, false, err
 	}
 	s.headerName = authHeaderName
 	s.header = authz
 	s.state = next
-	return authHeaderName, authz, true, nil
+	return DigestChallengeAuthorization{HeaderName: authHeaderName, Header: authz}, true, nil
 }
 
-func (s *DigestAuthSession) authorizeChallengeWithInput(ch DigestChallenge, authHeaderName, method, uri string, body []byte) (headerName, header string, ok bool, err error) {
+func (s *DigestAuthSession) authorizeChallengeWithInput(ch DigestChallenge, authHeaderName, method, uri string, body []byte) (DigestChallengeAuthorization, bool, error) {
 	input, err := s.challengeInput(ch, uri)
 	if err != nil {
-		return authHeaderName, "", false, err
+		return DigestChallengeAuthorization{HeaderName: authHeaderName}, false, err
 	}
 	input.Method = strings.ToUpper(strings.TrimSpace(method))
 	input.URI = strings.TrimSpace(uri)
@@ -139,7 +157,12 @@ func (s *DigestAuthSession) authorizeChallengeWithInput(ch DigestChallenge, auth
 	input.Body = append([]byte(nil), body...)
 	authz, err := BuildDigestAuthorization(ch, input)
 	if err != nil {
-		return authHeaderName, "", false, err
+		return DigestChallengeAuthorization{HeaderName: authHeaderName}, false, err
+	}
+	result := DigestChallengeAuthorization{
+		HeaderName:  authHeaderName,
+		Header:      authz,
+		SyncFailure: len(input.AUTS) > 0,
 	}
 
 	s.mu.Lock()
@@ -149,7 +172,7 @@ func (s *DigestAuthSession) authorizeChallengeWithInput(ch DigestChallenge, auth
 	if len(input.AUTS) == 0 {
 		s.state = newDigestAuthState(authHeaderName, ch, input, authz)
 	}
-	return authHeaderName, authz, true, nil
+	return result, true, nil
 }
 
 func ApplyDigestAuthenticationInfo(msg SIPRequestMessage, resp SIPResponse) error {
@@ -160,12 +183,17 @@ func ApplyDigestAuthenticationInfo(msg SIPRequestMessage, resp SIPResponse) erro
 }
 
 func DigestChallengeRetryRequest(msg SIPRequestMessage, resp SIPResponse) (SIPRequestMessage, bool, error) {
+	retry, _, ok, err := DigestChallengeRetryRequestWithResult(msg, resp)
+	return retry, ok, err
+}
+
+func DigestChallengeRetryRequestWithResult(msg SIPRequestMessage, resp SIPResponse) (SIPRequestMessage, DigestChallengeRetryResult, bool, error) {
 	if msg.AuthSession == nil || !isSIPDigestChallengeStatus(resp.StatusCode) || !methodAllowsDigestChallengeRetry(msg.Method) {
-		return SIPRequestMessage{}, false, nil
+		return SIPRequestMessage{}, DigestChallengeRetryResult{}, false, nil
 	}
-	headerName, header, ok, err := msg.AuthSession.AuthorizeChallenge(resp, msg.Method, msg.URI, msg.Body)
+	authz, ok, err := msg.AuthSession.AuthorizeChallengeWithResult(resp, msg.Method, msg.URI, msg.Body)
 	if err != nil || !ok {
-		return SIPRequestMessage{}, false, err
+		return SIPRequestMessage{}, DigestChallengeRetryResult{Authorization: authz}, false, err
 	}
 	retry := cloneSIPRequestMessage(msg)
 	if retry.Headers == nil {
@@ -173,8 +201,8 @@ func DigestChallengeRetryRequest(msg SIPRequestMessage, resp SIPResponse) (SIPRe
 	}
 	delete(retry.Headers, "Authorization")
 	delete(retry.Headers, "Proxy-Authorization")
-	retry.Headers[headerName] = header
-	return retry, true, nil
+	retry.Headers[authz.HeaderName] = authz.Header
+	return retry, DigestChallengeRetryResult{Authorization: authz}, true, nil
 }
 
 func RoundTripRequestWithDigestAuth(ctx context.Context, transport SIPRequestTransport, msg SIPRequestMessage) (SIPResponse, error) {
@@ -185,16 +213,24 @@ func RoundTripRequestWithDigestAuth(ctx context.Context, transport SIPRequestTra
 	if err != nil {
 		return resp, err
 	}
-	if retry, ok, err := DigestChallengeRetryRequest(msg, resp); err != nil {
-		return resp, err
-	} else if ok {
-		resp, err = transport.RoundTripRequest(ctx, retry)
+	current := msg
+	allowChallengeRetry := true
+	for retries := 0; retries < 2 && allowChallengeRetry; retries++ {
+		retry, result, ok, err := DigestChallengeRetryRequestWithResult(current, resp)
 		if err != nil {
 			return resp, err
 		}
-		return resp, ApplyDigestAuthenticationInfo(retry, resp)
+		if !ok {
+			break
+		}
+		current = retry
+		resp, err = transport.RoundTripRequest(ctx, current)
+		if err != nil {
+			return resp, err
+		}
+		allowChallengeRetry = result.Authorization.SyncFailure
 	}
-	return resp, ApplyDigestAuthenticationInfo(msg, resp)
+	return resp, ApplyDigestAuthenticationInfo(current, resp)
 }
 
 func isSIPDigestChallengeStatus(code int) bool {

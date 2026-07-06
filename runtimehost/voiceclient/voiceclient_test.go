@@ -1700,6 +1700,86 @@ func TestRoundTripRequestWithDigestAuthRecomputesAKAChallenge(t *testing.T) {
 	}
 }
 
+func TestRoundTripRequestWithDigestAuthHandlesAKASyncFailureChallenge(t *testing.T) {
+	staleNonce := append(bytesFrom(0x20, 16), bytesFrom(0x50, 16)...)
+	freshNonce := append(bytesFrom(0x70, 16), bytesFrom(0x90, 16)...)
+	staleChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(staleNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	freshChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(freshNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	auts := bytesFrom(0xC0, 14)
+	calls := 0
+	session := NewDigestAuthSessionWithChallengeInput("Authorization", "Digest old", DigestAuthState{}, func(ch DigestChallenge, uri string) (DigestAuthInput, error) {
+		calls++
+		input := DigestAuthInput{
+			Username: "impi@example",
+			CNonce:   "cnonce",
+		}
+		switch calls {
+		case 1:
+			input.AUTS = append([]byte(nil), auts...)
+		case 2:
+			input.Password = string([]byte{0x11, 0x22, 0x33, 0x44})
+		default:
+			t.Fatalf("unexpected digest challenge call %d for %+v uri=%q", calls, ch, uri)
+		}
+		return input, nil
+	})
+	msg := SIPRequestMessage{
+		Method:      "MESSAGE",
+		URI:         "sip:+18005551212@ims.example",
+		Headers:     map[string]string{"Authorization": "Digest old"},
+		Body:        []byte("hello"),
+		AuthSession: session,
+	}
+	transport := &fakeSIPRequestRoundTripTransport{responses: []SIPResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers:    map[string][]string{"WWW-Authenticate": {staleChallenge}},
+		},
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers:    map[string][]string{"WWW-Authenticate": {freshChallenge}},
+		},
+		{StatusCode: 202, Reason: "Accepted"},
+	}}
+	resp, err := RoundTripRequestWithDigestAuth(context.Background(), transport, msg)
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequestWithDigestAuth() resp=%+v err=%v", resp, err)
+	}
+	if calls != 2 || len(transport.requests) != 3 {
+		t.Fatalf("calls=%d requests=%+v", calls, transport.requests)
+	}
+	syncAuth := transport.requests[1].Headers["Authorization"]
+	if !strings.Contains(syncAuth, `nonce="`+base64.StdEncoding.EncodeToString(staleNonce)+`"`) ||
+		!strings.Contains(syncAuth, `auts="`+base64.StdEncoding.EncodeToString(auts)+`"`) {
+		t.Fatalf("sync retry Authorization=%s", syncAuth)
+	}
+	finalAuth := transport.requests[2].Headers["Authorization"]
+	if strings.Contains(finalAuth, `auts=`) {
+		t.Fatalf("final retry kept AUTS: %s", finalAuth)
+	}
+	ch, err := ParseWWWAuthenticate(freshChallenge)
+	if err != nil {
+		t.Fatalf("ParseWWWAuthenticate() error = %v", err)
+	}
+	want, err := BuildDigestAuthorization(ch, DigestAuthInput{
+		Method:   "MESSAGE",
+		URI:      msg.URI,
+		Username: "impi@example",
+		Password: string([]byte{0x11, 0x22, 0x33, 0x44}),
+		CNonce:   "cnonce",
+		NC:       1,
+		Body:     msg.Body,
+	})
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization() error = %v", err)
+	}
+	if finalAuth != want {
+		t.Fatalf("final retry Authorization=%s, want %s", finalAuth, want)
+	}
+}
+
 func TestDigestChallengeRetryRequestSkipsInvite(t *testing.T) {
 	retry, ok, err := DigestChallengeRetryRequest(SIPRequestMessage{
 		Method:      "INVITE",
