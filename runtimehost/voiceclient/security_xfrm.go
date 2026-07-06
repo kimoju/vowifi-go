@@ -236,12 +236,12 @@ func normalizeIMSSecurityAssociationXFRMRequest(req IMSSecurityAssociationInstal
 	if err != nil {
 		return imsSecurityXFRMParams{}, err
 	}
-	encAlgorithm, encKey, err := imssSecurityXFRMEncryption(firstNonEmpty(plan.EncryptionAlgorithm, req.Agreement.EncryptionAlgorithm, DefaultSecurityEAlg))
-	if err != nil {
-		return imsSecurityXFRMParams{}, err
-	}
 	if len(req.AKA.IK) != 16 {
 		return imsSecurityXFRMParams{}, fmt.Errorf("%w: IK length %d", ErrInvalidIMSSecurityXFRMPlan, len(req.AKA.IK))
+	}
+	encAlgorithm, encKey, err := imssSecurityXFRMEncryption(firstNonEmpty(plan.EncryptionAlgorithm, req.Agreement.EncryptionAlgorithm, DefaultSecurityEAlg), req.AKA.CK)
+	if err != nil {
+		return imsSecurityXFRMParams{}, err
 	}
 	localAddress, err := imssSecurityXFRMAddress(req.LocalEndpoint, "local")
 	if err != nil {
@@ -362,10 +362,15 @@ func imssSecurityXFRMAuthAlgorithm(algorithm string) (name, truncBits string, er
 	}
 }
 
-func imssSecurityXFRMEncryption(algorithm string) (name, key string, err error) {
+func imssSecurityXFRMEncryption(algorithm string, ck []byte) (name, key string, err error) {
 	switch strings.ToLower(strings.TrimSpace(algorithm)) {
 	case DefaultSecurityEAlg:
 		return "ecb(cipher_null)", "0x", nil
+	case SecurityEncryptionAlgorithmAES:
+		if len(ck) != 16 {
+			return "", "", fmt.Errorf("%w: CK length %d for %s", ErrInvalidIMSSecurityXFRMPlan, len(ck), SecurityEncryptionAlgorithmAES)
+		}
+		return "cbc(aes)", imssSecurityXFRMHexKey(ck), nil
 	default:
 		return "", "", fmt.Errorf("%w: unsupported encryption algorithm %q", ErrInvalidIMSSecurityXFRMPlan, algorithm)
 	}

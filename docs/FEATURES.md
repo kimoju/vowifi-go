@@ -71,7 +71,7 @@ protocol layers needed by VoHive:
   `Security-Server` parsing/selection against the offered client algorithms,
   direction-aware IMS IPsec SA plan extraction, Security-Verify
   echoing, Linux XFRM install planning for SHA1/MD5 96-bit HMAC IMS ESP
-  transport SAs, folded/compact SIP header parsing, strict
+  transport SAs with null or AES-CBC ESP encryption, folded/compact SIP header parsing, strict
   Content-Length body and duplicate-length validation, SIP response status-code
   range validation, deterministic wire ordering for REFER/supplementary-service
   headers, wire-level UDP/TCP REGISTER transport, and IMS registration binding

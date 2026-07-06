@@ -11,12 +11,13 @@ import (
 )
 
 const (
-	DefaultSecurityProtocol    = "ipsec-3gpp"
-	DefaultSecurityAlgorithm   = "hmac-sha-1-96"
-	SecurityAlgorithmHMACMD596 = "hmac-md5-96"
-	DefaultSecurityEAlg        = "null"
-	DefaultSecurityPortC       = 5062
-	DefaultSecurityPortS       = 5063
+	DefaultSecurityProtocol        = "ipsec-3gpp"
+	DefaultSecurityAlgorithm       = "hmac-sha-1-96"
+	SecurityAlgorithmHMACMD596     = "hmac-md5-96"
+	DefaultSecurityEAlg            = "null"
+	SecurityEncryptionAlgorithmAES = "aes-cbc"
+	DefaultSecurityPortC           = 5062
+	DefaultSecurityPortS           = 5063
 )
 
 type SecurityAgreement struct {

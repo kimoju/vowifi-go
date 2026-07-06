@@ -142,6 +142,23 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanSupportsHMACMD5(t *testing.T)
 	}
 }
 
+func TestBuildIMSSecurityAssociationXFRMInstallPlanSupportsAESCBC(t *testing.T) {
+	req := validSecurityXFRMInstallRequest()
+	req.Plan.EncryptionAlgorithm = SecurityEncryptionAlgorithmAES
+	req.Agreement.EncryptionAlgorithm = SecurityEncryptionAlgorithmAES
+	installPlan, err := BuildIMSSecurityAssociationXFRMInstallPlan(req)
+	if err != nil {
+		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
+	}
+	ck := securityXFRMHexKey(req.AKA.CK)
+	wantEnc := []string{"enc", "cbc(aes)", ck}
+	for i := 0; i < 2; i++ {
+		if got := installPlan.Commands[i].Args[19:22]; !reflect.DeepEqual(got, wantEnc) {
+			t.Fatalf("state command %d enc args=%v, want %v", i, got, wantEnc)
+		}
+	}
+}
+
 func TestBuildIMSSecurityAssociationXFRMInstallPlanRejectsInvalidInput(t *testing.T) {
 	cases := []struct {
 		name string
@@ -167,8 +184,12 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanRejectsInvalidInput(t *testin
 		{name: "unsupported auth", edit: func(req *IMSSecurityAssociationInstallRequest) {
 			req.Plan.Algorithm = "hmac-sha-256-128"
 		}},
+		{name: "missing CK for aes cbc", edit: func(req *IMSSecurityAssociationInstallRequest) {
+			req.Plan.EncryptionAlgorithm = SecurityEncryptionAlgorithmAES
+			req.AKA.CK = nil
+		}},
 		{name: "unsupported encryption", edit: func(req *IMSSecurityAssociationInstallRequest) {
-			req.Plan.EncryptionAlgorithm = "aes-cbc"
+			req.Plan.EncryptionAlgorithm = "des-ede3-cbc"
 		}},
 		{name: "unsupported mode", edit: func(req *IMSSecurityAssociationInstallRequest) {
 			req.Plan.Mode = "tunnel"
