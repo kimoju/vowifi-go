@@ -83,7 +83,8 @@ protocol layers needed by VoHive:
   `Expires: 0`, Contact `expires=0`, Security-Verify, and Digest/AKA retry on
   401/407 challenges
 - SMS segmentation, IMS SIP `MESSAGE` transport hooks, inbound SMS, delivery
-  report matching, and USSD session transport hooks, including recoverable IMS
+  report matching, and USSD session transport hooks, including 3xx Contact
+  redirect retries, USSD dialog target refresh, and recoverable IMS
   registration/route failure signals for MESSAGE, USSD INVITE/INFO, and USSD
   BYE failures
 - outbound voice dialog bridging helpers, SDP parsing/building, IMS INVITE/ACK/

@@ -92,6 +92,131 @@ func TestIMSUSSDTransportExecuteAndContinue(t *testing.T) {
 	}
 }
 
+func TestIMSUSSDTransportFollowsInviteRedirectContact(t *testing.T) {
+	replyXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "Balance: 10", Operation: IMSUSSDOperationNotify})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML() error = %v", err)
+	}
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers: map[string][]string{
+				"To":      {"<sip:*100%23@ims.example;user=dialstring>;tag=redirect-tag"},
+				"Contact": {"<sip:ussd-redirect@ims.example>"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":           {"<sip:*100%23@ims.example;user=dialstring>;tag=final-tag"},
+				"Contact":      {"<sip:ussd-dialog@ims.example>"},
+				"Content-Type": {IMSUSSDContentType},
+			},
+			Body: replyXML,
+		},
+	}}
+	ussd := &IMSUSSDTransport{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example", LocalIP: "192.0.2.10"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+
+	result, err := ussd.ExecuteUSSD(context.Background(), USSDRequest{SessionID: "session-invite-redirect", Command: "*100#"})
+	if err != nil || !result.Done || result.Text != "Balance: 10" || result.Status != 200 {
+		t.Fatalf("ExecuteUSSD() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	first := transport.requests[0]
+	redirect := transport.requests[1]
+	if first.Method != "INVITE" || first.URI != "sip:*100%23@ims.example;user=dialstring" || first.Headers["CSeq"] != "1 INVITE" {
+		t.Fatalf("first INVITE=%+v", first)
+	}
+	if redirect.Method != "INVITE" || redirect.URI != "sip:ussd-redirect@ims.example" || redirect.Headers["CSeq"] != "2 INVITE" {
+		t.Fatalf("redirect INVITE=%+v", redirect)
+	}
+	if len(transport.writes) != 2 || transport.writes[0].Method != "ACK" || transport.writes[1].Method != "ACK" {
+		t.Fatalf("ACK writes=%+v", transport.writes)
+	}
+	if transport.writes[0].Headers["CSeq"] != "1 ACK" || !strings.Contains(transport.writes[0].Headers["To"], "redirect-tag") {
+		t.Fatalf("redirect ACK=%+v", transport.writes[0])
+	}
+	if transport.writes[1].Headers["CSeq"] != "2 ACK" || transport.writes[1].URI != "sip:ussd-dialog@ims.example" {
+		t.Fatalf("final ACK=%+v", transport.writes[1])
+	}
+}
+
+func TestIMSUSSDTransportFollowsInfoRedirectContact(t *testing.T) {
+	menuXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "1. Balance", Operation: IMSUSSDOperationRequest})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML() error = %v", err)
+	}
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:*100%23@ims.example;user=dialstring>;tag=as-tag"},
+				"Contact": {"<sip:ussd-as@ims.example>"},
+			},
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers:    map[string][]string{"Contact": {"<sip:ussd-info-redirect@ims.example>"}},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact":      {"<sip:ussd-info-final@ims.example>"},
+				"Content-Type": {IMSUSSDContentType},
+			},
+			Body: menuXML,
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	ussd := &IMSUSSDTransport{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example", LocalIP: "192.0.2.10"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := ussd.ExecuteUSSD(context.Background(), USSDRequest{SessionID: "session-info-redirect", Command: "*100#"}); err != nil {
+		t.Fatalf("ExecuteUSSD() error = %v", err)
+	}
+	result, err := ussd.ContinueUSSD(context.Background(), USSDRequest{SessionID: "session-info-redirect", Input: "1"})
+	if err != nil || result.Done || result.Text != "1. Balance" {
+		t.Fatalf("ContinueUSSD() result=%+v err=%v", result, err)
+	}
+	if err := ussd.CancelUSSD(context.Background(), USSDRequest{SessionID: "session-info-redirect"}); err != nil {
+		t.Fatalf("CancelUSSD() error = %v", err)
+	}
+	if len(transport.requests) != 4 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	info := transport.requests[1]
+	redirect := transport.requests[2]
+	bye := transport.requests[3]
+	if info.Method != "INFO" || info.URI != "sip:ussd-as@ims.example" || info.Headers["CSeq"] != "2 INFO" {
+		t.Fatalf("INFO=%+v", info)
+	}
+	if redirect.Method != "INFO" || redirect.URI != "sip:ussd-info-redirect@ims.example" || redirect.Headers["CSeq"] != "3 INFO" {
+		t.Fatalf("redirect INFO=%+v", redirect)
+	}
+	if bye.Method != "BYE" || bye.URI != "sip:ussd-info-final@ims.example" || bye.Headers["CSeq"] != "4 BYE" {
+		t.Fatalf("BYE after INFO redirect=%+v", bye)
+	}
+}
+
 func TestIMSUSSDTransportCancelSendsBye(t *testing.T) {
 	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{
 		{

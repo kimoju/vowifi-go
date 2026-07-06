@@ -60,6 +60,56 @@ func TestIMSSMSTransportSendsSIPMessage(t *testing.T) {
 	}
 }
 
+func TestIMSSMSTransportFollowsRedirectContact(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers:    map[string][]string{"Contact": {"<sip:sms-as@ims.example>"}},
+		},
+		{StatusCode: 202, Reason: "Accepted"},
+	}}
+	sms := IMSSMSTransport{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+
+	result, err := sms.SendSMSPart(context.Background(), SMSSendRequest{
+		Peer:      "+18005551212",
+		MessageID: "sms-redirect",
+		Part:      SMSPart{PartNo: 1, TotalParts: 1, Text: "hello"},
+	})
+	if err != nil || result.State != "accepted" || result.SIPCode != 202 {
+		t.Fatalf("SendSMSPart() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	first := transport.requests[0]
+	redirect := transport.requests[1]
+	if first.URI != "sip:+18005551212@ims.example" || first.Headers["CSeq"] != "1 MESSAGE" {
+		t.Fatalf("first MESSAGE=%+v", first)
+	}
+	if redirect.URI != "sip:sms-as@ims.example" || redirect.Headers["CSeq"] != "2 MESSAGE" {
+		t.Fatalf("redirect MESSAGE=%+v", redirect)
+	}
+	firstMR, firstTPDU, err := ParseSMSRPData(first.Body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPData(first) error = %v", err)
+	}
+	redirectMR, redirectTPDU, err := ParseSMSRPData(redirect.Body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPData(redirect) error = %v", err)
+	}
+	if firstMR != 1 || redirectMR != 1 || string(firstTPDU) != string(redirectTPDU) {
+		t.Fatalf("RP-DATA changed firstMR=%d redirectMR=%d first=%x redirect=%x", firstMR, redirectMR, firstTPDU, redirectTPDU)
+	}
+}
+
 func TestIMSSMSTransportAllowsTextPlainPayload(t *testing.T) {
 	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 200, Reason: "OK"}}}
 	sms := IMSSMSTransport{

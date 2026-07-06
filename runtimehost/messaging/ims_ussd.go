@@ -60,22 +60,32 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 	}
 	boundary := "vowifi-ussd-" + smsToken(sessionID)
 	body := buildIMSUSSDMultipartBody(firstNonEmpty(t.Profile.LocalIP, "0.0.0.0"), boundary, xmlBody)
-	invite, err := voiceclient.BuildInviteRequest(cfg, body)
-	if err != nil {
-		return USSDResult{SessionID: sessionID, Done: true}, err
+	var resp voiceclient.SIPResponse
+	redirectRetries := 0
+	for {
+		invite, err := voiceclient.BuildInviteRequest(cfg, body)
+		if err != nil {
+			return USSDResult{SessionID: sessionID, Done: true}, err
+		}
+		prepareUSSDInvite(&invite, boundary)
+		resp, err = voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, invite)
+		if err != nil {
+			return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
+		}
+		if redirectRetries < maxIMSMessagingRedirects {
+			if retryCfg, ok := retryMessagingDialogConfigForRedirect(cfg, resp, nextMessagingCSeq(cfg.CSeq)); ok {
+				ackCfg := ussdDialogConfigFromResponse(cfg, resp)
+				if err := t.writeUSSDACK(ctx, ackCfg); err != nil {
+					return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
+				}
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
-	prepareUSSDInvite(&invite, boundary)
-	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, invite)
-	if err != nil {
-		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
-	}
-	cfg.RemoteTag = sipHeaderTagValue(firstHeaderValue(resp.Headers, "To"))
-	if contact := sipHeaderURIValue(firstHeaderValue(resp.Headers, "Contact")); contact != "" {
-		cfg.RemoteTargetURI = contact
-	}
-	if routeSet := ussdRecordRouteSet(resp.Headers); len(routeSet) > 0 {
-		cfg.RouteSet = routeSet
-	}
+	cfg = ussdDialogConfigFromResponse(cfg, resp)
 	if resp.StatusCode >= 200 {
 		if err := t.writeUSSDACK(ctx, cfg); err != nil {
 			return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
@@ -92,7 +102,7 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 		return result, fmt.Errorf("IMS USSD INVITE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
 	if !result.Done {
-		t.storeSession(sessionID, imsUSSDSession{cfg: cfg, cseq: 1})
+		t.storeSession(sessionID, imsUSSDSession{cfg: cfg, cseq: cfg.CSeq})
 	} else {
 		t.clearSession(sessionID)
 	}
@@ -128,15 +138,36 @@ func (t *IMSUSSDTransport) ContinueUSSD(ctx context.Context, req USSDRequest) (U
 	if err != nil {
 		return USSDResult{SessionID: sessionID, Done: true}, err
 	}
-	info, err := voiceclient.BuildInfoRequest(state.cfg, IMSUSSDContentType, xmlBody)
-	if err != nil {
-		return USSDResult{SessionID: sessionID, Done: true}, err
+	cfg := state.cfg
+	var resp voiceclient.SIPResponse
+	redirectRetries := 0
+	for {
+		info, err := voiceclient.BuildInfoRequest(cfg, IMSUSSDContentType, xmlBody)
+		if err != nil {
+			return USSDResult{SessionID: sessionID, Done: true}, err
+		}
+		prepareUSSDInfo(&info)
+		resp, err = voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, info)
+		if err != nil {
+			return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
+		}
+		if redirectRetries < maxIMSMessagingRedirects {
+			if retryCfg, ok := retryMessagingDialogConfigForRedirect(cfg, resp, nextMessagingCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				state.cfg = cfg
+				state.cseq = cfg.CSeq
+				t.storeSession(sessionID, state)
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
-	prepareUSSDInfo(&info)
-	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, info)
-	if err != nil {
-		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
+	if contact := sipHeaderURIValue(firstHeaderValue(resp.Headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
 	}
+	state.cfg = cfg
+	state.cseq = cfg.CSeq
 	result, parseErr := ussdResultFromSIPResponse(sessionID, resp, false)
 	result.RegistrationRecoveryNeeded = IMSRegistrationRecoveryNeededStatus(resp.StatusCode)
 	if parseErr != nil {
@@ -273,6 +304,19 @@ func (t *IMSUSSDTransport) writeUSSDACK(ctx context.Context, cfg voiceclient.Dia
 		return err
 	}
 	return t.Transport.WriteRequest(ctx, ack)
+}
+
+func ussdDialogConfigFromResponse(cfg voiceclient.DialogRequestConfig, resp voiceclient.SIPResponse) voiceclient.DialogRequestConfig {
+	if remoteTag := sipHeaderTagValue(firstHeaderValue(resp.Headers, "To")); remoteTag != "" {
+		cfg.RemoteTag = remoteTag
+	}
+	if contact := sipHeaderURIValue(firstHeaderValue(resp.Headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
+	}
+	if routeSet := ussdRecordRouteSet(resp.Headers); len(routeSet) > 0 {
+		cfg.RouteSet = routeSet
+	}
+	return cfg
 }
 
 func (t *IMSUSSDTransport) session(sessionID string) (imsUSSDSession, bool) {

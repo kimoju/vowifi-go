@@ -49,7 +49,7 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 	if err != nil {
 		return SMSSendResult{CallID: callID, RPMR: cseq, State: "failed", ErrorText: err.Error()}, err
 	}
-	msg, err := voiceclient.BuildMessageRequest(voiceclient.DialogRequestConfig{
+	cfg := voiceclient.DialogRequestConfig{
 		Profile:         t.Profile,
 		Registration:    t.Registration,
 		LocalURI:        localURI,
@@ -60,18 +60,32 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		LocalTag:        "sms",
 		CSeq:            cseq,
 		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
-	}, contentType, body)
-	if err != nil {
-		return SMSSendResult{State: "failed", ErrorText: err.Error()}, err
 	}
-	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, msg)
+	var resp voiceclient.SIPResponse
+	redirectRetries := 0
+	for {
+		msg, err := voiceclient.BuildMessageRequest(cfg, contentType, body)
+		if err != nil {
+			return SMSSendResult{State: "failed", ErrorText: err.Error()}, err
+		}
+		resp, err = voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, msg)
+		if err != nil {
+			result := SMSSendResult{CallID: callID, RPMR: cseq, SIPCode: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}
+			result.State = "failed"
+			result.ErrorText = err.Error()
+			result.RegistrationRecoveryNeeded = true
+			return result, err
+		}
+		if redirectRetries < maxIMSMessagingRedirects {
+			if retryCfg, ok := retryMessagingDialogConfigForRedirect(cfg, resp, nextMessagingCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
+	}
 	result := SMSSendResult{CallID: callID, RPMR: cseq, SIPCode: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}
-	if err != nil {
-		result.State = "failed"
-		result.ErrorText = err.Error()
-		result.RegistrationRecoveryNeeded = true
-		return result, err
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		result.State = "failed"
 		result.ErrorText = strings.TrimSpace(firstNonEmpty(resp.Reason, fmt.Sprintf("IMS MESSAGE rejected: %d", resp.StatusCode)))
