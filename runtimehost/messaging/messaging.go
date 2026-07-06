@@ -161,6 +161,9 @@ func RPCauseText(code int) string {
 	if code == 0 {
 		return ""
 	}
+	if text := smsRPCauseText(code); text != "" {
+		return text
+	}
 	return fmt.Sprintf("RP cause %d", code)
 }
 

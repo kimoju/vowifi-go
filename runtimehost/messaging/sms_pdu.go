@@ -207,6 +207,59 @@ func BuildSMSRPError(rpMR byte, cause byte) []byte {
 	return []byte{0x04, rpMR, 0x01, cause, 0x00}
 }
 
+func smsRPCauseText(code int) string {
+	switch code {
+	case 1:
+		return "RP cause 1: unassigned number"
+	case 8:
+		return "RP cause 8: operator determined barring"
+	case 10:
+		return "RP cause 10: call barred"
+	case 21:
+		return "RP cause 21: short message transfer rejected"
+	case 22:
+		return "RP cause 22: memory capacity exceeded"
+	case 27:
+		return "RP cause 27: destination out of order"
+	case 28:
+		return "RP cause 28: unidentified subscriber"
+	case 29:
+		return "RP cause 29: facility rejected"
+	case 30:
+		return "RP cause 30: unknown subscriber"
+	case 38:
+		return "RP cause 38: network out of order"
+	case 41:
+		return "RP cause 41: temporary failure"
+	case 42:
+		return "RP cause 42: congestion"
+	case 47:
+		return "RP cause 47: resources unavailable"
+	case 50:
+		return "RP cause 50: requested facility not subscribed"
+	case 69:
+		return "RP cause 69: requested facility not implemented"
+	case 81:
+		return "RP cause 81: invalid short message transfer reference"
+	case 95:
+		return "RP cause 95: semantically incorrect message"
+	case 96:
+		return "RP cause 96: invalid mandatory information"
+	case 97:
+		return "RP cause 97: message type not implemented"
+	case 98:
+		return "RP cause 98: message not compatible with SMS protocol state"
+	case 99:
+		return "RP cause 99: information element not implemented"
+	case 111:
+		return "RP cause 111: protocol error"
+	case 127:
+		return "RP cause 127: interworking unspecified"
+	default:
+		return ""
+	}
+}
+
 func ParseSMSDeliverTPDU(tpdu []byte) (SMSDeliver, error) {
 	raw := append([]byte(nil), tpdu...)
 	if len(tpdu) < 12 {
@@ -816,4 +869,59 @@ func smsStatusReportState(status byte) string {
 		return "failed"
 	}
 	return "accepted"
+}
+
+func SMSStatusReportText(status byte) string {
+	switch status {
+	case 0x00:
+		return "SMS status 0x00: short message received by SME"
+	case 0x01:
+		return "SMS status 0x01: short message forwarded by service center but delivery not confirmed"
+	case 0x02:
+		return "SMS status 0x02: short message replaced by service center"
+	case 0x20:
+		return "SMS status 0x20: congestion, service center still retrying"
+	case 0x21:
+		return "SMS status 0x21: SME busy, service center still retrying"
+	case 0x22:
+		return "SMS status 0x22: no response from SME, service center still retrying"
+	case 0x23:
+		return "SMS status 0x23: service rejected, service center still retrying"
+	case 0x24:
+		return "SMS status 0x24: quality of service unavailable, service center still retrying"
+	case 0x25:
+		return "SMS status 0x25: error in SME, service center still retrying"
+	case 0x40:
+		return "SMS status 0x40: remote procedure error"
+	case 0x41:
+		return "SMS status 0x41: incompatible destination"
+	case 0x42:
+		return "SMS status 0x42: connection rejected by SME"
+	case 0x43:
+		return "SMS status 0x43: not obtainable"
+	case 0x44:
+		return "SMS status 0x44: quality of service not available"
+	case 0x45:
+		return "SMS status 0x45: no interworking available"
+	case 0x46:
+		return "SMS status 0x46: short message validity period expired"
+	case 0x47:
+		return "SMS status 0x47: short message deleted by originating SME"
+	case 0x48:
+		return "SMS status 0x48: short message deleted by service center administration"
+	case 0x49:
+		return "SMS status 0x49: short message does not exist"
+	}
+	switch {
+	case status <= 0x1f:
+		return "SMS status 0x" + strings.ToUpper(hexByte(status)) + ": completed"
+	case status <= 0x3f:
+		return "SMS status 0x" + strings.ToUpper(hexByte(status)) + ": temporary error, service center still retrying"
+	case status <= 0x5f:
+		return "SMS status 0x" + strings.ToUpper(hexByte(status)) + ": permanent error, service center stopped retrying"
+	case status <= 0x7f:
+		return "SMS status 0x" + strings.ToUpper(hexByte(status)) + ": temporary error, service center stopped retrying"
+	default:
+		return "SMS status 0x" + strings.ToUpper(hexByte(status)) + ": reserved"
+	}
 }

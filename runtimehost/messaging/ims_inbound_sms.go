@@ -312,7 +312,7 @@ func smsStatusReportError(report SMSStatusReport) string {
 	if report.State != "failed" {
 		return ""
 	}
-	return "SMS status report 0x" + strings.ToUpper(hexByte(report.Status))
+	return SMSStatusReportText(report.Status)
 }
 
 func hexByte(v byte) string {

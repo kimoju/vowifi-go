@@ -154,6 +154,29 @@ func TestParseSMSStatusReportTPDU(t *testing.T) {
 	if report.Reference != 7 || report.Recipient != "+18005551212" || report.Status != 0 || report.State != "delivered" {
 		t.Fatalf("report=%+v", report)
 	}
+	if text := SMSStatusReportText(report.Status); !strings.Contains(text, "received by SME") {
+		t.Fatalf("SMSStatusReportText(0x00)=%q", text)
+	}
+}
+
+func TestParseSMSStatusReportTPDUStatesAndText(t *testing.T) {
+	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000020")
+	report, err := ParseSMSStatusReportTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSStatusReportTPDU(pending) error = %v", err)
+	}
+	if report.Status != 0x20 || report.State != "accepted" || !strings.Contains(SMSStatusReportText(report.Status), "still retrying") {
+		t.Fatalf("pending report=%+v text=%q", report, SMSStatusReportText(report.Status))
+	}
+
+	tpdu[len(tpdu)-1] = 0x46
+	report, err = ParseSMSStatusReportTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSStatusReportTPDU(failed) error = %v", err)
+	}
+	if report.Status != 0x46 || report.State != "failed" || !strings.Contains(SMSStatusReportText(report.Status), "validity period expired") {
+		t.Fatalf("failed report=%+v text=%q", report, SMSStatusReportText(report.Status))
+	}
 }
 
 func mustHex(tb testing.TB, s string) []byte {

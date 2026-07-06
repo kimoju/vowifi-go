@@ -204,6 +204,22 @@ func TestHandleSMSDeliveryReportFailureCause(t *testing.T) {
 	}
 }
 
+func TestHandleSMSDeliveryReportUsesMappedRPCauseText(t *testing.T) {
+	store := &fakeDeliveryStore{match: DeliveryPartMatch{MessageID: "msg-1", PartNo: 1, State: "failed"}}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+
+	_, err := svc.HandleSMSDeliveryReport(context.Background(), SMSDeliveryReport{
+		CallID:  "call-1",
+		RPCause: int(SMSRPCauseTemporaryFailure),
+	})
+	if err != nil {
+		t.Fatalf("HandleSMSDeliveryReport() error = %v", err)
+	}
+	if store.reportErrText != "RP cause 41: temporary failure" {
+		t.Fatalf("reportErrText=%q", store.reportErrText)
+	}
+}
+
 func TestHandleIncomingSMSDispatchesEvent(t *testing.T) {
 	dispatch := &fakeDispatcher{}
 	svc := NewService("dev-1", "310280233641503", nil, dispatch)
@@ -367,6 +383,33 @@ func TestHandleIMSMessageMarksRPErrorDeliveryReport(t *testing.T) {
 	}
 	if store.reportCallID != "call-1" || store.reportRPMR != 7 || store.reportState != "failed" || store.reportRPCause != int(SMSRPCauseTemporaryFailure) {
 		t.Fatalf("store=%+v", store)
+	}
+	if store.reportErrText != "RP cause 41: temporary failure" {
+		t.Fatalf("reportErrText=%q", store.reportErrText)
+	}
+}
+
+func TestHandleIMSMessageMarksStatusReportFailureText(t *testing.T) {
+	store := &fakeDeliveryStore{match: DeliveryPartMatch{MessageID: "msg-1", PartNo: 1, State: "failed"}}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000046")
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		CallID:      "status-report-failed",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x44, tpdu),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.StatusCode != 200 || result.DeliveryReport == nil {
+		t.Fatalf("result=%+v", result)
+	}
+	if store.reportCallID != "status-report-failed" || store.reportRPMR != 7 || store.reportState != "failed" || store.reportRPCause != 0x46 {
+		t.Fatalf("store=%+v", store)
+	}
+	if !strings.Contains(store.reportErrText, "validity period expired") {
+		t.Fatalf("reportErrText=%q", store.reportErrText)
 	}
 }
 
