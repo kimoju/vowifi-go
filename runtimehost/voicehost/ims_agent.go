@@ -833,47 +833,70 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 		}
 		body = RewriteSDPMediaEndpoint(body, state.relay.IMSEndpoint())
 	}
-	update, err := voiceclient.BuildUpdateRequest(cfg, body)
-	if err != nil {
-		a.mu.Unlock()
-		return DialogUpdateResult{Accepted: false, StatusCode: 500, Reason: "build IMS UPDATE failed"}, err
-	}
-	if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
-		update.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
-	}
-	applyDialogUpdateHeaders(update.Headers, req.Headers)
-	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
-	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.roundTripRequest(ctx, update)
-	if err != nil {
-		return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE failed", RegistrationRecoveryNeeded: true}, err
-	}
-	if resp.StatusCode == 422 {
-		if retryCfg, ok := retryDialogConfigForMinSE(cfg, update.Headers, resp.Headers); ok {
-			retryUpdate, err := voiceclient.BuildUpdateRequest(retryCfg, body)
-			if err != nil {
-				return DialogUpdateResult{Accepted: false, StatusCode: 500, Reason: "build IMS UPDATE retry failed"}, err
-			}
-			if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
-				retryUpdate.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
-			}
-			applyDialogUpdateHeaders(retryUpdate.Headers, req.Headers)
-			applySessionIntervalHeaders(retryUpdate.Headers, retryCfg)
-			a.mu.Lock()
-			if latest, ok := a.dialogs[callID]; ok {
-				latest.cfg.CSeq = outboundNextCSeq(retryCfg.CSeq)
-				latest.cfg.SessionExpires = retryCfg.SessionExpires
-				latest.cfg.SessionRefresher = retryCfg.SessionRefresher
-				latest.cfg.MinSE = retryCfg.MinSE
-				a.dialogs[callID] = latest
-			}
-			a.mu.Unlock()
-			resp, err = a.roundTripRequest(ctx, retryUpdate)
-			if err != nil {
-				return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE retry failed", RegistrationRecoveryNeeded: true}, err
+
+	buildUpdate := func(sendCfg voiceclient.DialogRequestConfig, forceSessionHeaders bool) (voiceclient.SIPRequestMessage, error) {
+		update, err := voiceclient.BuildUpdateRequest(sendCfg, body)
+		if err != nil {
+			return voiceclient.SIPRequestMessage{}, err
+		}
+		if len(body) > 0 && strings.TrimSpace(req.ContentType) != "" {
+			update.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
+		}
+		applyDialogUpdateHeaders(update.Headers, req.Headers)
+		if forceSessionHeaders {
+			applySessionIntervalHeaders(update.Headers, sendCfg)
+			if sendCfg.MinSE > 0 {
+				update.Headers["Min-SE"] = strconv.Itoa(sendCfg.MinSE)
 			}
 		}
+		return update, nil
+	}
+	storeAttempt := func(sendCfg voiceclient.DialogRequestConfig) {
+		a.mu.Lock()
+		if latest, ok := a.dialogs[callID]; ok {
+			latest.cfg.CSeq = outboundNextCSeq(sendCfg.CSeq)
+			latest.cfg.RemoteTargetURI = sendCfg.RemoteTargetURI
+			latest.cfg.SessionExpires = sendCfg.SessionExpires
+			latest.cfg.SessionRefresher = sendCfg.SessionRefresher
+			latest.cfg.MinSE = sendCfg.MinSE
+			a.dialogs[callID] = latest
+		}
+		a.mu.Unlock()
+	}
+
+	var update voiceclient.SIPRequestMessage
+	var resp voiceclient.SIPResponse
+	var err error
+	retriedSessionInterval := false
+	forceSessionHeaders := false
+	redirectRetries := 0
+	for {
+		update, err = buildUpdate(cfg, forceSessionHeaders)
+		if err != nil {
+			return DialogUpdateResult{Accepted: false, StatusCode: 500, Reason: "build IMS UPDATE failed"}, err
+		}
+		storeAttempt(cfg)
+		resp, err = a.roundTripRequest(ctx, update)
+		if err != nil {
+			return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE failed", RegistrationRecoveryNeeded: true}, err
+		}
+		if resp.StatusCode == 422 && !retriedSessionInterval {
+			if retryCfg, ok := retryDialogConfigForMinSE(cfg, update.Headers, resp.Headers); ok {
+				cfg = retryCfg
+				retriedSessionInterval = true
+				forceSessionHeaders = true
+				continue
+			}
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
+				continue
+			}
+		}
+		break
 	}
 	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
 	resultBody := append([]byte(nil), resp.Body...)

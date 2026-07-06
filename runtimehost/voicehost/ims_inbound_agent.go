@@ -587,6 +587,7 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 	var resp voiceclient.SIPResponse
 	var err error
 	retriedSessionInterval := false
+	redirectRetries := 0
 	for {
 		update, err = voiceclient.BuildUpdateRequest(cfg, body)
 		if err != nil {
@@ -602,6 +603,13 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 			if retryCfg, ok := retryDialogConfigForMinSE(cfg, update.Headers, resp.Headers); ok {
 				cfg = retryCfg
 				retriedSessionInterval = true
+				continue
+			}
+		}
+		if redirectRetries < maxIMSInviteRedirects {
+			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextInboundClientCSeq(cfg.CSeq)); ok {
+				cfg = retryCfg
+				redirectRetries++
 				continue
 			}
 		}

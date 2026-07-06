@@ -1281,6 +1281,89 @@ func TestIMSInboundAgentRetriesUpdateSessionTimerMinSE(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentFollowsClientUpdateRedirectContact(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 302,
+			Reason:     "Moved Temporarily",
+			Headers: map[string][]string{
+				"Contact": {"<sip:client2@127.0.0.1:5080>"},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact":         {"<sip:client2@192.0.2.60:5060>"},
+				"Content-Type":    {"application/sdp"},
+				"Session-Expires": {"900;refresher=uas"},
+				"X-Client":        {"update-redirect-ok"},
+			},
+			Body: []byte(sampleSDP("192.0.2.60", 4004)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-update-redirect",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		CSeq:      1,
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	update, err := agent.HandleInboundUpdate(context.Background(), InboundDialogRequest{
+		CallID: "in-call-update-redirect",
+		CSeq:   3,
+		RawSDP: []byte(sampleSDP("203.0.113.11", 49172)),
+		Headers: map[string][]string{
+			"Session-Expires": {"600;refresher=uas"},
+		},
+	})
+	if err != nil || !update.Accepted || update.Headers["X-Client"] != "update-redirect-ok" ||
+		update.LocalSDP.ConnectionIP != "192.0.2.60" {
+		t.Fatalf("HandleInboundUpdate() result=%+v err=%v", update, err)
+	}
+	if len(transport.requests) != 3 || transport.requests[1].Method != "UPDATE" ||
+		transport.requests[2].Method != "UPDATE" {
+		t.Fatalf("client UPDATE requests=%+v", transport.requests)
+	}
+	firstUpdate := transport.requests[1]
+	redirectUpdate := transport.requests[2]
+	if firstUpdate.URI != "sip:client@192.0.2.50:5060" ||
+		firstUpdate.Headers["CSeq"] != "3 UPDATE" ||
+		firstUpdate.Headers["Session-Expires"] != "600;refresher=uas" {
+		t.Fatalf("first UPDATE=%+v", firstUpdate)
+	}
+	if redirectUpdate.URI != "sip:client2@127.0.0.1:5080" ||
+		redirectUpdate.Headers["CSeq"] != "4 UPDATE" ||
+		redirectUpdate.Headers["Session-Expires"] != "600;refresher=uas" {
+		t.Fatalf("redirect UPDATE=%+v", redirectUpdate)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-update-redirect"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+	if len(transport.requests) != 4 || transport.requests[3].Method != "BYE" ||
+		transport.requests[3].URI != "sip:client2@192.0.2.60:5060" ||
+		transport.requests[3].Headers["CSeq"] != "5 BYE" {
+		t.Fatalf("BYE after UPDATE redirect=%+v", transport.requests)
+	}
+}
+
 func TestIMSInboundAgentForwardsInDialogInfoToClient(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
