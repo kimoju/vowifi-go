@@ -6,6 +6,67 @@ import (
 	"strings"
 )
 
+const (
+	// EAPAKAPermanentIdentityPrefix is the permanent username prefix for EAP-AKA.
+	EAPAKAPermanentIdentityPrefix byte = '0'
+	// EAPAKAPrimePermanentIdentityPrefix is the permanent username prefix for EAP-AKA'.
+	EAPAKAPrimePermanentIdentityPrefix byte = '6'
+)
+
+// EAPAKAPermanentIdentity contains the parsed permanent EAP-AKA NAI fields.
+type EAPAKAPermanentIdentity struct {
+	Prefix byte
+	IMSI   string
+	MCC    string
+	MNC    string
+	Realm  string
+}
+
+// FormatEAPAKAPermanentIdentity formats an EAP-AKA permanent NAI.
+func FormatEAPAKAPermanentIdentity(imsi, mcc, mnc string) (string, error) {
+	return formatEAPAKAPermanentIdentity(EAPAKAPermanentIdentityPrefix, imsi, mcc, mnc)
+}
+
+// FormatEAPAKAPrimePermanentIdentity formats an EAP-AKA' permanent NAI.
+func FormatEAPAKAPrimePermanentIdentity(imsi, mcc, mnc string) (string, error) {
+	return formatEAPAKAPermanentIdentity(EAPAKAPrimePermanentIdentityPrefix, imsi, mcc, mnc)
+}
+
+// ParseEAPAKAPermanentIdentity parses an EAP-AKA or EAP-AKA' permanent NAI.
+func ParseEAPAKAPermanentIdentity(identity string) (EAPAKAPermanentIdentity, error) {
+	identity = strings.TrimSpace(identity)
+	user, realm, ok := strings.Cut(identity, "@")
+	if !ok || user == "" || realm == "" {
+		return EAPAKAPermanentIdentity{}, fmt.Errorf("EAP-AKA identity must be user@realm")
+	}
+	if len(user) < 2 {
+		return EAPAKAPermanentIdentity{}, fmt.Errorf("EAP-AKA identity user is too short")
+	}
+	prefix := user[0]
+	if prefix != EAPAKAPermanentIdentityPrefix && prefix != EAPAKAPrimePermanentIdentityPrefix {
+		return EAPAKAPermanentIdentity{}, fmt.Errorf("unsupported EAP-AKA identity prefix %q", prefix)
+	}
+	imsi := user[1:]
+	if err := validateDecimalDigits("IMSI", imsi, 5, 15); err != nil {
+		return EAPAKAPermanentIdentity{}, err
+	}
+	mcc, realmMNC, normalizedRealm, err := parseEAPAKARealm(realm)
+	if err != nil {
+		return EAPAKAPermanentIdentity{}, err
+	}
+	mnc, err := inferNAIMNCFromIMSI(imsi, mcc, realmMNC)
+	if err != nil {
+		return EAPAKAPermanentIdentity{}, err
+	}
+	return EAPAKAPermanentIdentity{
+		Prefix: prefix,
+		IMSI:   imsi,
+		MCC:    mcc,
+		MNC:    mnc,
+		Realm:  normalizedRealm,
+	}, nil
+}
+
 // DecodeISIMIdentityString decodes EF_IMPI, EF_IMPU, and EF_DOMAIN string data.
 func DecodeISIMIdentityString(raw []byte) string {
 	data := trimEFPadding(raw)
@@ -85,6 +146,105 @@ func MNCLengthFromAD(ad []byte) (int, bool) {
 		return 0, false
 	}
 	return mncLen, true
+}
+
+func formatEAPAKAPermanentIdentity(prefix byte, imsi, mcc, mnc string) (string, error) {
+	imsi, mcc, mnc, realm, err := normalizeEAPAKAIdentityParts(imsi, mcc, mnc)
+	if err != nil {
+		return "", err
+	}
+	return string([]byte{prefix}) + imsi + "@" + realm, nil
+}
+
+func normalizeEAPAKAIdentityParts(imsi, mcc, mnc string) (string, string, string, string, error) {
+	imsi = strings.TrimSpace(imsi)
+	mcc = strings.TrimSpace(mcc)
+	mnc = strings.TrimSpace(mnc)
+	if err := validateDecimalDigits("IMSI", imsi, 5, 15); err != nil {
+		return "", "", "", "", err
+	}
+	if mcc == "" && len(imsi) >= 3 {
+		mcc = imsi[:3]
+	}
+	if mnc == "" && len(imsi) >= 6 {
+		mnc = imsi[3:6]
+	}
+	if err := validateDecimalDigits("MCC", mcc, 3, 3); err != nil {
+		return "", "", "", "", err
+	}
+	if err := validateDecimalDigits("MNC", mnc, 2, 3); err != nil {
+		return "", "", "", "", err
+	}
+	if err := validateIMSIPLMN(imsi, mcc, mnc); err != nil {
+		return "", "", "", "", err
+	}
+	return imsi, mcc, mnc, eapAKARealm(mcc, mnc), nil
+}
+
+func parseEAPAKARealm(realm string) (string, string, string, error) {
+	normalized := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(realm)), ".")
+	parts := strings.Split(normalized, ".")
+	if len(parts) != 5 ||
+		parts[0] != "wlan" ||
+		!strings.HasPrefix(parts[1], "mnc") ||
+		!strings.HasPrefix(parts[2], "mcc") ||
+		parts[3] != "3gppnetwork" ||
+		parts[4] != "org" {
+		return "", "", "", fmt.Errorf("EAP-AKA realm must be wlan.mncXXX.mccXXX.3gppnetwork.org")
+	}
+	mnc := strings.TrimPrefix(parts[1], "mnc")
+	mcc := strings.TrimPrefix(parts[2], "mcc")
+	if err := validateDecimalDigits("MCC", mcc, 3, 3); err != nil {
+		return "", "", "", err
+	}
+	if err := validateDecimalDigits("realm MNC", mnc, 3, 3); err != nil {
+		return "", "", "", err
+	}
+	return mcc, mnc, normalized, nil
+}
+
+func inferNAIMNCFromIMSI(imsi, mcc, realmMNC string) (string, error) {
+	if !strings.HasPrefix(imsi, mcc) {
+		return "", fmt.Errorf("IMSI does not match MCC %s", mcc)
+	}
+	rest := imsi[len(mcc):]
+	if strings.HasPrefix(rest, realmMNC) {
+		return realmMNC, nil
+	}
+	if strings.HasPrefix(realmMNC, "0") && strings.HasPrefix(rest, realmMNC[1:]) {
+		return realmMNC[1:], nil
+	}
+	return "", fmt.Errorf("IMSI does not match MNC %s", realmMNC)
+}
+
+func validateIMSIPLMN(imsi, mcc, mnc string) error {
+	if !strings.HasPrefix(imsi, mcc) {
+		return fmt.Errorf("IMSI does not match MCC %s", mcc)
+	}
+	rest := imsi[len(mcc):]
+	if !strings.HasPrefix(rest, mnc) {
+		return fmt.Errorf("IMSI does not match MNC %s", mnc)
+	}
+	return nil
+}
+
+func eapAKARealm(mcc, mnc string) string {
+	if len(mnc) == 2 {
+		mnc = "0" + mnc
+	}
+	return fmt.Sprintf("wlan.mnc%s.mcc%s.3gppnetwork.org", mnc, mcc)
+}
+
+func validateDecimalDigits(name, value string, minLen, maxLen int) error {
+	if len(value) < minLen || len(value) > maxLen {
+		return fmt.Errorf("%s length must be %d..%d digits: %d", name, minLen, maxLen, len(value))
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return fmt.Errorf("%s contains non-decimal digit", name)
+		}
+	}
+	return nil
 }
 
 func decodeISIMDataObject(data []byte) ([]byte, bool) {

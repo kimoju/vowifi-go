@@ -24,10 +24,11 @@ const imsCPIMIMDNNamespace = "urn:ietf:params:imdn"
 const imsIMDNContentType = "message/imdn+xml"
 
 type IMSCPIMMessage struct {
-	Headers        map[string][]string
-	ContentHeaders map[string][]string
-	ContentType    string
-	Body           []byte
+	Headers           map[string][]string
+	ContentHeaders    map[string][]string
+	ContentType       string
+	ContentTypeParams map[string]string
+	Body              []byte
 }
 
 func ParseIMSCPIMMessage(body []byte) (IMSCPIMMessage, error) {
@@ -47,7 +48,7 @@ func ParseIMSCPIMMessage(body []byte) (IMSCPIMMessage, error) {
 	if err != nil {
 		return IMSCPIMMessage{}, fmt.Errorf("CPIM content headers: %w", err)
 	}
-	contentType := normalizedIMSMessageContentType(textproto.MIMEHeader(contentHeaders).Get("Content-Type"))
+	contentType, contentTypeParams := parseIMSMessageContentType(textproto.MIMEHeader(contentHeaders).Get("Content-Type"))
 	if contentType == "" {
 		return IMSCPIMMessage{}, errors.New("CPIM content type is empty")
 	}
@@ -66,10 +67,11 @@ func ParseIMSCPIMMessage(body []byte) (IMSCPIMMessage, error) {
 		return IMSCPIMMessage{}, fmt.Errorf("CPIM content: %w", err)
 	}
 	return IMSCPIMMessage{
-		Headers:        messageHeaders,
-		ContentHeaders: contentHeaders,
-		ContentType:    contentType,
-		Body:           append([]byte(nil), content...),
+		Headers:           messageHeaders,
+		ContentHeaders:    contentHeaders,
+		ContentType:       contentType,
+		ContentTypeParams: contentTypeParams,
+		Body:              append([]byte(nil), content...),
 	}, nil
 }
 
@@ -414,18 +416,34 @@ func parseCPIMHeaders(block []byte) (map[string][]string, error) {
 }
 
 func normalizedIMSMessageContentType(contentType string) string {
+	mediaType, _ := parseIMSMessageContentType(contentType)
+	return mediaType
+}
+
+func parseIMSMessageContentType(contentType string) (string, map[string]string) {
 	contentType = strings.TrimSpace(contentType)
 	if contentType == "" {
-		return ""
+		return "", nil
 	}
-	mediaType, _, err := mime.ParseMediaType(contentType)
+	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err == nil {
-		return strings.ToLower(strings.TrimSpace(mediaType))
+		return strings.ToLower(strings.TrimSpace(mediaType)), cloneIMSContentTypeParams(params)
 	}
 	if semi := strings.IndexByte(contentType, ';'); semi >= 0 {
 		contentType = contentType[:semi]
 	}
-	return strings.ToLower(strings.TrimSpace(contentType))
+	return strings.ToLower(strings.TrimSpace(contentType)), nil
+}
+
+func cloneIMSContentTypeParams(params map[string]string) map[string]string {
+	if len(params) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(params))
+	for key, value := range params {
+		out[strings.ToLower(strings.TrimSpace(key))] = value
+	}
+	return out
 }
 
 func decodeIMSContentTransferEncoding(headers map[string][]string, body []byte) ([]byte, bool, error) {

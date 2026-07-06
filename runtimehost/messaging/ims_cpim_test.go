@@ -62,6 +62,9 @@ func TestIMSCPIMMessageHeaderRoundTrip(t *testing.T) {
 	if parsed.ContentType != "message/imdn+xml" {
 		t.Fatalf("ContentType=%q", parsed.ContentType)
 	}
+	if parsed.ContentTypeParams["charset"] != "UTF-8" {
+		t.Fatalf("ContentTypeParams=%+v", parsed.ContentTypeParams)
+	}
 	if got := content.Get("Content-Type"); got != `message/imdn+xml; charset=UTF-8` {
 		t.Fatalf("Content-Type=%q", got)
 	}
@@ -77,6 +80,32 @@ func TestIMSCPIMMessageHeaderRoundTrip(t *testing.T) {
 
 	if got := contentHeaders["Content-Length"][0]; got != "999" {
 		t.Fatalf("caller content headers mutated: Content-Length=%q", got)
+	}
+}
+
+func TestParseIMSCPIMMessageContentTypeParameters(t *testing.T) {
+	body := []byte(strings.Join([]string{
+		"From: <tel:+15550101000>",
+		"To: <tel:+15550101001>",
+		"",
+		`Content-Type: Application/Vnd.3Gpp.Sms; Charset="UTF-8"; profile="sms;imdn"`,
+		"Content-Length: 5",
+		"",
+		"hello",
+	}, "\r\n"))
+
+	parsed, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	if parsed.ContentType != IMS3GPPSMSContentType {
+		t.Fatalf("ContentType=%q want %q", parsed.ContentType, IMS3GPPSMSContentType)
+	}
+	if parsed.ContentTypeParams["charset"] != "UTF-8" || parsed.ContentTypeParams["profile"] != "sms;imdn" {
+		t.Fatalf("ContentTypeParams=%+v", parsed.ContentTypeParams)
+	}
+	if got := textproto.MIMEHeader(parsed.ContentHeaders).Get("Content-Type"); got != `Application/Vnd.3Gpp.Sms; Charset="UTF-8"; profile="sms;imdn"` {
+		t.Fatalf("raw Content-Type=%q", got)
 	}
 }
 

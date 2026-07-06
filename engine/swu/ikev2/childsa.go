@@ -57,17 +57,26 @@ func ESPKeyProfileFromSA(sa SecurityAssociation) (ESPKeyProfile, error) {
 	if !ok {
 		return ESPKeyProfile{}, fmt.Errorf("%w: missing ESP ENCR", ErrInvalidChildSA)
 	}
-	integ, ok := findTransform(p, TransformINTEG)
-	if !ok {
-		return ESPKeyProfile{}, fmt.Errorf("%w: missing ESP INTEG", ErrInvalidChildSA)
-	}
 	encrLen, _, err := encryptionProfile(encr)
 	if err != nil {
 		return ESPKeyProfile{}, err
 	}
-	integLen, _, err := integrityProfile(integ.ID)
-	if err != nil {
-		return ESPKeyProfile{}, err
+	var integID uint16
+	var integLen int
+	if isCombinedModeEncryption(encr.ID) {
+		if _, ok := findTransform(p, TransformINTEG); ok {
+			return ESPKeyProfile{}, fmt.Errorf("%w: combined-mode ESP ENCR must not include INTEG", ErrInvalidChildSA)
+		}
+	} else {
+		integ, ok := findTransform(p, TransformINTEG)
+		if !ok {
+			return ESPKeyProfile{}, fmt.Errorf("%w: missing ESP INTEG", ErrInvalidChildSA)
+		}
+		integID = integ.ID
+		integLen, _, err = integrityProfile(integ.ID)
+		if err != nil {
+			return ESPKeyProfile{}, err
+		}
 	}
 	esn := false
 	if tr, ok := findTransform(p, TransformESN); ok {
@@ -76,7 +85,7 @@ func ESPKeyProfileFromSA(sa SecurityAssociation) (ESPKeyProfile, error) {
 	return ESPKeyProfile{
 		EncryptionID:        encr.ID,
 		EncryptionKeyLength: encrLen,
-		IntegrityID:         integ.ID,
+		IntegrityID:         integID,
 		IntegrityKeyLength:  integLen,
 		ESN:                 esn,
 	}, nil

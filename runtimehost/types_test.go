@@ -393,6 +393,46 @@ func TestStartUsesIMSRegistrarResult(t *testing.T) {
 	}
 }
 
+func TestStartAndStopDispatchRuntimeStateSnapshots(t *testing.T) {
+	dispatch := &runtimeDispatcher{}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID: "dev-1",
+		Access:   NewModemAccessAdapter(testModem{}),
+		Dispatch: dispatch,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%d, want ready snapshot", len(dispatch.events))
+	}
+	ready, ok := dispatch.events[0].(eventhost.RuntimeStateSnapshot)
+	if !ok {
+		t.Fatalf("event=%T, want RuntimeStateSnapshot", dispatch.events[0])
+	}
+	if ready.DevID != "dev-1" || ready.Phase != eventhost.RuntimePhaseReady ||
+		!ready.AccessReady || !ready.IMSReady || !ready.SMSReady ||
+		ready.RegStatus != 1 || ready.RegStatusText != "registered" ||
+		ready.NetworkMode != "LTE" || ready.LastReason != "started" ||
+		ready.Time.IsZero() {
+		t.Fatalf("ready snapshot=%+v", ready)
+	}
+
+	if err := inst.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if len(dispatch.events) != 2 {
+		t.Fatalf("events=%d, want ready and stopped snapshots", len(dispatch.events))
+	}
+	stopped, ok := dispatch.events[1].(eventhost.RuntimeStateSnapshot)
+	if !ok {
+		t.Fatalf("event=%T, want RuntimeStateSnapshot", dispatch.events[1])
+	}
+	if stopped.Phase != eventhost.RuntimePhaseStopped || stopped.TunnelReady || stopped.LastReason != "stopped" {
+		t.Fatalf("stopped snapshot=%+v", stopped)
+	}
+}
+
 func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	transport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
@@ -1713,7 +1753,7 @@ func TestInstanceHandlesIncomingSMSAndDeliveryReport(t *testing.T) {
 	if err := inst.HandleIncomingSMS(context.Background(), messaging.IncomingSMS{Sender: "+10086", Content: "hi"}); err != nil {
 		t.Fatalf("HandleIncomingSMS() error = %v", err)
 	}
-	if len(dispatch.events) != 1 {
+	if len(dispatch.events) != 2 {
 		t.Fatalf("events=%d", len(dispatch.events))
 	}
 	match, err := inst.HandleSMSDeliveryReport(context.Background(), messaging.SMSDeliveryReport{InReplyTo: "sip-1", SIPCode: 200})
@@ -1741,12 +1781,12 @@ func TestInstanceHandlesIncomingSMSAndDeliveryReport(t *testing.T) {
 	if imsResult.StatusCode != 200 || imsResult.ContentType != messaging.IMS3GPPSMSContentType || string(imsResult.Body) != string(messaging.BuildSMSRPAck(0x33)) {
 		t.Fatalf("imsResult=%+v", imsResult)
 	}
-	if len(dispatch.events) != 2 {
+	if len(dispatch.events) != 3 {
 		t.Fatalf("events=%d", len(dispatch.events))
 	}
-	got, ok := dispatch.events[1].(eventhost.SMSReceived)
+	got, ok := dispatch.events[2].(eventhost.SMSReceived)
 	if !ok || got.Sender != "10086" || got.Content != "hello" {
-		t.Fatalf("event=%+v", dispatch.events[1])
+		t.Fatalf("event=%+v", dispatch.events[2])
 	}
 }
 

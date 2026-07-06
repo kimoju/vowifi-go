@@ -76,3 +76,44 @@ func TestDispatchRecoveryFillsTimeAndSkipsNilDispatcher(t *testing.T) {
 		t.Fatalf("event=%+v, want time and recoverable populated", got)
 	}
 }
+
+func TestDispatchRuntimeStateSnapshotNormalizesAndValidates(t *testing.T) {
+	if ok, err := DispatchRuntimeStateSnapshot(context.Background(), nil, RuntimeStateSnapshot{}); ok || err != nil {
+		t.Fatalf("DispatchRuntimeStateSnapshot(nil) = %t, %v; want false, nil", ok, err)
+	}
+
+	dispatcher := &captureDispatcher{}
+	ok, err := DispatchRuntimeStateSnapshot(context.Background(), dispatcher, RuntimeStateSnapshot{
+		DevID:         " dev-1 ",
+		Phase:         " READY ",
+		DataplaneMode: " userspace ",
+		RegStatusText: " registered ",
+		NetworkMode:   " LTE ",
+		LastReason:    " started ",
+		IMSReady:      true,
+		SMSReady:      true,
+	})
+	if err != nil || !ok {
+		t.Fatalf("DispatchRuntimeStateSnapshot() = %t, %v; want true, nil", ok, err)
+	}
+	got, ok := dispatcher.events[0].(RuntimeStateSnapshot)
+	if !ok {
+		t.Fatalf("event type=%T, want RuntimeStateSnapshot", dispatcher.events[0])
+	}
+	if got.DevID != "dev-1" || got.Phase != RuntimePhaseReady ||
+		got.DataplaneMode != "userspace" || got.RegStatusText != "registered" ||
+		got.NetworkMode != "LTE" || got.LastReason != "started" ||
+		!got.IMSReady || !got.SMSReady || got.Time.IsZero() {
+		t.Fatalf("snapshot=%+v, want normalized ready snapshot", got)
+	}
+
+	if ok, err := DispatchRuntimeStateSnapshot(context.Background(), dispatcher, RuntimeStateSnapshot{
+		DevID: "dev-1",
+		Phase: "paused",
+	}); ok || err == nil {
+		t.Fatalf("DispatchRuntimeStateSnapshot(invalid phase) = %t, %v; want false, error", ok, err)
+	}
+	if len(dispatcher.events) != 1 {
+		t.Fatalf("events=%d, want invalid snapshot skipped", len(dispatcher.events))
+	}
+}

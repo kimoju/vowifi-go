@@ -100,6 +100,23 @@ func TestValidateSelectedSARejectsAESGCMESPWithINTEG(t *testing.T) {
 	}
 }
 
+func TestValidateSelectedSAAllowsAESGCMIKEWithoutINTEG(t *testing.T) {
+	offered := aesGCMIKEProposal(false)
+	selected := aesGCMIKEProposal(false)
+	if err := ValidateSelectedSA(offered, selected); err != nil {
+		t.Fatalf("ValidateSelectedSA() error = %v", err)
+	}
+}
+
+func TestValidateSelectedSARejectsAESGCMIKEWithINTEG(t *testing.T) {
+	offered := aesGCMIKEProposal(true)
+	selected := aesGCMIKEProposal(true)
+	err := ValidateSelectedSA(offered, selected)
+	if !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("ValidateSelectedSA() err=%v, want ErrUnsupportedSASelection", err)
+	}
+}
+
 func TestValidateSelectedSARejectsMissingRequiredTransforms(t *testing.T) {
 	offeredIKE := DefaultIKEProposal()
 	selectedIKE := DefaultIKEProposal()

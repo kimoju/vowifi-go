@@ -2,6 +2,7 @@ package eventhost
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -21,6 +22,12 @@ const (
 
 	RecoveryActionRestartControlPort = "restart_control_port"
 	RecoveryActionRetryLater         = "retry_later"
+
+	RuntimePhaseStarting = "starting"
+	RuntimePhaseSIMReady = "sim_ready"
+	RuntimePhaseReady    = "ready"
+	RuntimePhaseStopped  = "stopped"
+	RuntimePhaseError    = "error"
 )
 
 type SMSReceived struct {
@@ -61,6 +68,24 @@ type LogNotify struct {
 	DevID   string
 	Message string
 	Time    time.Time
+}
+
+type RuntimeStateSnapshot struct {
+	DevID          string
+	Phase          string
+	DataplaneMode  string
+	SIMReady       bool
+	AccessReady    bool
+	TunnelReady    bool
+	IMSReady       bool
+	SMSReady       bool
+	RegStatus      int
+	RegStatusText  string
+	NetworkMode    string
+	LastErrorClass string
+	LastError      string
+	LastReason     string
+	Time           time.Time
 }
 
 type ControlPortHint struct {
@@ -133,6 +158,39 @@ func DispatchRecovery(ctx context.Context, dispatcher Dispatcher, ev RuntimeReco
 	return true
 }
 
+func NormalizeRuntimeStateSnapshot(snapshot RuntimeStateSnapshot) (RuntimeStateSnapshot, error) {
+	snapshot.DevID = strings.TrimSpace(snapshot.DevID)
+	snapshot.Phase = strings.ToLower(strings.TrimSpace(snapshot.Phase))
+	snapshot.DataplaneMode = strings.TrimSpace(snapshot.DataplaneMode)
+	snapshot.RegStatusText = strings.TrimSpace(snapshot.RegStatusText)
+	snapshot.NetworkMode = strings.TrimSpace(snapshot.NetworkMode)
+	snapshot.LastErrorClass = strings.TrimSpace(snapshot.LastErrorClass)
+	snapshot.LastError = strings.TrimSpace(snapshot.LastError)
+	snapshot.LastReason = strings.TrimSpace(snapshot.LastReason)
+	if snapshot.DevID == "" {
+		return RuntimeStateSnapshot{}, errors.New("runtime state snapshot device id is empty")
+	}
+	if !validRuntimePhase(snapshot.Phase) {
+		return RuntimeStateSnapshot{}, errors.New("runtime state snapshot phase is invalid")
+	}
+	return snapshot, nil
+}
+
+func DispatchRuntimeStateSnapshot(ctx context.Context, dispatcher Dispatcher, snapshot RuntimeStateSnapshot) (bool, error) {
+	if dispatcher == nil {
+		return false, nil
+	}
+	normalized, err := NormalizeRuntimeStateSnapshot(snapshot)
+	if err != nil {
+		return false, err
+	}
+	if normalized.Time.IsZero() {
+		normalized.Time = time.Now()
+	}
+	dispatcher.Dispatch(ctx, normalized)
+	return true, nil
+}
+
 func normalizeControlPort(portType string) string {
 	switch strings.ToLower(strings.TrimSpace(portType)) {
 	case ControlPortAT:
@@ -149,4 +207,13 @@ func errorReason(err error) string {
 		return ""
 	}
 	return strings.TrimSpace(err.Error())
+}
+
+func validRuntimePhase(phase string) bool {
+	switch phase {
+	case RuntimePhaseStarting, RuntimePhaseSIMReady, RuntimePhaseReady, RuntimePhaseStopped, RuntimePhaseError:
+		return true
+	default:
+		return false
+	}
 }

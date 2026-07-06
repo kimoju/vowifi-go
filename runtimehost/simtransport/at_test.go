@@ -300,6 +300,8 @@ func TestParseAPDUResultVariants(t *testing.T) {
 	}{
 		{name: "cgla quoted", in: "\r\n+CGLA: 12,\"01029000\"\r\nOK\r\n", body: "0102", sw: "9000"},
 		{name: "csim quoted", in: "+CSIM: 4,\"6A82\"", body: "", sw: "6A82"},
+		{name: "csim unquoted", in: "\r\n+CSIM: 8,beef9000\r\nOK\r\n", body: "BEEF", sw: "9000"},
+		{name: "echo before result", in: "AT+CGLA=2,10,\"00A4040002\"\r\n\r\n+CGLA: 4,\"9000\"\r\n\r\nOK\r\n", body: "", sw: "9000"},
 		{name: "plain hex", in: "DEADBEEF9000", body: "DEADBEEF", sw: "9000"},
 		{name: "lowercase quoted", in: "\"beef6283\"", body: "BEEF", sw: "6283"},
 	}
@@ -314,6 +316,13 @@ func TestParseAPDUResultVariants(t *testing.T) {
 				t.Fatalf("result = body %s sw %s, want body %s sw %s", got.Body, got.StatusString(), tt.body, tt.sw)
 			}
 		})
+	}
+}
+
+func TestParseAPDUResultIgnoresATCommandEcho(t *testing.T) {
+	_, err := ParseAPDUResult("AT+CSIM=10,\"00A4040002\"\r\n\r\nOK\r\n")
+	if err == nil || !strings.Contains(err.Error(), "parse APDU response hex") {
+		t.Fatalf("ParseAPDUResult(echo only) err = %v, want parse APDU response hex", err)
 	}
 }
 

@@ -3,6 +3,8 @@ package tracefixture
 import (
 	"errors"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -206,5 +208,131 @@ func TestSIPMessageHeaderLookupIsCaseInsensitiveAndDefensive(t *testing.T) {
 	values[0] = "mutated"
 	if got := msg.Header("Via"); got == "mutated" {
 		t.Fatalf("HeaderValues exposed mutable internal slice")
+	}
+}
+
+func TestSIPMessageMultipartLeavesExposeMetadata(t *testing.T) {
+	body := strings.Join([]string{
+		"--outer",
+		"Content-Type: application/sdp",
+		"Content-Disposition: session;handling=required",
+		"Content-ID: <sdp>",
+		"",
+		"v=0",
+		"m=audio 49170 RTP/AVP 0",
+		"--outer",
+		"Content-Type: multipart/mixed; boundary=inner",
+		"",
+		"--inner",
+		"Content-Type: application/vnd.3gpp.sms",
+		"Content-ID: <sms>",
+		"",
+		"sms-body",
+		"--inner--",
+		"--outer--",
+		"",
+	}, "\r\n")
+	wire := []byte(strings.Join([]string{
+		"MESSAGE sip:ims.example.invalid SIP/2.0",
+		"Call-ID: fixture-call",
+		"CSeq: 8 MESSAGE",
+		"Content-Type: multipart/mixed; boundary=outer",
+		"Content-Length: " + strconv.Itoa(len(body)),
+		"",
+		body,
+	}, "\r\n"))
+
+	msg, err := ParseSIPMessage(wire)
+	if err != nil {
+		t.Fatalf("ParseSIPMessage returned error: %v", err)
+	}
+	mediaType, params, ok, err := msg.ContentType()
+	if err != nil {
+		t.Fatalf("ContentType returned error: %v", err)
+	}
+	if !ok || mediaType != "multipart/mixed" || params["boundary"] != "outer" {
+		t.Fatalf("ContentType = %q %#v ok=%v, want multipart/mixed boundary outer", mediaType, params, ok)
+	}
+
+	leaves, err := msg.MultipartLeaves()
+	if err != nil {
+		t.Fatalf("MultipartLeaves returned error: %v", err)
+	}
+	if len(leaves) != 2 {
+		t.Fatalf("leaf count = %d, want 2: %#v", len(leaves), leaves)
+	}
+	if !reflect.DeepEqual(leaves[0].Path, []int{0}) {
+		t.Fatalf("first leaf path = %#v, want [0]", leaves[0].Path)
+	}
+	if leaves[0].ContentType != "application/sdp" || leaves[0].ContentDisposition != "session;handling=required" || leaves[0].ContentID != "<sdp>" {
+		t.Fatalf("first leaf metadata = %#v", leaves[0])
+	}
+	if string(leaves[0].Body) != "v=0\r\nm=audio 49170 RTP/AVP 0" {
+		t.Fatalf("first leaf body = %q", string(leaves[0].Body))
+	}
+	if !reflect.DeepEqual(leaves[1].Path, []int{1, 0}) {
+		t.Fatalf("second leaf path = %#v, want [1 0]", leaves[1].Path)
+	}
+	if leaves[1].ContentType != "application/vnd.3gpp.sms" || leaves[1].Header("content-id") != "<sms>" || string(leaves[1].Body) != "sms-body" {
+		t.Fatalf("second leaf metadata/body = %#v body=%q", leaves[1], string(leaves[1].Body))
+	}
+
+	leaves[0].Headers["Content-Type"][0] = "mutated"
+	leaves[0].Body[0] = 'X'
+	again, err := msg.MultipartLeaves()
+	if err != nil {
+		t.Fatalf("MultipartLeaves after mutation returned error: %v", err)
+	}
+	if again[0].ContentType != "application/sdp" || string(again[0].Body) != "v=0\r\nm=audio 49170 RTP/AVP 0" {
+		t.Fatalf("MultipartLeaves exposed mutable internal state: %#v body=%q", again[0], string(again[0].Body))
+	}
+}
+
+func TestSIPMessageMultipartLeavesRejectMalformedContentType(t *testing.T) {
+	wireWithBody := func(contentType, body string) string {
+		return strings.Join([]string{
+			"MESSAGE sip:ims.example.invalid SIP/2.0",
+			"Content-Type: " + contentType,
+			"Content-Length: " + strconv.Itoa(len(body)),
+			"",
+			body,
+		}, "\r\n")
+	}
+	nestedBody := strings.Join([]string{
+		"--outer",
+		"Content-Type: multipart/mixed",
+		"",
+		"nested",
+		"--outer--",
+		"",
+	}, "\r\n")
+	tests := []struct {
+		name string
+		wire string
+	}{
+		{
+			name: "top level missing boundary",
+			wire: wireWithBody("multipart/mixed", ""),
+		},
+		{
+			name: "nested missing boundary",
+			wire: wireWithBody("multipart/mixed; boundary=outer", nestedBody),
+		},
+		{
+			name: "invalid content type",
+			wire: wireWithBody("multipart/mixed; boundary", ""),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg, err := ParseSIPMessage([]byte(tt.wire))
+			if err != nil {
+				t.Fatalf("ParseSIPMessage returned error: %v", err)
+			}
+			_, err = msg.MultipartLeaves()
+			if !errors.Is(err, ErrInvalidSIPMessage) {
+				t.Fatalf("MultipartLeaves error = %v, want ErrInvalidSIPMessage", err)
+			}
+		})
 	}
 }

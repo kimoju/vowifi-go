@@ -20,6 +20,13 @@ const (
 	NextHeaderIPv6 = 41
 )
 
+const (
+	aesGCMSaltLength       = 4
+	aesGCMExplicitIVLength = 8
+	aesGCMICVLength        = 16
+	aesGCMPaddingAlignment = 4
+)
+
 var (
 	ErrInvalidSA     = errors.New("invalid esp sa")
 	ErrInvalidPacket = errors.New("invalid esp packet")
@@ -33,8 +40,16 @@ const (
 	IntegrityHMACSHA2_256_128 IntegrityAlgorithm = IntegrityAlgorithm(ikev2.INTEG_HMAC_SHA2_256_128)
 )
 
+type EncryptionAlgorithm uint16
+
+const (
+	EncryptionAESCBC    EncryptionAlgorithm = EncryptionAlgorithm(ikev2.ENCR_AES_CBC)
+	EncryptionAESGCM_16 EncryptionAlgorithm = EncryptionAlgorithm(ikev2.ENCR_AES_GCM_16)
+)
+
 type SA struct {
 	SPI              uint32
+	Encryption       EncryptionAlgorithm
 	EncryptionKey    []byte
 	IntegrityKey     []byte
 	Integrity        IntegrityAlgorithm
@@ -66,11 +81,12 @@ func NewOutboundSAFromChild(child ikev2.ChildSAResult) (*SA, error) {
 	}
 	return NewSA(SA{
 		SPI:           spi,
+		Encryption:    EncryptionAlgorithm(child.Keys.Profile.EncryptionID),
 		EncryptionKey: child.Keys.Outbound.EncryptionKey,
 		IntegrityKey:  child.Keys.Outbound.IntegrityKey,
 		Integrity:     IntegrityAlgorithm(child.Keys.Profile.IntegrityID),
-		ICVLength:     integrityICVLength(IntegrityAlgorithm(child.Keys.Profile.IntegrityID)),
-		BlockSize:     16,
+		ICVLength:     icvLengthForChildProfile(child.Keys.Profile),
+		BlockSize:     blockSizeForChildProfile(child.Keys.Profile),
 	})
 }
 
@@ -81,11 +97,12 @@ func NewInboundSAFromChild(child ikev2.ChildSAResult) (*SA, error) {
 	}
 	return NewSA(SA{
 		SPI:              spi,
+		Encryption:       EncryptionAlgorithm(child.Keys.Profile.EncryptionID),
 		EncryptionKey:    child.Keys.Inbound.EncryptionKey,
 		IntegrityKey:     child.Keys.Inbound.IntegrityKey,
 		Integrity:        IntegrityAlgorithm(child.Keys.Profile.IntegrityID),
-		ICVLength:        integrityICVLength(IntegrityAlgorithm(child.Keys.Profile.IntegrityID)),
-		BlockSize:        16,
+		ICVLength:        icvLengthForChildProfile(child.Keys.Profile),
+		BlockSize:        blockSizeForChildProfile(child.Keys.Profile),
 		ReplayWindowSize: 64,
 	})
 }
@@ -94,23 +111,44 @@ func NewSA(sa SA) (*SA, error) {
 	if sa.SPI == 0 {
 		return nil, fmt.Errorf("%w: spi is zero", ErrInvalidSA)
 	}
-	if len(sa.EncryptionKey) != 16 && len(sa.EncryptionKey) != 24 && len(sa.EncryptionKey) != 32 {
-		return nil, fmt.Errorf("%w: AES key length %d", ErrInvalidSA, len(sa.EncryptionKey))
-	}
-	if len(sa.IntegrityKey) == 0 {
-		return nil, fmt.Errorf("%w: integrity key is empty", ErrInvalidSA)
-	}
-	if sa.BlockSize == 0 {
-		sa.BlockSize = aes.BlockSize
-	}
-	if sa.BlockSize != aes.BlockSize {
-		return nil, fmt.Errorf("%w: block size %d", ErrInvalidSA, sa.BlockSize)
-	}
-	if sa.ICVLength == 0 {
-		sa.ICVLength = integrityICVLength(sa.Integrity)
-	}
-	if sa.ICVLength <= 0 {
-		return nil, fmt.Errorf("%w: unsupported integrity %d", ErrInvalidSA, sa.Integrity)
+	switch sa.encryptionAlgorithm() {
+	case EncryptionAESCBC:
+		if len(sa.EncryptionKey) != 16 && len(sa.EncryptionKey) != 24 && len(sa.EncryptionKey) != 32 {
+			return nil, fmt.Errorf("%w: AES key length %d", ErrInvalidSA, len(sa.EncryptionKey))
+		}
+		if len(sa.IntegrityKey) == 0 {
+			return nil, fmt.Errorf("%w: integrity key is empty", ErrInvalidSA)
+		}
+		if sa.BlockSize == 0 {
+			sa.BlockSize = aes.BlockSize
+		}
+		if sa.BlockSize != aes.BlockSize {
+			return nil, fmt.Errorf("%w: block size %d", ErrInvalidSA, sa.BlockSize)
+		}
+		if sa.ICVLength == 0 {
+			sa.ICVLength = integrityICVLength(sa.Integrity)
+		}
+		if sa.ICVLength <= 0 {
+			return nil, fmt.Errorf("%w: unsupported integrity %d", ErrInvalidSA, sa.Integrity)
+		}
+	case EncryptionAESGCM_16:
+		if !validAESGCMKeyLength(len(sa.EncryptionKey)) {
+			return nil, fmt.Errorf("%w: AES-GCM key length %d", ErrInvalidSA, len(sa.EncryptionKey))
+		}
+		if sa.BlockSize == 0 {
+			sa.BlockSize = aesGCMPaddingAlignment
+		}
+		if sa.BlockSize != aesGCMPaddingAlignment {
+			return nil, fmt.Errorf("%w: block size %d", ErrInvalidSA, sa.BlockSize)
+		}
+		if sa.ICVLength == 0 {
+			sa.ICVLength = aesGCMICVLength
+		}
+		if sa.ICVLength != aesGCMICVLength {
+			return nil, fmt.Errorf("%w: AES-GCM ICV length %d", ErrInvalidSA, sa.ICVLength)
+		}
+	default:
+		return nil, fmt.Errorf("%w: unsupported encryption %d", ErrInvalidSA, sa.Encryption)
 	}
 	return &sa, nil
 }
@@ -129,6 +167,17 @@ func (s *SA) Seal(nextHeader uint8, payload []byte, opts SealOptions) ([]byte, e
 	} else if seq > s.Sequence {
 		s.Sequence = seq
 	}
+	switch s.encryptionAlgorithm() {
+	case EncryptionAESCBC:
+		return s.sealAESCBC(nextHeader, payload, seq, opts)
+	case EncryptionAESGCM_16:
+		return s.sealAESGCM(nextHeader, payload, seq, opts)
+	default:
+		return nil, fmt.Errorf("%w: unsupported encryption %d", ErrInvalidSA, s.Encryption)
+	}
+}
+
+func (s *SA) sealAESCBC(nextHeader uint8, payload []byte, seq uint32, opts SealOptions) ([]byte, error) {
 	iv := append([]byte(nil), opts.IV...)
 	if len(iv) == 0 {
 		random := opts.Random
@@ -161,10 +210,44 @@ func (s *SA) Seal(nextHeader uint8, payload []byte, opts SealOptions) ([]byte, e
 	return packet, nil
 }
 
+func (s *SA) sealAESGCM(nextHeader uint8, payload []byte, seq uint32, opts SealOptions) ([]byte, error) {
+	iv := append([]byte(nil), opts.IV...)
+	if len(iv) == 0 {
+		iv = make([]byte, aesGCMExplicitIVLength)
+		binary.BigEndian.PutUint64(iv, uint64(seq))
+	}
+	if len(iv) != aesGCMExplicitIVLength {
+		return nil, fmt.Errorf("%w: iv length %d", ErrInvalidPacket, len(iv))
+	}
+	aead, salt, err := s.aesGCMAEAD()
+	if err != nil {
+		return nil, err
+	}
+	plain := espPlaintext(payload, nextHeader, s.BlockSize)
+	packet := make([]byte, 8, 8+len(iv)+len(plain)+aead.Overhead())
+	binary.BigEndian.PutUint32(packet[0:4], s.SPI)
+	binary.BigEndian.PutUint32(packet[4:8], seq)
+	packet = append(packet, iv...)
+	nonce := aesGCMNonce(salt, iv)
+	packet = aead.Seal(packet, nonce, plain, packet[:8])
+	return packet, nil
+}
+
 func (s *SA) Open(packet []byte) (OpenResult, error) {
 	if s == nil {
 		return OpenResult{}, ErrInvalidSA
 	}
+	switch s.encryptionAlgorithm() {
+	case EncryptionAESCBC:
+		return s.openAESCBC(packet)
+	case EncryptionAESGCM_16:
+		return s.openAESGCM(packet)
+	default:
+		return OpenResult{}, fmt.Errorf("%w: unsupported encryption %d", ErrInvalidSA, s.Encryption)
+	}
+}
+
+func (s *SA) openAESCBC(packet []byte) (OpenResult, error) {
 	if len(packet) < 8+s.BlockSize+s.ICVLength+s.BlockSize {
 		return OpenResult{}, fmt.Errorf("%w: too short", ErrInvalidPacket)
 	}
@@ -206,6 +289,40 @@ func (s *SA) Open(packet []byte) (OpenResult, error) {
 	return OpenResult{SPI: spi, Sequence: seq, NextHeader: nextHeader, Payload: payload}, nil
 }
 
+func (s *SA) openAESGCM(packet []byte) (OpenResult, error) {
+	if len(packet) < 8+aesGCMExplicitIVLength+s.ICVLength+2 {
+		return OpenResult{}, fmt.Errorf("%w: too short", ErrInvalidPacket)
+	}
+	spi := binary.BigEndian.Uint32(packet[0:4])
+	if spi != s.SPI {
+		return OpenResult{}, fmt.Errorf("%w: spi %08x != %08x", ErrInvalidPacket, spi, s.SPI)
+	}
+	seq := binary.BigEndian.Uint32(packet[4:8])
+	if seq == 0 {
+		return OpenResult{}, fmt.Errorf("%w: sequence zero", ErrInvalidPacket)
+	}
+	aead, salt, err := s.aesGCMAEAD()
+	if err != nil {
+		return OpenResult{}, err
+	}
+	body := packet[8:]
+	iv := body[:aesGCMExplicitIVLength]
+	ciphertext := body[aesGCMExplicitIVLength:]
+	plain, err := aead.Open(nil, aesGCMNonce(salt, iv), ciphertext, packet[:8])
+	if err != nil {
+		return OpenResult{}, fmt.Errorf("%w: icv mismatch", ErrInvalidPacket)
+	}
+	if err := s.checkReplay(seq); err != nil {
+		return OpenResult{}, err
+	}
+	payload, nextHeader, err := parseESPPlaintext(plain)
+	if err != nil {
+		return OpenResult{}, err
+	}
+	s.acceptSequence(seq)
+	return OpenResult{SPI: spi, Sequence: seq, NextHeader: nextHeader, Payload: payload}, nil
+}
+
 func (s *SA) integrity(data []byte) ([]byte, error) {
 	var mac hashMAC
 	switch s.Integrity {
@@ -222,6 +339,26 @@ func (s *SA) integrity(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: icv length %d", ErrInvalidSA, s.ICVLength)
 	}
 	return append([]byte(nil), sum[:s.ICVLength]...), nil
+}
+
+func (s *SA) aesGCMAEAD() (cipher.AEAD, []byte, error) {
+	keyLen := len(s.EncryptionKey) - aesGCMSaltLength
+	block, err := aes.NewCipher(s.EncryptionKey[:keyLen])
+	if err != nil {
+		return nil, nil, err
+	}
+	aead, err := cipher.NewGCMWithTagSize(block, s.ICVLength)
+	if err != nil {
+		return nil, nil, err
+	}
+	return aead, s.EncryptionKey[keyLen:], nil
+}
+
+func aesGCMNonce(salt, iv []byte) []byte {
+	nonce := make([]byte, 0, len(salt)+len(iv))
+	nonce = append(nonce, salt...)
+	nonce = append(nonce, iv...)
+	return nonce
 }
 
 type hashMAC interface {
@@ -326,6 +463,36 @@ func aesCBCDecrypt(key, iv, ciphertext []byte) ([]byte, error) {
 	out := make([]byte, len(ciphertext))
 	cipher.NewCBCDecrypter(block, iv).CryptBlocks(out, ciphertext)
 	return out, nil
+}
+
+func (s *SA) encryptionAlgorithm() EncryptionAlgorithm {
+	if s.Encryption == 0 {
+		return EncryptionAESCBC
+	}
+	return s.Encryption
+}
+
+func validAESGCMKeyLength(n int) bool {
+	switch n {
+	case 16 + aesGCMSaltLength, 24 + aesGCMSaltLength, 32 + aesGCMSaltLength:
+		return true
+	default:
+		return false
+	}
+}
+
+func blockSizeForChildProfile(profile ikev2.ESPKeyProfile) int {
+	if EncryptionAlgorithm(profile.EncryptionID) == EncryptionAESGCM_16 {
+		return aesGCMPaddingAlignment
+	}
+	return aes.BlockSize
+}
+
+func icvLengthForChildProfile(profile ikev2.ESPKeyProfile) int {
+	if EncryptionAlgorithm(profile.EncryptionID) == EncryptionAESGCM_16 {
+		return aesGCMICVLength
+	}
+	return integrityICVLength(IntegrityAlgorithm(profile.IntegrityID))
 }
 
 func integrityICVLength(integ IntegrityAlgorithm) int {

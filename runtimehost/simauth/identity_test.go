@@ -1,6 +1,7 @@
 package simauth
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -96,5 +97,130 @@ func TestMNCLengthFromAD(t *testing.T) {
 	}
 	if got, ok := MNCLengthFromAD([]byte{0x00, 0x00, 0x00}); ok || got != 0 {
 		t.Fatalf("MNCLengthFromAD(short) = %d/%v, want 0/false", got, ok)
+	}
+}
+
+func TestFormatEAPAKAPermanentIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		format func(string, string, string) (string, error)
+		imsi   string
+		mcc    string
+		mnc    string
+		want   string
+	}{
+		{
+			name:   "aka with three digit mnc",
+			format: FormatEAPAKAPermanentIdentity,
+			imsi:   "001010123456789",
+			mcc:    "001",
+			mnc:    "010",
+			want:   "0001010123456789@wlan.mnc010.mcc001.3gppnetwork.org",
+		},
+		{
+			name:   "aka prime with two digit mnc",
+			format: FormatEAPAKAPrimePermanentIdentity,
+			imsi:   "310260123456789",
+			mcc:    "310",
+			mnc:    "26",
+			want:   "6310260123456789@wlan.mnc026.mcc310.3gppnetwork.org",
+		},
+		{
+			name:   "derive plmn from imsi",
+			format: FormatEAPAKAPermanentIdentity,
+			imsi:   "001010123456789",
+			want:   "0001010123456789@wlan.mnc010.mcc001.3gppnetwork.org",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.format(tt.imsi, tt.mcc, tt.mnc)
+			if err != nil {
+				t.Fatalf("format() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("format() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseEAPAKAPermanentIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		nai  string
+		want EAPAKAPermanentIdentity
+	}{
+		{
+			name: "aka",
+			nai:  "0001010123456789@wlan.mnc010.mcc001.3gppnetwork.org",
+			want: EAPAKAPermanentIdentity{
+				Prefix: EAPAKAPermanentIdentityPrefix,
+				IMSI:   "001010123456789",
+				MCC:    "001",
+				MNC:    "010",
+				Realm:  "wlan.mnc010.mcc001.3gppnetwork.org",
+			},
+		},
+		{
+			name: "aka prime with two digit mnc",
+			nai:  "6310260123456789@WLAN.MNC026.MCC310.3GPPNETWORK.ORG.",
+			want: EAPAKAPermanentIdentity{
+				Prefix: EAPAKAPrimePermanentIdentityPrefix,
+				IMSI:   "310260123456789",
+				MCC:    "310",
+				MNC:    "26",
+				Realm:  "wlan.mnc026.mcc310.3gppnetwork.org",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseEAPAKAPermanentIdentity(tt.nai)
+			if err != nil {
+				t.Fatalf("ParseEAPAKAPermanentIdentity() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("ParseEAPAKAPermanentIdentity() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEAPAKAPermanentIdentityRejectsMalformedInput(t *testing.T) {
+	badFormats := []struct {
+		name string
+		imsi string
+		mcc  string
+		mnc  string
+	}{
+		{name: "non digit imsi", imsi: "00101A123456789", mcc: "001", mnc: "010"},
+		{name: "mcc mismatch", imsi: "001010123456789", mcc: "999", mnc: "010"},
+		{name: "mnc mismatch", imsi: "001010123456789", mcc: "001", mnc: "011"},
+		{name: "bad mnc length", imsi: "001010123456789", mcc: "001", mnc: "1"},
+	}
+	for _, tt := range badFormats {
+		t.Run("format "+tt.name, func(t *testing.T) {
+			if got, err := FormatEAPAKAPermanentIdentity(tt.imsi, tt.mcc, tt.mnc); err == nil {
+				t.Fatalf("FormatEAPAKAPermanentIdentity() = %q nil error, want error", got)
+			}
+		})
+	}
+
+	badParses := []string{
+		"001010123456789",
+		"2001010123456789@wlan.mnc010.mcc001.3gppnetwork.org",
+		"0001010123456789@ims.mnc010.mcc001.3gppnetwork.org",
+		"0001010123456789@wlan.mnc011.mcc001.3gppnetwork.org",
+		"0001010123456789@wlan.mnc01a.mcc001.3gppnetwork.org",
+	}
+	for _, nai := range badParses {
+		t.Run("parse "+nai, func(t *testing.T) {
+			if got, err := ParseEAPAKAPermanentIdentity(nai); err == nil {
+				t.Fatalf("ParseEAPAKAPermanentIdentity() = %+v nil error, want error", got)
+			}
+		})
 	}
 }

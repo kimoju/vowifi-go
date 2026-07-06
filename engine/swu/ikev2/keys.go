@@ -20,6 +20,12 @@ type KeyMaterialProfile struct {
 	PRFKeyLength            int
 }
 
+const (
+	aesGCMSaltLength       = 4
+	aesGCMExplicitIVLength = 8
+	aesGCM16ChecksumLength = 16
+)
+
 func (p KeyMaterialProfile) RequiredLength() int {
 	return p.PRFKeyLength + p.IntegrityKeyLength*2 + p.EncryptionKeyLength*2 + p.PRFKeyLength*2
 }
@@ -48,10 +54,6 @@ func KeyMaterialProfileFromSA(sa SecurityAssociation) (KeyMaterialProfile, error
 	if !ok {
 		return KeyMaterialProfile{}, fmt.Errorf("%w: missing PRF", ErrUnsupportedTransform)
 	}
-	integ, ok := findTransform(p, TransformINTEG)
-	if !ok {
-		return KeyMaterialProfile{}, fmt.Errorf("%w: missing INTEG", ErrUnsupportedTransform)
-	}
 	prfHash, err := PRFHashForTransform(prf.ID)
 	if err != nil {
 		return KeyMaterialProfile{}, err
@@ -60,16 +62,33 @@ func KeyMaterialProfileFromSA(sa SecurityAssociation) (KeyMaterialProfile, error
 	if err != nil {
 		return KeyMaterialProfile{}, err
 	}
-	integKeyLen, checksumLen, err := integrityProfile(integ.ID)
-	if err != nil {
-		return KeyMaterialProfile{}, err
+	var integID uint16
+	var integKeyLen, checksumLen int
+	if isCombinedModeEncryption(encr.ID) {
+		if _, ok := findTransform(p, TransformINTEG); ok {
+			return KeyMaterialProfile{}, fmt.Errorf("%w: combined-mode ENCR must not include INTEG", ErrUnsupportedTransform)
+		}
+		checksumLen, err = combinedModeChecksumLength(encr.ID)
+		if err != nil {
+			return KeyMaterialProfile{}, err
+		}
+	} else {
+		integ, ok := findTransform(p, TransformINTEG)
+		if !ok {
+			return KeyMaterialProfile{}, fmt.Errorf("%w: missing INTEG", ErrUnsupportedTransform)
+		}
+		integID = integ.ID
+		integKeyLen, checksumLen, err = integrityProfile(integ.ID)
+		if err != nil {
+			return KeyMaterialProfile{}, err
+		}
 	}
 	return KeyMaterialProfile{
 		PRF:                     prfHash,
 		EncryptionID:            encr.ID,
 		EncryptionKeyLength:     encrKeyLen,
 		EncryptionBlockSize:     blockSize,
-		IntegrityID:             integ.ID,
+		IntegrityID:             integID,
 		IntegrityKeyLength:      integKeyLen,
 		IntegrityChecksumLength: checksumLen,
 		PRFKeyLength:            prfHash.Size(),
@@ -137,8 +156,26 @@ func encryptionProfile(t Transform) (keyLen int, blockSize int, err error) {
 			return 0, 0, fmt.Errorf("%w: AES-CBC key length %d", ErrUnsupportedTransform, bits)
 		}
 		return int(bits / 8), 16, nil
+	case ENCR_AES_GCM_16:
+		bits := transformKeyLength(t)
+		if bits == 0 {
+			bits = 128
+		}
+		if bits != 128 && bits != 192 && bits != 256 {
+			return 0, 0, fmt.Errorf("%w: AES-GCM key length %d", ErrUnsupportedTransform, bits)
+		}
+		return int(bits/8) + aesGCMSaltLength, aesGCMExplicitIVLength, nil
 	default:
 		return 0, 0, fmt.Errorf("%w: ENCR %d", ErrUnsupportedTransform, t.ID)
+	}
+}
+
+func combinedModeChecksumLength(id uint16) (int, error) {
+	switch id {
+	case ENCR_AES_GCM_16:
+		return aesGCM16ChecksumLength, nil
+	default:
+		return 0, fmt.Errorf("%w: combined-mode ENCR %d", ErrUnsupportedTransform, id)
 	}
 }
 

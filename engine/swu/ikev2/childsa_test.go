@@ -2,6 +2,7 @@ package ikev2
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -25,6 +26,41 @@ func TestDeriveChildSAKeysWithNonces(t *testing.T) {
 		!bytes.Equal(keys.Inbound.EncryptionKey, keymat[48:64]) ||
 		!bytes.Equal(keys.Inbound.IntegrityKey, keymat[64:96]) {
 		t.Fatalf("keys=%+v keymat=%x", keys, keymat)
+	}
+}
+
+func TestDeriveChildSAKeysAllowsAESGCMESPWithoutINTEG(t *testing.T) {
+	init := fakeInitResult(t)
+	selected := aesGCMESPProposal([]byte{0xde, 0xad, 0xbe, 0xef}, false)
+	keys, err := DeriveChildSAKeys(init, selected)
+	if err != nil {
+		t.Fatalf("DeriveChildSAKeys(AES-GCM) error = %v", err)
+	}
+	if keys.Profile.EncryptionID != ENCR_AES_GCM_16 ||
+		keys.Profile.EncryptionKeyLength != 20 ||
+		keys.Profile.IntegrityID != 0 ||
+		keys.Profile.IntegrityKeyLength != 0 ||
+		keys.Profile.DirectionKeyLength() != 20 {
+		t.Fatalf("profile=%+v", keys.Profile)
+	}
+	if len(keys.Outbound.IntegrityKey) != 0 || len(keys.Inbound.IntegrityKey) != 0 {
+		t.Fatalf("combined-mode integrity keys should be empty: outbound=%x inbound=%x", keys.Outbound.IntegrityKey, keys.Inbound.IntegrityKey)
+	}
+	seed := append(append([]byte(nil), init.NonceI...), init.NonceR...)
+	keymat, err := PRFPlus(init.Keys.Profile.PRF, init.Keys.SKD, seed, 40)
+	if err != nil {
+		t.Fatalf("PRFPlus() error = %v", err)
+	}
+	if !bytes.Equal(keys.Outbound.EncryptionKey, keymat[:20]) ||
+		!bytes.Equal(keys.Inbound.EncryptionKey, keymat[20:40]) {
+		t.Fatalf("keys=%+v keymat=%x", keys, keymat)
+	}
+}
+
+func TestESPKeyProfileRejectsAESGCMESPWithINTEG(t *testing.T) {
+	_, err := ESPKeyProfileFromSA(aesGCMESPProposal([]byte{0xde, 0xad, 0xbe, 0xef}, true))
+	if !errors.Is(err, ErrInvalidChildSA) {
+		t.Fatalf("ESPKeyProfileFromSA(AES-GCM+INTEG) err=%v, want ErrInvalidChildSA", err)
 	}
 }
 

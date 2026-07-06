@@ -277,7 +277,11 @@ func parseSDPFingerprintLine(line string) (SDPFingerprintAttribute, bool, error)
 	if !ok || strings.TrimSpace(fingerprint) == "" {
 		return SDPFingerprintAttribute{}, true, fmt.Errorf("%w: malformed fingerprint attribute", ErrInvalidSDPSecurity)
 	}
-	return SDPFingerprintAttribute{HashFunc: hashFunc, Fingerprint: strings.TrimSpace(fingerprint)}, true, nil
+	attr := SDPFingerprintAttribute{HashFunc: hashFunc, Fingerprint: strings.TrimSpace(fingerprint)}
+	if err := validateSDPFingerprintAttribute(attr); err != nil {
+		return SDPFingerprintAttribute{}, true, fmt.Errorf("%w: %w", ErrInvalidSDPSecurity, err)
+	}
+	return attr, true, nil
 }
 
 func parseSDPSetupLine(line string) (string, bool, error) {
@@ -289,7 +293,52 @@ func parseSDPSetupLine(line string) (string, bool, error) {
 	if value == "" {
 		return "", true, fmt.Errorf("%w: malformed setup attribute", ErrInvalidSDPSecurity)
 	}
+	if !validSDPSetupRole(value) {
+		return "", true, fmt.Errorf("%w: unsupported setup role %q", ErrInvalidSDPSecurity, value)
+	}
 	return value, true, nil
+}
+
+func validateSDPFingerprintAttribute(attr SDPFingerprintAttribute) error {
+	hashFunc := strings.ToLower(strings.TrimSpace(attr.HashFunc))
+	switch hashFunc {
+	case "sha-1", "sha-224", "sha-256", "sha-384", "sha-512":
+	default:
+		return fmt.Errorf("unsupported fingerprint hash function %q", strings.TrimSpace(attr.HashFunc))
+	}
+	fingerprint := strings.TrimSpace(attr.Fingerprint)
+	if fingerprint == "" {
+		return fmt.Errorf("empty fingerprint")
+	}
+	parts := strings.Split(fingerprint, ":")
+	for _, part := range parts {
+		if len(part) != 2 || !isSDPHexOctet(part) {
+			return fmt.Errorf("malformed fingerprint")
+		}
+	}
+	return nil
+}
+
+func validSDPSetupRole(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "active", "passive", "actpass", "holdconn":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSDPHexOctet(value string) bool {
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func cutSDPAttributeValue(line, prefix string) (string, bool) {

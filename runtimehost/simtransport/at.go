@@ -14,6 +14,7 @@ const defaultTimeout = 10 * time.Second
 
 var (
 	hexTokenRE = regexp.MustCompile(`(?i)"([0-9a-f]+)"`)
+	apduLineRE = regexp.MustCompile(`(?im)^\s*\+(?:CGLA|CSIM):\s*\d+\s*,\s*(?:"([0-9a-fA-F]*)"|([0-9a-fA-F]+))\s*$`)
 	cmeErrorRE = regexp.MustCompile(`(?i)\+CME ERROR:\s*([^\r\n]+)`)
 	cchoLineRE = regexp.MustCompile(`(?im)^\s*\+CCHO:\s*(\d+)\s*$`)
 	crsmLineRE = regexp.MustCompile(`(?im)^\s*\+CRSM:\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(?:"([0-9a-fA-F]*)"|([0-9a-fA-F]+)))?\s*$`)
@@ -386,17 +387,45 @@ func mergeAPDUResult(bodyPrefix string, resp APDUResult) APDUResult {
 }
 
 func extractResponseHex(out string) (string, bool) {
-	if m := hexTokenRE.FindAllStringSubmatch(out, -1); len(m) > 0 {
-		return m[len(m)-1][1], true
+	if m := apduLineRE.FindAllStringSubmatch(out, -1); len(m) > 0 {
+		last := m[len(m)-1]
+		return firstNonEmpty(last[1], last[2]), true
 	}
-	for _, field := range strings.FieldsFunc(out, func(r rune) bool {
-		return r == '\r' || r == '\n' || r == ',' || r == ':' || r == ' ' || r == '\t'
-	}) {
-		if looksHex(field) && len(field) >= 4 {
-			return field, true
+	quoted := ""
+	for _, line := range atLines(out) {
+		if isATCommandEcho(line) {
+			continue
+		}
+		if m := hexTokenRE.FindAllStringSubmatch(line, -1); len(m) > 0 {
+			quoted = m[len(m)-1][1]
+		}
+	}
+	if quoted != "" {
+		return quoted, true
+	}
+	for _, line := range atLines(out) {
+		if isATCommandEcho(line) {
+			continue
+		}
+		for _, field := range strings.FieldsFunc(line, func(r rune) bool {
+			return r == ',' || r == ':' || r == ' ' || r == '\t'
+		}) {
+			if looksHex(field) && len(field) >= 4 {
+				return field, true
+			}
 		}
 	}
 	return "", false
+}
+
+func atLines(out string) []string {
+	return strings.FieldsFunc(out, func(r rune) bool {
+		return r == '\r' || r == '\n'
+	})
+}
+
+func isATCommandEcho(line string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "AT+")
 }
 
 func parseFirstInt(out string) (int, bool) {

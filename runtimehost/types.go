@@ -429,6 +429,7 @@ type Instance struct {
 	state        State
 	service      *messaging.Service
 	observers    []Observer
+	dispatch     eventhost.Dispatcher
 	notifier     func(string)
 	smsNotify    func(deviceID, sender, content string, ts time.Time)
 	tunnel       swu.TunnelSession
@@ -555,6 +556,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	inst := &Instance{
 		state:       state,
 		service:     svc,
+		dispatch:    req.Dispatch,
 		tunnel:      tunnel,
 		voice:       buildRuntimeVoiceAgentWithConfig(voiceConfig, imsResult),
 		voiceConfig: voiceConfig,
@@ -567,6 +569,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
 	inst.notify(ctx)
+	inst.dispatchRuntimeState(ctx)
 	return inst, nil
 }
 
@@ -694,6 +697,7 @@ func (i *Instance) Stop(ctx context.Context) error {
 		err = errors.Join(err, imsClose(ctx))
 	}
 	i.notify(ctx)
+	i.dispatchRuntimeState(ctx)
 	return err
 }
 
@@ -1010,6 +1014,7 @@ func (i *Instance) recordIMSRecoveryFailure(ctx context.Context, err error) {
 	i.state.UpdatedAt = time.Now()
 	i.mu.Unlock()
 	i.notify(ctx)
+	i.dispatchRuntimeState(ctx)
 }
 
 func (i *Instance) applyIMSRegistrationResult(ctx context.Context, result IMSRegistrationResult, reason string, updateVoice bool) {
@@ -1055,6 +1060,7 @@ func (i *Instance) applyIMSRegistrationResult(ctx context.Context, result IMSReg
 		}
 	}
 	i.notify(ctx)
+	i.dispatchRuntimeState(ctx)
 }
 
 type runtimeRecoveringSMSTransport struct {
@@ -1584,6 +1590,7 @@ func (i *Instance) TriggerMOBIKE(oldIP, newIP string) error {
 	i.state.UpdatedAt = time.Now()
 	i.mu.Unlock()
 	i.notify(context.Background())
+	i.dispatchRuntimeState(context.Background())
 	return nil
 }
 
@@ -1614,6 +1621,37 @@ func (i *Instance) Obs() map[string]interface{} {
 	}
 }
 
+func (i *Instance) dispatchRuntimeState(ctx context.Context) {
+	if i == nil {
+		return
+	}
+	i.mu.RLock()
+	dispatcher := i.dispatch
+	snapshot := runtimeStateSnapshot(i.state)
+	i.mu.RUnlock()
+	_, _ = eventhost.DispatchRuntimeStateSnapshot(ctx, dispatcher, snapshot)
+}
+
+func runtimeStateSnapshot(state State) eventhost.RuntimeStateSnapshot {
+	return eventhost.RuntimeStateSnapshot{
+		DevID:          state.DeviceID,
+		Phase:          string(state.Phase),
+		DataplaneMode:  state.DataplaneMode,
+		SIMReady:       state.SIMReady,
+		AccessReady:    state.AccessReady,
+		TunnelReady:    state.TunnelReady,
+		IMSReady:       state.IMSReady,
+		SMSReady:       state.SMSReady,
+		RegStatus:      state.RegStatus,
+		RegStatusText:  state.RegStatusText,
+		NetworkMode:    state.NetworkMode,
+		LastErrorClass: state.LastErrorClass,
+		LastError:      state.LastError,
+		LastReason:     state.LastReason,
+		Time:           state.UpdatedAt,
+	}
+}
+
 type EventDispatcher = eventhost.Dispatcher
 type ModuleEvent = eventhost.Event
 type EventSMSReceived = eventhost.SMSReceived
@@ -1621,6 +1659,7 @@ type EventSMSSent = eventhost.SMSSent
 type EventUSSDUpdated = eventhost.USSDUpdated
 type EventLocalNumberLearned = eventhost.LocalNumberLearned
 type EventLogNotify = eventhost.LogNotify
+type EventRuntimeStateSnapshot = eventhost.RuntimeStateSnapshot
 
 type PrepareStartInput = identity.PrepareStartInput
 

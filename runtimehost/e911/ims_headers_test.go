@@ -92,6 +92,65 @@ func TestBuildEmergencySIPRequestInfoReferencesPIDFLOBodyByCID(t *testing.T) {
 	}
 }
 
+func TestParsePAccessNetworkInfoParsesWLANAndCellularValues(t *testing.T) {
+	values, err := ParsePAccessNetworkInfo(`IEEE-802.11;i-wlan-node-id="aa:bb:cc:dd:ee:ff";network-provided, 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=3102600abcdef`)
+	if err != nil {
+		t.Fatalf("ParsePAccessNetworkInfo() error = %v", err)
+	}
+	if len(values) != 2 {
+		t.Fatalf("values=%+v", values)
+	}
+	if values[0].AccessType != "IEEE-802.11" ||
+		values[0].WLANNodeID != "aa:bb:cc:dd:ee:ff" ||
+		values[0].Parameters["network-provided"] != "" {
+		t.Fatalf("first PANI value=%+v", values[0])
+	}
+	if values[1].AccessType != "3GPP-E-UTRAN-FDD" ||
+		values[1].Parameters["utran-cell-id-3gpp"] != "3102600abcdef" {
+		t.Fatalf("second PANI value=%+v", values[1])
+	}
+}
+
+func TestNormalizePAccessNetworkInfoRoundTripsCommonCarrierParameters(t *testing.T) {
+	got, err := NormalizePAccessNetworkInfo(` 3GPP-E-UTRAN-FDD ; utran-cell-id-3gpp = "3102600abcdef" ; cgi-3gpp=310260ffff `)
+	if err != nil {
+		t.Fatalf("NormalizePAccessNetworkInfo() error = %v", err)
+	}
+	want := "3GPP-E-UTRAN-FDD;cgi-3gpp=310260ffff;utran-cell-id-3gpp=3102600abcdef"
+	if got != want {
+		t.Fatalf("NormalizePAccessNetworkInfo()=%q, want %q", got, want)
+	}
+
+	headers := BuildEmergencySIPHeaders(EmergencySIPHeaderConfig{
+		AccessNetworkInfo: EmergencyAccessNetworkInfo{
+			AccessType: "3GPP-E-UTRAN-FDD",
+			Parameters: map[string]string{
+				"utran-cell-id-3gpp": "3102600abcdef",
+			},
+		},
+	})
+	if headers["P-Access-Network-Info"] != "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=3102600abcdef" {
+		t.Fatalf("P-Access-Network-Info=%q", headers["P-Access-Network-Info"])
+	}
+}
+
+func TestParsePAccessNetworkInfoRejectsMalformedValues(t *testing.T) {
+	for _, header := range []string{
+		`;i-wlan-node-id="aa:bb:cc:dd:ee:ff"`,
+		`IEEE-802.11;i-wlan-node-id="unterminated`,
+		`IEEE-802.11;=value`,
+	} {
+		t.Run(header, func(t *testing.T) {
+			if _, err := ParsePAccessNetworkInfo(header); err == nil {
+				t.Fatal("ParsePAccessNetworkInfo() error = nil")
+			}
+			if _, err := NormalizePAccessNetworkInfo(header); err == nil {
+				t.Fatal("NormalizePAccessNetworkInfo() error = nil")
+			}
+		})
+	}
+}
+
 func TestParseGeolocationHeaderParsesMultipleLocationsAndParameters(t *testing.T) {
 	values, err := ParseGeolocationHeader(`<cid:loc-1@example.test>;inserted-by=endpoint;purpose="emergency, callback", <geo:47.6205,-122.3493>;routing-allowed=yes`)
 	if err != nil {

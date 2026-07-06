@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,7 @@ type EmergencyAccessNetworkInfo struct {
 	Raw        string
 	AccessType string
 	WLANNodeID string
+	Parameters map[string]string
 }
 
 type GeolocationHeaderValue struct {
@@ -140,10 +142,140 @@ func BuildPAccessNetworkInfo(info EmergencyAccessNetworkInfo) string {
 	if accessType == "" {
 		accessType = "IEEE-802.11"
 	}
-	if nodeID := strings.TrimSpace(info.WLANNodeID); nodeID != "" {
-		return accessType + `;i-wlan-node-id=` + quoteSIPParamValue(nodeID)
+	params := normalizePAccessNetworkInfoParameters(info.Parameters)
+	nodeID := strings.TrimSpace(info.WLANNodeID)
+	if nodeID == "" {
+		nodeID = params["i-wlan-node-id"]
 	}
-	return accessType
+	delete(params, "i-wlan-node-id")
+	var b strings.Builder
+	b.WriteString(accessType)
+	if nodeID != "" {
+		b.WriteString(`;i-wlan-node-id=`)
+		b.WriteString(quoteSIPParamValue(nodeID))
+	}
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		b.WriteByte(';')
+		b.WriteString(key)
+		if value := strings.TrimSpace(params[key]); value != "" {
+			b.WriteByte('=')
+			b.WriteString(formatSIPParamValue(value))
+		}
+	}
+	return b.String()
+}
+
+func ParsePAccessNetworkInfo(header string) ([]EmergencyAccessNetworkInfo, error) {
+	parts, err := splitSIPHeaderSegments(header, ',')
+	if err != nil {
+		return nil, err
+	}
+	var out []EmergencyAccessNetworkInfo
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		info, err := parsePAccessNetworkInfoValue(part)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+func NormalizePAccessNetworkInfo(header string) (string, error) {
+	values, err := ParsePAccessNetworkInfo(header)
+	if err != nil {
+		return "", err
+	}
+	var out []string
+	for _, value := range values {
+		if normalized := BuildPAccessNetworkInfo(value); normalized != "" {
+			out = append(out, normalized)
+		}
+	}
+	return strings.Join(out, ", "), nil
+}
+
+func parsePAccessNetworkInfoValue(value string) (EmergencyAccessNetworkInfo, error) {
+	parts, err := splitSIPHeaderSegments(value, ';')
+	if err != nil {
+		return EmergencyAccessNetworkInfo{}, err
+	}
+	if len(parts) == 0 {
+		return EmergencyAccessNetworkInfo{}, errors.New("invalid p-access-network-info header: empty value")
+	}
+	accessType := strings.TrimSpace(parts[0])
+	if accessType == "" {
+		return EmergencyAccessNetworkInfo{}, errors.New("invalid p-access-network-info header: empty access type")
+	}
+	params, err := parseSIPHeaderParameters(strings.Join(parts[1:], ";"))
+	if err != nil {
+		return EmergencyAccessNetworkInfo{}, err
+	}
+	out := EmergencyAccessNetworkInfo{
+		AccessType: accessType,
+		Parameters: params,
+	}
+	if params != nil {
+		out.WLANNodeID = params["i-wlan-node-id"]
+		delete(out.Parameters, "i-wlan-node-id")
+		if len(out.Parameters) == 0 {
+			out.Parameters = nil
+		}
+	}
+	return out, nil
+}
+
+func normalizePAccessNetworkInfoParameters(params map[string]string) map[string]string {
+	if len(params) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(params))
+	for key, value := range params {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" {
+			continue
+		}
+		out[key] = strings.TrimSpace(value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func formatSIPParamValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if isSIPToken(value) {
+		return value
+	}
+	return quoteSIPParamValue(value)
+}
+
+func isSIPToken(value string) bool {
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			continue
+		}
+		switch r {
+		case '-', '.', '!', '%', '*', '_', '+', '`', '\'', '~':
+			continue
+		default:
+			return false
+		}
+	}
+	return value != ""
 }
 
 func BuildEmergencySIPHeaders(cfg EmergencySIPHeaderConfig) map[string]string {

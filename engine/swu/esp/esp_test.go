@@ -72,6 +72,142 @@ func TestOpenRejectsTamperedICV(t *testing.T) {
 	}
 }
 
+func TestAESGCMSealOpenRoundTrip(t *testing.T) {
+	key := append(bytes.Repeat([]byte{0x11}, 16), 0xa1, 0xa2, 0xa3, 0xa4)
+	sa, err := NewSA(SA{
+		SPI:           0x11223344,
+		Encryption:    EncryptionAESGCM_16,
+		EncryptionKey: key,
+	})
+	if err != nil {
+		t.Fatalf("NewSA() error = %v", err)
+	}
+	payload := []byte{0x45, 0x00, 0x00, 0x14, 0xaa, 0xbb, 0xcc}
+	packet, err := sa.Seal(NextHeaderIPv4, payload, SealOptions{
+		Sequence: 9,
+		IV:       []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
+	})
+	if err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+	if binary.BigEndian.Uint32(packet[0:4]) != 0x11223344 || binary.BigEndian.Uint32(packet[4:8]) != 9 {
+		t.Fatalf("packet header=%x", packet[:8])
+	}
+	if len(packet) != 8+8+12+16 {
+		t.Fatalf("packet len=%d", len(packet))
+	}
+	if !bytes.Equal(packet[8:16], []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}) {
+		t.Fatalf("explicit iv=%x", packet[8:16])
+	}
+	openSA, err := NewSA(SA{
+		SPI:           0x11223344,
+		Encryption:    EncryptionAESGCM_16,
+		EncryptionKey: key,
+	})
+	if err != nil {
+		t.Fatalf("NewSA(open) error = %v", err)
+	}
+	out, err := openSA.Open(packet)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if out.SPI != 0x11223344 || out.Sequence != 9 || out.NextHeader != NextHeaderIPv4 || !bytes.Equal(out.Payload, payload) {
+		t.Fatalf("open=%+v payload=%x", out, out.Payload)
+	}
+}
+
+func TestAESGCMOpenRejectsTamperedTag(t *testing.T) {
+	key := append(bytes.Repeat([]byte{0x21}, 16), 0xb1, 0xb2, 0xb3, 0xb4)
+	sa, err := NewSA(SA{
+		SPI:           0x55667788,
+		Encryption:    EncryptionAESGCM_16,
+		EncryptionKey: key,
+	})
+	if err != nil {
+		t.Fatalf("NewSA() error = %v", err)
+	}
+	packet, err := sa.Seal(NextHeaderIPv6, []byte{0x60, 0x00, 0x00}, SealOptions{
+		Sequence: 3,
+		IV:       bytes.Repeat([]byte{0x45}, 8),
+	})
+	if err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+	packet[len(packet)-1] ^= 0xff
+	if _, err := sa.Open(packet); !errors.Is(err, ErrInvalidPacket) {
+		t.Fatalf("Open(tampered) err=%v, want ErrInvalidPacket", err)
+	}
+}
+
+func TestAESGCMSealDerivesDefaultIVFromSequence(t *testing.T) {
+	key := append(bytes.Repeat([]byte{0x31}, 16), 0xc1, 0xc2, 0xc3, 0xc4)
+	sa, err := NewSA(SA{
+		SPI:           0xaabbccdd,
+		Encryption:    EncryptionAESGCM_16,
+		EncryptionKey: key,
+	})
+	if err != nil {
+		t.Fatalf("NewSA() error = %v", err)
+	}
+	packet, err := sa.Seal(NextHeaderIPv4, []byte{0x45, 0x00}, SealOptions{Sequence: 0x01020304})
+	if err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+	if got, want := packet[8:16], []byte{0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04}; !bytes.Equal(got, want) {
+		t.Fatalf("explicit iv=%x, want %x", got, want)
+	}
+}
+
+func TestNewSAFromChildAESGCMUsesCombinedModeKeys(t *testing.T) {
+	aOutboundKey := append(bytes.Repeat([]byte{0x10}, 16), 0x01, 0x02, 0x03, 0x04)
+	aInboundKey := append(bytes.Repeat([]byte{0x30}, 16), 0x05, 0x06, 0x07, 0x08)
+	child := ikev2.ChildSAResult{
+		LocalSPI:  []byte{0xca, 0xfe, 0xba, 0xbe},
+		RemoteSPI: []byte{0xde, 0xad, 0xbe, 0xef},
+		Keys: ikev2.ChildSAKeys{
+			Profile: ikev2.ESPKeyProfile{
+				EncryptionID:        ikev2.ENCR_AES_GCM_16,
+				EncryptionKeyLength: 20,
+			},
+			Outbound: ikev2.ESPKeys{EncryptionKey: aOutboundKey},
+			Inbound:  ikev2.ESPKeys{EncryptionKey: aInboundKey},
+		},
+	}
+	outbound, err := NewOutboundSAFromChild(child)
+	if err != nil {
+		t.Fatalf("NewOutboundSAFromChild() error = %v", err)
+	}
+	peer := child
+	peer.LocalSPI = append([]byte(nil), child.RemoteSPI...)
+	peer.RemoteSPI = append([]byte(nil), child.LocalSPI...)
+	peer.Keys.Inbound = ikev2.ESPKeys{EncryptionKey: aOutboundKey}
+	inbound, err := NewInboundSAFromChild(peer)
+	if err != nil {
+		t.Fatalf("NewInboundSAFromChild() error = %v", err)
+	}
+	if outbound.Encryption != EncryptionAESGCM_16 || inbound.Encryption != EncryptionAESGCM_16 {
+		t.Fatalf("encryption outbound=%d inbound=%d", outbound.Encryption, inbound.Encryption)
+	}
+	if outbound.BlockSize != aesGCMPaddingAlignment || outbound.ICVLength != aesGCMICVLength || len(outbound.IntegrityKey) != 0 {
+		t.Fatalf("outbound block=%d icv=%d integ=%x", outbound.BlockSize, outbound.ICVLength, outbound.IntegrityKey)
+	}
+	payload := []byte{0x45, 0x00, 0x00, 0x14}
+	packet, err := outbound.Seal(NextHeaderIPv4, payload, SealOptions{
+		Sequence: 4,
+		IV:       bytes.Repeat([]byte{0x99}, 8),
+	})
+	if err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+	out, err := inbound.Open(packet)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if out.SPI != 0xdeadbeef || out.Sequence != 4 || out.NextHeader != NextHeaderIPv4 || !bytes.Equal(out.Payload, payload) {
+		t.Fatalf("open=%+v payload=%x", out, out.Payload)
+	}
+}
+
 func TestReplayDetection(t *testing.T) {
 	sealer, err := NewSA(SA{
 		SPI:              0x11111111,

@@ -148,6 +148,32 @@ func TestParseAndBuildSDPSecurityFingerprintSetup(t *testing.T) {
 	}
 }
 
+func TestParseSDPSecurityRejectsInvalidFingerprintAndSetup(t *testing.T) {
+	tests := []struct {
+		name string
+		attr string
+	}{
+		{name: "unsupported hash", attr: "a=fingerprint:MD5 AA:BB:CC"},
+		{name: "non hex octet", attr: "a=fingerprint:SHA-256 AA:GG:CC"},
+		{name: "short octet", attr: "a=fingerprint:SHA-256 AA:B:CC"},
+		{name: "empty octet", attr: "a=fingerprint:SHA-256 AA::CC"},
+		{name: "unsupported setup", attr: "a=setup:sideways"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte("v=0\r\n" +
+				"c=IN IP4 203.0.113.8\r\n" +
+				"m=audio 49170 RTP/SAVPF 111\r\n" +
+				tt.attr + "\r\n" +
+				"a=rtpmap:111 AMR/8000\r\n")
+			_, err := ParseSDPSecurity(raw)
+			if !errors.Is(err, ErrInvalidSDPSecurity) {
+				t.Fatalf("ParseSDPSecurity() err=%v, want ErrInvalidSDPSecurity", err)
+			}
+		})
+	}
+}
+
 func TestBuildSDPAnswerWithSecurityConstructsCrypto(t *testing.T) {
 	keyParams := testSDPSecurityCryptoInlineKeyParams(t)
 	security := SDPSecurityInfo{

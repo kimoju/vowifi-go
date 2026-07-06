@@ -152,12 +152,14 @@ protocol layers needed by VoHive:
 - IKEv2 SA proposal/transform encoding, default IKE/ESP proposals,
   configuration payload requests, identity payloads, traffic selectors, and
   EAP-AKA/AKA' packet and attribute codecs, including selected-SA validation
-  for combined-mode ESP AES-GCM proposals without separate INTEG transforms
+  plus key material/profile derivation for combined-mode AES-GCM proposals
+  without separate INTEG transforms
 - IKE_SA_INIT initiator flow with UDP/NAT-T transport support, X25519 key
   exchange, NAT-D/MOBIKE notifications, responder parsing, SKEYSEED, and IKE SA
   key material derivation
 - IKEv2 key material split into SK_d/SK_ai/SK_ar/SK_ei/SK_er/SK_pi/SK_pr plus
-  AES-CBC/HMAC protected SK payload construction and verification
+  AES-CBC/HMAC and AES-GCM AEAD protected SK payload construction and
+  verification
 - IKEv2 encrypted INFORMATIONAL exchange runner for empty DPD liveness probes
   and DELETE payloads for IKE/ESP/AH SA teardown, plus SWu close-handler wiring
   for graceful CHILD_SA/IKE_SA deletion
@@ -190,8 +192,8 @@ protocol layers needed by VoHive:
   configuration/traffic selector extraction, and RFC 7296 ESP outbound/inbound
   key material derivation from SK_d and IKE_SA_INIT nonces
 - userspace ESP packet seal/open primitives with SPI/sequence handling, AES-CBC
-  payload encryption, HMAC-SHA integrity checks, RFC 4303 padding, next-header
-  restoration, and replay-window validation
+  payload encryption, HMAC-SHA integrity checks, combined-mode AES-GCM-16,
+  RFC 4303 padding, next-header restoration, and replay-window validation
 - SWu userspace packet tunnel session wiring that builds outbound/inbound ESP
   SAs from the CHILD_SA result, auto-selects IPv4/IPv6 next headers, sends ESP
   packets through a transport boundary, opens inbound ESP packets, tracks

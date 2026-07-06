@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/textproto"
 	"strconv"
 	"strings"
@@ -22,6 +25,15 @@ type SIPMessage struct {
 	Reason     string
 	Headers    map[string][]string
 	Body       []byte
+}
+
+type SIPMultipartLeaf struct {
+	Path               []int
+	Headers            map[string][]string
+	ContentType        string
+	ContentDisposition string
+	ContentID          string
+	Body               []byte
 }
 
 func (event ReplayEvent) SIPMessage() (SIPMessage, error) {
@@ -96,6 +108,47 @@ func (msg SIPMessage) CSeq() (int, string, bool) {
 		return 0, "", false
 	}
 	return seq, method, true
+}
+
+func (msg SIPMessage) ContentType() (string, map[string]string, bool, error) {
+	return parseSIPContentType(msg.Header("Content-Type"))
+}
+
+func (msg SIPMessage) MultipartLeaves() ([]SIPMultipartLeaf, error) {
+	mediaType, params, ok, err := msg.ContentType()
+	if err != nil || !ok || !strings.HasPrefix(mediaType, "multipart/") {
+		return nil, err
+	}
+	boundary := params["boundary"]
+	if boundary == "" {
+		return nil, fmt.Errorf("%w: multipart content type missing boundary", ErrInvalidSIPMessage)
+	}
+	leaves, err := multipartLeaves(msg.Body, boundary, nil)
+	if err != nil {
+		return nil, err
+	}
+	return leaves, nil
+}
+
+func (leaf SIPMultipartLeaf) Header(name string) string {
+	values := leaf.HeaderValues(name)
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func (leaf SIPMultipartLeaf) HeaderValues(name string) []string {
+	if len(leaf.Headers) == 0 {
+		return nil
+	}
+	values := leaf.Headers[canonicalSIPHeaderName(name)]
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
 }
 
 func splitSIPWire(wire []byte) (string, []byte, error) {
@@ -203,6 +256,83 @@ func validateSIPContentLength(headers map[string][]string, body []byte) ([]byte,
 		return nil, fmt.Errorf("%w: content length %d does not match body length %d", ErrInvalidSIPMessage, want, len(body))
 	}
 	return body, nil
+}
+
+func multipartLeaves(body []byte, boundary string, path []int) ([]SIPMultipartLeaf, error) {
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	var leaves []SIPMultipartLeaf
+	for index := 0; ; index++ {
+		part, err := reader.NextRawPart()
+		if errors.Is(err, io.EOF) {
+			return leaves, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: malformed multipart body", ErrInvalidSIPMessage)
+		}
+		partBody, err := io.ReadAll(part)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read multipart body: %v", ErrInvalidSIPMessage, err)
+		}
+		partPath := append(append([]int(nil), path...), index)
+		headers := cloneSIPHeaderMap(part.Header)
+		contentType := firstSIPHeader(headers, "Content-Type")
+		mediaType, params, ok, err := parseSIPContentType(contentType)
+		if err != nil {
+			return nil, err
+		}
+		if ok && strings.HasPrefix(mediaType, "multipart/") {
+			boundary := params["boundary"]
+			if boundary == "" {
+				return nil, fmt.Errorf("%w: nested multipart content type missing boundary", ErrInvalidSIPMessage)
+			}
+			nested, err := multipartLeaves(partBody, boundary, partPath)
+			if err != nil {
+				return nil, err
+			}
+			leaves = append(leaves, nested...)
+			continue
+		}
+		leaves = append(leaves, SIPMultipartLeaf{
+			Path:               partPath,
+			Headers:            headers,
+			ContentType:        contentType,
+			ContentDisposition: firstSIPHeader(headers, "Content-Disposition"),
+			ContentID:          firstSIPHeader(headers, "Content-ID"),
+			Body:               bytes.Clone(partBody),
+		})
+	}
+}
+
+func parseSIPContentType(value string) (string, map[string]string, bool, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", nil, false, nil
+	}
+	mediaType, params, err := mime.ParseMediaType(value)
+	if err != nil {
+		return "", nil, true, fmt.Errorf("%w: invalid content type", ErrInvalidSIPMessage)
+	}
+	out := make(map[string]string, len(params))
+	for name, value := range params {
+		out[strings.ToLower(name)] = value
+	}
+	return strings.ToLower(mediaType), out, true, nil
+}
+
+func cloneSIPHeaderMap(headers map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(headers))
+	for name, values := range headers {
+		canonicalName := canonicalSIPHeaderName(name)
+		out[canonicalName] = append(out[canonicalName], values...)
+	}
+	return out
+}
+
+func firstSIPHeader(headers map[string][]string, name string) string {
+	values := headers[canonicalSIPHeaderName(name)]
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 func validSIPHeaderName(name string) bool {
