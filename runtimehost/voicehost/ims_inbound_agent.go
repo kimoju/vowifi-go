@@ -857,6 +857,7 @@ func (a *IMSInboundAgent) HandleInboundSubscribe(ctx context.Context, req Inboun
 	var subscribe voiceclient.SIPRequestMessage
 	var err error
 	redirectRetries := 0
+	retriedMinExpires := false
 	for {
 		subscribe, err = voiceclient.BuildSubscribeRequest(cfg, event, expires, req.ContentType, req.Body)
 		if err != nil {
@@ -873,6 +874,14 @@ func (a *IMSInboundAgent) HandleInboundSubscribe(ctx context.Context, req Inboun
 		resp, err = a.ClientTransport.RoundTripRequest(ctx, subscribe)
 		if err != nil {
 			return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client SUBSCRIBE failed"}, err
+		}
+		if resp.StatusCode == 423 && !retriedMinExpires {
+			if retryCfg, retryExpires, ok := retryDialogConfigForMinExpires(cfg, subscribe.Headers, resp.Headers); ok {
+				cfg = retryCfg
+				expires = retryExpires
+				retriedMinExpires = true
+				continue
+			}
 		}
 		if redirectRetries < maxIMSInviteRedirects {
 			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextInboundClientCSeq(cfg.CSeq)); ok {

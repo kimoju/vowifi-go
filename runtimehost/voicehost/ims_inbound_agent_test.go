@@ -937,6 +937,63 @@ func TestIMSInboundAgentHandlesSubscribe(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentRetriesSubscribeMinExpires(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@192.0.2.50:5060>"},
+			},
+			Body: []byte(sampleSDP("192.0.2.50", 4002)),
+		},
+		{
+			StatusCode: 423,
+			Reason:     "Interval Too Brief",
+			Headers:    map[string][]string{"Min-Expires": {"900"}},
+		},
+		{
+			StatusCode: 202,
+			Reason:     "Accepted",
+			Headers:    map[string][]string{"Expires": {"900"}, "X-Client": {"subscribe-retry-ok"}},
+		},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-subscribe-min-expires",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	result, err := agent.HandleInboundSubscribe(context.Background(), InboundDialogRequest{
+		CallID:  "in-call-subscribe-min-expires",
+		CSeq:    7,
+		Event:   "refer",
+		Expires: "300",
+	})
+	if err != nil || result.StatusCode != 202 || result.Headers["Expires"] != "900" || result.Headers["X-Client"] != "subscribe-retry-ok" {
+		t.Fatalf("HandleInboundSubscribe() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 3 || transport.requests[1].Method != "SUBSCRIBE" || transport.requests[2].Method != "SUBSCRIBE" {
+		t.Fatalf("SUBSCRIBE requests=%+v", transport.requests)
+	}
+	first := transport.requests[1]
+	retry := transport.requests[2]
+	if first.Headers["CSeq"] != "7 SUBSCRIBE" || first.Headers["Expires"] != "300" {
+		t.Fatalf("first SUBSCRIBE=%+v", first)
+	}
+	if retry.Headers["CSeq"] != "8 SUBSCRIBE" || retry.Headers["Expires"] != "900" || retry.Headers["Event"] != "refer" {
+		t.Fatalf("retry SUBSCRIBE=%+v", retry)
+	}
+}
+
 func TestIMSInboundAgentFollowsClientSupplementaryRedirectContacts(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

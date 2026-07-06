@@ -818,20 +818,30 @@ func (a *IMSOutboundAgent) SendDialogSubscribe(ctx context.Context, req DialogSu
 
 	var resp voiceclient.SIPResponse
 	redirectRetries := 0
+	retriedMinExpires := false
+	subscribeExpires := strings.TrimSpace(req.Expires)
 	for {
-		subscribe, err := voiceclient.BuildSubscribeRequest(cfg, event, req.Expires, req.ContentType, req.Body)
+		subscribe, err := voiceclient.BuildSubscribeRequest(cfg, event, subscribeExpires, req.ContentType, req.Body)
 		if err != nil {
 			return DialogSubscribeResult{Accepted: false, StatusCode: 500, Reason: "build IMS SUBSCRIBE failed"}, err
 		}
 		applyDialogUpdateHeaders(subscribe.Headers, req.Headers)
 		subscribe.Headers["Event"] = event
-		if expires := strings.TrimSpace(req.Expires); expires != "" {
-			subscribe.Headers["Expires"] = expires
+		if subscribeExpires != "" {
+			subscribe.Headers["Expires"] = subscribeExpires
 		}
 		a.storeOutboundDialogAttempt(callID, cfg)
 		resp, err = a.roundTripRequest(ctx, subscribe)
 		if err != nil {
 			return DialogSubscribeResult{Accepted: false, Reason: "IMS SUBSCRIBE failed", RegistrationRecoveryNeeded: true}, err
+		}
+		if resp.StatusCode == 423 && !retriedMinExpires {
+			if retryCfg, retryExpires, ok := retryDialogConfigForMinExpires(cfg, subscribe.Headers, resp.Headers); ok {
+				cfg = retryCfg
+				subscribeExpires = retryExpires
+				retriedMinExpires = true
+				continue
+			}
 		}
 		if redirectRetries < maxIMSInviteRedirects {
 			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
@@ -1777,6 +1787,58 @@ func retryDialogConfigForMinSE(cfg voiceclient.DialogRequestConfig, sentHeaders 
 	retry.SessionRefresher = sentInterval.Refresher
 	retry.MinSE = minSE
 	return retry, true
+}
+
+func retryDialogConfigForMinExpires(cfg voiceclient.DialogRequestConfig, sentHeaders map[string]string, responseHeaders map[string][]string) (voiceclient.DialogRequestConfig, string, bool) {
+	minExpires := minExpiresHeader(responseHeaders)
+	if minExpires <= 0 {
+		return voiceclient.DialogRequestConfig{}, "", false
+	}
+	expires := subscribeExpiresHeader(sentHeaders)
+	if expires >= minExpires {
+		return voiceclient.DialogRequestConfig{}, "", false
+	}
+	retry := cfg
+	retry.CSeq = outboundNextCSeq(cfg.CSeq)
+	return retry, strconv.Itoa(minExpires), true
+}
+
+func minExpiresHeader(headers map[string][]string) int {
+	for key, values := range headers {
+		if !strings.EqualFold(key, "Min-Expires") {
+			continue
+		}
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				part = strings.TrimSpace(part)
+				if semi := strings.IndexByte(part, ';'); semi >= 0 {
+					part = part[:semi]
+				}
+				n, err := strconv.Atoi(strings.TrimSpace(part))
+				if err == nil && n > 0 {
+					return n
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func subscribeExpiresHeader(headers map[string]string) int {
+	for key, value := range headers {
+		if !strings.EqualFold(key, "Expires") {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if semi := strings.IndexByte(value, ';'); semi >= 0 {
+			value = value[:semi]
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 type sessionIntervalHeader struct {
