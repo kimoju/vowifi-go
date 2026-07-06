@@ -440,6 +440,7 @@ func (s *IMSInboundWireServer) handleRefer(ctx context.Context, req voiceclient.
 	if result.Accepted {
 		final.StatusCode = inboundStatusCode(result.StatusCode, 202)
 		final.Reason = firstVoiceNonEmpty(result.Reason, "Accepted")
+		final.Headers["Contact"] = "<" + s.contactURI() + ">"
 	}
 	applyInboundWireResultHeaders(final.Headers, result.Headers)
 	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err

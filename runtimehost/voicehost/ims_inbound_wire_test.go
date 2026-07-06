@@ -1331,7 +1331,9 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeMessageAnd
 	if err != nil {
 		t.Fatalf("HandleRequest(REFER) error = %v", err)
 	}
-	if len(responses) != 1 || responses[0].StatusCode != 202 || responses[0].Headers["X-Client"] != "refer-ok" {
+	if len(responses) != 1 || responses[0].StatusCode != 202 ||
+		responses[0].Headers["Contact"] != "<sip:vowifi@127.0.0.1:5060>" ||
+		responses[0].Headers["X-Client"] != "refer-ok" {
 		t.Fatalf("REFER responses=%+v", responses)
 	}
 	referReq := transport.readRequest(t)

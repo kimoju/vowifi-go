@@ -235,7 +235,8 @@ protocol layers needed by VoHive:
   dialog CSeq advancement
 - IMS-originated in-dialog SIP REFER forwarding to the local softphone, including
   `norefersub` option-tag support, `Refer-Sub` propagation, response mapping,
-  remote Contact refresh, and dialog CSeq tracking
+  remote Contact refresh, accepted-response Contact advertisement, and dialog
+  CSeq tracking
 - local softphone in-dialog SIP NOTIFY forwarding to IMS dialogs for REFER
   subscription result reporting, including structured `Event` and
   `Subscription-State` handling, `message/sipfrag` bodies, response header/body
