@@ -502,14 +502,14 @@ func (g *Gateway) handleClientReinvite(deviceID string, req *sip.Request, tx sip
 }
 
 func (g *Gateway) HandleClientCancel(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
-	if tx != nil && req != nil {
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
-	}
 	if req == nil {
 		return
 	}
 	callID := sipCallID(req)
 	if callID == "" {
+		if tx != nil {
+			_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
+		}
 		return
 	}
 	dialog := g.dialog(callID)
@@ -518,9 +518,30 @@ func (g *Gateway) HandleClientCancel(deviceID string, req *sip.Request, tx sip.S
 	dialog.Body = append([]byte(nil), req.Body()...)
 	dialog.Headers = sipRequestHeaderMap(req)
 	dialog.State = DialogStateTerminated
+	agent := g.GetAgent(deviceID)
+	if canceller, ok := agent.(DialogCancellerWithResult); ok {
+		result, err := canceller.CancelVoiceCallWithResult(context.Background(), dialog)
+		if dialogResultTerminatesLocalDialog(result, err) {
+			g.recordDialog(dialog)
+		}
+		if tx != nil {
+			_ = tx.Respond(dialogInfoResultResponse(req, result, err, "VoWiFi CANCEL failed"))
+		}
+		return
+	}
+	if canceller, ok := agent.(DialogCanceller); ok {
+		err := canceller.CancelVoiceCall(context.Background(), dialog)
+		if err == nil {
+			g.recordDialog(dialog)
+		}
+		if tx != nil {
+			_ = tx.Respond(legacyDialogActionResponse(req, err, "VoWiFi CANCEL failed"))
+		}
+		return
+	}
 	g.recordDialog(dialog)
-	if canceller, ok := g.GetAgent(deviceID).(DialogCanceller); ok {
-		_ = canceller.CancelVoiceCall(context.Background(), dialog)
+	if tx != nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 	}
 }
 
@@ -926,24 +947,46 @@ func (g *Gateway) HandleClientUpdate(deviceID string, req *sip.Request, tx sip.S
 func (g *Gateway) HandleClientAck(deviceID string, req *sip.Request, tx sip.ServerTransaction) {}
 
 func (g *Gateway) HandleClientBye(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
-	if tx != nil && req != nil {
-		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
-	}
 	if req == nil {
 		return
 	}
 	callID := sipCallID(req)
 	if callID == "" {
+		if tx != nil {
+			_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
+		}
 		return
 	}
 	dialog := g.dialog(callID)
+	dialog.DeviceID = firstVoiceNonEmpty(dialog.DeviceID, strings.TrimSpace(deviceID))
 	dialog.State = DialogStateTerminated
 	dialog.ContentType = sipHeaderValue(req, "Content-Type")
 	dialog.Body = append([]byte(nil), req.Body()...)
 	dialog.Headers = sipRequestHeaderMap(req)
+	agent := g.GetAgent(deviceID)
+	if terminator, ok := agent.(DialogTerminatorWithResult); ok {
+		result, err := terminator.EndVoiceCallWithResult(context.Background(), dialog)
+		if dialogResultTerminatesLocalDialog(result, err) {
+			g.recordDialog(dialog)
+		}
+		if tx != nil {
+			_ = tx.Respond(dialogInfoResultResponse(req, result, err, "VoWiFi BYE failed"))
+		}
+		return
+	}
+	if terminator, ok := agent.(DialogTerminator); ok {
+		err := terminator.EndVoiceCall(context.Background(), dialog)
+		if err == nil {
+			g.recordDialog(dialog)
+		}
+		if tx != nil {
+			_ = tx.Respond(legacyDialogActionResponse(req, err, "VoWiFi BYE failed"))
+		}
+		return
+	}
 	g.recordDialog(dialog)
-	if terminator, ok := g.GetAgent(deviceID).(DialogTerminator); ok {
-		_ = terminator.EndVoiceCall(context.Background(), dialog)
+	if tx != nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 	}
 }
 
@@ -1110,6 +1153,49 @@ func localDialogInfoStatusCode(code int, accepted bool) int {
 		return 200
 	}
 	return 500
+}
+
+func dialogInfoResultResponse(req *sip.Request, result DialogInfoResult, err error, failureReason string) *sip.Response {
+	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)
+	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	if !result.Accepted && statusCode >= 300 {
+		reason = firstVoiceNonEmpty(result.Reason, failureReason)
+	}
+	if err != nil && result.StatusCode <= 0 {
+		statusCode = 503
+		reason = firstVoiceNonEmpty(result.Reason, failureReason)
+	}
+	body := append([]byte(nil), result.Body...)
+	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
+	if len(body) > 0 && strings.TrimSpace(result.ContentType) != "" {
+		res.AppendHeader(sip.NewHeader("Content-Type", strings.TrimSpace(result.ContentType)))
+	}
+	for key, value := range result.Headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
+	return res
+}
+
+func legacyDialogActionResponse(req *sip.Request, err error, failureReason string) *sip.Response {
+	if err != nil {
+		return sip.NewResponseFromRequest(req, 503, firstVoiceNonEmpty(failureReason, err.Error()), nil)
+	}
+	return sip.NewResponseFromRequest(req, 200, "OK", nil)
+}
+
+func dialogResultTerminatesLocalDialog(result DialogInfoResult, err error) bool {
+	if result.Accepted || (result.StatusCode >= 200 && result.StatusCode < 300) {
+		return true
+	}
+	if result.StatusCode == 481 {
+		return true
+	}
+	return err == nil && result.StatusCode == 0
 }
 
 func sipHeaderValue(req *sip.Request, name string) string {

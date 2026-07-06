@@ -90,7 +90,8 @@ protocol layers needed by VoHive:
   BYE/CANCEL request construction with MMTel service identification headers,
   route-set application, UDP/TCP SIP request transport, outbound IMS voice
   agent, ACK/BYE/CANCEL dialog handling with release Reason/body forwarding,
-  IMS BYE/CANCEL response status/body/header capture,
+  IMS BYE/CANCEL response status/body/header capture and local softphone
+  response propagation,
   RTP/RTCP media relay endpoint allocation, SDP media/RTCP rewriting, packet
   forwarding, and dialog termination hooks
 - SWu tunnel manager/session contracts with startup validation, tunnel readiness

@@ -2,6 +2,7 @@ package voicehost
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -32,6 +33,8 @@ type fakeOutboundAgent struct {
 	subscribeResult DialogSubscribeResult
 	updateResult    DialogUpdateResult
 	reinviteResult  DialogReinviteResult
+	terminateResult DialogInfoResult
+	cancelResult    DialogInfoResult
 	err             error
 	infoErr         error
 	messageErr      error
@@ -42,6 +45,8 @@ type fakeOutboundAgent struct {
 	subscribeErr    error
 	updateErr       error
 	reinviteErr     error
+	terminateErr    error
+	cancelErr       error
 }
 
 func (a *fakeOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCallRequest) (OutboundCallResult, error) {
@@ -57,12 +62,34 @@ func (a *fakeOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundC
 
 func (a *fakeOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) error {
 	a.terminated = append(a.terminated, info)
-	return nil
+	return a.terminateErr
 }
 
 func (a *fakeOutboundAgent) CancelVoiceCall(ctx context.Context, info DialogInfo) error {
 	a.canceled = append(a.canceled, info)
-	return nil
+	return a.cancelErr
+}
+
+func (a *fakeOutboundAgent) EndVoiceCallWithResult(ctx context.Context, info DialogInfo) (DialogInfoResult, error) {
+	a.terminated = append(a.terminated, info)
+	if a.terminateErr != nil {
+		return a.terminateResult, a.terminateErr
+	}
+	if isZeroFakeDialogInfoResult(a.terminateResult) {
+		return DialogInfoResult{Accepted: true, StatusCode: 200, Reason: "OK"}, nil
+	}
+	return a.terminateResult, nil
+}
+
+func (a *fakeOutboundAgent) CancelVoiceCallWithResult(ctx context.Context, info DialogInfo) (DialogInfoResult, error) {
+	a.canceled = append(a.canceled, info)
+	if a.cancelErr != nil {
+		return a.cancelResult, a.cancelErr
+	}
+	if isZeroFakeDialogInfoResult(a.cancelResult) {
+		return DialogInfoResult{Accepted: true, StatusCode: 200, Reason: "OK"}, nil
+	}
+	return a.cancelResult, nil
 }
 
 func (a *fakeOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoRequest) (DialogInfoResult, error) {
@@ -135,6 +162,17 @@ func (a *fakeOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRe
 		return DialogReinviteResult{}, a.reinviteErr
 	}
 	return a.reinviteResult, nil
+}
+
+func isZeroFakeDialogInfoResult(result DialogInfoResult) bool {
+	return !result.Accepted &&
+		result.StatusCode == 0 &&
+		result.Reason == "" &&
+		!result.RegistrationRecoveryNeeded &&
+		result.RetryAfter == 0 &&
+		result.ContentType == "" &&
+		len(result.Body) == 0 &&
+		len(result.Headers) == 0
 }
 
 type fakeServerTransaction struct {
@@ -274,7 +312,17 @@ func TestGatewayHandleClientInviteRoutesEstablishedDialogReinvite(t *testing.T) 
 
 func TestGatewayHandleClientByeTerminatesDialog(t *testing.T) {
 	g := NewGateway()
-	agent := &fakeOutboundAgent{result: OutboundCallResult{Accepted: true, LocalSDP: SDPInfo{ConnectionIP: "192.0.2.20", MediaPort: 5004}}}
+	agent := &fakeOutboundAgent{
+		result: OutboundCallResult{Accepted: true, LocalSDP: SDPInfo{ConnectionIP: "192.0.2.20", MediaPort: 5004}},
+		terminateResult: DialogInfoResult{
+			Accepted:    true,
+			StatusCode:  202,
+			Reason:      "Accepted",
+			ContentType: "message/sipfrag",
+			Body:        []byte("SIP/2.0 202 Accepted\r\n"),
+			Headers:     map[string]string{"Content-Type": "ignored", "X-IMS": "bye-ok"},
+		},
+	}
 	g.RegisterAgent("dev-1", agent)
 	g.HandleClientInvite("dev-1", newInviteRequest("call-1", "18005551212", sampleSDP("198.51.100.10", 4002)), &fakeServerTransaction{})
 
@@ -286,7 +334,10 @@ func TestGatewayHandleClientByeTerminatesDialog(t *testing.T) {
 	byeReq.SetBody([]byte("SIP/2.0 200 OK\r\n"))
 	g.HandleClientBye("dev-1", byeReq, tx)
 
-	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 {
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 202 || tx.responses[0].Reason != "Accepted" ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "message/sipfrag" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "bye-ok" ||
+		string(tx.responses[0].Body()) != "SIP/2.0 202 Accepted\r\n" {
 		t.Fatalf("BYE responses=%v", responseCodes(tx.responses))
 	}
 	if len(agent.terminated) != 1 || agent.terminated[0].State != DialogStateTerminated {
@@ -301,6 +352,40 @@ func TestGatewayHandleClientByeTerminatesDialog(t *testing.T) {
 	}
 	if status := g.DeviceStatus("dev-1"); status["active_dialogs"] != 0 {
 		t.Fatalf("DeviceStatus=%+v, want no active dialog", status)
+	}
+}
+
+func TestGatewayHandleClientByeKeepsDialogOnIMSFailure(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{
+		terminateResult: DialogInfoResult{
+			Accepted:    false,
+			StatusCode:  503,
+			Reason:      "Service Unavailable",
+			ContentType: "message/sipfrag",
+			Body:        []byte("SIP/2.0 503 Service Unavailable\r\n"),
+			Headers:     map[string]string{"X-IMS": "bye-failed"},
+		},
+		terminateErr: errors.New("IMS BYE rejected"),
+	}
+	g.RegisterAgent("dev-1", agent)
+	g.recordDialog(DialogInfo{DeviceID: "dev-1", CallID: "call-bye-failed", Callee: "18005551212", State: DialogStateEstablished})
+
+	tx := &fakeServerTransaction{}
+	g.HandleClientBye("dev-1", newByeRequest("call-bye-failed"), tx)
+
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 503 ||
+		tx.responses[0].Reason != "Service Unavailable" ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "message/sipfrag" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "bye-failed" ||
+		string(tx.responses[0].Body()) != "SIP/2.0 503 Service Unavailable\r\n" {
+		t.Fatalf("BYE failure responses=%+v", tx.responses)
+	}
+	if len(agent.terminated) != 1 {
+		t.Fatalf("terminated=%+v", agent.terminated)
+	}
+	if status := g.DeviceStatus("dev-1"); status["active_dialogs"] != 1 {
+		t.Fatalf("DeviceStatus=%+v, want dialog kept for retry", status)
 	}
 }
 
@@ -333,6 +418,40 @@ func TestGatewayHandleClientCancelCancelsEarlyDialog(t *testing.T) {
 	}
 	if status := g.DeviceStatus("dev-1"); status["active_dialogs"] != 0 {
 		t.Fatalf("DeviceStatus=%+v, want no active dialog", status)
+	}
+}
+
+func TestGatewayHandleClientCancelPropagatesIMSResponse(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeOutboundAgent{
+		cancelResult: DialogInfoResult{
+			Accepted:    false,
+			StatusCode:  481,
+			Reason:      "Call/Transaction Does Not Exist",
+			ContentType: "message/sipfrag",
+			Body:        []byte("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+			Headers:     map[string]string{"Content-Type": "ignored", "X-IMS": "cancel-miss"},
+		},
+		cancelErr: errors.New("IMS CANCEL rejected"),
+	}
+	g.RegisterAgent("dev-1", agent)
+	g.recordDialog(DialogInfo{DeviceID: "dev-1", CallID: "call-cancel-miss", Callee: "18005551212", State: DialogStateEarly})
+
+	tx := &fakeServerTransaction{}
+	g.HandleClientCancel("dev-1", newCancelRequest("call-cancel-miss"), tx)
+
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 481 ||
+		tx.responses[0].Reason != "Call/Transaction Does Not Exist" ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "message/sipfrag" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "cancel-miss" ||
+		string(tx.responses[0].Body()) != "SIP/2.0 481 Call/Transaction Does Not Exist\r\n" {
+		t.Fatalf("CANCEL responses=%+v", tx.responses)
+	}
+	if len(agent.canceled) != 1 || agent.canceled[0].CallID != "call-cancel-miss" {
+		t.Fatalf("canceled=%+v", agent.canceled)
+	}
+	if status := g.DeviceStatus("dev-1"); status["active_dialogs"] != 0 {
+		t.Fatalf("DeviceStatus=%+v, want 481 to terminate local dialog", status)
 	}
 }
 
