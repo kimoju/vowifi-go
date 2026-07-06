@@ -65,6 +65,7 @@ type InboundDialogRequest struct {
 	ReferTo           string
 	ReferredBy        string
 	Event             string
+	Expires           string
 	SubscriptionState string
 }
 
@@ -733,6 +734,60 @@ func (a *IMSInboundAgent) HandleInboundNotify(ctx context.Context, req InboundDi
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
 		cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, notifyCSeq)
+		state.clientCfg = cfg
+		a.storeInboundDialog(callID, state)
+	}
+	return IMSInfoResult{
+		Handled:     true,
+		StatusCode:  inboundStatusCode(resp.StatusCode, 500),
+		Reason:      firstVoiceNonEmpty(resp.Reason, "OK"),
+		ContentType: firstVoiceHeader(resp.Headers, "Content-Type"),
+		Body:        append([]byte(nil), resp.Body...),
+		Headers:     firstValueSIPHeaders(resp.Headers),
+	}, nil
+}
+
+func (a *IMSInboundAgent) HandleInboundSubscribe(ctx context.Context, req InboundDialogRequest) (IMSInfoResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.ClientTransport == nil {
+		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return IMSInfoResult{Handled: true, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	event := firstVoiceNonEmpty(req.Event, firstVoiceHeader(req.Headers, "Event"))
+	if strings.TrimSpace(event) == "" {
+		return IMSInfoResult{Handled: true, StatusCode: 400, Reason: "Event empty"}, errors.New("Event is empty")
+	}
+	expires := firstVoiceNonEmpty(req.Expires, firstVoiceHeader(req.Headers, "Expires"))
+	state, ok := a.inboundDialog(callID)
+	if !ok {
+		return IMSInfoResult{Handled: true, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	cfg := state.clientCfg
+	subscribeCSeq := inboundCSeq(req.CSeq)
+	cfg.CSeq = subscribeCSeq
+	subscribe, err := voiceclient.BuildSubscribeRequest(cfg, event, expires, req.ContentType, req.Body)
+	if err != nil {
+		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "build client SUBSCRIBE failed"}, err
+	}
+	applyIncomingInfoHeaders(subscribe.Headers, "", req.Headers)
+	subscribe.Headers["Event"] = event
+	if strings.TrimSpace(expires) != "" {
+		subscribe.Headers["Expires"] = strings.TrimSpace(expires)
+	}
+	state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, subscribeCSeq)
+	a.storeInboundDialog(callID, state)
+	resp, err := a.ClientTransport.RoundTripRequest(ctx, subscribe)
+	if err != nil {
+		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client SUBSCRIBE failed"}, err
+	}
+	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
+		cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, subscribeCSeq)
 		state.clientCfg = cfg
 		a.storeInboundDialog(callID, state)
 	}

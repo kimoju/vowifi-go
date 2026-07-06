@@ -1217,7 +1217,7 @@ func TestIMSInboundWireServerRetransmitsInviteFinalUntilAck(t *testing.T) {
 	}
 }
 
-func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifyAndOptions(t *testing.T) {
+func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeAndOptions(t *testing.T) {
 	transport := newWireInboundTransport([]voiceclient.SIPResponse{
 		{
 			StatusCode: 200,
@@ -1234,6 +1234,7 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifyAndOptions(t *testi
 		},
 		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"X-Client": {"refer-ok"}}},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-Client": {"notify-ok"}}},
+		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"Expires": {"300"}, "X-Client": {"subscribe-ok"}}},
 	})
 	server := &IMSInboundWireServer{
 		Agent: &IMSInboundAgent{
@@ -1326,6 +1327,31 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifyAndOptions(t *testi
 		t.Fatalf("client NOTIFY=%+v body=%q", notifyReq, notifyReq.Body)
 	}
 
+	subscribe := parseWireIncoming(t, wireIMSRequest("wire-call-dialog", "SUBSCRIBE", 6, []byte("<resource-lists/>"),
+		"Event: refer\r\n",
+		"Expires: 300\r\n",
+		"Content-Type: application/resource-lists+xml\r\n",
+		"Allow-Events: refer\r\n",
+	))
+	responses, err = server.HandleRequest(context.Background(), subscribe)
+	if err != nil {
+		t.Fatalf("HandleRequest(SUBSCRIBE) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 202 ||
+		responses[0].Headers["Expires"] != "300" ||
+		responses[0].Headers["X-Client"] != "subscribe-ok" {
+		t.Fatalf("SUBSCRIBE responses=%+v", responses)
+	}
+	subscribeReq := transport.readRequest(t)
+	if subscribeReq.Method != "SUBSCRIBE" || subscribeReq.Headers["CSeq"] != "6 SUBSCRIBE" ||
+		subscribeReq.Headers["Event"] != "refer" ||
+		subscribeReq.Headers["Expires"] != "300" ||
+		subscribeReq.Headers["Content-Type"] != "application/resource-lists+xml" ||
+		subscribeReq.Headers["Allow-Events"] != "refer" ||
+		string(subscribeReq.Body) != "<resource-lists/>" {
+		t.Fatalf("client SUBSCRIBE=%+v body=%q", subscribeReq, subscribeReq.Body)
+	}
+
 	options := parseWireIncoming(t, wireIMSRequest("wire-options", "OPTIONS", 1, nil))
 	responses, err = server.HandleRequest(context.Background(), options)
 	if err != nil {
@@ -1334,6 +1360,7 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifyAndOptions(t *testi
 	if len(responses) != 1 || responses[0].StatusCode != 200 ||
 		!strings.Contains(responses[0].Headers["Allow"], "REFER") ||
 		!strings.Contains(responses[0].Headers["Allow"], "NOTIFY") ||
+		!strings.Contains(responses[0].Headers["Allow"], "SUBSCRIBE") ||
 		!strings.Contains(responses[0].Headers["Supported"], "norefersub") ||
 		responses[0].Headers["Allow-Events"] != "refer" ||
 		responses[0].Headers["Contact"] == "" {
@@ -1481,12 +1508,12 @@ func TestIMSInboundWireServerDispatchesReinviteAndAck(t *testing.T) {
 func TestIMSInboundWireServerRejectsUnsupportedMethod(t *testing.T) {
 	server := &IMSInboundWireServer{}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
-		Method: "SUBSCRIBE",
+		Method: "PUBLISH",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
-			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-SUBSCRIBE"},
+			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-PUBLISH"},
 			"Call-ID": {"call-options"},
-			"CSeq":    {"1 SUBSCRIBE"},
+			"CSeq":    {"1 PUBLISH"},
 			"From":    {"<sip:+18005551212@ims.example>;tag=ims-tag"},
 			"To":      {"<sip:user@ims.example>"},
 		},

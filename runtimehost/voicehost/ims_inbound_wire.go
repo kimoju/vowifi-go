@@ -175,6 +175,8 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		responses, err = s.handleRefer(ctx, req)
 	case "NOTIFY":
 		responses, err = s.handleNotify(ctx, req)
+	case "SUBSCRIBE":
+		responses, err = s.handleSubscribe(ctx, req)
 	case "OPTIONS":
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(s.optionsResponse())}
 	case "BYE":
@@ -424,6 +426,22 @@ func (s *IMSInboundWireServer) handleNotify(ctx context.Context, req voiceclient
 	return s.infoResultResponse(result, err), err
 }
 
+func (s *IMSInboundWireServer) handleSubscribe(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
+	if s == nil || s.Agent == nil {
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+	}
+	result, err := s.Agent.HandleInboundSubscribe(ctx, InboundDialogRequest{
+		CallID:      wireCallID(req),
+		CSeq:        wireCSeq(req),
+		ContentType: firstVoiceHeader(req.Headers, "Content-Type"),
+		Body:        append([]byte(nil), req.Body...),
+		Headers:     cloneSIPHeaders(req.Headers),
+		Event:       firstVoiceHeader(req.Headers, "Event"),
+		Expires:     firstVoiceHeader(req.Headers, "Expires"),
+	})
+	return s.infoResultResponse(result, err), err
+}
+
 func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient.SIPIncomingRequest, key string, emit imsInboundWireResponseEmitter) ([]IMSInboundWireResponse, error) {
 	trying := s.withResponseHeaders(wireResponse(100, "Trying"))
 	responses := []IMSInboundWireResponse{trying}
@@ -634,7 +652,7 @@ func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 }
 
 func (s *IMSInboundWireServer) allowHeader() string {
-	allow := "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, REFER, NOTIFY, OPTIONS"
+	allow := "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, REFER, NOTIFY, SUBSCRIBE, OPTIONS"
 	if s != nil && s.InfoHandler != nil {
 		allow += ", INFO"
 	}
