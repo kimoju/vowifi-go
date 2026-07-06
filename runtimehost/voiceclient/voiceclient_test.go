@@ -360,6 +360,81 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionInstallsSecurityPlanBeforeAuthenticatedRegister(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce", algorithm=MD5, qop="auth"`},
+				"Security-Server": {
+					`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063;q=0.8`,
+					`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065;q=0.4`,
+				},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	installer := &fakeSecurityPlanInstaller{transport: transport}
+	result, err := RegisterSession{
+		Transport:             transport,
+		Profile:               IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:          "sip:ims.example",
+		ContactURI:            "sip:user@192.0.2.10:5060",
+		CNonce:                "cnonce",
+		SecurityPlanInstaller: installer,
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", result, len(transport.requests))
+	}
+	if len(installer.calls) != 1 || len(installer.requestsAtCall) != 1 || installer.requestsAtCall[0] != 1 {
+		t.Fatalf("installer calls=%+v requestsAtCall=%+v", installer.calls, installer.requestsAtCall)
+	}
+	plan := installer.calls[0]
+	if plan.SPIClient != 111 || plan.SPIServer != 222 || plan.PortClient != 5062 || plan.PortServer != 5063 ||
+		plan.Inbound.SPI != 111 || plan.Outbound.SPI != 222 || plan.QValue != "0.8" {
+		t.Fatalf("installed plan=%+v", plan)
+	}
+	if got := transport.requests[1].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=111") {
+		t.Fatalf("Security-Verify=%q", got)
+	}
+}
+
+func TestRegisterSessionPropagatesSecurityPlanInstallerError(t *testing.T) {
+	installErr := errors.New("security plan install failed")
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce", algorithm=MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	installer := &fakeSecurityPlanInstaller{transport: transport, err: installErr}
+	result, err := RegisterSession{
+		Transport:             transport,
+		Profile:               IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:          "sip:ims.example",
+		ContactURI:            "sip:user@192.0.2.10:5060",
+		SecurityPlanInstaller: installer,
+	}.Register(context.Background())
+	if !errors.Is(err, installErr) {
+		t.Fatalf("Register() err=%v, want %v", err, installErr)
+	}
+	if result.Registered || result.StatusCode != 401 || result.Attempts != 1 || len(transport.requests) != 1 || len(installer.calls) != 1 {
+		t.Fatalf("result=%+v requests=%d installerCalls=%d", result, len(transport.requests), len(installer.calls))
+	}
+	if result.AuthHeader == "" || result.AuthHeaderName != "Authorization" || result.Challenge.Nonce != "nonce" {
+		t.Fatalf("result auth/challenge=%+v", result)
+	}
+}
+
 func TestRegisterSessionHandlesAKASynchronizationFailure(t *testing.T) {
 	firstNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	secondNonce := append(bytesFrom(0x60, 16), bytesFrom(0x80, 16)...)
@@ -2320,6 +2395,21 @@ func (f *fakeRegisterTransport) RoundTripRegister(ctx context.Context, msg Regis
 	resp := f.responses[0]
 	f.responses = f.responses[1:]
 	return resp, nil
+}
+
+type fakeSecurityPlanInstaller struct {
+	transport      *fakeRegisterTransport
+	calls          []IMSSecurityAssociationPlan
+	requestsAtCall []int
+	err            error
+}
+
+func (f *fakeSecurityPlanInstaller) InstallSecurityPlan(ctx context.Context, plan IMSSecurityAssociationPlan) error {
+	f.calls = append(f.calls, plan)
+	if f.transport != nil {
+		f.requestsAtCall = append(f.requestsAtCall, len(f.transport.requests))
+	}
+	return f.err
 }
 
 type fakeSIPRequestRoundTripTransport struct {

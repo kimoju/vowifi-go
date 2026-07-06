@@ -75,8 +75,9 @@ protocol layers needed by VoHive:
   DNS servers to the runtime and using them for default IMS SRV/A/AAAA lookups
 - IMS REGISTER session flow with MMTel Contact capability advertisement,
   401/407 authentication retry, 423 `Min-Expires` retry handling, associated
-  URI, Service-Route, Path, Security-Server, and Contact expiry capture, plus a
-  runtime `IMSRegistrar` adapter for the wire transport
+  URI, Service-Route, Path, Security-Server, optional IMS security-plan
+  installer hook before authenticated REGISTER retries, and Contact expiry
+  capture, plus a runtime `IMSRegistrar` adapter for the wire transport
 - IMS REGISTER refresh maintenance on the reusable SIP flow, including
   expiry-based renewal, 423 `Min-Expires` retry handling, retry scheduling,
   binding/auth/CSeq state updates, full re-registration after recoverable

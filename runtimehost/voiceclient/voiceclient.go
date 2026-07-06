@@ -93,17 +93,22 @@ type SIPRegisterTransport interface {
 	RoundTripRegister(context.Context, RegisterMessage) (RegisterResponse, error)
 }
 
+type SecurityPlanInstaller interface {
+	InstallSecurityPlan(context.Context, IMSSecurityAssociationPlan) error
+}
+
 type RegisterSession struct {
-	Transport      SIPRegisterTransport
-	AKAProvider    sim.AKAProvider
-	Profile        IMSProfile
-	RegistrarURI   string
-	ContactURI     string
-	CallID         string
-	CNonce         string
-	Expires        int
-	SecurityClient SecurityAgreement
-	SecurityRandom io.Reader
+	Transport             SIPRegisterTransport
+	AKAProvider           sim.AKAProvider
+	Profile               IMSProfile
+	RegistrarURI          string
+	ContactURI            string
+	CallID                string
+	CNonce                string
+	Expires               int
+	SecurityClient        SecurityAgreement
+	SecurityRandom        io.Reader
+	SecurityPlanInstaller SecurityPlanInstaller
 }
 
 type RegisterResult struct {
@@ -508,6 +513,9 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if err != nil {
 		return registerFailureResult(resp, attempts, ch, ""), err
 	}
+	if err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClient); err != nil {
+		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, Challenge: ch, AuthHeader: authz, AuthHeaderName: authzHeader}, err
+	}
 
 	cseq++
 	resp2, err := sendRegister(cseq, authzHeader, authz, resp.Headers)
@@ -571,6 +579,9 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		currentAuthInput = nextAuthInput
 		nextChallengeHeaders := resp2.Headers
 		securityHeaders = nextChallengeHeaders
+		if err := s.installChallengeSecurityPlan(ctx, nextChallengeHeaders, securityClient); err != nil {
+			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: ch, AuthHeader: authz, AuthHeaderName: authzHeader}, err
+		}
 		cseq++
 		resp2, err = sendRegister(cseq, authzHeader, authz, nextChallengeHeaders)
 		if err != nil {
@@ -915,6 +926,17 @@ func (s RegisterSession) securityClientAgreement() SecurityAgreement {
 		return DefaultSecurityClientAgreement(s.SecurityRandom)
 	}
 	return completeSecurityAgreement(s.SecurityClient)
+}
+
+func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, client SecurityAgreement) error {
+	if s.SecurityPlanInstaller == nil {
+		return nil
+	}
+	_, plan, ok := securityPlanFromChallenge(headers, client)
+	if !ok {
+		return nil
+	}
+	return s.SecurityPlanInstaller.InstallSecurityPlan(ctx, plan)
 }
 
 func nextDigestAuthorization(state DigestAuthState, method, uri, fallbackName, fallbackHeader string) (string, string, DigestAuthState, error) {
@@ -1563,6 +1585,22 @@ func securityVerifyFromChallenge(headers map[string][]string) string {
 		return ""
 	}
 	return strings.Join(values, ", ")
+}
+
+func securityPlanFromChallenge(headers map[string][]string, client SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
+	return securityPlanFromValues(headerListValues(headers, "Security-Server"), client)
+}
+
+func securityPlanFromValues(values []string, client SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
+	selected, ok := SelectSecurityAgreement(values, client)
+	if !ok {
+		return SecurityAgreement{}, IMSSecurityAssociationPlan{}, false
+	}
+	plan, ok := BuildIMSSecurityAssociationPlan(selected)
+	if !ok {
+		return selected, IMSSecurityAssociationPlan{}, false
+	}
+	return selected, plan, true
 }
 
 func md5Hex(s string) string {
