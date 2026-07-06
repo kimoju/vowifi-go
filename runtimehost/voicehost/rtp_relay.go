@@ -2,6 +2,8 @@ package voicehost
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var ErrRTPRelayConfig = errors.New("invalid rtp relay config")
@@ -31,10 +34,38 @@ type RTPRelayConfig struct {
 type RTPRelayTransform func([]byte) ([]byte, error)
 
 type RTPRelayTransforms struct {
-	ClientToIMSRTP  RTPRelayTransform
-	IMSToClientRTP  RTPRelayTransform
-	ClientToIMSRTCP RTPRelayTransform
-	IMSToClientRTCP RTPRelayTransform
+	ClientToIMSRTP       RTPRelayTransform
+	IMSToClientRTP       RTPRelayTransform
+	ClientToIMSRTCP      RTPRelayTransform
+	IMSToClientRTCP      RTPRelayTransform
+	GeneratedToIMSRTP    RTPRelayTransform
+	GeneratedToClientRTP RTPRelayTransform
+}
+
+type RTPRelayDTMFRequest struct {
+	Direction      RTPDTMFDirection
+	Signal         string
+	DurationMS     int
+	StepMS         int
+	EndPacketCount int
+	Volume         uint8
+	SequenceNumber uint16
+	Timestamp      uint32
+	SSRC           uint32
+	PayloadType    uint8
+	ClockRate      int
+}
+
+type RTPRelayDTMFResult struct {
+	Packets        int
+	Bytes          int
+	PayloadType    uint8
+	ClockRate      int
+	SequenceNumber uint16
+	Timestamp      uint32
+	SSRC           uint32
+	Signal         string
+	DurationMS     int
 }
 
 type RTPRelayStats struct {
@@ -106,6 +137,10 @@ type RTPRelaySession struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	dtmfMu               sync.Mutex
+	dtmfClientToIMSState rtpDTMFSequenceState
+	dtmfIMSToClientState rtpDTMFSequenceState
+
 	clientToIMSRTPPackets                atomic.Uint64
 	imsToClientRTPPackets                atomic.Uint64
 	clientToIMSRTCPPackets               atomic.Uint64
@@ -145,6 +180,12 @@ type RTPRelaySession struct {
 	rtpDTMFClientToIMSRemappedEvents     atomic.Uint64
 	rtpDTMFIMSToClientRemappedEvents     atomic.Uint64
 	rtpDTMFParseErrors                   atomic.Uint64
+}
+
+type rtpDTMFSequenceState struct {
+	nextSeq       uint16
+	nextTimestamp uint32
+	ssrc          uint32
 }
 
 func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SDPInfo) (*RTPRelaySession, error) {
@@ -201,17 +242,19 @@ func newRTPRelaySession(ctx context.Context, cfg RTPRelayConfig) (*RTPRelaySessi
 	}
 	childCtx, cancel := context.WithCancel(ctx)
 	s := &RTPRelaySession{
-		clientConn:          clientConn,
-		imsConn:             imsConn,
-		clientRTCPConn:      clientRTCPConn,
-		imsRTCPConn:         imsRTCPConn,
-		clientAdvertiseIP:   advertiseIP(cfg.ClientAdvertiseIP, clientListenIP),
-		imsAdvertiseIP:      advertiseIP(cfg.IMSAdvertiseIP, imsListenIP),
-		bufferSize:          cfg.BufferSize,
-		cancel:              cancel,
-		transforms:          cfg.Transforms,
-		rtcpFeedbackHandler: cfg.RTCPFeedbackHandler,
-		rtpDTMFHandler:      cfg.RTPDTMFHandler,
+		clientConn:           clientConn,
+		imsConn:              imsConn,
+		clientRTCPConn:       clientRTCPConn,
+		imsRTCPConn:          imsRTCPConn,
+		clientAdvertiseIP:    advertiseIP(cfg.ClientAdvertiseIP, clientListenIP),
+		imsAdvertiseIP:       advertiseIP(cfg.IMSAdvertiseIP, imsListenIP),
+		bufferSize:           cfg.BufferSize,
+		cancel:               cancel,
+		transforms:           cfg.Transforms,
+		rtcpFeedbackHandler:  cfg.RTCPFeedbackHandler,
+		rtpDTMFHandler:       cfg.RTPDTMFHandler,
+		dtmfClientToIMSState: newRTPDTMFSequenceState(),
+		dtmfIMSToClientState: newRTPDTMFSequenceState(),
 	}
 	if s.bufferSize <= 0 {
 		s.bufferSize = 2048
@@ -371,6 +414,106 @@ func (s *RTPRelaySession) Close() error {
 	return err
 }
 
+func (s *RTPRelaySession) SendRTPDTMFToIMS(ctx context.Context, req RTPRelayDTMFRequest) (RTPRelayDTMFResult, error) {
+	req.Direction = RTPDTMFClientToIMS
+	return s.SendRTPDTMF(ctx, req)
+}
+
+func (s *RTPRelaySession) SendRTPDTMFToClient(ctx context.Context, req RTPRelayDTMFRequest) (RTPRelayDTMFResult, error) {
+	req.Direction = RTPDTMFIMSToClient
+	return s.SendRTPDTMF(ctx, req)
+}
+
+func (s *RTPRelaySession) SendRTPDTMF(ctx context.Context, req RTPRelayDTMFRequest) (RTPRelayDTMFResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s == nil {
+		return RTPRelayDTMFResult{}, ErrRTPRelayConfig
+	}
+	direction, err := normalizeRTPDTMFDirection(req.Direction)
+	if err != nil {
+		return RTPRelayDTMFResult{DurationMS: rtpDTMFDurationMS(req.DurationMS)}, err
+	}
+	signal, err := NormalizeRTPDTMFSignal(req.Signal)
+	if err != nil {
+		return RTPRelayDTMFResult{DurationMS: rtpDTMFDurationMS(req.DurationMS)}, err
+	}
+	route, err := s.rtpDTMFSendRoute(direction)
+	if err != nil {
+		return RTPRelayDTMFResult{Signal: signal, DurationMS: rtpDTMFDurationMS(req.DurationMS)}, err
+	}
+	if route.target == nil {
+		return RTPRelayDTMFResult{Signal: signal, DurationMS: rtpDTMFDurationMS(req.DurationMS)}, fmt.Errorf("%w: %s RTP target unavailable", ErrRTPRelayConfig, route.label)
+	}
+	if route.conn == nil {
+		return RTPRelayDTMFResult{Signal: signal, DurationMS: rtpDTMFDurationMS(req.DurationMS)}, fmt.Errorf("%w: %s RTP socket unavailable", ErrRTPRelayConfig, route.label)
+	}
+	if route.allow != nil && !route.allow() {
+		route.drops.Add(1)
+		return RTPRelayDTMFResult{Signal: signal, DurationMS: rtpDTMFDurationMS(req.DurationMS)}, fmt.Errorf("%w: %s RTP direction is not sendable", ErrRTPRelayConfig, route.label)
+	}
+	if len(route.payloads) == 0 && req.PayloadType == 0 {
+		route.drops.Add(1)
+		return RTPRelayDTMFResult{Signal: signal, DurationMS: rtpDTMFDurationMS(req.DurationMS)}, fmt.Errorf("%w: %s RTP telephone-event payload unavailable", ErrRTPRelayConfig, route.label)
+	}
+	payloadType, clockRate := rtpDTMFGenerationPayload(req, route.payloads)
+	req.Signal = signal
+	packets, cfg, err := s.buildGeneratedRTPDTMFSequence(direction, req, payloadType, clockRate)
+	result := RTPRelayDTMFResult{
+		PayloadType:    cfg.PayloadType,
+		ClockRate:      cfg.ClockRate,
+		SequenceNumber: cfg.SequenceNumber,
+		Timestamp:      cfg.Timestamp,
+		SSRC:           cfg.SSRC,
+		Signal:         signal,
+		DurationMS:     rtpDTMFDurationMS(req.DurationMS),
+	}
+	if err != nil {
+		return result, err
+	}
+	interval := time.Duration(rtpDTMFStepMS(req.StepMS, result.DurationMS)) * time.Millisecond
+	payloads := map[uint8]int{cfg.PayloadType: cfg.ClockRate}
+	for i, packet := range packets {
+		if i > 0 {
+			if err := waitRTPDTMFInterval(ctx, interval); err != nil {
+				return result, err
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				return result, ctx.Err()
+			default:
+			}
+		}
+		summary, err := InspectRTPDTMF(direction, packet, payloads, s.rtpDTMFHandler)
+		if err != nil {
+			route.drops.Add(1)
+			s.rtpDTMFParseErrors.Add(1)
+			return result, err
+		}
+		s.recordRTPDTMFSummary(direction, summary)
+		out := packet
+		if route.transform != nil {
+			transformed, err := route.transform(packet)
+			if err != nil {
+				route.drops.Add(1)
+				return result, err
+			}
+			out = transformed
+		}
+		if _, err := route.conn.WriteToUDP(out, route.target); err != nil {
+			route.drops.Add(1)
+			return result, err
+		}
+		route.packets.Add(1)
+		route.bytes.Add(uint64(len(out)))
+		result.Packets++
+		result.Bytes += len(out)
+	}
+	return result, nil
+}
+
 func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, allow func() bool, packets, bytes, drops *atomic.Uint64, transform RTPRelayTransform, rtcpDirection RTCPFeedbackDirection, dtmfDirection RTPDTMFDirection, dtmfPayloads, dtmfTargetPayloads func() map[uint8]int) {
 	defer s.wg.Done()
 	buf := make([]byte, s.bufferSize)
@@ -485,6 +628,241 @@ func (s *RTPRelaySession) recordRTPDTMFRemap(direction RTPDTMFDirection) {
 	case RTPDTMFIMSToClient:
 		s.rtpDTMFIMSToClientRemappedEvents.Add(1)
 	}
+}
+
+type rtpDTMFSendRoute struct {
+	label     string
+	conn      *net.UDPConn
+	target    *net.UDPAddr
+	allow     func() bool
+	payloads  map[uint8]int
+	transform RTPRelayTransform
+	packets   *atomic.Uint64
+	bytes     *atomic.Uint64
+	drops     *atomic.Uint64
+}
+
+func (s *RTPRelaySession) rtpDTMFSendRoute(direction RTPDTMFDirection) (rtpDTMFSendRoute, error) {
+	if s == nil {
+		return rtpDTMFSendRoute{}, ErrRTPRelayConfig
+	}
+	switch direction {
+	case RTPDTMFClientToIMS:
+		return rtpDTMFSendRoute{
+			label:     "IMS",
+			conn:      s.imsConn,
+			target:    s.currentIMSTarget(),
+			allow:     s.allowClientToIMSRTP,
+			payloads:  s.currentIMSRTPDTMFPayloads(),
+			transform: s.transforms.GeneratedToIMSRTP,
+			packets:   &s.clientToIMSRTPPackets,
+			bytes:     &s.clientToIMSRTPBytes,
+			drops:     &s.clientToIMSRTPDrops,
+		}, nil
+	case RTPDTMFIMSToClient:
+		return rtpDTMFSendRoute{
+			label:     "client",
+			conn:      s.clientConn,
+			target:    s.currentClientTarget(),
+			allow:     s.allowIMSToClientRTP,
+			payloads:  s.currentClientRTPDTMFPayloads(),
+			transform: s.transforms.GeneratedToClientRTP,
+			packets:   &s.imsToClientRTPPackets,
+			bytes:     &s.imsToClientRTPBytes,
+			drops:     &s.imsToClientRTPDrops,
+		}, nil
+	default:
+		return rtpDTMFSendRoute{}, fmt.Errorf("%w: unsupported RTP DTMF direction %q", ErrInvalidDTMF, direction)
+	}
+}
+
+func (s *RTPRelaySession) buildGeneratedRTPDTMFSequence(direction RTPDTMFDirection, req RTPRelayDTMFRequest, payloadType uint8, clockRate int) ([][]byte, RTPDTMFSequenceConfig, error) {
+	if s == nil {
+		return nil, RTPDTMFSequenceConfig{}, ErrRTPRelayConfig
+	}
+	if clockRate <= 0 {
+		clockRate = DefaultRTPDTMFClockRate
+	}
+	cfg := RTPDTMFSequenceConfig{
+		PayloadType:    payloadType,
+		Signal:         req.Signal,
+		DurationMS:     rtpDTMFDurationMS(req.DurationMS),
+		StepMS:         req.StepMS,
+		EndPacketCount: req.EndPacketCount,
+		Volume:         req.Volume,
+		SequenceNumber: req.SequenceNumber,
+		Timestamp:      req.Timestamp,
+		SSRC:           req.SSRC,
+		ClockRate:      clockRate,
+	}
+	s.dtmfMu.Lock()
+	defer s.dtmfMu.Unlock()
+	state := &s.dtmfClientToIMSState
+	if direction == RTPDTMFIMSToClient {
+		state = &s.dtmfIMSToClientState
+	}
+	if state.ssrc == 0 {
+		*state = newRTPDTMFSequenceState()
+	}
+	if cfg.SequenceNumber == 0 {
+		cfg.SequenceNumber = state.nextSeq
+	}
+	if cfg.Timestamp == 0 {
+		cfg.Timestamp = state.nextTimestamp
+	}
+	if cfg.SSRC == 0 {
+		cfg.SSRC = state.ssrc
+	}
+	packets, err := BuildRTPDTMFSequence(cfg)
+	if err != nil {
+		return nil, cfg, err
+	}
+	durationSamples, err := rtpDTMFSamplesForDuration(cfg.DurationMS, cfg.ClockRate)
+	if err != nil {
+		return nil, cfg, err
+	}
+	state.nextSeq = cfg.SequenceNumber + uint16(len(packets))
+	state.nextTimestamp = cfg.Timestamp + uint32(durationSamples)
+	state.ssrc = cfg.SSRC
+	return packets, cfg, nil
+}
+
+func normalizeRTPDTMFDirection(direction RTPDTMFDirection) (RTPDTMFDirection, error) {
+	switch direction {
+	case "", RTPDTMFClientToIMS:
+		return RTPDTMFClientToIMS, nil
+	case RTPDTMFIMSToClient:
+		return RTPDTMFIMSToClient, nil
+	default:
+		return "", fmt.Errorf("%w: unsupported RTP DTMF direction %q", ErrInvalidDTMF, direction)
+	}
+}
+
+func rtpDTMFGenerationPayload(req RTPRelayDTMFRequest, payloads map[uint8]int) (uint8, int) {
+	if req.PayloadType != 0 {
+		clockRate := req.ClockRate
+		if clockRate <= 0 {
+			clockRate = payloads[req.PayloadType]
+		}
+		if clockRate <= 0 {
+			clockRate = DefaultRTPDTMFClockRate
+		}
+		return req.PayloadType, clockRate
+	}
+	preferredClock := req.ClockRate
+	if payload, clockRate, ok := preferredRTPDTMFPayload(payloads, preferredClock); ok {
+		return payload, clockRate
+	}
+	clockRate := preferredClock
+	if clockRate <= 0 {
+		clockRate = DefaultRTPDTMFClockRate
+	}
+	return DefaultRTPDTMFPayloadType, clockRate
+}
+
+func preferredRTPDTMFPayload(payloads map[uint8]int, preferredClock int) (uint8, int, bool) {
+	if len(payloads) == 0 {
+		return 0, 0, false
+	}
+	if clockRate, ok := payloads[DefaultRTPDTMFPayloadType]; ok && (preferredClock <= 0 || clockRate == preferredClock) {
+		if clockRate <= 0 {
+			clockRate = DefaultRTPDTMFClockRate
+		}
+		return DefaultRTPDTMFPayloadType, clockRate, true
+	}
+	var bestPayload uint8
+	var bestClock int
+	found := false
+	for payload, clockRate := range payloads {
+		if clockRate <= 0 {
+			clockRate = DefaultRTPDTMFClockRate
+		}
+		if preferredClock > 0 && clockRate != preferredClock {
+			continue
+		}
+		if !found || payload < bestPayload {
+			bestPayload = payload
+			bestClock = clockRate
+			found = true
+		}
+	}
+	if found {
+		return bestPayload, bestClock, true
+	}
+	for payload, clockRate := range payloads {
+		if clockRate <= 0 {
+			clockRate = DefaultRTPDTMFClockRate
+		}
+		if !found || payload < bestPayload {
+			bestPayload = payload
+			bestClock = clockRate
+			found = true
+		}
+	}
+	return bestPayload, bestClock, found
+}
+
+func rtpDTMFDurationMS(durationMS int) int {
+	if durationMS <= 0 {
+		return DefaultDTMFDurationMS
+	}
+	return durationMS
+}
+
+func rtpDTMFStepMS(stepMS, durationMS int) int {
+	if durationMS <= 0 {
+		durationMS = DefaultDTMFDurationMS
+	}
+	if stepMS <= 0 {
+		stepMS = DefaultRTPDTMFStepMS
+	}
+	if stepMS > durationMS {
+		return durationMS
+	}
+	return stepMS
+}
+
+func waitRTPDTMFInterval(ctx context.Context, interval time.Duration) error {
+	if interval <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func newRTPDTMFSequenceState() rtpDTMFSequenceState {
+	return rtpDTMFSequenceState{
+		nextSeq:       uint16(randomRTPDTMFUint32()),
+		nextTimestamp: randomRTPDTMFUint32(),
+		ssrc:          randomRTPDTMFNonZeroUint32(),
+	}
+}
+
+func randomRTPDTMFNonZeroUint32() uint32 {
+	v := randomRTPDTMFUint32()
+	if v != 0 {
+		return v
+	}
+	return uint32(time.Now().UnixNano()) | 1
+}
+
+func randomRTPDTMFUint32() uint32 {
+	var b [4]byte
+	if _, err := crand.Read(b[:]); err == nil {
+		return binary.BigEndian.Uint32(b[:])
+	}
+	return uint32(time.Now().UnixNano())
 }
 
 func (s *RTPRelaySession) allowClientToIMSRTP() bool {

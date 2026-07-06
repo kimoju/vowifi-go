@@ -1,6 +1,7 @@
 package voicehost
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -86,6 +87,18 @@ func TestBuildDialogDTMFInfoRequest(t *testing.T) {
 	req.Headers["X-Test"] = "changed"
 	if req2, err := BuildDialogDTMFInfoRequest(DialogDTMFRequest{CallID: "call-1", Signal: "5", Headers: map[string]string{"X-Test": "dtmf"}}); err != nil || req2.Headers["X-Test"] != "dtmf" {
 		t.Fatalf("headers were not cloned req=%+v err=%v", req2, err)
+	}
+}
+
+func TestIMSOutboundAgentSendDialogRTPDTMFRequiresRelay(t *testing.T) {
+	agent := &IMSOutboundAgent{}
+	agent.storeDialog("call-1", imsDialogState{})
+	result, err := agent.SendDialogRTPDTMF(context.Background(), DialogRTPDTMFRequest{CallID: "call-1", Signal: "5"})
+	if !errors.Is(err, ErrRTPRelayConfig) {
+		t.Fatalf("SendDialogRTPDTMF() err=%v, want ErrRTPRelayConfig", err)
+	}
+	if result.Accepted || result.StatusCode != 409 {
+		t.Fatalf("result=%+v", result)
 	}
 }
 

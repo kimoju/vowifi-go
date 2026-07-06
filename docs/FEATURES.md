@@ -198,7 +198,10 @@ protocol layers needed by VoHive:
   repetition semantics, SDP dynamic payload discovery, relay-side event
   inspection, direction-aware callbacks, dynamic payload type/duration
   remapping across relay legs, clear-relay DTMF event/end/remap/error counters,
-  and SRTP plaintext-stage DTMF inspection/remapping during media transforms
+  relay-level generated DTMF packet scheduling toward IMS or client media legs
+  with per-direction sequence/timestamp/SSRC state, call-dialog RTP DTMF send
+  entry points, and SRTP plaintext-stage DTMF inspection/remapping plus
+  generated-packet protection during media transforms
 - inbound IMS voice agent helpers that bridge IMS-originated INVITEs to a local
   SIP client, parse SDP answers, forward ACK/BYE/CANCEL dialog requests, and
   support RTP relay allocation with IMS-offer/client-answer SDP rewriting,

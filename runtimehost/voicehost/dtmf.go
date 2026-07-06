@@ -21,6 +21,10 @@ type DialogDTMFSender interface {
 	SendDialogDTMF(context.Context, DialogDTMFRequest) (DialogDTMFResult, error)
 }
 
+type DialogRTPDTMFSender interface {
+	SendDialogRTPDTMF(context.Context, DialogRTPDTMFRequest) (DialogRTPDTMFResult, error)
+}
+
 type DialogDTMFRequest struct {
 	DeviceID   string
 	CallID     string
@@ -31,12 +35,85 @@ type DialogDTMFRequest struct {
 
 type DialogDTMFResult = DialogInfoResult
 
+type DialogRTPDTMFRequest struct {
+	DeviceID       string
+	CallID         string
+	Direction      RTPDTMFDirection
+	Signal         string
+	DurationMS     int
+	StepMS         int
+	EndPacketCount int
+	Volume         uint8
+	SequenceNumber uint16
+	Timestamp      uint32
+	SSRC           uint32
+	PayloadType    uint8
+	ClockRate      int
+}
+
+type DialogRTPDTMFResult struct {
+	Accepted   bool
+	StatusCode int
+	Reason     string
+	RTP        RTPRelayDTMFResult
+}
+
 func (a *IMSOutboundAgent) SendDialogDTMF(ctx context.Context, req DialogDTMFRequest) (DialogDTMFResult, error) {
 	infoReq, err := BuildDialogDTMFInfoRequest(req)
 	if err != nil {
 		return DialogDTMFResult{Accepted: false, StatusCode: 400, Reason: err.Error()}, err
 	}
 	return a.SendDialogInfo(ctx, infoReq)
+}
+
+func (a *IMSOutboundAgent) SendDialogRTPDTMF(ctx context.Context, req DialogRTPDTMFRequest) (DialogRTPDTMFResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: 503, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	state, ok := a.dialog(callID)
+	if !ok {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	if state.relay == nil {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: 409, Reason: "RTP relay unavailable"}, ErrRTPRelayConfig
+	}
+	result, err := state.relay.SendRTPDTMF(ctx, dialogRTPDTMFRelayRequest(req))
+	if err != nil {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: dialogRTPDTMFErrorStatus(err), Reason: err.Error(), RTP: result}, err
+	}
+	return DialogRTPDTMFResult{Accepted: true, StatusCode: 200, Reason: "OK", RTP: result}, nil
+}
+
+func (a *IMSInboundAgent) SendDialogRTPDTMF(ctx context.Context, req DialogRTPDTMFRequest) (DialogRTPDTMFResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: 503, Reason: "IMS inbound voice transport unavailable"}, ErrIMSInboundAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	state, ok := a.inboundDialog(callID)
+	if !ok {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	if state.relay == nil {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: 409, Reason: "RTP relay unavailable"}, ErrRTPRelayConfig
+	}
+	result, err := state.relay.SendRTPDTMF(ctx, dialogRTPDTMFRelayRequest(req))
+	if err != nil {
+		return DialogRTPDTMFResult{Accepted: false, StatusCode: dialogRTPDTMFErrorStatus(err), Reason: err.Error(), RTP: result}, err
+	}
+	return DialogRTPDTMFResult{Accepted: true, StatusCode: 200, Reason: "OK", RTP: result}, nil
 }
 
 func BuildDialogDTMFInfoRequest(req DialogDTMFRequest) (DialogInfoRequest, error) {
@@ -97,6 +174,37 @@ func ParseDTMFRelayBody(body []byte) (signal string, durationMS int, err error) 
 		return "", 0, fmt.Errorf("%w: duration %dms exceeds %dms", ErrInvalidDTMF, durationMS, MaxDTMFDurationMS)
 	}
 	return signal, durationMS, nil
+}
+
+func dialogRTPDTMFRelayRequest(req DialogRTPDTMFRequest) RTPRelayDTMFRequest {
+	direction := req.Direction
+	if direction == "" {
+		direction = RTPDTMFClientToIMS
+	}
+	return RTPRelayDTMFRequest{
+		Direction:      direction,
+		Signal:         req.Signal,
+		DurationMS:     req.DurationMS,
+		StepMS:         req.StepMS,
+		EndPacketCount: req.EndPacketCount,
+		Volume:         req.Volume,
+		SequenceNumber: req.SequenceNumber,
+		Timestamp:      req.Timestamp,
+		SSRC:           req.SSRC,
+		PayloadType:    req.PayloadType,
+		ClockRate:      req.ClockRate,
+	}
+}
+
+func dialogRTPDTMFErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrInvalidDTMF):
+		return 400
+	case errors.Is(err, ErrRTPRelayConfig):
+		return 409
+	default:
+		return 500
+	}
 }
 
 func NormalizeDTMFSignal(signal string) (string, error) {
