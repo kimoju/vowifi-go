@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"testing"
 )
 
@@ -215,6 +216,39 @@ func TestRunCREATECHILDSARejectsUnsupportedSelectedSA(t *testing.T) {
 	}
 }
 
+func TestRunCREATECHILDSARejectsWidenedTrafficSelector(t *testing.T) {
+	init := fakeInitResult(t)
+	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
+	narrowTSi := TrafficSelectors{Selectors: []TrafficSelector{{
+		Type:      TSIPv4AddressRange,
+		StartPort: 0,
+		EndPort:   65535,
+		StartAddr: net.IPv4(10, 0, 0, 10),
+		EndAddr:   net.IPv4(10, 0, 0, 10),
+	}}}
+	transport := &createChildTransport{
+		t:             t,
+		init:          init,
+		messageID:     11,
+		localSPI:      localSPI,
+		remoteSPI:     []byte{0xde, 0xad, 0xbe, 0xef},
+		responseNonce: bytes.Repeat([]byte{0x67}, 32),
+		responseTSi:   IPv4AnyTrafficSelectors(),
+	}
+	_, err := RunCREATE_CHILD_SA(context.Background(), CreateChildSAConfig{
+		Transport: transport,
+		Init:      init,
+		ChildSPI:  localSPI,
+		Nonce:     bytes.Repeat([]byte{0x46}, 32),
+		MessageID: 11,
+		TSi:       narrowTSi,
+		IV:        bytes.Repeat([]byte{0x97}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if !errors.Is(err, ErrInvalidChildSA) || !errors.Is(err, ErrInvalidTrafficSelector) {
+		t.Fatalf("RunCREATE_CHILD_SA() err=%v, want ErrInvalidChildSA and ErrInvalidTrafficSelector", err)
+	}
+}
+
 type createChildTransport struct {
 	t                 *testing.T
 	init              InitResult
@@ -224,6 +258,8 @@ type createChildTransport struct {
 	responseSA        SecurityAssociation
 	responseNotify    *Notify
 	responseNonce     []byte
+	responseTSi       TrafficSelectors
+	responseTSr       TrafficSelectors
 	rekeySPI          []byte
 	omitResponseNonce bool
 	requests          int
@@ -303,11 +339,19 @@ func (tr *createChildTransport) ExchangeIKE(ctx context.Context, request []byte)
 	if err != nil {
 		tr.t.Fatalf("SecurityAssociationPayload() error = %v", err)
 	}
-	tsiPayload, err := TrafficSelectorsPayload(PayloadTSi, IPv4AnyTrafficSelectors())
+	responseTSi := tr.responseTSi
+	if len(responseTSi.Selectors) == 0 {
+		responseTSi = IPv4AnyTrafficSelectors()
+	}
+	tsiPayload, err := TrafficSelectorsPayload(PayloadTSi, responseTSi)
 	if err != nil {
 		tr.t.Fatalf("TrafficSelectorsPayload(TSi) error = %v", err)
 	}
-	tsrPayload, err := TrafficSelectorsPayload(PayloadTSr, IPv4AnyTrafficSelectors())
+	responseTSr := tr.responseTSr
+	if len(responseTSr.Selectors) == 0 {
+		responseTSr = IPv4AnyTrafficSelectors()
+	}
+	tsrPayload, err := TrafficSelectorsPayload(PayloadTSr, responseTSr)
 	if err != nil {
 		tr.t.Fatalf("TrafficSelectorsPayload(TSr) error = %v", err)
 	}

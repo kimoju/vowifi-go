@@ -27,6 +27,7 @@ func TestResolveEffectiveCarrierConfigNormalizesTwoDigitMNC(t *testing.T) {
 		t.Fatalf("E911 enabled for unknown normalized preset: %+v", cfg.E911)
 	}
 	if cfg.Network.IMSRealm != "ims.mnc028.mcc310.3gppnetwork.org" ||
+		cfg.Network.PrivateIdentityRealm != "ims.mnc028.mcc310.3gppnetwork.org" ||
 		cfg.Network.NAIRealm != "nai.epc.mnc028.mcc310.3gppnetwork.org" ||
 		cfg.Network.PCSCFFQDN != "pcscf.ims.mnc028.mcc310.3gppnetwork.org" ||
 		cfg.Network.EPDGFQDN != "epdg.epc.mnc028.mcc310.pub.3gppnetwork.org" ||
@@ -41,6 +42,7 @@ func TestNormalizeSubscriberProfileDerivesRealmsAndNAI(t *testing.T) {
 		t.Fatalf("profile PLMN=(%q,%q) PresetID=%q, want 001010", profile.MCC, profile.MNC, profile.PresetID)
 	}
 	if profile.Network.IMSRealm != "ims.mnc010.mcc001.3gppnetwork.org" ||
+		profile.Network.PrivateIdentityRealm != "ims.mnc010.mcc001.3gppnetwork.org" ||
 		profile.Network.NAIRealm != "nai.epc.mnc010.mcc001.3gppnetwork.org" ||
 		profile.Network.PCSCFFQDN != "pcscf.ims.mnc010.mcc001.3gppnetwork.org" ||
 		profile.Network.EPDGFQDN != "epdg.epc.mnc010.mcc001.pub.3gppnetwork.org" ||
@@ -101,6 +103,7 @@ func TestLoadCarrierOverridesNormalizesShortKeyAndNetworkPolicy(t *testing.T) {
 		"31028": {
 			"network": {
 				"ims_realm": " IMS.OVERRIDE.EXAMPLE. ",
+				"private_identity_realm": " Private.OVERRIDE.EXAMPLE. ",
 				"pcscf_fqdn": " PCSCF.OVERRIDE.EXAMPLE. ",
 				"epdg_fqdn": " EPDG.OVERRIDE.EXAMPLE. ",
 				"emergency_domain": " SOS.OVERRIDE.EXAMPLE. "
@@ -121,6 +124,7 @@ func TestLoadCarrierOverridesNormalizesShortKeyAndNetworkPolicy(t *testing.T) {
 		t.Fatalf("PLMN=(%q,%q) PresetID=%q, want normalized 310028", cfg.MCC, cfg.MNC, cfg.PresetID)
 	}
 	if cfg.Network.IMSRealm != "ims.override.example" ||
+		cfg.Network.PrivateIdentityRealm != "private.override.example" ||
 		cfg.Network.NAIRealm != "nai.epc.mnc028.mcc310.3gppnetwork.org" ||
 		cfg.Network.PCSCFFQDN != "pcscf.override.example" ||
 		cfg.Network.EPDGFQDN != "epdg.override.example" ||
@@ -128,6 +132,28 @@ func TestLoadCarrierOverridesNormalizesShortKeyAndNetworkPolicy(t *testing.T) {
 		t.Fatalf("Network=%+v, want override plus fallback defaults", cfg.Network)
 	}
 	ClearCarrierOverrides()
+}
+
+func TestDeriveIdentitiesUsePrivateIdentityRealm(t *testing.T) {
+	network := NetworkConfig{
+		IMSRealm:             " IMS.EXAMPLE.TEST. ",
+		PrivateIdentityRealm: " Private.EXAMPLE.TEST. ",
+		NAIRealm:             " NAI.EXAMPLE.TEST. ",
+	}
+	if got := DeriveIMSPrivateIdentityForNetwork("001010123456789", network); got != "001010123456789@private.example.test" {
+		t.Fatalf("DeriveIMSPrivateIdentityForNetwork()=%q", got)
+	}
+	if got := DeriveIMSPublicIdentityForNetwork("001010123456789", network); got != "sip:001010123456789@ims.example.test" {
+		t.Fatalf("DeriveIMSPublicIdentityForNetwork()=%q", got)
+	}
+	if got := DerivePermanentNAIForNetwork("001010123456789", network); got != "0001010123456789@nai.example.test" {
+		t.Fatalf("DerivePermanentNAIForNetwork()=%q", got)
+	}
+
+	network.PrivateIdentityRealm = ""
+	if got := DeriveIMSPrivateIdentityForNetwork("001010123456789", network); got != "001010123456789@ims.example.test" {
+		t.Fatalf("DeriveIMSPrivateIdentityForNetwork(fallback)=%q", got)
+	}
 }
 
 func TestDeriveIdentitiesRejectInvalidSubscriberData(t *testing.T) {

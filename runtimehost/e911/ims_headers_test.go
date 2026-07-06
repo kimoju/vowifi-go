@@ -79,6 +79,57 @@ func TestParseGeolocationHeaderParsesMultipleLocationsAndParameters(t *testing.T
 	}
 }
 
+func TestParseGeolocationRoutingHeaderNormalizesValues(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		header  string
+		allowed bool
+		present bool
+		normal  string
+	}{
+		{name: "yes", header: " YES ", allowed: true, present: true, normal: GeolocationRoutingYes},
+		{name: "no", header: "\tno", allowed: false, present: true, normal: GeolocationRoutingNo},
+		{name: "quoted", header: `"yes"`, allowed: true, present: true, normal: GeolocationRoutingYes},
+		{name: "duplicate", header: "yes, YES", allowed: true, present: true, normal: GeolocationRoutingYes},
+		{name: "empty", header: " , ", allowed: false, present: false, normal: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allowed, present, err := ParseGeolocationRoutingHeader(tc.header)
+			if err != nil {
+				t.Fatalf("ParseGeolocationRoutingHeader() error = %v", err)
+			}
+			if allowed != tc.allowed || present != tc.present {
+				t.Fatalf("ParseGeolocationRoutingHeader() allowed=%v present=%v, want %v %v", allowed, present, tc.allowed, tc.present)
+			}
+			normal, err := NormalizeGeolocationRoutingHeader(tc.header)
+			if err != nil {
+				t.Fatalf("NormalizeGeolocationRoutingHeader() error = %v", err)
+			}
+			if normal != tc.normal {
+				t.Fatalf("NormalizeGeolocationRoutingHeader()=%q, want %q", normal, tc.normal)
+			}
+		})
+	}
+}
+
+func TestParseGeolocationRoutingHeaderRejectsAmbiguousValues(t *testing.T) {
+	for _, header := range []string{
+		"maybe",
+		"yes, no",
+		"yes;foo=bar",
+		`"yes`,
+	} {
+		t.Run(header, func(t *testing.T) {
+			if _, _, err := ParseGeolocationRoutingHeader(header); err == nil {
+				t.Fatal("ParseGeolocationRoutingHeader() error = nil")
+			}
+			if _, err := NormalizeGeolocationRoutingHeader(header); err == nil {
+				t.Fatal("NormalizeGeolocationRoutingHeader() error = nil")
+			}
+		})
+	}
+}
+
 func TestBuildAndParseEmergencyPIDFLO(t *testing.T) {
 	body, err := BuildEmergencyPIDFLO(EmergencyPIDFLOConfig{
 		Entity:    "pres:device@example.test",

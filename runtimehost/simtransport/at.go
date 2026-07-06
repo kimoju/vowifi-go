@@ -1,6 +1,7 @@
 package simtransport
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
@@ -120,6 +121,18 @@ func (a *Adapter) TransmitAPDU(channel int, hexAPDU string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid APDU: %w", err)
 	}
+	resp, err := a.transmitAPDUOnce(channel, apdu)
+	if err != nil {
+		return "", err
+	}
+	resp, err = a.recoverAPDUStatus(channel, apdu, resp)
+	if err != nil {
+		return "", err
+	}
+	return resp.Hex, nil
+}
+
+func (a *Adapter) transmitAPDUOnce(channel int, apdu string) (APDUResult, error) {
 	var cmd string
 	if channel > 0 {
 		cmd = fmt.Sprintf(`AT+CGLA=%d,%d,"%s"`, channel, len(apdu), apdu)
@@ -128,13 +141,56 @@ func (a *Adapter) TransmitAPDU(channel int, hexAPDU string) (string, error) {
 	}
 	out, err := a.Control.ExecuteATSilent(cmd, a.timeout())
 	if err != nil {
-		return "", err
+		return APDUResult{}, err
 	}
 	resp, err := ParseAPDUResult(out)
 	if err != nil {
-		return "", err
+		return APDUResult{}, err
 	}
-	return resp.Hex, nil
+	return resp, nil
+}
+
+func (a *Adapter) recoverAPDUStatus(channel int, apdu string, resp APDUResult) (APDUResult, error) {
+	bodyPrefix := ""
+	usedCorrectLe := false
+	getResponses := 0
+
+	for {
+		plan := PlanAPDUStatusRecovery(resp.SW1, resp.SW2)
+		switch plan.Action {
+		case APDURecoveryCorrectLe:
+			if usedCorrectLe {
+				return mergeAPDUResult(bodyPrefix, resp), nil
+			}
+			corrected, err := correctAPDUHexLe(apdu, plan.Le)
+			if err != nil {
+				return mergeAPDUResult(bodyPrefix, resp), nil
+			}
+			apdu = corrected
+			resp, err = a.transmitAPDUOnce(channel, apdu)
+			if err != nil {
+				return APDUResult{}, err
+			}
+			usedCorrectLe = true
+		case APDURecoveryGetResponse:
+			if getResponses >= 4 {
+				return mergeAPDUResult(bodyPrefix, resp), nil
+			}
+			bodyPrefix += resp.Body
+			getResponse, err := GetResponseAPDU(plan.Le)
+			if err != nil {
+				return mergeAPDUResult(bodyPrefix, resp), nil
+			}
+			apdu = strings.ToUpper(hex.EncodeToString(getResponse))
+			resp, err = a.transmitAPDUOnce(channel, apdu)
+			if err != nil {
+				return APDUResult{}, err
+			}
+			getResponses++
+		default:
+			return mergeAPDUResult(bodyPrefix, resp), nil
+		}
+	}
 }
 
 func (a *Adapter) ReadCRSMBinary(fileID uint16, offset, length int, pathID string) (CRSMResult, error) {
@@ -291,6 +347,31 @@ func crsmLengthByte(length int) int {
 
 func validCRSMByte(n int) bool {
 	return n >= 0 && n <= 0xff
+}
+
+func correctAPDUHexLe(apdu string, le int) (string, error) {
+	raw, err := hex.DecodeString(apdu)
+	if err != nil {
+		return "", err
+	}
+	corrected, err := CorrectAPDULe(raw, le)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToUpper(hex.EncodeToString(corrected)), nil
+}
+
+func mergeAPDUResult(bodyPrefix string, resp APDUResult) APDUResult {
+	if bodyPrefix == "" {
+		return resp
+	}
+	body := bodyPrefix + resp.Body
+	return APDUResult{
+		Hex:  body + resp.StatusString(),
+		Body: body,
+		SW1:  resp.SW1,
+		SW2:  resp.SW2,
+	}
 }
 
 func extractResponseHex(out string) (string, bool) {

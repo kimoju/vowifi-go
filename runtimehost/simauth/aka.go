@@ -18,6 +18,7 @@ const (
 	AKARESMaxLength = 16
 	AKACKLength     = 16
 	AKAIKLength     = 16
+	AKAKcLength     = 8
 	AKAAUTSLength   = 14
 	AKAAKLength     = 6
 	AKAMACLength    = 8
@@ -283,12 +284,13 @@ func parseUSIMAuthDB(body []byte) (AKAResult, bool) {
 	}
 	pos += resLen
 
+	keyLen := AKACKLength + AKAIKLength
 	remain := len(body) - pos
-	if remain == 32 {
+	if remain == keyLen {
 		return AKAResult{
 			RES: res,
-			CK:  append([]byte(nil), body[pos:pos+16]...),
-			IK:  append([]byte(nil), body[pos+16:pos+32]...),
+			CK:  append([]byte(nil), body[pos:pos+AKACKLength]...),
+			IK:  append([]byte(nil), body[pos+AKACKLength:pos+keyLen]...),
 		}, true
 	}
 
@@ -302,9 +304,25 @@ func parseUSIMAuthDB(body []byte) (AKAResult, bool) {
 
 	ikLen := int(body[pos])
 	pos++
-	if ikLen != AKAIKLength || len(body) != pos+ikLen {
+	if ikLen != AKAIKLength || len(body) < pos+ikLen {
 		return AKAResult{}, false
 	}
 	ik := append([]byte(nil), body[pos:pos+ikLen]...)
+	pos += ikLen
+	// Some USIMs append Kc after CK/IK; AKAResult keeps the legacy RES/CK/IK surface.
+	if len(body) != pos && !hasOnlyTLVPadding(body, pos) && !hasOptionalKc(body, pos) {
+		return AKAResult{}, false
+	}
 	return AKAResult{RES: res, CK: ck, IK: ik}, true
+}
+
+func hasOptionalKc(body []byte, pos int) bool {
+	return pos < len(body) &&
+		int(body[pos]) == AKAKcLength &&
+		pos+1+AKAKcLength <= len(body) &&
+		hasOnlyTLVPadding(body, pos+1+AKAKcLength)
+}
+
+func hasOnlyTLVPadding(body []byte, pos int) bool {
+	return pos <= len(body) && len(trimTLVPadding(body[pos:])) == 0
 }

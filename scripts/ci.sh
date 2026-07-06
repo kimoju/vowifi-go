@@ -75,6 +75,61 @@ module_path_check() {
 	printf '\n==> verified Go module/source references do not use %s\n' "$legacy_module"
 }
 
+grep_repo_fixed() {
+	grep -RInIF \
+		--exclude-dir=.git \
+		--exclude='go.sum' \
+		--exclude='go.work.sum' \
+		"$@" . 2>/dev/null || true
+}
+
+grep_repo_regex() {
+	grep -RInIE \
+		--exclude-dir=.git \
+		--exclude='go.sum' \
+		--exclude='go.work.sum' \
+		"$@" . 2>/dev/null || true
+}
+
+privacy_check() {
+	local email_regex legacy_base legacy_module local_path_regex status
+	local email_refs=()
+	local legacy_refs=()
+	local local_path_refs=()
+
+	status=0
+	legacy_base="${CI_LEGACY_MODULE_BASE:-github.com/iniwex5}"
+	legacy_module="${CI_LEGACY_MODULE:-${legacy_base%/}/vowifi-go}"
+	email_regex="${CI_PRIVACY_EMAIL_RE:-[[:alnum:]_.%+-]+[@]([[:alnum:]-]+[.])?(gmail|googlemail|hotmail|outlook|live|msn|icloud|me|mac|yahoo|ymail|rocketmail|proton|protonmail|pm|aol|qq|163|126|yeah|foxmail)[.][[:alpha:].]{2,}}"
+	local_path_regex='/(home|Users)/[[:alnum:]_.-]+|[[:alpha:]]:[\\]+Users[\\]+[[:alnum:]_.-]+'
+
+	mapfile -t legacy_refs < <(grep_repo_fixed -- "$legacy_module")
+	if [[ ${#legacy_refs[@]} -gt 0 ]]; then
+		printf 'legacy vowifi-go module references found in repository files:\n' >&2
+		printf '  %s\n' "${legacy_refs[@]}" >&2
+		status=1
+	fi
+
+	mapfile -t local_path_refs < <(grep_repo_regex -- "$local_path_regex")
+	if [[ ${#local_path_refs[@]} -gt 0 ]]; then
+		printf 'possible local home path references found in repository files:\n' >&2
+		printf '  %s\n' "${local_path_refs[@]}" >&2
+		status=1
+	fi
+
+	mapfile -t email_refs < <(grep_repo_regex -- "$email_regex")
+	if [[ ${#email_refs[@]} -gt 0 ]]; then
+		printf 'possible personal email references found in repository files:\n' >&2
+		printf '  %s\n' "${email_refs[@]}" >&2
+		status=1
+	fi
+
+	if [[ "$status" == "0" ]]; then
+		printf '\n==> privacy scan found no personal emails, local home paths, or legacy vowifi-go module references\n'
+	fi
+	return "$status"
+}
+
 parse_go_version() {
 	local raw major minor patch
 	raw="${1#go}"
@@ -201,7 +256,7 @@ coverage() {
 
 usage() {
 	cat <<'USAGE'
-Usage: scripts/ci.sh [all|version|module-path|download|fmt|tidy|vet|smoke|test|race|coverage ...]
+Usage: scripts/ci.sh [all|version|module-path|privacy|download|fmt|tidy|vet|smoke|test|race|coverage ...]
 
 Environment:
   GO_BIN               path to go binary when it is not on PATH
@@ -209,6 +264,7 @@ Environment:
   CI_MODULE_PATH       expected module path, default: github.com/boa-z/vowifi-go
   CI_LEGACY_MODULE     legacy module path rejected in Go files
   CI_LEGACY_MODULE_BASE legacy owner/base used to build the default legacy path
+  CI_PRIVACY_EMAIL_RE  personal email regex for privacy checks
   CI_SMOKE_PACKAGES    package pattern(s) for smoke tests, default: ./...
   CI_SMOKE_RUN         go test -run pattern for smoke tests, default: ^$
   SKIP_RACE=1          skip race tests
@@ -217,13 +273,13 @@ Environment:
   CI_COVERAGE_FILE     coverage profile path; default: temporary file
   CI_COVERAGE_MODE     Go coverage mode, default: atomic
 
-Default all runs version/module-path/download/fmt/tidy/vet/smoke/test. Race
+Default all runs version/module-path/privacy/download/fmt/tidy/vet/smoke/test. Race
 and coverage are opt-in so the main local and GitHub CI path stays lightweight.
 USAGE
 }
 
 if [[ $# -eq 0 || "${1:-}" == "all" ]]; then
-	tasks=(version module-path download fmt tidy vet smoke test)
+	tasks=(version module-path privacy download fmt tidy vet smoke test)
 else
 	tasks=("$@")
 fi
@@ -235,6 +291,7 @@ for task in "${tasks[@]}"; do
 	case "$task" in
 		version | go-version) version_check ;;
 		module-path | module_path) module_path_check ;;
+		privacy | privacy-check) privacy_check ;;
 		download) download ;;
 		fmt | fmt-check) fmt_check ;;
 		tidy | tidy-check) tidy_check ;;

@@ -237,13 +237,39 @@ type SIMAdapter interface {
 
 type readerSIMAdapter struct {
 	provider swusim.AKAProvider
+	mu       sync.Mutex
+	imsi     string
 }
 
 func NewReaderSIMAdapter(provider swusim.AKAProvider) SIMAdapter {
 	return &readerSIMAdapter{provider: provider}
 }
 
-func (a *readerSIMAdapter) GetIMSI() (string, error) { return "", nil }
+func (a *readerSIMAdapter) GetIMSI() (string, error) {
+	if a == nil || a.provider == nil {
+		return "", errors.New("aka provider is nil")
+	}
+	a.mu.Lock()
+	if a.imsi != "" {
+		imsi := a.imsi
+		a.mu.Unlock()
+		return imsi, nil
+	}
+	a.mu.Unlock()
+
+	imsi, ok, err := providerIMSI(a.provider)
+	if err != nil || !ok {
+		return "", err
+	}
+	imsi, err = normalizeRuntimeIMSI(imsi)
+	if err != nil {
+		return "", err
+	}
+	a.mu.Lock()
+	a.imsi = imsi
+	a.mu.Unlock()
+	return imsi, nil
+}
 
 func (a *readerSIMAdapter) CalculateAKA(rand16, autn16 []byte) (swusim.AKAResult, error) {
 	if a == nil || a.provider == nil {
@@ -252,7 +278,46 @@ func (a *readerSIMAdapter) CalculateAKA(rand16, autn16 []byte) (swusim.AKAResult
 	return a.provider.CalculateAKA(rand16, autn16)
 }
 
-func (a *readerSIMAdapter) Close() error { return nil }
+func (a *readerSIMAdapter) Close() error {
+	if a == nil || a.provider == nil {
+		return nil
+	}
+	if closer, ok := a.provider.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+func providerIMSI(provider swusim.AKAProvider) (string, bool, error) {
+	switch p := provider.(type) {
+	case interface{ GetIMSI() (string, error) }:
+		imsi, err := p.GetIMSI()
+		return imsi, true, err
+	case interface{ IMSI() (string, error) }:
+		imsi, err := p.IMSI()
+		return imsi, true, err
+	case interface{ IMSI() string }:
+		return p.IMSI(), true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+func normalizeRuntimeIMSI(imsi string) (string, error) {
+	imsi = strings.TrimSpace(imsi)
+	if imsi == "" {
+		return "", nil
+	}
+	if len(imsi) < 5 || len(imsi) > 15 {
+		return "", fmt.Errorf("invalid IMSI length: %d", len(imsi))
+	}
+	for _, r := range imsi {
+		if r < '0' || r > '9' {
+			return "", fmt.Errorf("invalid IMSI digit %q", r)
+		}
+	}
+	return imsi, nil
+}
 
 type ProxyConfig struct {
 	ID       string

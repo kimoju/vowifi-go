@@ -167,6 +167,22 @@ func TestBuildAndParseUSIMAuth(t *testing.T) {
 		t.Fatalf("AKA lengths = RES %d CK %d IK %d", len(res.RES), len(res.CK), len(res.IK))
 	}
 
+	bodyWithKc := append([]byte{0xDB, 0x04, 0x11, 0x22, 0x33, 0x44, 0x10}, bytesFrom(0x31, 16)...)
+	bodyWithKc = append(bodyWithKc, 0x10)
+	bodyWithKc = append(bodyWithKc, bytesFrom(0x51, 16)...)
+	bodyWithKc = append(bodyWithKc, 0x08)
+	bodyWithKc = append(bodyWithKc, bytesFrom(0x71, 8)...)
+	bodyWithKc = append(bodyWithKc, 0x00, 0xFF)
+	res, err = ParseUSIMAuthResponse(bodyWithKc, 0x90, 0x00)
+	if err != nil {
+		t.Fatalf("ParseUSIMAuthResponse(Kc) error = %v", err)
+	}
+	if hex.EncodeToString(res.RES) != "11223344" ||
+		hex.EncodeToString(res.CK) != "3132333435363738393a3b3c3d3e3f40" ||
+		hex.EncodeToString(res.IK) != "5152535455565758595a5b5c5d5e5f60" {
+		t.Fatalf("AKA with Kc result=%+v", res)
+	}
+
 	res, err = ParseUSIMAuthResponse(append([]byte{0xDC, 0x0E}, bytesFrom(0xAA, 14)...), 0x90, 0x00)
 	if !errors.Is(err, swusim.ErrSyncFailure) || len(res.AUTS) != AKAAUTSLength {
 		t.Fatalf("sync failure = %+v err=%v, want AUTS and ErrSyncFailure", res, err)
@@ -262,6 +278,15 @@ func TestParseUSIMAuthRejectsInvalidLengths(t *testing.T) {
 	shortCK = append(shortCK, bytesFrom(0x21, 16)...)
 	if _, err := ParseUSIMAuthResponse(shortCK, 0x90, 0x00); err == nil {
 		t.Fatal("ParseUSIMAuthResponse(short CK) err=nil, want error")
+	}
+
+	badKc := append([]byte{0xDB, 0x04, 0x11, 0x22, 0x33, 0x44, 0x10}, bytesFrom(0x01, 16)...)
+	badKc = append(badKc, 0x10)
+	badKc = append(badKc, bytesFrom(0x21, 16)...)
+	badKc = append(badKc, 0x07)
+	badKc = append(badKc, bytesFrom(0x31, 7)...)
+	if _, err := ParseUSIMAuthResponse(badKc, 0x90, 0x00); err == nil {
+		t.Fatal("ParseUSIMAuthResponse(bad Kc) err=nil, want error")
 	}
 
 	wrongAUTS := append([]byte{0xDC, 0x02}, 0xAA, 0xBB)

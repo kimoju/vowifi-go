@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
@@ -641,7 +642,7 @@ func messageLenWithLanguage(text, encoding string, lockingLang, singleLang int) 
 		}
 		return utf8.RuneCountInString(text)
 	}
-	return utf8.RuneCountInString(text)
+	return len(utf16.Encode([]rune(text)))
 }
 
 func takeSMSChunk(text, encoding string, limit int) (string, string) {
@@ -669,11 +670,42 @@ func takeSMSChunkWithLanguage(text, encoding string, limit int, lockingLang, sin
 	if encoding == "gsm7" {
 		return takeGSM7ChunkWithLanguage(text, limit, lockingLang, singleLang)
 	}
+	if encoding == "ucs2" {
+		return takeUCS2Chunk(text, limit)
+	}
 	runes := []rune(text)
 	if len(runes) <= limit {
 		return text, ""
 	}
 	return string(runes[:limit]), string(runes[limit:])
+}
+
+func takeUCS2Chunk(text string, limit int) (string, string) {
+	if text == "" || limit <= 0 {
+		return "", text
+	}
+	used := 0
+	end := 0
+	for pos, r := range text {
+		units := 1
+		if r > 0xffff {
+			units = 2
+		}
+		if used > 0 && used+units > limit {
+			break
+		}
+		used += units
+		_, size := utf8.DecodeRuneInString(text[pos:])
+		end = pos + size
+		if used >= limit {
+			break
+		}
+	}
+	if end <= 0 {
+		_, size := utf8.DecodeRuneInString(text)
+		end = size
+	}
+	return text[:end], text[end:]
 }
 
 func concatUDH(total, partNo int) []byte {

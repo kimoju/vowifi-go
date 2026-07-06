@@ -1,6 +1,7 @@
 package ikev2
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -164,6 +165,15 @@ type TrafficSelectors struct {
 	Selectors []TrafficSelector
 }
 
+type trafficSelectorRange struct {
+	Type       uint8
+	IPProtocol uint8
+	StartPort  uint16
+	EndPort    uint16
+	StartAddr  []byte
+	EndAddr    []byte
+}
+
 func (ts TrafficSelectors) MarshalBinary() ([]byte, error) {
 	if len(ts.Selectors) == 0 || len(ts.Selectors) > 0xff {
 		return nil, fmt.Errorf("%w: selector count %d", ErrInvalidTrafficSelector, len(ts.Selectors))
@@ -219,6 +229,34 @@ func IPv4AnyTrafficSelectors() TrafficSelectors {
 		StartAddr: net.IPv4(0, 0, 0, 0),
 		EndAddr:   net.IPv4(255, 255, 255, 255),
 	}}}
+}
+
+func ValidateTrafficSelectorNarrowing(offered, selected TrafficSelectors) error {
+	if len(offered.Selectors) == 0 {
+		return fmt.Errorf("%w: offered selector count 0", ErrInvalidTrafficSelector)
+	}
+	if len(selected.Selectors) == 0 {
+		return fmt.Errorf("%w: selected selector count 0", ErrInvalidTrafficSelector)
+	}
+	offeredRanges := make([]trafficSelectorRange, 0, len(offered.Selectors))
+	for _, selector := range offered.Selectors {
+		normalized, err := normalizeTrafficSelectorRange(selector)
+		if err != nil {
+			return err
+		}
+		offeredRanges = append(offeredRanges, normalized)
+	}
+	for i, selector := range selected.Selectors {
+		normalized, err := normalizeTrafficSelectorRange(selector)
+		if err != nil {
+			return err
+		}
+		if trafficSelectorCoveredByAny(offeredRanges, normalized) {
+			continue
+		}
+		return fmt.Errorf("%w: selected selector %d is outside offered selectors", ErrInvalidTrafficSelector, i)
+	}
+	return nil
 }
 
 func (ts TrafficSelector) MarshalBinary() ([]byte, error) {
@@ -288,4 +326,58 @@ func normalizeSelectorAddresses(selectorType uint8, start, end net.IP) ([]byte, 
 	default:
 		return nil, nil, fmt.Errorf("%w: selector type %d", ErrInvalidTrafficSelector, selectorType)
 	}
+}
+
+func trafficSelectorsOrIPv4Any(ts TrafficSelectors) TrafficSelectors {
+	if len(ts.Selectors) == 0 {
+		return IPv4AnyTrafficSelectors()
+	}
+	return ts
+}
+
+func normalizeTrafficSelectorRange(selector TrafficSelector) (trafficSelectorRange, error) {
+	start, end, err := normalizeSelectorAddresses(selector.Type, selector.StartAddr, selector.EndAddr)
+	if err != nil {
+		return trafficSelectorRange{}, err
+	}
+	if selector.StartPort > selector.EndPort {
+		return trafficSelectorRange{}, fmt.Errorf("%w: selector port range %d-%d", ErrInvalidTrafficSelector, selector.StartPort, selector.EndPort)
+	}
+	if bytes.Compare(start, end) > 0 {
+		return trafficSelectorRange{}, fmt.Errorf("%w: selector address range %s-%s", ErrInvalidTrafficSelector, selector.StartAddr, selector.EndAddr)
+	}
+	return trafficSelectorRange{
+		Type:       selector.Type,
+		IPProtocol: selector.IPProtocol,
+		StartPort:  selector.StartPort,
+		EndPort:    selector.EndPort,
+		StartAddr:  start,
+		EndAddr:    end,
+	}, nil
+}
+
+func trafficSelectorCoveredByAny(offered []trafficSelectorRange, selected trafficSelectorRange) bool {
+	for _, candidate := range offered {
+		if trafficSelectorCovers(candidate, selected) {
+			return true
+		}
+	}
+	return false
+}
+
+func trafficSelectorCovers(offered, selected trafficSelectorRange) bool {
+	if offered.Type != selected.Type {
+		return false
+	}
+	if offered.IPProtocol != 0 && offered.IPProtocol != selected.IPProtocol {
+		return false
+	}
+	if selected.IPProtocol == 0 && offered.IPProtocol != 0 {
+		return false
+	}
+	if offered.StartPort > selected.StartPort || selected.EndPort > offered.EndPort {
+		return false
+	}
+	return bytes.Compare(offered.StartAddr, selected.StartAddr) <= 0 &&
+		bytes.Compare(selected.EndAddr, offered.EndAddr) <= 0
 }

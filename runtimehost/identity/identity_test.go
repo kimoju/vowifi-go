@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/boa-z/vowifi-go/runtimehost/carrier"
 	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
 )
 
@@ -140,6 +142,48 @@ func TestPrepareStartDerivesProfileIMSIdentityWith3GPPRealm(t *testing.T) {
 	}
 	if prepared.EPDGAddr != "epdg.epc.mnc010.mcc001.pub.3gppnetwork.org" {
 		t.Fatalf("EPDGAddr=%q", prepared.EPDGAddr)
+	}
+}
+
+func TestPrepareStartUsesCarrierPrivateIdentityRealmOverride(t *testing.T) {
+	carrier.ClearCarrierOverrides()
+	t.Cleanup(carrier.ClearCarrierOverrides)
+
+	path := t.TempDir() + "/carriers.json"
+	if err := os.WriteFile(path, []byte(`{
+		"001010": {
+			"mcc": "001",
+			"mnc": "010",
+			"network": {
+				"ims_realm": " ims.example.test. ",
+				"private_identity_realm": " private.example.test. ",
+				"epdg_fqdn": " epdg.example.test. "
+			}
+		}
+	}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := carrier.LoadCarrierOverrides(path); err != nil {
+		t.Fatalf("LoadCarrierOverrides() error = %v", err)
+	}
+
+	prepared, err := PrepareStart(PrepareStartInput{
+		Profile: Profile{IMSI: "001010123456789"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.IMSIdentity.IMPI != "001010123456789@private.example.test" ||
+		prepared.IMSIdentity.IMPU != "sip:001010123456789@ims.example.test" ||
+		prepared.IMSIdentity.Domain != "ims.example.test" {
+		t.Fatalf("profile IMS identity=%+v, want private IMPI realm with public IMS realm", prepared.IMSIdentity)
+	}
+	if prepared.EPDGAddr != "epdg.example.test" {
+		t.Fatalf("EPDGAddr=%q, want override", prepared.EPDGAddr)
+	}
+	if prepared.EffectiveCarrier.MCC != "001" || prepared.EffectiveCarrier.MNC != "010" ||
+		prepared.EffectiveCarrier.PresetID != "001010" {
+		t.Fatalf("EffectiveCarrier=%+v, want normalized override carrier", prepared.EffectiveCarrier)
 	}
 }
 

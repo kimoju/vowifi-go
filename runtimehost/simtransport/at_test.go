@@ -106,6 +106,69 @@ func TestAdapterCSIMOnBasicChannel(t *testing.T) {
 	}
 }
 
+func TestAdapterTransmitAPDURetries6CWithCorrectLe(t *testing.T) {
+	at := &fakeAT{responses: []string{
+		`+CSIM: 4,"6C03"`,
+		`+CSIM: 10,"AABBCC9000"`,
+	}}
+	adapter := NewAdapter(at)
+
+	resp, err := adapter.TransmitAPDU(0, "00B0000000")
+	if err != nil {
+		t.Fatalf("TransmitAPDU() error = %v", err)
+	}
+	if resp != "AABBCC9000" {
+		t.Fatalf("response = %s, want AABBCC9000", resp)
+	}
+	want := []string{
+		`AT+CSIM=10,"00B0000000"`,
+		`AT+CSIM=10,"00B0000003"`,
+	}
+	if !reflect.DeepEqual(at.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", at.calls, want)
+	}
+}
+
+func TestAdapterTransmitAPDUSendsGetResponseFor61(t *testing.T) {
+	at := &fakeAT{responses: []string{
+		`+CGLA: 8,"11226102"`,
+		`+CGLA: 8,"33449000"`,
+	}}
+	adapter := NewAdapter(at)
+
+	resp, err := adapter.TransmitAPDU(3, "00A4040002AABB")
+	if err != nil {
+		t.Fatalf("TransmitAPDU() error = %v", err)
+	}
+	if resp != "112233449000" {
+		t.Fatalf("response = %s, want 112233449000", resp)
+	}
+	want := []string{
+		`AT+CGLA=3,14,"00A4040002AABB"`,
+		`AT+CGLA=3,10,"00C0000002"`,
+	}
+	if !reflect.DeepEqual(at.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", at.calls, want)
+	}
+}
+
+func TestAdapterTransmitAPDUKeeps6CWhenLeCannotBeCorrected(t *testing.T) {
+	at := &fakeAT{responses: []string{`+CSIM: 4,"6C10"`}}
+	adapter := NewAdapter(at)
+
+	resp, err := adapter.TransmitAPDU(0, "00")
+	if err != nil {
+		t.Fatalf("TransmitAPDU() error = %v", err)
+	}
+	if resp != "6C10" {
+		t.Fatalf("response = %s, want 6C10", resp)
+	}
+	want := []string{`AT+CSIM=2,"00"`}
+	if !reflect.DeepEqual(at.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", at.calls, want)
+	}
+}
+
 func TestAdapterCRSMReadsTransparentAndRecordEFs(t *testing.T) {
 	at := &fakeAT{responses: []string{
 		"\r\n+CRSM: 144,0,\"8003616263\"\r\n\r\nOK\r\n",

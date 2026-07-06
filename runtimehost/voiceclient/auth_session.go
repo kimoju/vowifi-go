@@ -3,6 +3,7 @@ package voiceclient
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -191,6 +192,9 @@ func DigestChallengeRetryRequestWithResult(msg SIPRequestMessage, resp SIPRespon
 	if msg.AuthSession == nil || !isSIPDigestChallengeStatus(resp.StatusCode) || !methodAllowsDigestChallengeRetry(msg.Method) {
 		return SIPRequestMessage{}, DigestChallengeRetryResult{}, false, nil
 	}
+	if !digestRetryRequestHasRequiredCSeq(msg) {
+		return SIPRequestMessage{}, DigestChallengeRetryResult{}, false, nil
+	}
 	authz, ok, err := msg.AuthSession.AuthorizeChallengeWithResult(resp, msg.Method, msg.URI, msg.Body)
 	if err != nil || !ok {
 		return SIPRequestMessage{}, DigestChallengeRetryResult{Authorization: authz}, false, err
@@ -199,9 +203,10 @@ func DigestChallengeRetryRequestWithResult(msg SIPRequestMessage, resp SIPRespon
 	if retry.Headers == nil {
 		retry.Headers = make(map[string]string)
 	}
-	delete(retry.Headers, "Authorization")
-	delete(retry.Headers, "Proxy-Authorization")
+	deleteSIPHeader(retry.Headers, "Authorization")
+	deleteSIPHeader(retry.Headers, "Proxy-Authorization")
 	retry.Headers[authz.HeaderName] = authz.Header
+	incrementDigestRetryCSeq(retry.Headers, msg.Method)
 	return retry, DigestChallengeRetryResult{Authorization: authz}, true, nil
 }
 
@@ -222,6 +227,9 @@ func RoundTripRequestWithDigestAuth(ctx context.Context, transport SIPRequestTra
 		}
 		if !ok {
 			break
+		}
+		if err := ackInviteDigestChallenge(ctx, transport, current, resp); err != nil {
+			return resp, err
 		}
 		current = retry
 		resp, err = transport.RoundTripRequest(ctx, current)
@@ -246,11 +254,101 @@ func digestChallengeHeaders(statusCode int) (challengeHeader, authHeader string)
 
 func methodAllowsDigestChallengeRetry(method string) bool {
 	switch strings.ToUpper(strings.TrimSpace(method)) {
-	case "", "INVITE", "ACK", "CANCEL":
+	case "", "ACK", "CANCEL":
 		return false
 	default:
 		return true
 	}
+}
+
+func digestRetryRequestHasRequiredCSeq(msg SIPRequestMessage) bool {
+	if !strings.EqualFold(strings.TrimSpace(msg.Method), "INVITE") {
+		return true
+	}
+	_, method, ok := sipCSeqParts(firstHeaderValue(msg.Headers, "CSeq"))
+	return ok && strings.EqualFold(method, "INVITE")
+}
+
+func incrementDigestRetryCSeq(headers map[string]string, method string) {
+	if headers == nil {
+		return
+	}
+	seq, cseqMethod, ok := sipCSeqParts(firstHeaderValue(headers, "CSeq"))
+	if !ok || !strings.EqualFold(cseqMethod, strings.TrimSpace(method)) {
+		return
+	}
+	setSIPHeader(headers, "CSeq", strconv.Itoa(seq+1)+" "+strings.ToUpper(strings.TrimSpace(cseqMethod)))
+}
+
+func ackInviteDigestChallenge(ctx context.Context, transport SIPRequestTransport, msg SIPRequestMessage, resp SIPResponse) error {
+	if !strings.EqualFold(strings.TrimSpace(msg.Method), "INVITE") || !isSIPDigestChallengeStatus(resp.StatusCode) {
+		return nil
+	}
+	ack, ok := inviteDigestChallengeAck(msg, resp)
+	if !ok {
+		return nil
+	}
+	return transport.WriteRequest(ctx, ack)
+}
+
+func inviteDigestChallengeAck(msg SIPRequestMessage, resp SIPResponse) (SIPRequestMessage, bool) {
+	seq, method, ok := sipCSeqParts(firstHeaderValue(msg.Headers, "CSeq"))
+	if !ok || !strings.EqualFold(method, "INVITE") {
+		return SIPRequestMessage{}, false
+	}
+	headers := make(map[string]string)
+	copySIPHeader(headers, msg.Headers, "Via")
+	copySIPHeader(headers, msg.Headers, "Route")
+	copySIPHeader(headers, msg.Headers, "Max-Forwards")
+	copySIPHeader(headers, msg.Headers, "From")
+	copySIPHeader(headers, msg.Headers, "Call-ID")
+	copySIPHeader(headers, msg.Headers, "User-Agent")
+	copySIPHeader(headers, msg.Headers, "Supported")
+	copySIPHeader(headers, msg.Headers, "Contact")
+	if to := firstHeader(resp.Headers, "To"); strings.TrimSpace(to) != "" {
+		headers["To"] = strings.TrimSpace(to)
+	} else {
+		copySIPHeader(headers, msg.Headers, "To")
+	}
+	headers["CSeq"] = strconv.Itoa(seq) + " ACK"
+	return SIPRequestMessage{
+		Method:  "ACK",
+		URI:     msg.URI,
+		Headers: headers,
+	}, true
+}
+
+func copySIPHeader(dst map[string]string, src map[string]string, name string) {
+	if dst == nil || src == nil {
+		return
+	}
+	for key, value := range src {
+		if strings.EqualFold(key, name) && strings.TrimSpace(value) != "" {
+			dst[canonicalHeaderName(name)] = strings.TrimSpace(value)
+			return
+		}
+	}
+}
+
+func deleteSIPHeader(headers map[string]string, name string) {
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			delete(headers, key)
+		}
+	}
+}
+
+func setSIPHeader(headers map[string]string, name, value string) {
+	if headers == nil {
+		return
+	}
+	for key := range headers {
+		if strings.EqualFold(key, name) {
+			headers[key] = value
+			return
+		}
+	}
+	headers[name] = value
 }
 
 func bindDigestAuth(binding RegistrationBinding, headerName, header string, state DigestAuthState) RegistrationBinding {

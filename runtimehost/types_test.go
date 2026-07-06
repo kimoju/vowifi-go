@@ -249,6 +249,99 @@ func TestModemAccessAdapterFallsBackToATCRSM(t *testing.T) {
 	}
 }
 
+func TestReaderSIMAdapterExposesProviderIMSIAndCaches(t *testing.T) {
+	provider := &readerSIMGetIMSIProvider{imsi: " 310280233641503 "}
+	adapter := NewReaderSIMAdapter(provider)
+
+	imsi, err := adapter.GetIMSI()
+	if err != nil {
+		t.Fatalf("GetIMSI() error = %v", err)
+	}
+	if imsi != "310280233641503" {
+		t.Fatalf("GetIMSI() = %q", imsi)
+	}
+
+	imsi, err = adapter.GetIMSI()
+	if err != nil {
+		t.Fatalf("second GetIMSI() error = %v", err)
+	}
+	if imsi != "310280233641503" {
+		t.Fatalf("second GetIMSI() = %q", imsi)
+	}
+	if provider.imsiCalls != 1 {
+		t.Fatalf("GetIMSI provider calls = %d, want 1", provider.imsiCalls)
+	}
+
+	aka, err := adapter.CalculateAKA([]byte{1}, []byte{2})
+	if err != nil {
+		t.Fatalf("CalculateAKA() error = %v", err)
+	}
+	if got := hex.EncodeToString(aka.RES); got != "01020304" {
+		t.Fatalf("CalculateAKA RES = %s", got)
+	}
+	if provider.akaCalls != 1 {
+		t.Fatalf("CalculateAKA provider calls = %d, want 1", provider.akaCalls)
+	}
+
+	if err := adapter.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !provider.closed {
+		t.Fatal("Close() did not delegate to provider")
+	}
+}
+
+func TestReaderSIMAdapterSupportsIMSIVariants(t *testing.T) {
+	tests := []struct {
+		name string
+		sim  swusim.AKAProvider
+		want string
+	}{
+		{
+			name: "IMSI string method",
+			sim:  &readerSIMIMSIStringProvider{imsi: "310280233641503"},
+			want: "310280233641503",
+		},
+		{
+			name: "IMSI string error method",
+			sim:  &readerSIMIMSIErrorProvider{imsi: "310280233641504"},
+			want: "310280233641504",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			imsi, err := NewReaderSIMAdapter(tt.sim).GetIMSI()
+			if err != nil {
+				t.Fatalf("GetIMSI() error = %v", err)
+			}
+			if imsi != tt.want {
+				t.Fatalf("GetIMSI() = %q, want %q", imsi, tt.want)
+			}
+		})
+	}
+}
+
+func TestReaderSIMAdapterPreservesUnsupportedIMSIBehavior(t *testing.T) {
+	imsi, err := NewReaderSIMAdapter(&readerSIMAKAOnlyProvider{}).GetIMSI()
+	if err != nil {
+		t.Fatalf("GetIMSI() error = %v", err)
+	}
+	if imsi != "" {
+		t.Fatalf("GetIMSI() = %q, want empty", imsi)
+	}
+}
+
+func TestReaderSIMAdapterRejectsInvalidIMSI(t *testing.T) {
+	_, err := NewReaderSIMAdapter(&readerSIMGetIMSIProvider{imsi: "31028x"}).GetIMSI()
+	if err == nil {
+		t.Fatal("GetIMSI() error = nil, want invalid IMSI error")
+	}
+	if !strings.Contains(err.Error(), "invalid IMSI") {
+		t.Fatalf("GetIMSI() error = %v", err)
+	}
+}
+
 func runtimeISIMTLVString(s string) []byte {
 	return append([]byte{0x80, byte(len(s))}, []byte(s)...)
 }
@@ -1844,6 +1937,55 @@ func (s *runtimeSIMAdapter) CalculateAKA(rand16, autn16 []byte) (swusim.AKAResul
 }
 
 func (s *runtimeSIMAdapter) Close() error { return nil }
+
+type readerSIMGetIMSIProvider struct {
+	imsi      string
+	imsiErr   error
+	imsiCalls int
+	akaCalls  int
+	closed    bool
+}
+
+func (p *readerSIMGetIMSIProvider) GetIMSI() (string, error) {
+	p.imsiCalls++
+	return p.imsi, p.imsiErr
+}
+
+func (p *readerSIMGetIMSIProvider) CalculateAKA(rand16, autn16 []byte) (swusim.AKAResult, error) {
+	p.akaCalls++
+	return swusim.AKAResult{RES: []byte{1, 2, 3, 4}}, nil
+}
+
+func (p *readerSIMGetIMSIProvider) Close() error {
+	p.closed = true
+	return nil
+}
+
+type readerSIMIMSIStringProvider struct {
+	imsi string
+}
+
+func (p *readerSIMIMSIStringProvider) IMSI() string { return p.imsi }
+
+func (p *readerSIMIMSIStringProvider) CalculateAKA(rand16, autn16 []byte) (swusim.AKAResult, error) {
+	return swusim.AKAResult{}, nil
+}
+
+type readerSIMIMSIErrorProvider struct {
+	imsi string
+}
+
+func (p *readerSIMIMSIErrorProvider) IMSI() (string, error) { return p.imsi, nil }
+
+func (p *readerSIMIMSIErrorProvider) CalculateAKA(rand16, autn16 []byte) (swusim.AKAResult, error) {
+	return swusim.AKAResult{}, nil
+}
+
+type readerSIMAKAOnlyProvider struct{}
+
+func (p *readerSIMAKAOnlyProvider) CalculateAKA(rand16, autn16 []byte) (swusim.AKAResult, error) {
+	return swusim.AKAResult{}, nil
+}
 
 type runtimeUSSDTransport struct {
 	executeRequests []messaging.USSDRequest

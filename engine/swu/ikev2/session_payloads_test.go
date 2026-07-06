@@ -67,3 +67,45 @@ func TestTrafficSelectorRejectsWrongAddressFamily(t *testing.T) {
 		t.Fatalf("MarshalBinary() err=%v, want ErrInvalidTrafficSelector", err)
 	}
 }
+
+func TestValidateTrafficSelectorNarrowingAllowsSubset(t *testing.T) {
+	offered := TrafficSelectors{Selectors: []TrafficSelector{{
+		Type:      TSIPv4AddressRange,
+		StartPort: 0,
+		EndPort:   65535,
+		StartAddr: net.IPv4(10, 0, 0, 0),
+		EndAddr:   net.IPv4(10, 0, 0, 255),
+	}}}
+	selected := TrafficSelectors{Selectors: []TrafficSelector{{
+		Type:       TSIPv4AddressRange,
+		IPProtocol: 17,
+		StartPort:  500,
+		EndPort:    4500,
+		StartAddr:  net.IPv4(10, 0, 0, 10),
+		EndAddr:    net.IPv4(10, 0, 0, 20),
+	}}}
+	if err := ValidateTrafficSelectorNarrowing(offered, selected); err != nil {
+		t.Fatalf("ValidateTrafficSelectorNarrowing() error = %v", err)
+	}
+}
+
+func TestValidateTrafficSelectorNarrowingRejectsWidening(t *testing.T) {
+	offered := TrafficSelectors{Selectors: []TrafficSelector{{
+		Type:       TSIPv4AddressRange,
+		IPProtocol: 17,
+		StartPort:  500,
+		EndPort:    4500,
+		StartAddr:  net.IPv4(10, 0, 0, 10),
+		EndAddr:    net.IPv4(10, 0, 0, 20),
+	}}}
+	selected := TrafficSelectors{Selectors: []TrafficSelector{{
+		Type:      TSIPv4AddressRange,
+		StartPort: 0,
+		EndPort:   65535,
+		StartAddr: net.IPv4(10, 0, 0, 0),
+		EndAddr:   net.IPv4(10, 0, 0, 255),
+	}}}
+	if err := ValidateTrafficSelectorNarrowing(offered, selected); !errors.Is(err, ErrInvalidTrafficSelector) {
+		t.Fatalf("ValidateTrafficSelectorNarrowing() err=%v, want ErrInvalidTrafficSelector", err)
+	}
+}

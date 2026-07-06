@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"testing"
 
 	"github.com/boa-z/vowifi-go/engine/sim"
@@ -1658,9 +1659,37 @@ func TestParseIKEAuthChildSARejectsUnsupportedSelectedSA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TrafficSelectorsPayload(TSr) error = %v", err)
 	}
-	_, ok, err := parseChildSAIfPresent(init, []Payload{saPayload, tsiPayload, tsrPayload}, localSPI, 2, DefaultESPProposal(localSPI))
+	_, ok, err := parseChildSAIfPresent(init, []Payload{saPayload, tsiPayload, tsrPayload}, localSPI, 2, DefaultESPProposal(localSPI), TrafficSelectors{}, TrafficSelectors{})
 	if ok || !errors.Is(err, ErrUnsupportedSASelection) {
 		t.Fatalf("parseChildSAIfPresent() ok=%t err=%v, want ErrUnsupportedSASelection", ok, err)
+	}
+}
+
+func TestParseIKEAuthChildSARejectsWidenedTrafficSelector(t *testing.T) {
+	init := fakeInitResult(t)
+	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
+	saPayload, err := SecurityAssociationPayload(DefaultESPProposal([]byte{0xde, 0xad, 0xbe, 0xef}))
+	if err != nil {
+		t.Fatalf("SecurityAssociationPayload() error = %v", err)
+	}
+	tsiPayload, err := TrafficSelectorsPayload(PayloadTSi, IPv4AnyTrafficSelectors())
+	if err != nil {
+		t.Fatalf("TrafficSelectorsPayload(TSi) error = %v", err)
+	}
+	tsrPayload, err := TrafficSelectorsPayload(PayloadTSr, IPv4AnyTrafficSelectors())
+	if err != nil {
+		t.Fatalf("TrafficSelectorsPayload(TSr) error = %v", err)
+	}
+	offeredTSi := TrafficSelectors{Selectors: []TrafficSelector{{
+		Type:      TSIPv4AddressRange,
+		StartPort: 0,
+		EndPort:   65535,
+		StartAddr: net.IPv4(10, 0, 0, 10),
+		EndAddr:   net.IPv4(10, 0, 0, 10),
+	}}}
+	_, ok, err := parseChildSAIfPresent(init, []Payload{saPayload, tsiPayload, tsrPayload}, localSPI, 2, DefaultESPProposal(localSPI), offeredTSi, IPv4AnyTrafficSelectors())
+	if ok || !errors.Is(err, ErrInvalidChildSA) || !errors.Is(err, ErrInvalidTrafficSelector) {
+		t.Fatalf("parseChildSAIfPresent() ok=%t err=%v, want ErrInvalidChildSA and ErrInvalidTrafficSelector", ok, err)
 	}
 }
 

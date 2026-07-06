@@ -118,14 +118,14 @@ func ParseChildSAResult(init InitResult, inner []Payload, localSPI []byte) (Chil
 }
 
 func ParseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, nonceI, nonceR []byte) (ChildSAResult, error) {
-	return parseChildSAResultWithNonces(init, inner, localSPI, nonceI, nonceR, nil)
+	return parseChildSAResultWithNonces(init, inner, localSPI, nonceI, nonceR, nil, TrafficSelectors{}, TrafficSelectors{})
 }
 
 func parseChildSAResultWithOfferedSA(init InitResult, inner []Payload, localSPI []byte, offeredSA SecurityAssociation) (ChildSAResult, error) {
-	return parseChildSAResultWithNonces(init, inner, localSPI, init.NonceI, init.NonceR, &offeredSA)
+	return parseChildSAResultWithNonces(init, inner, localSPI, init.NonceI, init.NonceR, &offeredSA, TrafficSelectors{}, TrafficSelectors{})
 }
 
-func parseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, nonceI, nonceR []byte, offeredSA *SecurityAssociation) (ChildSAResult, error) {
+func parseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, nonceI, nonceR []byte, offeredSA *SecurityAssociation, offeredTSi, offeredTSr TrafficSelectors) (ChildSAResult, error) {
 	var out ChildSAResult
 	for _, p := range inner {
 		switch p.Type {
@@ -177,6 +177,16 @@ func parseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, no
 	}
 	if len(out.TSr.Selectors) == 0 {
 		return ChildSAResult{}, fmt.Errorf("%w: missing TSr", ErrInvalidChildSA)
+	}
+	if len(offeredTSi.Selectors) > 0 {
+		if err := ValidateTrafficSelectorNarrowing(offeredTSi, out.TSi); err != nil {
+			return ChildSAResult{}, fmt.Errorf("%w: TSi narrowing: %w", ErrInvalidChildSA, err)
+		}
+	}
+	if len(offeredTSr.Selectors) > 0 {
+		if err := ValidateTrafficSelectorNarrowing(offeredTSr, out.TSr); err != nil {
+			return ChildSAResult{}, fmt.Errorf("%w: TSr narrowing: %w", ErrInvalidChildSA, err)
+		}
 	}
 	keys, err := DeriveChildSAKeysWithNonces(init.Keys.Profile.PRF, init.Keys.SKD, nonceI, nonceR, out.SelectedSA)
 	if err != nil {

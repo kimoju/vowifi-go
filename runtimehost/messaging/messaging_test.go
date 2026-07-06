@@ -151,6 +151,43 @@ func TestSegmentSMSUCS2(t *testing.T) {
 	}
 }
 
+func TestSegmentSMSUCS2SurrogatePairBoundaries(t *testing.T) {
+	single := SegmentSMS(strings.Repeat("\U0001F642", 35), "")
+	if len(single) != 1 {
+		t.Fatalf("single parts=%d, want 1", len(single))
+	}
+	if single[0].Encoding != "ucs2" || messageLen(single[0].Text, single[0].Encoding) != 70 || len(single[0].UDH) != 0 {
+		t.Fatalf("single part=%+v units=%d", single[0], messageLen(single[0].Text, single[0].Encoding))
+	}
+	tpdu, err := BuildSMSSubmitTPDU("+18005551212", single[0], 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU(single) error = %v", err)
+	}
+	if tpdu[11] != 0x08 || tpdu[12] != 140 || len(tpdu[13:]) != 140 {
+		t.Fatalf("single UCS2 DCS=0x%02x UDL=%d userData=%d TPDU=%x", tpdu[11], tpdu[12], len(tpdu[13:]), tpdu)
+	}
+
+	parts := SegmentSMSWithOptions(strings.Repeat("\U0001F642", 36), SendOptions{ConcatRef: 0x7a, ConcatRefBits: 8})
+	if len(parts) != 2 {
+		t.Fatalf("parts=%d, want 2", len(parts))
+	}
+	if parts[0].Encoding != "ucs2" || len([]rune(parts[0].Text)) != 33 || messageLen(parts[0].Text, parts[0].Encoding) != 66 {
+		t.Fatalf("first part=%+v units=%d", parts[0], messageLen(parts[0].Text, parts[0].Encoding))
+	}
+	if len([]rune(parts[1].Text)) != 3 || messageLen(parts[1].Text, parts[1].Encoding) != 6 {
+		t.Fatalf("second part=%+v units=%d", parts[1], messageLen(parts[1].Text, parts[1].Encoding))
+	}
+	for _, part := range parts {
+		tpdu, err := BuildSMSSubmitTPDU("+18005551212", part, byte(part.PartNo))
+		if err != nil {
+			t.Fatalf("BuildSMSSubmitTPDU(part %d) error = %v", part.PartNo, err)
+		}
+		if tpdu[11] != 0x08 || int(tpdu[12]) > 140 || len(tpdu[13:]) != int(tpdu[12]) {
+			t.Fatalf("part %d DCS=0x%02x UDL=%d userData=%d TPDU=%x", part.PartNo, tpdu[11], tpdu[12], len(tpdu[13:]), tpdu)
+		}
+	}
+}
+
 func TestSendSMSWithTransportStoresEveryPart(t *testing.T) {
 	store := &fakeDeliveryStore{}
 	dispatch := &fakeDispatcher{}

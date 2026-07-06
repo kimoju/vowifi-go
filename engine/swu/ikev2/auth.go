@@ -66,6 +66,8 @@ type AKAChallengeConfig struct {
 	Request            eapaka.Packet
 	IdentityTranscript [][]byte
 	ChildSPI           []byte
+	TSi                TrafficSelectors
+	TSr                TrafficSelectors
 	MessageID          uint32
 	Random             io.Reader
 	IV                 []byte
@@ -297,7 +299,9 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		FinalResponseInner: clonePayloads(finalInner),
 	}
 	offeredChildSA := authOfferedChildSA(cfg.ChildSA, localChildSPI)
-	if child, ok, err := parseChildSAIfPresent(cfg.Init, finalInner, localChildSPI, out.NextMessageID, offeredChildSA); err != nil {
+	offeredTSi := trafficSelectorsOrIPv4Any(cfg.TSi)
+	offeredTSr := trafficSelectorsOrIPv4Any(cfg.TSr)
+	if child, ok, err := parseChildSAIfPresent(cfg.Init, finalInner, localChildSPI, out.NextMessageID, offeredChildSA, offeredTSi, offeredTSr); err != nil {
 		return FullAuthResult{}, err
 	} else if ok {
 		out.ChildSA = &child
@@ -313,7 +317,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		}
 		out.EAPLast = cloneEAPPacketPtr(next)
 		if next.Code == eapaka.CodeSuccess {
-			if child, ok, err := parseChildSAIfPresent(cfg.Init, out.FinalResponseInner, localChildSPI, out.NextMessageID, offeredChildSA); err != nil {
+			if child, ok, err := parseChildSAIfPresent(cfg.Init, out.FinalResponseInner, localChildSPI, out.NextMessageID, offeredChildSA, offeredTSi, offeredTSr); err != nil {
 				return FullAuthResult{}, err
 			} else if ok {
 				out.ChildSA = &child
@@ -356,7 +360,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			out.NextMessageID = exchange.NextMessageID
 			out.FinalResponseBytes = append([]byte(nil), exchange.ResponseBytes...)
 			out.FinalResponseInner = clonePayloads(exchange.ResponseInner)
-			if child, ok, err := parseChildSAIfPresent(cfg.Init, out.FinalResponseInner, localChildSPI, out.NextMessageID, offeredChildSA); err != nil {
+			if child, ok, err := parseChildSAIfPresent(cfg.Init, out.FinalResponseInner, localChildSPI, out.NextMessageID, offeredChildSA, offeredTSi, offeredTSr); err != nil {
 				return FullAuthResult{}, err
 			} else if ok {
 				out.ChildSA = &child
@@ -379,12 +383,14 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			Request:            *next,
 			IdentityTranscript: identityTranscript,
 			ChildSPI:           localChildSPI,
+			TSi:                offeredTSi,
+			TSr:                offeredTSr,
 			MessageID:          out.NextMessageID,
 			Random:             cfg.Random,
 			EAPReauthIV:        cfg.EAPReauthIV,
 			EAPReauthCounter:   cfg.EAPReauthCounter,
 			EAPReauthCounterOK: cfg.EAPReauthCounterOK,
-		}, offeredChildSA)
+		}, offeredChildSA, offeredTSi, offeredTSr)
 		if err != nil {
 			return FullAuthResult{}, err
 		}
@@ -431,10 +437,10 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 	if len(cfg.ChildSPI) > 0 {
 		offeredChildSA = DefaultESPProposal(cfg.ChildSPI)
 	}
-	return runIKE_AUTH_AKAChallenge(ctx, cfg, offeredChildSA)
+	return runIKE_AUTH_AKAChallenge(ctx, cfg, offeredChildSA, cfg.TSi, cfg.TSr)
 }
 
-func runIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig, offeredChildSA SecurityAssociation) (AKAChallengeResult, error) {
+func runIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig, offeredChildSA SecurityAssociation, offeredTSi, offeredTSr TrafficSelectors) (AKAChallengeResult, error) {
 	if cfg.Transport == nil {
 		return AKAChallengeResult{}, fmt.Errorf("%w: transport is nil", ErrInvalidAuthConfig)
 	}
@@ -621,13 +627,11 @@ func runIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig, offer
 		out.EAPNext = &next
 	}
 	if hasPayload(finalInner, PayloadSA) {
-		var child ChildSAResult
-		var err error
+		var offeredSA *SecurityAssociation
 		if len(offeredChildSA.Proposals) > 0 {
-			child, err = parseChildSAResultWithOfferedSA(cfg.Init, finalInner, cfg.ChildSPI, offeredChildSA)
-		} else {
-			child, err = ParseChildSAResult(cfg.Init, finalInner, cfg.ChildSPI)
+			offeredSA = &offeredChildSA
 		}
+		child, err := parseChildSAResultWithNonces(cfg.Init, finalInner, cfg.ChildSPI, cfg.Init.NonceI, cfg.Init.NonceR, offeredSA, offeredTSi, offeredTSr)
 		if err != nil {
 			return AKAChallengeResult{}, err
 		}
@@ -975,17 +979,15 @@ func authNextEAP(auth AuthResult) *eapaka.Packet {
 	return nil
 }
 
-func parseChildSAIfPresent(init InitResult, inner []Payload, localSPI []byte, nextMessageID uint32, offeredSA SecurityAssociation) (ChildSAResult, bool, error) {
+func parseChildSAIfPresent(init InitResult, inner []Payload, localSPI []byte, nextMessageID uint32, offeredSA SecurityAssociation, offeredTSi, offeredTSr TrafficSelectors) (ChildSAResult, bool, error) {
 	if !hasPayload(inner, PayloadSA) {
 		return ChildSAResult{}, false, nil
 	}
-	var child ChildSAResult
-	var err error
+	var offered *SecurityAssociation
 	if len(offeredSA.Proposals) > 0 {
-		child, err = parseChildSAResultWithOfferedSA(init, inner, localSPI, offeredSA)
-	} else {
-		child, err = ParseChildSAResult(init, inner, localSPI)
+		offered = &offeredSA
 	}
+	child, err := parseChildSAResultWithNonces(init, inner, localSPI, init.NonceI, init.NonceR, offered, offeredTSi, offeredTSr)
 	if err != nil {
 		return ChildSAResult{}, false, err
 	}

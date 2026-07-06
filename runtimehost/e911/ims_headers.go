@@ -15,6 +15,8 @@ const (
 	IMSMMTelServiceIdentifier  = "urn:urn-7:3gpp-service.ims.icsi.mmtel"
 	IMSEmergencyAcceptContact  = `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";require;explicit`
 	EmergencyPIDFLOContentType = "application/pidf+xml"
+	GeolocationRoutingYes      = "yes"
+	GeolocationRoutingNo       = "no"
 )
 
 const (
@@ -130,7 +132,7 @@ func BuildEmergencySIPHeaders(cfg EmergencySIPHeaderConfig) map[string]string {
 	if geolocation := emergencyGeolocationHeader(cfg); geolocation != "" {
 		headers["Geolocation"] = geolocation
 		if cfg.GeolocationRouting {
-			headers["Geolocation-Routing"] = "yes"
+			headers["Geolocation-Routing"] = GeolocationRoutingYes
 		}
 	}
 	return headers
@@ -161,6 +163,46 @@ func ParseGeolocationHeader(header string) ([]GeolocationHeaderValue, error) {
 		out = append(out, value)
 	}
 	return out, nil
+}
+
+func NormalizeGeolocationRoutingHeader(header string) (string, error) {
+	allowed, present, err := ParseGeolocationRoutingHeader(header)
+	if err != nil || !present {
+		return "", err
+	}
+	if allowed {
+		return GeolocationRoutingYes, nil
+	}
+	return GeolocationRoutingNo, nil
+}
+
+func ParseGeolocationRoutingHeader(header string) (allowed bool, present bool, err error) {
+	parts, err := splitSIPHeaderSegments(header, ',')
+	if err != nil {
+		return false, false, err
+	}
+	var normalized string
+	for _, part := range parts {
+		value, err := normalizeGeolocationRoutingValue(part)
+		if err != nil {
+			return false, false, err
+		}
+		if value == "" {
+			continue
+		}
+		if normalized != "" && normalized != value {
+			return false, false, errors.New("invalid geolocation-routing header: conflicting values")
+		}
+		normalized = value
+	}
+	switch normalized {
+	case GeolocationRoutingYes:
+		return true, true, nil
+	case GeolocationRoutingNo:
+		return false, true, nil
+	default:
+		return false, false, nil
+	}
 }
 
 func BuildEmergencyPIDFLO(cfg EmergencyPIDFLOConfig) ([]byte, error) {
@@ -482,6 +524,33 @@ func parseGeolocationHeaderValue(value string) (GeolocationHeaderValue, error) {
 		return GeolocationHeaderValue{}, err
 	}
 	return GeolocationHeaderValue{URI: uri, Parameters: parsedParams}, nil
+}
+
+func normalizeGeolocationRoutingValue(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	key, params, hasParams := strings.Cut(value, ";")
+	if hasParams && strings.TrimSpace(params) != "" {
+		return "", errors.New("invalid geolocation-routing header: unexpected parameters")
+	}
+	key = strings.TrimSpace(key)
+	if strings.HasPrefix(key, `"`) || strings.HasSuffix(key, `"`) {
+		if len(key) < 2 || key[0] != '"' || key[len(key)-1] != '"' {
+			return "", errors.New("invalid geolocation-routing header: unterminated quoted value")
+		}
+		key = unquoteSIPHeaderParameter(key)
+	}
+	key = strings.ToLower(strings.TrimSpace(key))
+	switch key {
+	case GeolocationRoutingYes:
+		return GeolocationRoutingYes, nil
+	case GeolocationRoutingNo:
+		return GeolocationRoutingNo, nil
+	default:
+		return "", errors.New("invalid geolocation-routing header: expected yes or no")
+	}
 }
 
 func splitSIPHeaderSegments(s string, sep rune) ([]string, error) {

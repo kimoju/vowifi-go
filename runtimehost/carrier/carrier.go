@@ -17,11 +17,12 @@ type E911Config struct {
 }
 
 type NetworkConfig struct {
-	IMSRealm        string `json:"ims_realm"`
-	NAIRealm        string `json:"nai_realm"`
-	PCSCFFQDN       string `json:"pcscf_fqdn"`
-	EPDGFQDN        string `json:"epdg_fqdn"`
-	EmergencyDomain string `json:"emergency_domain"`
+	IMSRealm             string `json:"ims_realm"`
+	PrivateIdentityRealm string `json:"private_identity_realm"`
+	NAIRealm             string `json:"nai_realm"`
+	PCSCFFQDN            string `json:"pcscf_fqdn"`
+	EPDGFQDN             string `json:"epdg_fqdn"`
+	EmergencyDomain      string `json:"emergency_domain"`
 }
 
 type SubscriberProfileInput struct {
@@ -197,9 +198,9 @@ func NormalizeSubscriberProfile(in SubscriberProfileInput) SubscriberProfile {
 		MNC:                mnc,
 		PresetID:           presetKey(mcc, mnc),
 		Network:            network,
-		IMSPrivateIdentity: DeriveIMSPrivateIdentity(imsi, mcc, mnc),
-		IMSPublicIdentity:  DeriveIMSPublicIdentity(imsi, mcc, mnc),
-		PermanentNAI:       DerivePermanentNAI(imsi, mcc, mnc),
+		IMSPrivateIdentity: DeriveIMSPrivateIdentityForNetwork(imsi, network),
+		IMSPublicIdentity:  DeriveIMSPublicIdentityForNetwork(imsi, network),
+		PermanentNAI:       DerivePermanentNAIForNetwork(imsi, network),
 	}
 }
 
@@ -253,6 +254,10 @@ func DefaultIMSRealm(mcc, mnc string) string {
 	return fmt.Sprintf("ims.mnc%s.mcc%s.3gppnetwork.org", mnc, mcc)
 }
 
+func DefaultPrivateIdentityRealm(mcc, mnc string) string {
+	return DefaultIMSRealm(mcc, mnc)
+}
+
 func DefaultNAIRealm(mcc, mnc string) string {
 	mcc = normalizeMCC(mcc)
 	mnc = normalizeMNC(mnc)
@@ -285,26 +290,53 @@ func DefaultEmergencyDomain(mcc, mnc string) string {
 }
 
 func DeriveIMSPrivateIdentity(imsi, mcc, mnc string) string {
+	return deriveIMSPrivateIdentityWithRealm(imsi, DefaultPrivateIdentityRealm(mcc, mnc))
+}
+
+func DeriveIMSPublicIdentity(imsi, mcc, mnc string) string {
+	return deriveIMSPublicIdentityWithRealm(imsi, DefaultIMSRealm(mcc, mnc))
+}
+
+func DerivePermanentNAI(imsi, mcc, mnc string) string {
+	return derivePermanentNAIWithRealm(imsi, DefaultNAIRealm(mcc, mnc))
+}
+
+func DeriveIMSPrivateIdentityForNetwork(imsi string, network NetworkConfig) string {
+	network = normalizeNetworkConfig("", "", network)
+	return deriveIMSPrivateIdentityWithRealm(imsi, network.PrivateIdentityRealm)
+}
+
+func DeriveIMSPublicIdentityForNetwork(imsi string, network NetworkConfig) string {
+	network = normalizeNetworkConfig("", "", network)
+	return deriveIMSPublicIdentityWithRealm(imsi, network.IMSRealm)
+}
+
+func DerivePermanentNAIForNetwork(imsi string, network NetworkConfig) string {
+	network = normalizeNetworkConfig("", "", network)
+	return derivePermanentNAIWithRealm(imsi, network.NAIRealm)
+}
+
+func deriveIMSPrivateIdentityWithRealm(imsi, realm string) string {
 	imsi = normalizeIMSI(imsi)
-	realm := DefaultIMSRealm(mcc, mnc)
+	realm = normalizeDomainName(realm)
 	if imsi == "" || realm == "" {
 		return ""
 	}
 	return imsi + "@" + realm
 }
 
-func DeriveIMSPublicIdentity(imsi, mcc, mnc string) string {
+func deriveIMSPublicIdentityWithRealm(imsi, realm string) string {
 	imsi = normalizeIMSI(imsi)
-	realm := DefaultIMSRealm(mcc, mnc)
+	realm = normalizeDomainName(realm)
 	if imsi == "" || realm == "" {
 		return ""
 	}
 	return "sip:" + imsi + "@" + realm
 }
 
-func DerivePermanentNAI(imsi, mcc, mnc string) string {
+func derivePermanentNAIWithRealm(imsi, realm string) string {
 	imsi = normalizeIMSI(imsi)
-	realm := DefaultNAIRealm(mcc, mnc)
+	realm = normalizeDomainName(realm)
 	if imsi == "" || realm == "" {
 		return ""
 	}
@@ -313,11 +345,15 @@ func DerivePermanentNAI(imsi, mcc, mnc string) string {
 
 func normalizeNetworkConfig(mcc, mnc string, cfg NetworkConfig) NetworkConfig {
 	cfg.IMSRealm = normalizeDomainName(cfg.IMSRealm)
+	cfg.PrivateIdentityRealm = normalizeDomainName(cfg.PrivateIdentityRealm)
 	cfg.NAIRealm = normalizeDomainName(cfg.NAIRealm)
 	cfg.PCSCFFQDN = normalizeDomainName(cfg.PCSCFFQDN)
 	cfg.EPDGFQDN = normalizeDomainName(cfg.EPDGFQDN)
 	cfg.EmergencyDomain = normalizeDomainName(cfg.EmergencyDomain)
 	if mcc == "" || mnc == "" {
+		if cfg.PrivateIdentityRealm == "" {
+			cfg.PrivateIdentityRealm = cfg.IMSRealm
+		}
 		if cfg.EmergencyDomain == "" {
 			cfg.EmergencyDomain = cfg.IMSRealm
 		}
@@ -325,6 +361,9 @@ func normalizeNetworkConfig(mcc, mnc string, cfg NetworkConfig) NetworkConfig {
 	}
 	if cfg.IMSRealm == "" {
 		cfg.IMSRealm = DefaultIMSRealm(mcc, mnc)
+	}
+	if cfg.PrivateIdentityRealm == "" {
+		cfg.PrivateIdentityRealm = cfg.IMSRealm
 	}
 	if cfg.NAIRealm == "" {
 		cfg.NAIRealm = DefaultNAIRealm(mcc, mnc)

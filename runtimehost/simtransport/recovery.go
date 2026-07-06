@@ -50,6 +50,10 @@ type statusCarrier interface {
 	Status() uint16
 }
 
+type timeoutCarrier interface {
+	Timeout() bool
+}
+
 func (c RecoveryClass) Recoverable() bool {
 	return c != RecoveryClassNone
 }
@@ -170,6 +174,10 @@ func ClassifyError(err error) RecoveryClass {
 		if class := StatusUint16RecoveryClass(status.Status()); class != RecoveryClassNone {
 			return class
 		}
+	}
+	var timeout timeoutCarrier
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return RecoveryClassControlPortHung
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return RecoveryClassControlPortHung

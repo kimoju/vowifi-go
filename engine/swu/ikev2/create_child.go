@@ -89,7 +89,7 @@ func RunCREATE_CHILD_SA(ctx context.Context, cfg CreateChildSAConfig) (CreateChi
 	}
 	parseInit := cfg.Init
 	parseInit.Keys = keys
-	child, err := parseChildSAResultWithNonces(parseInit, inner, localSPI, requestNonce, responseNonce, &offeredSA)
+	child, err := parseChildSAResultWithNonces(parseInit, inner, localSPI, requestNonce, responseNonce, &offeredSA, trafficSelectorsOrIPv4Any(cfg.TSi), trafficSelectorsOrIPv4Any(cfg.TSr))
 	if err != nil {
 		return CreateChildSAResult{}, err
 	}

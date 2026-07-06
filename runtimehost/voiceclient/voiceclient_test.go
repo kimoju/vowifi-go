@@ -2634,6 +2634,50 @@ func TestDigestChallengeRetryRequestUpdatesSession(t *testing.T) {
 	}
 }
 
+func TestDigestChallengeRetryRequestCleansAuthHeadersAndIncrementsCSeq(t *testing.T) {
+	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-update-old", Algorithm: "MD5", QOP: "auth"}
+	state := newDigestAuthState("Authorization", ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, "")
+	msg := SIPRequestMessage{
+		Method: "UPDATE",
+		URI:    "sip:+18005551212@pcscf.example",
+		Headers: map[string]string{
+			"authorization":       "Digest old-origin",
+			"Proxy-Authorization": "Digest old-proxy",
+			"CSeq":                "4 UPDATE",
+		},
+		Body:        []byte("v=0\r\n"),
+		AuthSession: NewDigestAuthSession("Authorization", "", state),
+	}
+	retry, ok, err := DigestChallengeRetryRequest(msg, SIPResponse{
+		StatusCode: 401,
+		Reason:     "Unauthorized",
+		Headers: map[string][]string{
+			"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-update-new", algorithm=MD5, qop="auth"`},
+		},
+	})
+	if err != nil || !ok {
+		t.Fatalf("DigestChallengeRetryRequest() ok=%v err=%v", ok, err)
+	}
+	if retry.Headers["authorization"] != "" || retry.Headers["Proxy-Authorization"] != "" {
+		t.Fatalf("retry kept stale auth headers: %+v", retry.Headers)
+	}
+	if retry.Headers["CSeq"] != "5 UPDATE" {
+		t.Fatalf("retry CSeq=%q, want 5 UPDATE", retry.Headers["CSeq"])
+	}
+	auth := retry.Headers["Authorization"]
+	if !strings.Contains(auth, `nonce="nonce-update-new"`) || !strings.Contains(auth, `uri="sip:+18005551212@pcscf.example"`) ||
+		!strings.Contains(auth, `nc=00000001`) {
+		t.Fatalf("retry Authorization=%s", auth)
+	}
+}
+
 func TestRoundTripRequestWithDigestAuthRetriesChallenge(t *testing.T) {
 	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-roundtrip-old", Algorithm: "MD5", QOP: "auth"}
 	state := newDigestAuthState("Authorization", ch, DigestAuthInput{
@@ -2667,6 +2711,68 @@ func TestRoundTripRequestWithDigestAuthRetriesChallenge(t *testing.T) {
 	}
 	if auth := transport.requests[1].Headers["Authorization"]; !strings.Contains(auth, `nonce="nonce-roundtrip-new"`) || !strings.Contains(auth, `nc=00000001`) {
 		t.Fatalf("retry Authorization=%s", auth)
+	}
+}
+
+func TestRoundTripRequestWithDigestAuthAcksAndRetriesInviteChallenge(t *testing.T) {
+	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-invite-old", Algorithm: "MD5", QOP: "auth"}
+	state := newDigestAuthState("Authorization", ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, "")
+	transport := &fakeSIPRequestRoundTripTransport{responses: []SIPResponse{
+		{
+			StatusCode: 407,
+			Reason:     "Proxy Authentication Required",
+			Headers: map[string][]string{
+				"Proxy-Authenticate": {`Digest realm="ims.example", nonce="nonce-invite-new", algorithm=MD5, qop="auth"`},
+				"To":                 {`<sip:+18005551212@ims.example>;tag=remote`},
+				"CSeq":               {"7 INVITE"},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	resp, err := RoundTripRequestWithDigestAuth(context.Background(), transport, SIPRequestMessage{
+		Method: "INVITE",
+		URI:    "sip:+18005551212@pcscf.example",
+		Headers: map[string]string{
+			"To":            "<sip:+18005551212@ims.example>",
+			"From":          "<sip:user@ims.example>;tag=local",
+			"Call-ID":       "call-invite-auth",
+			"CSeq":          "7 INVITE",
+			"Route":         "<sip:pcscf.example;lr>",
+			"Max-Forwards":  "70",
+			"Authorization": "Digest old",
+		},
+		Body:        []byte("v=0\r\n"),
+		AuthSession: NewDigestAuthSession("Authorization", "", state),
+	})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("RoundTripRequestWithDigestAuth() resp=%+v err=%v", resp, err)
+	}
+	if len(transport.requests) != 3 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	ack := transport.requests[1]
+	if ack.Method != "ACK" || ack.URI != "sip:+18005551212@pcscf.example" ||
+		ack.Headers["CSeq"] != "7 ACK" ||
+		ack.Headers["To"] != "<sip:+18005551212@ims.example>;tag=remote" ||
+		ack.Headers["Call-ID"] != "call-invite-auth" {
+		t.Fatalf("ACK request=%+v", ack)
+	}
+	retry := transport.requests[2]
+	if retry.Method != "INVITE" || retry.Headers["CSeq"] != "8 INVITE" || retry.Headers["Authorization"] != "" {
+		t.Fatalf("retry INVITE=%+v", retry)
+	}
+	auth := retry.Headers["Proxy-Authorization"]
+	if !strings.Contains(auth, `nonce="nonce-invite-new"`) ||
+		!strings.Contains(auth, `uri="sip:+18005551212@pcscf.example"`) ||
+		!strings.Contains(auth, `nc=00000001`) {
+		t.Fatalf("retry Proxy-Authorization=%s", auth)
 	}
 }
 

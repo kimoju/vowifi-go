@@ -100,6 +100,17 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 	if profile.IMSI == "" {
 		return PreparedSession{}, errors.New("IMSI is empty")
 	}
+	effectiveCfg := carrier.ResolveEffectiveCarrierConfig(carrier.EffectiveCarrierConfigInput{
+		IMSI: profile.IMSI,
+		MCC:  profile.MCC,
+		MNC:  profile.MNC,
+	})
+	if effectiveCfg.MCC != "" {
+		profile.MCC = effectiveCfg.MCC
+	}
+	if effectiveCfg.MNC != "" {
+		profile.MNC = effectiveCfg.MNC
+	}
 	imeiSource := IMEISourceProfile
 	var fallbacks []FallbackMetadata
 	if profile.IMEI == "" {
@@ -125,11 +136,11 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 	prepared := PreparedSession{
 		Profile: profile,
 		EffectiveCarrier: EffectiveCarrier{
-			MCC:      profile.MCC,
-			MNC:      profile.MNC,
-			PresetID: profile.MCC + profile.MNC,
+			MCC:      effectiveCfg.MCC,
+			MNC:      effectiveCfg.MNC,
+			PresetID: effectiveCfg.PresetID,
 		},
-		EPDGAddr:           defaultEPDG(profile),
+		EPDGAddr:           defaultEPDGWithNetwork(effectiveCfg.Network),
 		EPDGSource:         "derived",
 		IdentityIMSISource: IMSISourceProfile,
 		IdentityIMEISource: imeiSource,
@@ -138,9 +149,9 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 			ActualSource:     IMSIdentitySourceProfile,
 			AKAAppPreference: AKAAppPreferenceUSIM,
 			Applied:          true,
-			IMPI:             profileIMPI(profile),
-			IMPU:             profileIMPU(profile),
-			Domain:           profileDomain(profile),
+			IMPI:             profileIMPIWithNetwork(profile, effectiveCfg.Network),
+			IMPU:             profileIMPUWithNetwork(profile, effectiveCfg.Network),
+			Domain:           profileDomainWithNetwork(effectiveCfg.Network),
 		},
 		Fallbacks: fallbacks,
 	}
@@ -248,33 +259,57 @@ func sipURIDomain(uri string) string {
 }
 
 func profileIMPU(profile Profile) string {
+	return profileIMPUWithNetwork(profile, profileNetwork(profile))
+}
+
+func profileIMPUWithNetwork(profile Profile, network carrier.NetworkConfig) string {
 	imsi := strings.TrimSpace(profile.IMSI)
 	if imsi == "" {
 		return ""
 	}
-	if domain := profileDomain(profile); domain != "" {
-		return "sip:" + imsi + "@" + domain
+	if impu := carrier.DeriveIMSPublicIdentityForNetwork(imsi, network); impu != "" {
+		return impu
 	}
 	return "sip:" + imsi
 }
 
 func profileIMPI(profile Profile) string {
+	return profileIMPIWithNetwork(profile, profileNetwork(profile))
+}
+
+func profileIMPIWithNetwork(profile Profile, network carrier.NetworkConfig) string {
 	imsi := strings.TrimSpace(profile.IMSI)
 	if imsi == "" {
 		return ""
 	}
-	if domain := profileDomain(profile); domain != "" {
-		return imsi + "@" + domain
+	if impi := carrier.DeriveIMSPrivateIdentityForNetwork(imsi, network); impi != "" {
+		return impi
 	}
 	return imsi
 }
 
 func profileDomain(profile Profile) string {
-	return carrier.DefaultIMSRealm(profile.MCC, profile.MNC)
+	return profileDomainWithNetwork(profileNetwork(profile))
+}
+
+func profileDomainWithNetwork(network carrier.NetworkConfig) string {
+	return strings.TrimSpace(network.IMSRealm)
 }
 
 func defaultEPDG(p Profile) string {
-	return carrier.DefaultEPDGFQDN(p.MCC, p.MNC)
+	return defaultEPDGWithNetwork(profileNetwork(p))
+}
+
+func defaultEPDGWithNetwork(network carrier.NetworkConfig) string {
+	return strings.TrimSpace(network.EPDGFQDN)
+}
+
+func profileNetwork(profile Profile) carrier.NetworkConfig {
+	return carrier.ResolveEffectiveCarrierConfig(carrier.EffectiveCarrierConfigInput{
+		IMSI: profile.IMSI,
+		MCC:  profile.MCC,
+		MNC:  profile.MNC,
+	}).Network
 }
 
 func ReadISIMIdentity(access interface {

@@ -51,10 +51,26 @@ func (e statusErrorForTest) Status() uint16 {
 	return e.status
 }
 
+type timeoutErrorForTest struct{}
+
+func (e timeoutErrorForTest) Error() string {
+	return "read failed"
+}
+
+func (e timeoutErrorForTest) Timeout() bool {
+	return true
+}
+
 func TestClassifyRecoveryErrorFromStatusCarrier(t *testing.T) {
 	err := errors.Join(errors.New("logical-channel ISIM identity"), statusErrorForTest{status: 0x6F00})
 	if got := ClassifyError(err); got != RecoveryClassSIMBusy {
 		t.Fatalf("ClassifyError(status carrier) = %q, want SIM busy", got)
+	}
+}
+
+func TestClassifyRecoveryErrorFromTimeoutCarrier(t *testing.T) {
+	if got := ClassifyError(timeoutErrorForTest{}); got != RecoveryClassControlPortHung {
+		t.Fatalf("ClassifyError(timeout carrier) = %q, want control port hung", got)
 	}
 }
 
