@@ -28,6 +28,54 @@ func TestNotifyPayloadMarshalParse(t *testing.T) {
 	}
 }
 
+func TestNotifyErrorClassification(t *testing.T) {
+	cases := []struct {
+		name       string
+		notifyType uint16
+		want       error
+	}{
+		{"unsupported critical", NotifyUnsupportedCriticalPayload, ErrNotifyUnsupportedCriticalPayload},
+		{"invalid syntax", NotifyInvalidSyntax, ErrNotifyInvalidSyntax},
+		{"no proposal chosen", NotifyNoProposalChosen, ErrNotifyNoProposalChosen},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := NotifyPayload(Notify{
+				ProtocolID:       ProtocolIKE,
+				NotifyType:       tc.notifyType,
+				SPI:              []byte{0x01, 0x02, 0x03, 0x04},
+				NotificationData: []byte{0xaa},
+			})
+			if err != nil {
+				t.Fatalf("NotifyPayload() error = %v", err)
+			}
+			err = FirstNotifyError([]Payload{MOBIKESupportedNotify(), payload})
+			if !errors.Is(err, ErrIKEv2NotifyError) || !errors.Is(err, tc.want) {
+				t.Fatalf("FirstNotifyError() err=%v, want %v and ErrIKEv2NotifyError", err, tc.want)
+			}
+			var notifyErr *NotifyError
+			if !errors.As(err, &notifyErr) {
+				t.Fatalf("FirstNotifyError() err=%T, want *NotifyError", err)
+			}
+			if notifyErr.Notify.NotifyType != tc.notifyType ||
+				hex.EncodeToString(notifyErr.Notify.SPI) != "01020304" ||
+				hex.EncodeToString(notifyErr.Notify.NotificationData) != "aa" {
+				t.Fatalf("notifyErr=%+v", notifyErr)
+			}
+		})
+	}
+
+	if err := FirstNotifyError([]Payload{MOBIKESupportedNotify()}); err != nil {
+		t.Fatalf("FirstNotifyError(informational) error = %v", err)
+	}
+	if err := NotifyErrorFor(Notify{NotifyType: NotifyMOBIKESupported}); err != nil {
+		t.Fatalf("NotifyErrorFor(MOBIKE_SUPPORTED) error = %v", err)
+	}
+	if got, want := NotifyTypeName(NotifyNoProposalChosen), "NO_PROPOSAL_CHOSEN"; got != want {
+		t.Fatalf("NotifyTypeName()=%q, want %q", got, want)
+	}
+}
+
 func TestDeletePayloadMarshalParseESP(t *testing.T) {
 	payload, err := ESPDeletePayload(mustHex("01020304"), mustHex("aabbccdd"))
 	if err != nil {

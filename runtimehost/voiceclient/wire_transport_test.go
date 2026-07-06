@@ -146,6 +146,56 @@ func TestSIPFailureRecoveryClassifiesRecoverableFailures(t *testing.T) {
 	}
 }
 
+func TestSIPFinalResponseDrainDurationSkipsInvite(t *testing.T) {
+	if got := sipFinalResponseDrainDuration("INVITE", time.Second); got != 0 {
+		t.Fatalf("sipFinalResponseDrainDuration(INVITE)=%v, want 0", got)
+	}
+	if got := sipFinalResponseDrainDuration("MESSAGE", 25*time.Millisecond); got != 25*time.Millisecond {
+		t.Fatalf("sipFinalResponseDrainDuration(MESSAGE)=%v", got)
+	}
+}
+
+func TestDrainSIPUDPFinalResponsesConsumesMatchedDuplicateFinal(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	msg := SIPRequestMessage{
+		Method: "MESSAGE",
+		Headers: map[string]string{
+			"Via":     "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-drain",
+			"Call-ID": "drain-final",
+			"CSeq":    "1 MESSAGE",
+		},
+	}
+	duplicateFinal := strings.Join([]string{
+		"SIP/2.0 202 Accepted",
+		"Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-drain",
+		"Call-ID: drain-final",
+		"CSeq: 1 MESSAGE",
+		"Content-Length: 0",
+		"",
+		"",
+	}, "\r\n")
+
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := server.Write([]byte(duplicateFinal))
+		wrote <- err
+	}()
+
+	drainSIPUDPFinalResponses(context.Background(), client, msg, 20*time.Millisecond)
+	if err := <-wrote; err != nil {
+		t.Fatalf("server.Write() error = %v", err)
+	}
+
+	buf := make([]byte, 1)
+	_ = client.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	if _, err := client.Read(buf); !isSIPTimeout(err) {
+		t.Fatalf("client.Read() err=%v, want timeout after duplicate was drained", err)
+	}
+}
+
 func TestParseSIPRequestAndBuildResponseWire(t *testing.T) {
 	raw := strings.Join([]string{
 		"INVITE sip:user@example SIP/2.0",

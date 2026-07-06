@@ -106,6 +106,75 @@ func TestBuildIMSCPIMMessageWithHeadersDeduplicatesContentLength(t *testing.T) {
 	}
 }
 
+func TestParseIMSCPIMMessageNormalizesIMDNNamespaceAlias(t *testing.T) {
+	payload := "<imdn><message-id>msg-aliased</message-id></imdn>"
+	body := []byte(strings.Join([]string{
+		"From: <sip:alice@example.com>",
+		"NS: MsgState <URN:IETF:PARAMS:IMDN>",
+		"MsgState.Message-Id: msg-aliased",
+		"MsgState.Disposition-Notification: positive-delivery, display",
+		"",
+		"Content-Type: message/imdn+xml",
+		"Content-Length: " + strconv.Itoa(len(payload)),
+		"",
+		payload,
+	}, "\r\n"))
+
+	parsed, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+
+	if got := imsHeaderValue(parsed.Headers, "imdn.Message-ID"); got != "msg-aliased" {
+		t.Fatalf("imdn.Message-ID=%q", got)
+	}
+	if got := imsHeaderValue(parsed.Headers, "imdn.Disposition-Notification"); got != "positive-delivery, display" {
+		t.Fatalf("imdn.Disposition-Notification=%q", got)
+	}
+	if got := imsHeaderValue(parsed.Headers, "MsgState.Message-ID"); got != "" {
+		t.Fatalf("aliased MsgState.Message-ID still present as %q", got)
+	}
+	if values := parsed.Headers["imdn.Message-ID"]; len(values) != 1 || values[0] != "msg-aliased" {
+		t.Fatalf("normalized Message-ID header=%+v", parsed.Headers)
+	}
+}
+
+func TestParseIMSCPIMMessageMergesCanonicalAndAliasedIMDNHeaders(t *testing.T) {
+	payload := "<imdn/>"
+	body := []byte(strings.Join([]string{
+		"From: <sip:alice@example.com>",
+		"NS: x <urn:ietf:params:imdn>",
+		"imdn.Message-ID: canonical",
+		"x.Message-ID: aliased",
+		"",
+		"Content-Type: message/imdn+xml",
+		"Content-Length: " + strconv.Itoa(len(payload)),
+		"",
+		payload,
+	}, "\r\n"))
+
+	parsed, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	values := parsed.Headers["imdn.Message-ID"]
+	if len(values) != 2 || !cpimTestHasValue(values, "canonical") || !cpimTestHasValue(values, "aliased") {
+		t.Fatalf("merged imdn.Message-ID values=%+v headers=%+v", values, parsed.Headers)
+	}
+	if got := parsed.Headers["x.Message-ID"]; len(got) != 0 {
+		t.Fatalf("alias key still present: %+v", got)
+	}
+}
+
+func cpimTestHasValue(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBuildIMSCPIMMessageWithHeadersRejectsInvalidHeaders(t *testing.T) {
 	_, err := BuildIMSCPIMMessageWithHeaders(nil, map[string][]string{"Content-Type": {"text/plain"}}, []byte("hello"))
 	if err != nil {

@@ -21,6 +21,7 @@ type WireSIPFlow struct {
 	RetransmitInterval    time.Duration
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
+	FinalResponseDrain    time.Duration
 
 	mu          sync.Mutex
 	conn        net.Conn
@@ -369,6 +370,7 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 			continue
 		}
 		if !isSIPProvisionalResponse(resp.StatusCode) {
+			drainSIPUDPFinalResponses(ctx, conn, msg, sipFinalResponseDrainDuration(msg.Method, f.FinalResponseDrain))
 			return resp, nil
 		}
 		if onProvisional != nil && shouldReportSIPProvisionalResponse(msg.Method) {

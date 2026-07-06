@@ -102,6 +102,51 @@ func TestRunCREATECHILDSARejectsMissingResponseNonce(t *testing.T) {
 	}
 }
 
+func TestRunCREATECHILDSAClassifiesResponseNotifyErrors(t *testing.T) {
+	cases := []struct {
+		name       string
+		notifyType uint16
+		want       error
+	}{
+		{"invalid syntax", NotifyInvalidSyntax, ErrNotifyInvalidSyntax},
+		{"no proposal chosen", NotifyNoProposalChosen, ErrNotifyNoProposalChosen},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			init := fakeInitResult(t)
+			transport := &createChildTransport{
+				t:         t,
+				init:      init,
+				messageID: 9,
+				localSPI:  []byte{0xca, 0xfe, 0xba, 0xbe},
+				responseNotify: &Notify{
+					NotifyType: tc.notifyType,
+				},
+			}
+			_, err := RunCREATE_CHILD_SA(context.Background(), CreateChildSAConfig{
+				Transport: transport,
+				Init:      init,
+				ChildSPI:  transport.localSPI,
+				Nonce:     bytes.Repeat([]byte{0x47}, 32),
+				MessageID: 9,
+				IV:        bytes.Repeat([]byte{0x95}, init.Keys.Profile.EncryptionBlockSize),
+			})
+			if !errors.Is(err, ErrInvalidCreateChild) ||
+				!errors.Is(err, ErrIKEv2NotifyError) ||
+				!errors.Is(err, tc.want) {
+				t.Fatalf("RunCREATE_CHILD_SA() err=%v, want ErrInvalidCreateChild, ErrIKEv2NotifyError, and %v", err, tc.want)
+			}
+			var notifyErr *NotifyError
+			if !errors.As(err, &notifyErr) {
+				t.Fatalf("RunCREATE_CHILD_SA() err=%T, want *NotifyError", err)
+			}
+			if notifyErr.Notify.NotifyType != tc.notifyType {
+				t.Fatalf("notifyErr=%+v", notifyErr)
+			}
+		})
+	}
+}
+
 func TestRunCREATECHILDSARejectsUnsupportedSelectedSA(t *testing.T) {
 	init := fakeInitResult(t)
 	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
@@ -137,6 +182,7 @@ type createChildTransport struct {
 	localSPI          []byte
 	remoteSPI         []byte
 	responseSA        SecurityAssociation
+	responseNotify    *Notify
 	responseNonce     []byte
 	omitResponseNonce bool
 	requests          int
@@ -178,6 +224,23 @@ func (tr *createChildTransport) ExchangeIKE(ctx context.Context, request []byte)
 		case PayloadTSr:
 			tr.sawTSr = true
 		}
+	}
+	if tr.responseNotify != nil {
+		notifyPayload, err := NotifyPayload(*tr.responseNotify)
+		if err != nil {
+			tr.t.Fatalf("NotifyPayload(response) error = %v", err)
+		}
+		_, raw, err := ProtectMessage(
+			createChildHeader(tr.init, tr.messageID, false),
+			tr.init.Keys,
+			false,
+			[]Payload{notifyPayload},
+			bytes.Repeat([]byte{0x93}, tr.init.Keys.Profile.EncryptionBlockSize),
+		)
+		if err != nil {
+			tr.t.Fatalf("ProtectMessage(response notify) error = %v", err)
+		}
+		return raw, nil
 	}
 	responseSA := tr.responseSA
 	if len(responseSA.Proposals) == 0 {

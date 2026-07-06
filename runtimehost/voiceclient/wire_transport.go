@@ -27,6 +27,7 @@ type WireRegisterTransport struct {
 	RetransmitInterval    time.Duration
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
+	FinalResponseDrain    time.Duration
 }
 
 func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg RegisterMessage) (RegisterResponse, error) {
@@ -181,6 +182,7 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 				gotResponse = true
 				continue
 			}
+			drainSIPUDPFinalResponses(ctx, conn, attempt, sipFinalResponseDrainDuration(attempt.Method, t.FinalResponseDrain))
 			return resp, nil
 		}
 		if ctx.Err() != nil {
@@ -1026,6 +1028,46 @@ func nextSIPRetransmitInterval(interval, maxInterval time.Duration) time.Duratio
 
 func shouldSIPRetransmit(done, max int) bool {
 	return max <= 0 || done < max
+}
+
+func sipFinalResponseDrainDuration(method string, configured time.Duration) time.Duration {
+	if configured <= 0 || strings.EqualFold(strings.TrimSpace(method), "INVITE") {
+		return 0
+	}
+	return configured
+}
+
+func drainSIPUDPFinalResponses(ctx context.Context, conn net.Conn, msg SIPRequestMessage, duration time.Duration) {
+	if duration <= 0 || conn == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline := time.Now().Add(duration)
+	buf := make([]byte, 65535)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			return
+		}
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		if !isSIPResponseWire(buf[:n]) {
+			continue
+		}
+		resp, err := ParseSIPResponse(buf[:n])
+		if err != nil || !sipResponseMatchesRequest(resp, msg) {
+			continue
+		}
+		if isSIPProvisionalResponse(resp.StatusCode) {
+			continue
+		}
+	}
 }
 
 func isSIPTimeout(err error) bool {

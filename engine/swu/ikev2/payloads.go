@@ -15,18 +15,21 @@ const (
 )
 
 const (
-	NotifyUnacceptableAddresses     uint16 = 40
-	NotifyUnexpectedNATDetected     uint16 = 41
-	NotifyNATDetectionSourceIP      uint16 = 16388
-	NotifyNATDetectionDestinationIP uint16 = 16389
-	NotifyRekeySA                   uint16 = 16393
-	NotifyMOBIKESupported           uint16 = 16396
-	NotifyAdditionalIPv4Address     uint16 = 16397
-	NotifyAdditionalIPv6Address     uint16 = 16398
-	NotifyNoAdditionalAddresses     uint16 = 16399
-	NotifyUpdateSAAddresses         uint16 = 16400
-	NotifyCookie2                   uint16 = 16401
-	NotifyNoNATsAllowed             uint16 = 16402
+	NotifyUnsupportedCriticalPayload uint16 = 1
+	NotifyInvalidSyntax              uint16 = 7
+	NotifyNoProposalChosen           uint16 = 14
+	NotifyUnacceptableAddresses      uint16 = 40
+	NotifyUnexpectedNATDetected      uint16 = 41
+	NotifyNATDetectionSourceIP       uint16 = 16388
+	NotifyNATDetectionDestinationIP  uint16 = 16389
+	NotifyRekeySA                    uint16 = 16393
+	NotifyMOBIKESupported            uint16 = 16396
+	NotifyAdditionalIPv4Address      uint16 = 16397
+	NotifyAdditionalIPv6Address      uint16 = 16398
+	NotifyNoAdditionalAddresses      uint16 = 16399
+	NotifyUpdateSAAddresses          uint16 = 16400
+	NotifyCookie2                    uint16 = 16401
+	NotifyNoNATsAllowed              uint16 = 16402
 )
 
 const (
@@ -38,9 +41,13 @@ const (
 )
 
 var (
-	ErrInvalidNotify  = errors.New("invalid ikev2 notify payload")
-	ErrInvalidDelete  = errors.New("invalid ikev2 delete payload")
-	ErrInvalidAddress = errors.New("invalid ikev2 address")
+	ErrInvalidNotify                    = errors.New("invalid ikev2 notify payload")
+	ErrIKEv2NotifyError                 = errors.New("ikev2 notify error")
+	ErrNotifyUnsupportedCriticalPayload = errors.New("ikev2 unsupported critical payload notify")
+	ErrNotifyInvalidSyntax              = errors.New("ikev2 invalid syntax notify")
+	ErrNotifyNoProposalChosen           = errors.New("ikev2 no proposal chosen notify")
+	ErrInvalidDelete                    = errors.New("invalid ikev2 delete payload")
+	ErrInvalidAddress                   = errors.New("invalid ikev2 address")
 )
 
 type Notify struct {
@@ -48,6 +55,29 @@ type Notify struct {
 	NotifyType       uint16
 	SPI              []byte
 	NotificationData []byte
+}
+
+type NotifyError struct {
+	Notify Notify
+	Err    error
+}
+
+func (e *NotifyError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%s: %s", ErrIKEv2NotifyError, NotifyTypeName(e.Notify.NotifyType))
+}
+
+func (e *NotifyError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *NotifyError) Is(target error) bool {
+	return target == ErrIKEv2NotifyError || target == e.Err
 }
 
 func (n Notify) MarshalBinary() ([]byte, error) {
@@ -85,6 +115,83 @@ func NotifyPayload(n Notify) (Payload, error) {
 		return Payload{}, err
 	}
 	return Payload{Type: PayloadNotify, Body: body}, nil
+}
+
+func NotifyErrorFor(n Notify) error {
+	err := notifyErrorClass(n.NotifyType)
+	if err == nil {
+		return nil
+	}
+	return &NotifyError{Notify: cloneNotify(n), Err: err}
+}
+
+func FirstNotifyError(payloads []Payload) error {
+	for _, payload := range payloads {
+		if payload.Type != PayloadNotify {
+			continue
+		}
+		notify, err := ParseNotify(payload.Body)
+		if err != nil {
+			return err
+		}
+		if err := NotifyErrorFor(notify); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func NotifyTypeName(notifyType uint16) string {
+	switch notifyType {
+	case NotifyUnsupportedCriticalPayload:
+		return "UNSUPPORTED_CRITICAL_PAYLOAD"
+	case NotifyInvalidSyntax:
+		return "INVALID_SYNTAX"
+	case NotifyNoProposalChosen:
+		return "NO_PROPOSAL_CHOSEN"
+	case NotifyUnacceptableAddresses:
+		return "UNACCEPTABLE_ADDRESSES"
+	case NotifyUnexpectedNATDetected:
+		return "UNEXPECTED_NAT_DETECTED"
+	case NotifyNATDetectionSourceIP:
+		return "NAT_DETECTION_SOURCE_IP"
+	case NotifyNATDetectionDestinationIP:
+		return "NAT_DETECTION_DESTINATION_IP"
+	case NotifyRekeySA:
+		return "REKEY_SA"
+	case NotifyMOBIKESupported:
+		return "MOBIKE_SUPPORTED"
+	case NotifyAdditionalIPv4Address:
+		return "ADDITIONAL_IP4_ADDRESS"
+	case NotifyAdditionalIPv6Address:
+		return "ADDITIONAL_IP6_ADDRESS"
+	case NotifyNoAdditionalAddresses:
+		return "NO_ADDITIONAL_ADDRESSES"
+	case NotifyUpdateSAAddresses:
+		return "UPDATE_SA_ADDRESSES"
+	case NotifyCookie2:
+		return "COOKIE2"
+	case NotifyNoNATsAllowed:
+		return "NO_NATS_ALLOWED"
+	default:
+		return fmt.Sprintf("notify %d", notifyType)
+	}
+}
+
+func notifyErrorClass(notifyType uint16) error {
+	switch notifyType {
+	case NotifyUnsupportedCriticalPayload:
+		return ErrNotifyUnsupportedCriticalPayload
+	case NotifyInvalidSyntax:
+		return ErrNotifyInvalidSyntax
+	case NotifyNoProposalChosen:
+		return ErrNotifyNoProposalChosen
+	default:
+		if notifyType < 16384 {
+			return ErrIKEv2NotifyError
+		}
+		return nil
+	}
 }
 
 type Delete struct {
@@ -330,6 +437,15 @@ func FirstNotify(payloads []Payload, notifyType uint16) (Notify, bool, error) {
 		}
 	}
 	return Notify{}, false, nil
+}
+
+func cloneNotify(n Notify) Notify {
+	return Notify{
+		ProtocolID:       n.ProtocolID,
+		NotifyType:       n.NotifyType,
+		SPI:              append([]byte(nil), n.SPI...),
+		NotificationData: append([]byte(nil), n.NotificationData...),
+	}
 }
 
 func appendUint64(dst []byte, v uint64) []byte {

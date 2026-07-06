@@ -604,6 +604,150 @@ func TestRTPRelaySessionTracksRTPStreamsAndSendsReceiverReport(t *testing.T) {
 	}
 }
 
+func TestRTPRelaySessionReportsQualitySnapshot(t *testing.T) {
+	clientPeer := listenTestUDP(t)
+	defer clientPeer.Close()
+	clientRTCPPeer := listenTestUDP(t)
+	defer clientRTCPPeer.Close()
+	imsPeer := listenTestUDP(t)
+	defer imsPeer.Close()
+	imsRTCPPeer := listenTestUDP(t)
+	defer imsRTCPPeer.Close()
+
+	clientAddr := clientPeer.LocalAddr().(*net.UDPAddr)
+	clientRTCPAddr := clientRTCPPeer.LocalAddr().(*net.UDPAddr)
+	imsAddr := imsPeer.LocalAddr().(*net.UDPAddr)
+	imsRTCPAddr := imsRTCPPeer.LocalAddr().(*net.UDPAddr)
+	relay, err := NewRTPRelaySession(context.Background(), RTPRelayConfig{
+		ClientListenIP:     "127.0.0.1",
+		ClientAdvertiseIP:  "127.0.0.1",
+		IMSListenIP:        "127.0.0.1",
+		IMSAdvertiseIP:     "127.0.0.1",
+		ClientRTPClockRate: 8000,
+		IMSRTPClockRate:    8000,
+	}, SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: clientAddr.Port, RTCPPort: clientRTCPAddr.Port})
+	if err != nil {
+		t.Fatalf("NewRTPRelaySession() error = %v", err)
+	}
+	defer relay.Close()
+	if err := relay.SetIMSRemote(SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: imsAddr.Port, RTCPPort: imsRTCPAddr.Port}); err != nil {
+		t.Fatalf("SetIMSRemote() error = %v", err)
+	}
+
+	clientEndpoint := udpAddrFromSDP(t, relay.ClientEndpoint())
+	clientRTCPEndpoint := udpRTCPAddrFromSDP(t, relay.ClientEndpoint())
+	imsEndpoint := udpAddrFromSDP(t, relay.IMSEndpoint())
+	imsRTCPEndpoint := udpRTCPAddrFromSDP(t, relay.IMSEndpoint())
+
+	for _, input := range []struct {
+		sequence  uint16
+		timestamp uint32
+	}{
+		{sequence: 10, timestamp: 1000},
+		{sequence: 12, timestamp: 1320},
+	} {
+		packet := buildRTPStatsPacket(0x11111111, input.sequence, input.timestamp)
+		if _, err := clientPeer.WriteToUDP(packet, clientEndpoint); err != nil {
+			t.Fatalf("client WriteToUDP(%d) error = %v", input.sequence, err)
+		}
+		if got, _ := readTestUDP(t, imsPeer); !bytes.Equal(got, packet) {
+			t.Fatalf("IMS got seq=%d packet=%x, want %x", input.sequence, got, packet)
+		}
+	}
+	for _, input := range []struct {
+		sequence  uint16
+		timestamp uint32
+	}{
+		{sequence: 20, timestamp: 2000},
+		{sequence: 21, timestamp: 2160},
+	} {
+		packet := buildRTPStatsPacket(0x22222222, input.sequence, input.timestamp)
+		if _, err := imsPeer.WriteToUDP(packet, imsEndpoint); err != nil {
+			t.Fatalf("ims WriteToUDP(%d) error = %v", input.sequence, err)
+		}
+		if got, _ := readTestUDP(t, clientPeer); !bytes.Equal(got, packet) {
+			t.Fatalf("client got seq=%d packet=%x, want %x", input.sequence, got, packet)
+		}
+	}
+
+	imsReport, err := rtcp.Marshal([]rtcp.Packet{
+		&rtcp.ReceiverReport{
+			SSRC: 0x51515151,
+			Reports: []rtcp.ReceptionReport{{
+				SSRC:               0x11111111,
+				FractionLost:       64,
+				TotalLost:          3,
+				LastSequenceNumber: 12,
+				Jitter:             44,
+				LastSenderReport:   0x12345678,
+				Delay:              0x00001000,
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal(ims report) error = %v", err)
+	}
+	if _, err := imsRTCPPeer.WriteToUDP(imsReport, imsRTCPEndpoint); err != nil {
+		t.Fatalf("IMS RTCP WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, clientRTCPPeer); !bytes.Equal(got, imsReport) {
+		t.Fatalf("client RTCP got=%x, want %x", got, imsReport)
+	}
+
+	clientReport, err := rtcp.Marshal([]rtcp.Packet{
+		&rtcp.SenderReport{
+			SSRC: 0x61616161,
+			Reports: []rtcp.ReceptionReport{{
+				SSRC:               0x22222222,
+				FractionLost:       8,
+				TotalLost:          1,
+				LastSequenceNumber: 21,
+				Jitter:             7,
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal(client report) error = %v", err)
+	}
+	if _, err := clientRTCPPeer.WriteToUDP(clientReport, clientRTCPEndpoint); err != nil {
+		t.Fatalf("client RTCP WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, imsRTCPPeer); !bytes.Equal(got, clientReport) {
+		t.Fatalf("IMS RTCP got=%x, want %x", got, clientReport)
+	}
+
+	quality := waitRelayQuality(t, relay, func(quality RTPRelayQualityStats) bool {
+		return quality.ClientToIMS.RTPPackets == 2 &&
+			quality.IMSToClient.RTPPackets == 2 &&
+			len(quality.ClientToIMS.RTCPReports) == 1 &&
+			len(quality.IMSToClient.RTCPReports) == 1
+	})
+	if quality.ClientToIMS.RTPReceivedPackets != 2 || quality.ClientToIMS.RTPExpectedPackets != 3 ||
+		quality.ClientToIMS.RTPLostPackets != 1 || quality.ClientToIMS.RTPFractionLost != 85 {
+		t.Fatalf("client-to-IMS quality=%+v", quality.ClientToIMS)
+	}
+	if quality.IMSToClient.RTPReceivedPackets != 2 || quality.IMSToClient.RTPExpectedPackets != 2 ||
+		quality.IMSToClient.RTPLostPackets != 0 || quality.IMSToClient.RTPFractionLost != 0 {
+		t.Fatalf("IMS-to-client quality=%+v", quality.IMSToClient)
+	}
+	if quality.ClientToIMS.RTCPPackets != 1 || quality.IMSToClient.RTCPPackets != 1 ||
+		quality.RTCPFeedback.Packets != 2 || quality.RTCPFeedback.ReceiverReports != 1 ||
+		quality.RTCPFeedback.SenderReports != 1 || quality.RTCPFeedbackParseErrors != 0 {
+		t.Fatalf("RTCP quality=%+v", quality)
+	}
+	if report := quality.IMSToClient.RTCPReports[0]; report.Direction != RTCPFeedbackIMSToClient ||
+		report.ReporterSSRC != 0x51515151 || report.MediaSSRC != 0x11111111 ||
+		report.FractionLost != 64 || report.TotalLost != 3 || report.Jitter != 44 ||
+		report.LastSenderReport != 0x12345678 || report.Delay != 0x00001000 {
+		t.Fatalf("IMS report quality=%+v", report)
+	}
+	if report := quality.ClientToIMS.RTCPReports[0]; report.Direction != RTCPFeedbackClientToIMS ||
+		report.ReporterSSRC != 0x61616161 || report.MediaSSRC != 0x22222222 ||
+		report.FractionLost != 8 || report.TotalLost != 1 || report.Jitter != 7 {
+		t.Fatalf("client report quality=%+v", report)
+	}
+}
+
 func TestRTPRelaySessionSendsSenderReportWithSourceDescription(t *testing.T) {
 	clientPeer := listenTestUDP(t)
 	defer clientPeer.Close()
@@ -1081,6 +1225,21 @@ func waitRelayStats(t *testing.T, relay *RTPRelaySession, pred func(RTPRelayStat
 		}
 		if time.Now().After(deadline) {
 			return stats
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitRelayQuality(t *testing.T, relay *RTPRelaySession, pred func(RTPRelayQualityStats) bool) RTPRelayQualityStats {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		quality := relay.Quality()
+		if pred(quality) {
+			return quality
+		}
+		if time.Now().After(deadline) {
+			return quality
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

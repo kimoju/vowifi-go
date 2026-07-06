@@ -31,6 +31,7 @@ type WireSIPTransport struct {
 	RetransmitInterval    time.Duration
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
+	FinalResponseDrain    time.Duration
 }
 
 func (t WireSIPTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMessage) (SIPResponse, error) {
@@ -161,6 +162,7 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 			continue
 		}
 		if !isSIPProvisionalResponse(resp.StatusCode) {
+			drainSIPUDPFinalResponses(ctx, conn, attempt, sipFinalResponseDrainDuration(attempt.Method, t.FinalResponseDrain))
 			return resp, nil
 		}
 		if onProvisional != nil && shouldReportSIPProvisionalResponse(attempt.Method) {

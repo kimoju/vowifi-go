@@ -14,6 +14,8 @@ import (
 
 const IMSCPIMContentType = "message/cpim"
 
+const imsCPIMIMDNNamespace = "urn:ietf:params:imdn"
+
 type IMSCPIMMessage struct {
 	Headers        map[string][]string
 	ContentHeaders map[string][]string
@@ -114,6 +116,7 @@ func parseCPIMHeaders(block []byte) (map[string][]string, error) {
 	for key, values := range header {
 		out[key] = append([]string(nil), values...)
 	}
+	normalizeCPIMIMDNHeaders(out)
 	return out, nil
 }
 
@@ -161,6 +164,113 @@ func setCPIMHeader(headers map[string][]string, key, value string) {
 		}
 	}
 	headers[key] = []string{value}
+}
+
+func normalizeCPIMIMDNHeaders(headers map[string][]string) {
+	prefixes := cpimNamespacePrefixes(headers, imsCPIMIMDNNamespace)
+	if len(prefixes) == 0 {
+		return
+	}
+	normalized := make(map[string][]string, len(headers))
+	changed := false
+	for key, values := range headers {
+		target := key
+		if normalizedKey, ok := normalizeCPIMIMDNHeaderName(key, prefixes); ok {
+			target = normalizedKey
+			if key != normalizedKey {
+				changed = true
+			}
+		}
+		appendCPIMHeaderValues(normalized, target, values)
+	}
+	if !changed {
+		return
+	}
+	for key := range headers {
+		delete(headers, key)
+	}
+	for key, values := range normalized {
+		headers[key] = values
+	}
+}
+
+func cpimNamespacePrefixes(headers map[string][]string, namespaceURI string) map[string]bool {
+	prefixes := map[string]bool{}
+	for _, value := range cpimHeaderValues(headers, "NS") {
+		prefix, uri, ok := parseCPIMNamespaceHeader(value)
+		if !ok || !strings.EqualFold(uri, namespaceURI) {
+			continue
+		}
+		prefixes[strings.ToLower(prefix)] = true
+	}
+	return prefixes
+}
+
+func cpimHeaderValues(headers map[string][]string, key string) []string {
+	var out []string
+	for candidate, values := range headers {
+		if strings.EqualFold(strings.TrimSpace(candidate), key) {
+			out = append(out, values...)
+		}
+	}
+	return out
+}
+
+func parseCPIMNamespaceHeader(value string) (prefix, uri string, ok bool) {
+	value = strings.TrimSpace(value)
+	start := strings.IndexByte(value, '<')
+	end := strings.LastIndexByte(value, '>')
+	if start <= 0 || end <= start {
+		return "", "", false
+	}
+	prefix = strings.TrimSpace(value[:start])
+	uri = strings.TrimSpace(value[start+1 : end])
+	if !validCPIMHeaderName(prefix) || uri == "" {
+		return "", "", false
+	}
+	return prefix, uri, true
+}
+
+func normalizeCPIMIMDNHeaderName(name string, prefixes map[string]bool) (string, bool) {
+	name = strings.TrimSpace(name)
+	prefix, suffix, ok := strings.Cut(name, ".")
+	if !ok || strings.TrimSpace(suffix) == "" {
+		return "", false
+	}
+	lowerPrefix := strings.ToLower(prefix)
+	if lowerPrefix != "imdn" && !prefixes[lowerPrefix] {
+		return "", false
+	}
+	return "imdn." + canonicalCPIMIMDNHeaderSuffix(suffix), true
+}
+
+func canonicalCPIMIMDNHeaderSuffix(suffix string) string {
+	switch strings.ToLower(strings.TrimSpace(suffix)) {
+	case "message-id":
+		return "Message-ID"
+	case "disposition-notification":
+		return "Disposition-Notification"
+	case "original-to":
+		return "Original-To"
+	case "datetime":
+		return "DateTime"
+	default:
+		return strings.TrimSpace(suffix)
+	}
+}
+
+func appendCPIMHeaderValues(headers map[string][]string, key string, values []string) {
+	for candidate, existing := range headers {
+		if !strings.EqualFold(strings.TrimSpace(candidate), key) {
+			continue
+		}
+		if candidate != key {
+			delete(headers, candidate)
+		}
+		headers[key] = append(append([]string(nil), existing...), values...)
+		return
+	}
+	headers[key] = append([]string(nil), values...)
 }
 
 func writeCPIMHeaders(out *bytes.Buffer, headers map[string][]string) error {

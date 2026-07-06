@@ -80,6 +80,9 @@ func RunCREATE_CHILD_SA(ctx context.Context, cfg CreateChildSAConfig) (CreateChi
 	if err != nil {
 		return CreateChildSAResult{}, err
 	}
+	if err := FirstNotifyError(inner); err != nil {
+		return CreateChildSAResult{}, fmt.Errorf("%w: %w", ErrInvalidCreateChild, err)
+	}
 	responseNonce, err := firstNonce(inner)
 	if err != nil {
 		return CreateChildSAResult{}, err

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -146,6 +147,44 @@ type RTPRelayStats struct {
 	IMSToClientRTPStreams                []RTPStreamStats
 }
 
+type RTPRelayQualityStats struct {
+	ClientToIMS             RTPRelayDirectionQuality
+	IMSToClient             RTPRelayDirectionQuality
+	RTCPFeedback            RTCPFeedbackSummary
+	RTCPFeedbackParseErrors uint64
+}
+
+type RTPRelayDirectionQuality struct {
+	Direction            RTCPFeedbackDirection
+	RTPPackets           uint64
+	RTPBytes             uint64
+	RTPDrops             uint64
+	RTCPPackets          uint64
+	RTCPBytes            uint64
+	RTCPDrops            uint64
+	RTPReceivedPackets   uint64
+	RTPExpectedPackets   uint64
+	RTPLostPackets       uint64
+	RTPDuplicatePackets  uint64
+	RTPOutOfOrderPackets uint64
+	RTPFractionLost      uint8
+	RTPMaxJitter         uint32
+	RTPStreams           []RTPStreamStats
+	RTCPReports          []RTPRelayRTCPReportQuality
+}
+
+type RTPRelayRTCPReportQuality struct {
+	Direction          RTCPFeedbackDirection
+	ReporterSSRC       uint32
+	MediaSSRC          uint32
+	FractionLost       uint8
+	TotalLost          uint32
+	LastSequenceNumber uint32
+	Jitter             uint32
+	LastSenderReport   uint32
+	Delay              uint32
+}
+
 type RTPRelaySession struct {
 	clientConn     *net.UDPConn
 	imsConn        *net.UDPConn
@@ -174,12 +213,15 @@ type RTPRelaySession struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	dtmfMu               sync.Mutex
-	dtmfClientToIMSState rtpDTMFSequenceState
-	dtmfIMSToClientState rtpDTMFSequenceState
-	rtpStatsMu           sync.Mutex
-	clientToIMSRTPStats  RTPStreamStatsTracker
-	imsToClientRTPStats  RTPStreamStatsTracker
+	dtmfMu                 sync.Mutex
+	dtmfClientToIMSState   rtpDTMFSequenceState
+	dtmfIMSToClientState   rtpDTMFSequenceState
+	rtpStatsMu             sync.Mutex
+	clientToIMSRTPStats    RTPStreamStatsTracker
+	imsToClientRTPStats    RTPStreamStatsTracker
+	rtcpQualityMu          sync.Mutex
+	clientToIMSRTCPReports map[rtpRelayRTCPReportKey]RTPRelayRTCPReportQuality
+	imsToClientRTCPReports map[rtpRelayRTCPReportKey]RTPRelayRTCPReportQuality
 
 	clientToIMSRTPPackets                atomic.Uint64
 	imsToClientRTPPackets                atomic.Uint64
@@ -226,6 +268,11 @@ type rtpDTMFSequenceState struct {
 	nextSeq       uint16
 	nextTimestamp uint32
 	ssrc          uint32
+}
+
+type rtpRelayRTCPReportKey struct {
+	reporterSSRC uint32
+	mediaSSRC    uint32
 }
 
 func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SDPInfo) (*RTPRelaySession, error) {
@@ -429,6 +476,55 @@ func (s *RTPRelaySession) Stats() RTPRelayStats {
 	}
 }
 
+func (s *RTPRelaySession) Quality() RTPRelayQualityStats {
+	if s == nil {
+		return RTPRelayQualityStats{}
+	}
+	stats := s.Stats()
+	return RTPRelayQualityStats{
+		ClientToIMS: newRTPRelayDirectionQuality(
+			RTCPFeedbackClientToIMS,
+			stats.ClientToIMSRTPPackets,
+			stats.ClientToIMSRTPBytes,
+			stats.ClientToIMSRTPDrops,
+			stats.ClientToIMSRTCPPackets,
+			stats.ClientToIMSRTCPBytes,
+			stats.ClientToIMSRTCPDrops,
+			stats.ClientToIMSRTPStreams,
+			s.rtcpReportQuality(RTCPFeedbackClientToIMS),
+		),
+		IMSToClient: newRTPRelayDirectionQuality(
+			RTCPFeedbackIMSToClient,
+			stats.IMSToClientRTPPackets,
+			stats.IMSToClientRTPBytes,
+			stats.IMSToClientRTPDrops,
+			stats.IMSToClientRTCPPackets,
+			stats.IMSToClientRTCPBytes,
+			stats.IMSToClientRTCPDrops,
+			stats.IMSToClientRTPStreams,
+			s.rtcpReportQuality(RTCPFeedbackIMSToClient),
+		),
+		RTCPFeedback: RTCPFeedbackSummary{
+			Packets:                          stats.RTCPFeedbackPackets,
+			SenderReports:                    stats.RTCPSenderReports,
+			ReceiverReports:                  stats.RTCPReceiverReports,
+			PictureLossIndications:           stats.RTCPPictureLossIndications,
+			FullIntraRequests:                stats.RTCPFullIntraRequests,
+			RapidResynchronizationRequests:   stats.RTCPRapidResynchronizationRequests,
+			TransportLayerNacks:              stats.RTCPTransportLayerNacks,
+			ReceiverEstimatedMaximumBitrates: stats.RTCPReceiverEstimatedMaximumBitrates,
+			TransportLayerCongestionControls: stats.RTCPTransportLayerCongestionControls,
+			SliceLossIndications:             stats.RTCPSliceLossIndications,
+			ExtendedReports:                  stats.RTCPExtendedReports,
+			SourceDescriptions:               stats.RTCPSourceDescriptions,
+			Goodbyes:                         stats.RTCPGoodbyes,
+			ApplicationDefined:               stats.RTCPApplicationDefined,
+			UnknownPackets:                   stats.RTCPUnknownPackets,
+		},
+		RTCPFeedbackParseErrors: stats.RTCPFeedbackParseErrors,
+	}
+}
+
 func (s *RTPRelaySession) ClientToIMSRTPStreamStats() []RTPStreamStats {
 	if s == nil {
 		return nil
@@ -445,6 +541,43 @@ func (s *RTPRelaySession) IMSToClientRTPStreamStats() []RTPStreamStats {
 	s.rtpStatsMu.Lock()
 	defer s.rtpStatsMu.Unlock()
 	return s.imsToClientRTPStats.Stats()
+}
+
+func newRTPRelayDirectionQuality(direction RTCPFeedbackDirection, rtpPackets, rtpBytes, rtpDrops, rtcpPackets, rtcpBytes, rtcpDrops uint64, streams []RTPStreamStats, reports []RTPRelayRTCPReportQuality) RTPRelayDirectionQuality {
+	quality := RTPRelayDirectionQuality{
+		Direction:   direction,
+		RTPPackets:  rtpPackets,
+		RTPBytes:    rtpBytes,
+		RTPDrops:    rtpDrops,
+		RTCPPackets: rtcpPackets,
+		RTCPBytes:   rtcpBytes,
+		RTCPDrops:   rtcpDrops,
+		RTPStreams:  append([]RTPStreamStats(nil), streams...),
+		RTCPReports: append([]RTPRelayRTCPReportQuality(nil), reports...),
+	}
+	for _, stream := range streams {
+		quality.RTPReceivedPackets += stream.Packets
+		quality.RTPExpectedPackets += stream.ExpectedPackets
+		quality.RTPLostPackets += stream.LostPackets
+		quality.RTPDuplicatePackets += stream.DuplicatePackets
+		quality.RTPOutOfOrderPackets += stream.OutOfOrderPackets
+		if stream.Jitter > quality.RTPMaxJitter {
+			quality.RTPMaxJitter = stream.Jitter
+		}
+	}
+	quality.RTPFractionLost = rtpRelayFractionLost(quality.RTPLostPackets, quality.RTPExpectedPackets)
+	return quality
+}
+
+func rtpRelayFractionLost(lost, expected uint64) uint8 {
+	if lost == 0 || expected == 0 {
+		return 0
+	}
+	fraction := lost * 256 / expected
+	if fraction > 255 {
+		return 255
+	}
+	return uint8(fraction)
 }
 
 func (s *RTPRelaySession) RTPPlaintextHandler() RTPPlaintextHandler {
@@ -638,7 +771,7 @@ func (s *RTPRelaySession) SendRTCP(ctx context.Context, req RTPRelayRTCPRequest)
 		route.drops.Add(1)
 		return RTPRelayRTCPResult{}, err
 	}
-	summary, err := InspectRTCPFeedback(direction, packet, s.rtcpFeedbackHandler)
+	summary, err := s.inspectRTCPFeedbackPacket(direction, packet)
 	if err != nil {
 		route.drops.Add(1)
 		s.rtcpFeedbackParseErrors.Add(1)
@@ -1208,12 +1341,19 @@ func (s *RTPRelaySession) inspectRTCPFeedback(direction RTCPFeedbackDirection, p
 	if s == nil {
 		return
 	}
-	summary, err := InspectRTCPFeedback(direction, packet, s.rtcpFeedbackHandler)
+	summary, err := s.inspectRTCPFeedbackPacket(direction, packet)
 	if err != nil {
 		s.rtcpFeedbackParseErrors.Add(1)
 		return
 	}
 	s.recordRTCPFeedbackSummary(summary)
+}
+
+func (s *RTPRelaySession) inspectRTCPFeedbackPacket(direction RTCPFeedbackDirection, packet []byte) (RTCPFeedbackSummary, error) {
+	return InspectRTCPFeedback(direction, packet, func(event RTCPFeedbackEvent) {
+		s.recordRTCPReportQuality(event)
+		emitRTCPFeedback(s.rtcpFeedbackHandler, event)
+	})
 }
 
 func (s *RTPRelaySession) recordRTCPFeedbackSummary(summary RTCPFeedbackSummary) {
@@ -1235,6 +1375,70 @@ func (s *RTPRelaySession) recordRTCPFeedbackSummary(summary RTCPFeedbackSummary)
 	s.rtcpGoodbyes.Add(summary.Goodbyes)
 	s.rtcpApplicationDefined.Add(summary.ApplicationDefined)
 	s.rtcpUnknownPackets.Add(summary.UnknownPackets)
+}
+
+func (s *RTPRelaySession) recordRTCPReportQuality(event RTCPFeedbackEvent) {
+	if s == nil || len(event.Reports) == 0 {
+		return
+	}
+	direction, err := normalizeRTCPFeedbackDirection(event.Direction)
+	if err != nil {
+		return
+	}
+	s.rtcpQualityMu.Lock()
+	defer s.rtcpQualityMu.Unlock()
+	reports := s.clientToIMSRTCPReports
+	if direction == RTCPFeedbackIMSToClient {
+		reports = s.imsToClientRTCPReports
+	}
+	if reports == nil {
+		reports = make(map[rtpRelayRTCPReportKey]RTPRelayRTCPReportQuality)
+		if direction == RTCPFeedbackIMSToClient {
+			s.imsToClientRTCPReports = reports
+		} else {
+			s.clientToIMSRTCPReports = reports
+		}
+	}
+	for _, report := range event.Reports {
+		key := rtpRelayRTCPReportKey{reporterSSRC: event.SSRC, mediaSSRC: report.SSRC}
+		reports[key] = RTPRelayRTCPReportQuality{
+			Direction:          direction,
+			ReporterSSRC:       event.SSRC,
+			MediaSSRC:          report.SSRC,
+			FractionLost:       report.FractionLost,
+			TotalLost:          report.TotalLost,
+			LastSequenceNumber: report.LastSequenceNumber,
+			Jitter:             report.Jitter,
+			LastSenderReport:   report.LastSenderReport,
+			Delay:              report.Delay,
+		}
+	}
+}
+
+func (s *RTPRelaySession) rtcpReportQuality(direction RTCPFeedbackDirection) []RTPRelayRTCPReportQuality {
+	if s == nil {
+		return nil
+	}
+	s.rtcpQualityMu.Lock()
+	defer s.rtcpQualityMu.Unlock()
+	reports := s.clientToIMSRTCPReports
+	if direction == RTCPFeedbackIMSToClient {
+		reports = s.imsToClientRTCPReports
+	}
+	if len(reports) == 0 {
+		return nil
+	}
+	out := make([]RTPRelayRTCPReportQuality, 0, len(reports))
+	for _, report := range reports {
+		out = append(out, report)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ReporterSSRC != out[j].ReporterSSRC {
+			return out[i].ReporterSSRC < out[j].ReporterSSRC
+		}
+		return out[i].MediaSSRC < out[j].MediaSSRC
+	})
+	return out
 }
 
 func (s *RTPRelaySession) currentIMSTarget() *net.UDPAddr {
