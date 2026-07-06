@@ -125,6 +125,23 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanDerivesPlanFromAgreement(t *t
 	}
 }
 
+func TestBuildIMSSecurityAssociationXFRMInstallPlanSupportsHMACMD5(t *testing.T) {
+	req := validSecurityXFRMInstallRequest()
+	req.Plan.Algorithm = SecurityAlgorithmHMACMD596
+	req.Agreement.Algorithm = SecurityAlgorithmHMACMD596
+	installPlan, err := BuildIMSSecurityAssociationXFRMInstallPlan(req)
+	if err != nil {
+		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
+	}
+	ik := securityXFRMHexKey(req.AKA.IK)
+	wantAuth := []string{"auth-trunc", "hmac(md5)", ik, "96"}
+	for i := 0; i < 2; i++ {
+		if got := installPlan.Commands[i].Args[15:19]; !reflect.DeepEqual(got, wantAuth) {
+			t.Fatalf("state command %d auth args=%v, want %v", i, got, wantAuth)
+		}
+	}
+}
+
 func TestBuildIMSSecurityAssociationXFRMInstallPlanRejectsInvalidInput(t *testing.T) {
 	cases := []struct {
 		name string
@@ -148,7 +165,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanRejectsInvalidInput(t *testin
 			req.Agreement.SPIClient = 0
 		}},
 		{name: "unsupported auth", edit: func(req *IMSSecurityAssociationInstallRequest) {
-			req.Plan.Algorithm = "hmac-md5-96"
+			req.Plan.Algorithm = "hmac-sha-256-128"
 		}},
 		{name: "unsupported encryption", edit: func(req *IMSSecurityAssociationInstallRequest) {
 			req.Plan.EncryptionAlgorithm = "aes-cbc"

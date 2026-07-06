@@ -355,6 +355,8 @@ func imssSecurityXFRMAuthAlgorithm(algorithm string) (name, truncBits string, er
 	switch strings.ToLower(strings.TrimSpace(algorithm)) {
 	case DefaultSecurityAlgorithm:
 		return "hmac(sha1)", "96", nil
+	case SecurityAlgorithmHMACMD596:
+		return "hmac(md5)", "96", nil
 	default:
 		return "", "", fmt.Errorf("%w: unsupported auth algorithm %q", ErrInvalidIMSSecurityXFRMPlan, algorithm)
 	}
