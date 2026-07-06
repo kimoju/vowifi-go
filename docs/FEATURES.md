@@ -91,8 +91,8 @@ protocol layers needed by VoHive:
   TP/RP address semi-octet support for `*`, `#`, `a`, `b`, and `c`,
   structured TP-DCS parsing for message class, auto-delete, compression, MWI,
   and reserved coding fallback, SMS-STATUS-REPORT TP-PI/PID/DCS/user-data optional parameter parsing,
-  raw UDH IE preservation, 8-bit/16-bit application port addressing UDH
-  parsing, per-message SMS concatenation references with 8-bit and 16-bit UDH support,
+  raw UDH IE preservation, inbound parsing and outbound construction of
+  8-bit/16-bit application port addressing UDH, per-message SMS concatenation references with 8-bit and 16-bit UDH support,
   SMS-SUBMIT relative and absolute validity-period
   encoding, SMS-SUBMIT TP-PID/TP-DCS overrides with alphabet validation,
   SMS-SUBMIT Reply-Path and Reject-Duplicates first-octet flags, USSD dialog

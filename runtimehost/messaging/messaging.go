@@ -28,17 +28,20 @@ func WithSuppressSendTGSuccess(ctx context.Context) context.Context {
 }
 
 type SendOptions struct {
-	Encoding            string
-	ValidityPeriod      time.Duration
-	ValidityDeadline    time.Time
-	ProtocolID          byte
-	DataCodingScheme    byte
-	UseProtocolID       bool
-	UseDataCodingScheme bool
-	ReplyPath           bool
-	RejectDuplicates    bool
-	ConcatRef           int
-	ConcatRefBits       int
+	Encoding              string
+	ValidityPeriod        time.Duration
+	ValidityDeadline      time.Time
+	ProtocolID            byte
+	DataCodingScheme      byte
+	UseProtocolID         bool
+	UseDataCodingScheme   bool
+	ReplyPath             bool
+	RejectDuplicates      bool
+	ConcatRef             int
+	ConcatRefBits         int
+	ApplicationDestPort   int
+	ApplicationSourcePort int
+	ApplicationPortBits   int
 }
 
 type SendOutcome struct {
@@ -99,22 +102,25 @@ type SMSDeliveryReport struct {
 }
 
 type SMSPart struct {
-	PartNo              int
-	TotalParts          int
-	Text                string
-	Encoding            string
-	UDH                 []byte
-	ValidityPeriod      time.Duration
-	ValidityDeadline    time.Time
-	ProtocolID          byte
-	DataCodingScheme    byte
-	UseProtocolID       bool
-	UseDataCodingScheme bool
-	ReplyPath           bool
-	RejectDuplicates    bool
-	ConcatRef           int
-	ConcatRefBits       int
-	RequestStatusReport bool
+	PartNo                int
+	TotalParts            int
+	Text                  string
+	Encoding              string
+	UDH                   []byte
+	ValidityPeriod        time.Duration
+	ValidityDeadline      time.Time
+	ProtocolID            byte
+	DataCodingScheme      byte
+	UseProtocolID         bool
+	UseDataCodingScheme   bool
+	ReplyPath             bool
+	RejectDuplicates      bool
+	ConcatRef             int
+	ConcatRefBits         int
+	ApplicationDestPort   int
+	ApplicationSourcePort int
+	ApplicationPortBits   int
+	RequestStatusReport   bool
 }
 
 type SMSSendRequest struct {
@@ -495,9 +501,18 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	if err != nil {
 		return nil, err
 	}
-	single, concat := smsPartLimitsForUDH(enc, concatUDHLength(normalizeSMSConcatRefBits(opts.ConcatRef, opts.ConcatRefBits)))
-	if messageLen(text, enc) <= single {
-		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates}}, nil
+	portBits, hasPorts, err := validateSMSApplicationPortOptions(opts.ApplicationDestPort, opts.ApplicationSourcePort, opts.ApplicationPortBits)
+	if err != nil {
+		return nil, err
+	}
+	singleUDHLen := smsSubmitUDHLength(hasPorts, portBits, false, 0)
+	singleLimit := smsPartLimitForUDH(enc, singleUDHLen)
+	if messageLen(text, enc) <= singleLimit {
+		udh, err := buildSMSSubmitUDH(hasPorts, opts.ApplicationDestPort, opts.ApplicationSourcePort, portBits, 0, 0, 1, 1)
+		if err != nil {
+			return nil, err
+		}
+		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates, ApplicationDestPort: opts.ApplicationDestPort, ApplicationSourcePort: opts.ApplicationSourcePort, ApplicationPortBits: portBits}}, nil
 	}
 	refBits, err := validateSMSConcatOptions(opts.ConcatRef, opts.ConcatRefBits)
 	if err != nil {
@@ -507,7 +522,11 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	if ref == 0 {
 		ref = nextSMSConcatRef(refBits)
 	}
-	_, concat = smsPartLimitsForUDH(enc, concatUDHLength(refBits))
+	concatUDHLen := smsSubmitUDHLength(hasPorts, portBits, true, refBits)
+	concat := smsPartLimitForUDH(enc, concatUDHLen)
+	if concat <= 0 {
+		return nil, fmt.Errorf("sms UDH leaves no room for %s payload", enc)
+	}
 	total := int(math.Ceil(float64(messageLen(text, enc)) / float64(concat)))
 	if total <= 0 {
 		total = 1
@@ -519,16 +538,16 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	remaining := text
 	for partNo := 1; remaining != ""; partNo++ {
 		chunk, rest := takeSMSChunk(remaining, enc, concat)
-		udh, err := concatUDHWithRef(ref, refBits, total, partNo)
+		udh, err := buildSMSSubmitUDH(hasPorts, opts.ApplicationDestPort, opts.ApplicationSourcePort, portBits, ref, refBits, total, partNo)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates, ConcatRef: ref, ConcatRefBits: refBits})
+		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates, ConcatRef: ref, ConcatRefBits: refBits, ApplicationDestPort: opts.ApplicationDestPort, ApplicationSourcePort: opts.ApplicationSourcePort, ApplicationPortBits: portBits})
 		remaining = rest
 	}
 	for i := range out {
 		out[i].TotalParts = len(out)
-		udh, err := concatUDHWithRef(ref, refBits, len(out), out[i].PartNo)
+		udh, err := buildSMSSubmitUDH(hasPorts, opts.ApplicationDestPort, opts.ApplicationSourcePort, portBits, ref, refBits, len(out), out[i].PartNo)
 		if err != nil {
 			return nil, err
 		}
@@ -558,17 +577,28 @@ func smsPartLimits(encoding string) (single int, concat int) {
 }
 
 func smsPartLimitsForUDH(encoding string, udhBytes int) (single int, concat int) {
+	return smsPartLimitForUDH(encoding, 0), smsPartLimitForUDH(encoding, udhBytes)
+}
+
+func smsPartLimitForUDH(encoding string, udhBytes int) int {
 	if udhBytes <= 0 {
-		udhBytes = 6
+		switch encoding {
+		case "utf8":
+			return 140
+		case "ucs2":
+			return 70
+		default:
+			return 160
+		}
 	}
 	switch encoding {
 	case "gsm7":
 		headerSeptets := (udhBytes*8 + 6) / 7
-		return 160, 160 - headerSeptets
+		return 160 - headerSeptets
 	case "utf8":
-		return 140, 140 - udhBytes
+		return 140 - udhBytes
 	default:
-		return 70, (140 - udhBytes) / 2
+		return (140 - udhBytes) / 2
 	}
 }
 
@@ -619,6 +649,14 @@ func concatUDH(total, partNo int) []byte {
 }
 
 func concatUDHWithRef(ref, refBits, total, partNo int) ([]byte, error) {
+	elem, err := smsConcatUDHElement(ref, refBits, total, partNo)
+	if err != nil || elem == nil {
+		return elem, err
+	}
+	return smsUDHFromElements(elem), nil
+}
+
+func smsConcatUDHElement(ref, refBits, total, partNo int) ([]byte, error) {
 	if total <= 1 {
 		return nil, nil
 	}
@@ -633,15 +671,120 @@ func concatUDHWithRef(ref, refBits, total, partNo int) ([]byte, error) {
 		if ref < 0 || ref > 0xff {
 			return nil, fmt.Errorf("sms 8-bit concat reference out of range: %d", ref)
 		}
-		return []byte{0x05, 0x00, 0x03, byte(ref), byte(total), byte(partNo)}, nil
+		return []byte{0x00, 0x03, byte(ref), byte(total), byte(partNo)}, nil
 	case 16:
 		if ref < 0 || ref > 0xffff {
 			return nil, fmt.Errorf("sms 16-bit concat reference out of range: %d", ref)
 		}
-		return []byte{0x06, 0x08, 0x04, byte(ref >> 8), byte(ref), byte(total), byte(partNo)}, nil
+		return []byte{0x08, 0x04, byte(ref >> 8), byte(ref), byte(total), byte(partNo)}, nil
 	default:
 		return nil, fmt.Errorf("unsupported sms concat reference size: %d", refBits)
 	}
+}
+
+func smsUDHFromElements(elements ...[]byte) []byte {
+	total := 0
+	for _, elem := range elements {
+		total += len(elem)
+	}
+	if total == 0 {
+		return nil
+	}
+	udh := make([]byte, 0, 1+total)
+	udh = append(udh, byte(total))
+	for _, elem := range elements {
+		udh = append(udh, elem...)
+	}
+	return udh
+}
+
+func buildSMSSubmitUDHForPart(part SMSPart) ([]byte, error) {
+	portBits, hasPorts, err := validateSMSApplicationPortOptions(part.ApplicationDestPort, part.ApplicationSourcePort, part.ApplicationPortBits)
+	if err != nil || !hasPorts {
+		return nil, err
+	}
+	return buildSMSSubmitUDH(hasPorts, part.ApplicationDestPort, part.ApplicationSourcePort, portBits, 0, 0, 1, 1)
+}
+
+func buildSMSSubmitUDH(hasPorts bool, destPort, sourcePort, portBits, ref, refBits, total, partNo int) ([]byte, error) {
+	var elements [][]byte
+	if hasPorts {
+		elem, err := smsApplicationPortUDHElement(destPort, sourcePort, portBits)
+		if err != nil {
+			return nil, err
+		}
+		elements = append(elements, elem)
+	}
+	if total > 1 {
+		elem, err := smsConcatUDHElement(ref, refBits, total, partNo)
+		if err != nil {
+			return nil, err
+		}
+		elements = append(elements, elem)
+	}
+	return smsUDHFromElements(elements...), nil
+}
+
+func smsSubmitUDHLength(hasPorts bool, portBits int, hasConcat bool, concatRefBits int) int {
+	bodyLen := 0
+	if hasPorts {
+		if portBits == 8 {
+			bodyLen += 4
+		} else {
+			bodyLen += 6
+		}
+	}
+	if hasConcat {
+		if concatRefBits == 16 {
+			bodyLen += 6
+		} else {
+			bodyLen += 5
+		}
+	}
+	if bodyLen == 0 {
+		return 0
+	}
+	return 1 + bodyLen
+}
+
+func smsApplicationPortUDHElement(destPort, sourcePort, portBits int) ([]byte, error) {
+	portBits, hasPorts, err := validateSMSApplicationPortOptions(destPort, sourcePort, portBits)
+	if err != nil || !hasPorts {
+		return nil, err
+	}
+	if portBits == 8 {
+		return []byte{0x04, 0x02, byte(destPort), byte(sourcePort)}, nil
+	}
+	return []byte{0x05, 0x04, byte(destPort >> 8), byte(destPort), byte(sourcePort >> 8), byte(sourcePort)}, nil
+}
+
+func validateSMSApplicationPortOptions(destPort, sourcePort, portBits int) (int, bool, error) {
+	hasPorts := destPort != 0 || sourcePort != 0 || portBits != 0
+	if !hasPorts {
+		return 0, false, nil
+	}
+	if destPort < 0 || sourcePort < 0 {
+		return 0, false, fmt.Errorf("sms application port out of range: dest=%d source=%d", destPort, sourcePort)
+	}
+	switch portBits {
+	case 0:
+		if destPort <= 0xff && sourcePort <= 0xff {
+			portBits = 8
+		} else {
+			portBits = 16
+		}
+	case 8, 16:
+	default:
+		return 0, false, fmt.Errorf("unsupported sms application port size: %d", portBits)
+	}
+	maxPort := 0xffff
+	if portBits == 8 {
+		maxPort = 0xff
+	}
+	if destPort > maxPort || sourcePort > maxPort {
+		return 0, false, fmt.Errorf("sms %d-bit application port out of range: dest=%d source=%d", portBits, destPort, sourcePort)
+	}
+	return portBits, true, nil
 }
 
 func concatUDHLength(refBits int) int {

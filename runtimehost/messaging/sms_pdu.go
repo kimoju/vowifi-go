@@ -128,6 +128,13 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 		return nil, err
 	}
 	udh := append([]byte(nil), part.UDH...)
+	if len(udh) == 0 {
+		var err error
+		udh, err = buildSMSSubmitUDHForPart(part)
+		if err != nil {
+			return nil, err
+		}
+	}
 	firstOctet := byte(0x01)
 	if part.RejectDuplicates {
 		firstOctet |= 0x04

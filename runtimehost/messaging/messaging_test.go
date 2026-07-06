@@ -57,6 +57,42 @@ func TestSegmentSMSWithExplicit16BitConcatReference(t *testing.T) {
 	}
 }
 
+func TestSegmentSMSWithApplicationPorts(t *testing.T) {
+	parts := SegmentSMSWithOptions("hi", SendOptions{ApplicationDestPort: 2948, ApplicationSourcePort: 9200})
+	if len(parts) != 1 {
+		t.Fatalf("parts=%d, want 1", len(parts))
+	}
+	part := parts[0]
+	wantUDH := []byte{0x06, 0x05, 0x04, 0x0b, 0x84, 0x23, 0xf0}
+	if string(part.UDH) != string(wantUDH) || part.ApplicationPortBits != 16 {
+		t.Fatalf("part=%+v UDH=%x want %x", part, part.UDH, wantUDH)
+	}
+	if part.ApplicationDestPort != 2948 || part.ApplicationSourcePort != 9200 {
+		t.Fatalf("application ports=%d/%d", part.ApplicationDestPort, part.ApplicationSourcePort)
+	}
+}
+
+func TestSegmentSMSWithApplicationPortsAndConcat(t *testing.T) {
+	parts := SegmentSMSWithOptions(strings.Repeat("a", 155), SendOptions{
+		ApplicationDestPort:   0x7f,
+		ApplicationSourcePort: 0x00,
+		ApplicationPortBits:   8,
+		ConcatRef:             0x7a,
+		ConcatRefBits:         8,
+	})
+	if len(parts) != 2 {
+		t.Fatalf("parts=%d, want 2", len(parts))
+	}
+	wantFirstUDH := []byte{0x09, 0x04, 0x02, 0x7f, 0x00, 0x00, 0x03, 0x7a, 0x02, 0x01}
+	wantSecondUDH := []byte{0x09, 0x04, 0x02, 0x7f, 0x00, 0x00, 0x03, 0x7a, 0x02, 0x02}
+	if string(parts[0].UDH) != string(wantFirstUDH) || string(parts[1].UDH) != string(wantSecondUDH) {
+		t.Fatalf("UDH first=%x second=%x", parts[0].UDH, parts[1].UDH)
+	}
+	if messageLen(parts[0].Text, "gsm7") != 148 {
+		t.Fatalf("first part septets=%d want 148", messageLen(parts[0].Text, "gsm7"))
+	}
+}
+
 func TestSegmentSMSGSM7ExtendedCharacters(t *testing.T) {
 	single := SegmentSMS(strings.Repeat("^", 80), "")
 	if len(single) != 1 || single[0].Encoding != "gsm7" || single[0].UDH != nil || messageLen(single[0].Text, single[0].Encoding) != 160 {
@@ -241,6 +277,17 @@ func TestSendSMSWithOptionsRejectsInvalidValidityPeriod(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("SendSMSWithOptions() err=%v, want mutual exclusion", err)
+	}
+}
+
+func TestSendSMSWithOptionsRejectsInvalidApplicationPort(t *testing.T) {
+	svc := NewService("dev-1", "310280233641503", nil, nil)
+	_, err := svc.SendSMSWithOptions(context.Background(), "+18005551212", "hello", SendOptions{
+		ApplicationDestPort: 0x100,
+		ApplicationPortBits: 8,
+	})
+	if err == nil || !strings.Contains(err.Error(), "8-bit application port") {
+		t.Fatalf("SendSMSWithOptions() err=%v, want 8-bit application port error", err)
 	}
 }
 

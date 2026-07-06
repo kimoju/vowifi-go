@@ -31,6 +31,23 @@ func TestBuildSMSSubmitTPDUSpecialAddressDigits(t *testing.T) {
 	}
 }
 
+func TestBuildSMSSubmitTPDUWithApplicationPorts(t *testing.T) {
+	tpdu, err := BuildSMSSubmitTPDU("10086", SMSPart{
+		Text:                  "hi",
+		Encoding:              "gsm7",
+		ApplicationDestPort:   2948,
+		ApplicationSourcePort: 9200,
+	}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU() error = %v", err)
+	}
+	got := strings.ToUpper(hex.EncodeToString(tpdu))
+	want := "410105810180F600000A0605040B8423F0E834"
+	if got != want {
+		t.Fatalf("TPDU=%s want %s", got, want)
+	}
+}
+
 func TestBuildSMSSubmitTPDURelativeValidityPeriod(t *testing.T) {
 	tpdu, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", Encoding: "gsm7", ValidityPeriod: time.Hour}, 1)
 	if err != nil {
