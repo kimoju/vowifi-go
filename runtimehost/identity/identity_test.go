@@ -369,6 +369,42 @@ func TestReadISIMIdentityCRSMReadsIMPIIMPUAndDomain(t *testing.T) {
 	}
 }
 
+func TestReadISIMIdentityCRSMReadsLongFormISIMStrings(t *testing.T) {
+	longIMPI := strings.Repeat("a", 118) + "@private.example.test"
+	longDomain := strings.Repeat("ims", 43) + ".example.test"
+	longIMPU := "sip:" + strings.Repeat("u", 116) + "@ims.example.test"
+	ft := &crsmIdentityFake{
+		binary: []simtransport.CRSMResult{
+			crsmOK(isimTLVLongString(longIMPI)),
+			crsmOK(isimLengthLongString(longDomain)),
+		},
+		records: []simtransport.CRSMResult{
+			crsmOK(padRecord(isimTLVLongString(longIMPU), 180)),
+			{SW1: 0x6A, SW2: 0x83},
+		},
+	}
+
+	id, err := ReadISIMIdentityCRSM(ft, "7fff")
+	if err != nil {
+		t.Fatalf("ReadISIMIdentityCRSM(long form) error = %v", err)
+	}
+	if id.IMPI != longIMPI || id.Domain != longDomain || !reflect.DeepEqual(id.IMPU, []string{longIMPU}) {
+		t.Fatalf("identity = %+v", id)
+	}
+}
+
+func TestDecodeISIMStringSupportsFourByteLongFormLength(t *testing.T) {
+	value := strings.Repeat("x", 130)
+	tlv := append([]byte{0x80, 0x84, 0x00, 0x00, 0x00, byte(len(value))}, []byte(value)...)
+	if got := decodeISIMString(tlv); got != value {
+		t.Fatalf("decodeISIMString(TLV 0x84) length=%d want %d", len(got), len(value))
+	}
+	plain := append([]byte{0x84, 0x00, 0x00, 0x00, byte(len(value))}, []byte(value)...)
+	if got := decodeISIMString(plain); got != value {
+		t.Fatalf("decodeISIMString(plain 0x84) length=%d want %d", len(got), len(value))
+	}
+}
+
 func TestReadISIMIdentityCRSMReturnsPartialIdentity(t *testing.T) {
 	ft := &crsmIdentityFake{
 		binary: []simtransport.CRSMResult{
@@ -476,8 +512,27 @@ func isimTLVString(s string) []byte {
 	return append([]byte{0x80, byte(len(s))}, []byte(s)...)
 }
 
+func isimTLVLongString(s string) []byte {
+	return append(append([]byte{0x80}, isimLongLength(len(s))...), []byte(s)...)
+}
+
 func isimLengthString(s string) []byte {
 	return append([]byte{byte(len(s))}, []byte(s)...)
+}
+
+func isimLengthLongString(s string) []byte {
+	return append(isimLongLength(len(s)), []byte(s)...)
+}
+
+func isimLongLength(n int) []byte {
+	switch {
+	case n <= 0xff:
+		return []byte{0x81, byte(n)}
+	case n <= 0xffff:
+		return []byte{0x82, byte(n >> 8), byte(n)}
+	default:
+		return []byte{0x84, byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+	}
 }
 
 func hexResponse(body []byte) string {

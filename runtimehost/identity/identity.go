@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/boa-z/vowifi-go/runtimehost/carrier"
@@ -491,11 +492,11 @@ func decodeISIMString(raw []byte) string {
 	}
 	if data[0] == 0x80 {
 		if v, ok := decodeISIMDataObject(data[1:]); ok {
-			return decodeISIMStringValue(v)
+			return decodeISIMTextValue(v)
 		}
 	}
 	if v, ok := simauth.FindTLV(data, 0x80); ok {
-		if s := decodeISIMStringValue(v); s != "" {
+		if s := decodeISIMTextValue(v); s != "" {
 			return s
 		}
 	}
@@ -503,26 +504,11 @@ func decodeISIMString(raw []byte) string {
 }
 
 func decodeISIMDataObject(data []byte) ([]byte, bool) {
-	if len(data) == 0 {
+	l, rest, ok := readISIMStringLength(data)
+	if !ok || len(rest) < l {
 		return nil, false
 	}
-	l := int(data[0])
-	data = data[1:]
-	if l&0x80 != 0 {
-		n := l & 0x7F
-		if n == 0 || n > 3 || len(data) < n {
-			return nil, false
-		}
-		l = 0
-		for _, b := range data[:n] {
-			l = (l << 8) | int(b)
-		}
-		data = data[n:]
-	}
-	if l < 0 || len(data) < l {
-		return nil, false
-	}
-	return data[:l], true
+	return rest[:l], true
 }
 
 func decodeISIMStringValue(data []byte) string {
@@ -530,10 +516,41 @@ func decodeISIMStringValue(data []byte) string {
 	if len(data) == 0 {
 		return ""
 	}
-	if l := int(data[0]); l > 0 && len(data) >= 1+l {
-		return strings.TrimSpace(string(trimISIMPadding(data[1 : 1+l])))
+	if l, rest, ok := readISIMStringLength(data); ok && l > 0 && len(rest) >= l {
+		return strings.TrimSpace(string(trimISIMPadding(rest[:l])))
 	}
 	return strings.TrimSpace(string(data))
+}
+
+func decodeISIMTextValue(data []byte) string {
+	data = trimISIMPadding(data)
+	if len(data) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func readISIMStringLength(data []byte) (int, []byte, bool) {
+	if len(data) == 0 {
+		return 0, nil, false
+	}
+	first := data[0]
+	data = data[1:]
+	if first&0x80 == 0 {
+		return int(first), data, true
+	}
+	n := int(first & 0x7F)
+	if n == 0 || n > 4 || len(data) < n {
+		return 0, nil, false
+	}
+	length := 0
+	for _, part := range data[:n] {
+		if length > (math.MaxInt-int(part))/256 {
+			return 0, nil, false
+		}
+		length = (length << 8) | int(part)
+	}
+	return length, data[n:], true
 }
 
 func trimISIMPadding(data []byte) []byte {
