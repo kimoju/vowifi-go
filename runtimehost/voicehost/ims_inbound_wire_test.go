@@ -1271,7 +1271,7 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeMessageAnd
 		},
 		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"X-Client": {"refer-ok"}}},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-Client": {"notify-ok"}}},
-		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"Expires": {"300"}, "X-Client": {"subscribe-ok"}}},
+		{StatusCode: 202, Reason: "Accepted", Headers: map[string][]string{"X-Client": {"subscribe-ok"}}},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"Content-Type": {"text/plain"}, "X-Client": {"message-ok"}}, Body: []byte("delivered")},
 	})
 	server := &IMSInboundWireServer{

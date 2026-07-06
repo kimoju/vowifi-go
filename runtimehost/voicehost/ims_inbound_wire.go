@@ -475,7 +475,37 @@ func (s *IMSInboundWireServer) handleSubscribe(ctx context.Context, req voicecli
 		Event:       firstVoiceHeader(req.Headers, "Event"),
 		Expires:     firstVoiceHeader(req.Headers, "Expires"),
 	})
+	ensureSubscribeResultExpires(&result, req, err)
 	return s.infoResultResponse(result, err), err
+}
+
+const defaultSubscribeExpires = "3600"
+
+func ensureSubscribeResultExpires(result *IMSInfoResult, req voiceclient.SIPIncomingRequest, err error) {
+	if result == nil || err != nil {
+		return
+	}
+	statusCode := inboundStatusCode(result.StatusCode, 200)
+	if statusCode < 200 || statusCode >= 300 || stringMapHeader(result.Headers, "Expires") != "" {
+		return
+	}
+	expires := strings.TrimSpace(firstVoiceHeader(req.Headers, "Expires"))
+	if expires == "" {
+		expires = defaultSubscribeExpires
+	}
+	if result.Headers == nil {
+		result.Headers = make(map[string]string)
+	}
+	result.Headers["Expires"] = expires
+}
+
+func stringMapHeader(headers map[string]string, name string) string {
+	for key, value := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient.SIPIncomingRequest, key string, emit imsInboundWireResponseEmitter) ([]IMSInboundWireResponse, error) {
