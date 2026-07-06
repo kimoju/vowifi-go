@@ -191,13 +191,19 @@ func ValidateSelectedSA(offered, selected SecurityAssociation) error {
 
 func validateSelectedProposalRequiredTransforms(proposal Proposal) error {
 	var required []uint8
+	encr, hasENCR := findTransform(proposal, TransformENCR)
 	switch proposal.ProtocolID {
 	case ProtocolIKE:
-		required = []uint8{TransformENCR, TransformPRF, TransformINTEG, TransformDHRGroup}
+		required = []uint8{TransformENCR, TransformPRF, TransformDHRGroup}
 	case ProtocolESP:
-		required = []uint8{TransformENCR, TransformINTEG, TransformESN}
+		required = []uint8{TransformENCR, TransformESN}
 	default:
 		return fmt.Errorf("%w: protocol %d", ErrUnsupportedSASelection, proposal.ProtocolID)
+	}
+	if !hasENCR || !isCombinedModeEncryption(encr.ID) {
+		required = append(required, TransformINTEG)
+	} else if proposalHasTransformType(proposal, TransformINTEG) {
+		return fmt.Errorf("%w: combined-mode ENCR must not include INTEG", ErrUnsupportedSASelection)
 	}
 	for _, transformType := range required {
 		if !proposalHasTransformType(proposal, transformType) {
@@ -205,6 +211,10 @@ func validateSelectedProposalRequiredTransforms(proposal Proposal) error {
 		}
 	}
 	return nil
+}
+
+func isCombinedModeEncryption(id uint16) bool {
+	return id == ENCR_AES_GCM_16
 }
 
 func proposalSupportsSelection(offered, selected Proposal) bool {

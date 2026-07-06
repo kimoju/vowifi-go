@@ -1,6 +1,8 @@
 package voicehost
 
 import (
+	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -51,7 +53,7 @@ func TestParseSDPSecuritySAVPCrypto(t *testing.T) {
 		"c=IN IP4 203.0.113.8\r\n" +
 		"t=0 0\r\n" +
 		"m=audio 49170 RTP/SAVP 96 110\r\n" +
-		"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:MTIzNDU2Nzg5MDEyMzQ1Ng==|2^20|1:32 UNENCRYPTED_SRTCP\r\n" +
+		"a=crypto:1 AES_CM_128_HMAC_SHA1_80 " + testSDPSecurityCryptoInlineKeyParams(t) + "|2^20|1:32 UNENCRYPTED_SRTCP\r\n" +
 		"a=rtpmap:96 AMR/8000\r\n" +
 		"a=rtpmap:110 telephone-event/16000\r\n" +
 		"a=sendrecv\r\n")
@@ -68,9 +70,38 @@ func TestParseSDPSecuritySAVPCrypto(t *testing.T) {
 	crypto := security.Crypto[0]
 	if crypto.Tag != "1" ||
 		crypto.Suite != "AES_CM_128_HMAC_SHA1_80" ||
-		crypto.KeyParams != "inline:MTIzNDU2Nzg5MDEyMzQ1Ng==|2^20|1:32" ||
+		crypto.KeyParams != testSDPSecurityCryptoInlineKeyParams(t)+"|2^20|1:32" ||
 		crypto.SessionParams != "UNENCRYPTED_SRTCP" {
 		t.Fatalf("crypto=%+v", crypto)
+	}
+}
+
+func TestParseSDPSecurityRejectsInvalidCryptoAttributes(t *testing.T) {
+	validKey := testSDPSecurityCryptoInlineKeyParams(t)
+	tests := []struct {
+		name   string
+		crypto string
+	}{
+		{name: "zero tag", crypto: "0 AES_CM_128_HMAC_SHA1_80 " + validKey},
+		{name: "nonnumeric tag", crypto: "x AES_CM_128_HMAC_SHA1_80 " + validKey},
+		{name: "unsupported suite", crypto: "1 F8_128_HMAC_SHA1_80 " + validKey},
+		{name: "unsupported key method", crypto: "1 AES_CM_128_HMAC_SHA1_80 prompt:abc"},
+		{name: "short inline key", crypto: "1 AES_CM_128_HMAC_SHA1_80 inline:MTIzNDU2Nzg5MDEyMzQ1Ng=="},
+		{name: "bad lifetime", crypto: "1 AES_CM_128_HMAC_SHA1_80 " + validKey + "|never"},
+		{name: "bad mki", crypto: "1 AES_CM_128_HMAC_SHA1_80 " + validKey + "|2^20|abc:4"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte("v=0\r\n" +
+				"c=IN IP4 203.0.113.8\r\n" +
+				"m=audio 49170 RTP/SAVP 96\r\n" +
+				"a=crypto:" + tt.crypto + "\r\n" +
+				"a=rtpmap:96 AMR/8000\r\n")
+			_, err := ParseSDPSecurity(raw)
+			if !errors.Is(err, ErrInvalidSDPSecurity) {
+				t.Fatalf("ParseSDPSecurity() err=%v, want ErrInvalidSDPSecurity", err)
+			}
+		})
 	}
 }
 
@@ -118,12 +149,13 @@ func TestParseAndBuildSDPSecurityFingerprintSetup(t *testing.T) {
 }
 
 func TestBuildSDPAnswerWithSecurityConstructsCrypto(t *testing.T) {
+	keyParams := testSDPSecurityCryptoInlineKeyParams(t)
 	security := SDPSecurityInfo{
 		RTPProfile: "RTP/SAVP",
 		Crypto: []SDPCryptoAttribute{{
 			Tag:       "2",
 			Suite:     "AES_CM_128_HMAC_SHA1_32",
-			KeyParams: "inline:YWJjZGVmZ2hpamtsbW5vcA==",
+			KeyParams: keyParams,
 		}},
 	}
 	answer := string(BuildSDPAnswerWithSecurity(SDPInfo{
@@ -134,7 +166,7 @@ func TestBuildSDPAnswerWithSecurityConstructsCrypto(t *testing.T) {
 	}, security))
 	for _, want := range []string{
 		"m=audio 6000 RTP/SAVP 0 101\r\n",
-		"a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:YWJjZGVmZ2hpamtsbW5vcA==\r\n",
+		"a=crypto:2 AES_CM_128_HMAC_SHA1_32 " + keyParams + "\r\n",
 		"a=sendrecv\r\n",
 	} {
 		if !strings.Contains(answer, want) {
@@ -148,6 +180,18 @@ func TestBuildSDPAnswerWithSecurityConstructsCrypto(t *testing.T) {
 	if parsed.RTPProfile != "RTP/SAVP" || len(parsed.Crypto) != 1 || parsed.Crypto[0].Suite != "AES_CM_128_HMAC_SHA1_32" {
 		t.Fatalf("parsed security=%+v", parsed)
 	}
+}
+
+func testSDPSecurityCryptoInlineKeyParams(t *testing.T) string {
+	t.Helper()
+	value, err := BuildSDPCryptoInlineKeyParams(SRTPProfileAes128CmHmacSha1_80, SDPCryptoInlineKeyParams{
+		MasterKey:  bytes.Repeat([]byte{0x11}, 16),
+		MasterSalt: bytes.Repeat([]byte{0x22}, 14),
+	})
+	if err != nil {
+		t.Fatalf("BuildSDPCryptoInlineKeyParams() error = %v", err)
+	}
+	return value
 }
 
 func TestSelectSDPSecurityAnswerChoosesFingerprintAndSetup(t *testing.T) {

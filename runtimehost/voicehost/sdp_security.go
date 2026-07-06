@@ -256,12 +256,16 @@ func parseSDPCryptoLine(line string) (SDPCryptoAttribute, bool, error) {
 	if !ok {
 		return SDPCryptoAttribute{}, true, fmt.Errorf("%w: malformed crypto attribute", ErrInvalidSDPSecurity)
 	}
-	return SDPCryptoAttribute{
+	attr := SDPCryptoAttribute{
 		Tag:           tag,
 		Suite:         suite,
 		KeyParams:     keyParams,
 		SessionParams: strings.TrimSpace(sessionParams),
-	}, true, nil
+	}
+	if err := ValidateSDPCryptoAttribute(attr); err != nil {
+		return SDPCryptoAttribute{}, true, fmt.Errorf("%w: %w", ErrInvalidSDPSecurity, err)
+	}
+	return attr, true, nil
 }
 
 func parseSDPFingerprintLine(line string) (SDPFingerprintAttribute, bool, error) {

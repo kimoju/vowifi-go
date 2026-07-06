@@ -35,8 +35,9 @@ type IMSMessageResult struct {
 }
 
 const (
-	smsConcatTTL     = 10 * time.Minute
-	smsConcatMaxSets = 64
+	smsConcatTTL         = 10 * time.Minute
+	smsConcatMaxSets     = 64
+	imsMultipartMaxDepth = 4
 )
 
 type smsConcatKey struct {
@@ -103,16 +104,11 @@ func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (
 }
 
 func (s *Service) handleIMSMultipartMessage(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {
-	_, params, err := mime.ParseMediaType(msg.ContentType)
+	boundary, err := imsMessageMultipartBoundary(msg.ContentType)
 	if err != nil {
 		return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
 	}
-	boundary := strings.TrimSpace(params["boundary"])
-	if boundary == "" {
-		err := errors.New("IMS MESSAGE multipart boundary is empty")
-		return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
-	}
-	parts, err := readIMSMessageMultipartParts(msg.Body, boundary)
+	parts, err := readIMSMessageMultipartLeafParts(msg.Body, boundary, msg.Headers, 0)
 	if err != nil {
 		return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
 	}
@@ -124,7 +120,7 @@ func (s *Service) handleIMSMultipartMessage(ctx context.Context, msg IMSMessageR
 			nested := msg
 			nested.ContentType = part.ContentType
 			nested.Body = part.Body
-			nested.Headers = mergeIMSMessageHeaders(msg.Headers, part.Headers)
+			nested.Headers = part.Headers
 			return s.HandleIMSMessage(ctx, nested)
 		}
 	}
@@ -169,6 +165,46 @@ func readIMSMessageMultipartParts(body []byte, boundary string) ([]imsMessageMul
 		return nil, fmt.Errorf("IMS MESSAGE multipart has no parts")
 	}
 	return parts, nil
+}
+
+func readIMSMessageMultipartLeafParts(body []byte, boundary string, headers map[string][]string, depth int) ([]imsMessageMultipartPart, error) {
+	if depth > imsMultipartMaxDepth {
+		return nil, fmt.Errorf("IMS MESSAGE multipart nesting exceeds %d levels", imsMultipartMaxDepth)
+	}
+	parts, err := readIMSMessageMultipartParts(body, boundary)
+	if err != nil {
+		return nil, err
+	}
+	var out []imsMessageMultipartPart
+	for _, part := range parts {
+		part.Headers = mergeIMSMessageHeaders(headers, part.Headers)
+		if strings.HasPrefix(normalizedIMSMessageContentType(part.ContentType), "multipart/") {
+			nestedBoundary, err := imsMessageMultipartBoundary(part.ContentType)
+			if err != nil {
+				return nil, err
+			}
+			nested, err := readIMSMessageMultipartLeafParts(part.Body, nestedBoundary, part.Headers, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, nested...)
+			continue
+		}
+		out = append(out, part)
+	}
+	return out, nil
+}
+
+func imsMessageMultipartBoundary(contentType string) (string, error) {
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return "", err
+	}
+	boundary := strings.TrimSpace(params["boundary"])
+	if boundary == "" {
+		return "", errors.New("IMS MESSAGE multipart boundary is empty")
+	}
+	return boundary, nil
 }
 
 func imsMultipartContentPriorities() []string {

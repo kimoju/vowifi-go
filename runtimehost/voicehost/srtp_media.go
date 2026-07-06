@@ -141,12 +141,19 @@ func ParseSDPCryptoInlineKeyParams(profile SRTPProtectionProfile, keyParams stri
 		MasterSalt: append([]byte(nil), raw[keyLen:]...),
 	}
 	if len(parts) >= 2 {
-		out.Lifetime = strings.TrimSpace(parts[1])
+		lifetime := strings.TrimSpace(parts[1])
+		if lifetime != "" && !validSDPCryptoLifetime(lifetime) {
+			return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: malformed SDP crypto lifetime", ErrSRTPMediaConfig)
+		}
+		out.Lifetime = lifetime
 	}
 	if len(parts) >= 3 {
 		value, length, ok := strings.Cut(strings.TrimSpace(parts[2]), ":")
 		if !ok || strings.TrimSpace(value) == "" || strings.TrimSpace(length) == "" {
 			return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: malformed SDP crypto MKI", ErrSRTPMediaConfig)
+		}
+		if !validSDPCryptoDecimal(strings.TrimSpace(value), false) {
+			return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: malformed SDP crypto MKI value", ErrSRTPMediaConfig)
 		}
 		mkiLength, err := strconv.Atoi(strings.TrimSpace(length))
 		if err != nil || mkiLength <= 0 {
@@ -159,6 +166,14 @@ func ParseSDPCryptoInlineKeyParams(profile SRTPProtectionProfile, keyParams stri
 		return SDPCryptoInlineKeyParams{}, fmt.Errorf("%w: unsupported SDP crypto inline key params", ErrSRTPMediaConfig)
 	}
 	return out, nil
+}
+
+func ValidateSDPCryptoAttribute(attr SDPCryptoAttribute) error {
+	if err := validateSDPCryptoTag(attr.Tag); err != nil {
+		return err
+	}
+	_, _, err := ParseSDPCryptoAttributeKeys(attr)
+	return err
 }
 
 func BuildSDPCryptoInlineKeyParams(profile SRTPProtectionProfile, params SDPCryptoInlineKeyParams) (string, error) {
@@ -203,8 +218,8 @@ func ParseSDPCryptoAttributeKeys(attr SDPCryptoAttribute) (SRTPProtectionProfile
 
 func BuildSDPCryptoAttribute(tag string, profile SRTPProtectionProfile, params SDPCryptoInlineKeyParams, sessionParams string) (SDPCryptoAttribute, error) {
 	tag = strings.TrimSpace(tag)
-	if tag == "" {
-		return SDPCryptoAttribute{}, fmt.Errorf("%w: SDP crypto tag is empty", ErrSRTPMediaConfig)
+	if err := validateSDPCryptoTag(tag); err != nil {
+		return SDPCryptoAttribute{}, err
 	}
 	suite := profile.SDPCryptoSuite()
 	if suite == "" {
@@ -504,6 +519,50 @@ func validateSRTPKeys(profile srtp.ProtectionProfile, keys SRTPKeys, label strin
 		return fmt.Errorf("%w: %s master salt length %d != %d", ErrSRTPMediaConfig, label, len(keys.MasterSalt), saltLen)
 	}
 	return nil
+}
+
+func validateSDPCryptoTag(tag string) error {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return fmt.Errorf("%w: SDP crypto tag is empty", ErrSRTPMediaConfig)
+	}
+	if !validSDPCryptoDecimal(tag, true) {
+		return fmt.Errorf("%w: malformed SDP crypto tag", ErrSRTPMediaConfig)
+	}
+	value, err := strconv.ParseInt(tag, 10, 32)
+	if err != nil || value <= 0 {
+		return fmt.Errorf("%w: SDP crypto tag out of range", ErrSRTPMediaConfig)
+	}
+	return nil
+}
+
+func validSDPCryptoLifetime(value string) bool {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "2^") {
+		return validSDPCryptoDecimal(strings.TrimPrefix(value, "2^"), true)
+	}
+	return validSDPCryptoDecimal(value, true)
+}
+
+func validSDPCryptoDecimal(value string, positive bool) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	if !positive {
+		return true
+	}
+	for _, ch := range value {
+		if ch != '0' {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeSDPInlineKey(value string) ([]byte, error) {

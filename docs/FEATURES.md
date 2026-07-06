@@ -109,8 +109,9 @@ protocol layers needed by VoHive:
   401/407 challenges
 - SMS segmentation, IMS SIP `MESSAGE` transport hooks, inbound SMS, delivery
   report matching, CPIM and IMS `Content-Transfer-Encoding` decoding for
-  base64/quoted-printable SMS payloads, strict UCS2/8-bit user-data length
-  validation, and USSD session transport hooks, including 3xx Contact
+  base64/quoted-printable SMS payloads, nested multipart MESSAGE leaf
+  selection for CPIM/3GPP SMS/IMDN payloads, strict UCS2/8-bit user-data
+  length validation, and USSD session transport hooks, including 3xx Contact
   redirect retries, TP-SRR delivery-status requests, SMS RP-ERROR/
   STATUS-REPORT cause mapping, RP-ACK user-data STATUS-REPORT handling,
   RP-ERROR diagnostics/user-data preservation, SMS-DELIVER TP-PID/TP-DCS and
@@ -150,7 +151,8 @@ protocol layers needed by VoHive:
   primitives for the SWu dataplane
 - IKEv2 SA proposal/transform encoding, default IKE/ESP proposals,
   configuration payload requests, identity payloads, traffic selectors, and
-  EAP-AKA/AKA' packet and attribute codecs
+  EAP-AKA/AKA' packet and attribute codecs, including selected-SA validation
+  for combined-mode ESP AES-GCM proposals without separate INTEG transforms
 - IKE_SA_INIT initiator flow with UDP/NAT-T transport support, X25519 key
   exchange, NAT-D/MOBIKE notifications, responder parsing, SKEYSEED, and IKE SA
   key material derivation
@@ -220,7 +222,8 @@ protocol layers needed by VoHive:
 - SRTP/SRTCP media helpers and RTP relay transforms for protecting and
   unprotecting RTP/RTCP packets with AES-CM/HMAC-SHA1 and AEAD-AES-GCM
   profiles, independent client/IMS key material, replay protection, and
-  authentication failure handling
+  authentication failure handling, plus SDP `a=crypto` tag, suite, inline key,
+  lifetime, and MKI validation on parse/build boundaries
 - RTCP feedback inspection for RTP/SRTP relay paths, including Sender/Receiver
   Reports, PLI/FIR/rapid resynchronization requests, NACK, REMB, transport-wide
   congestion control, SLI, XR, SDES, BYE, application-defined packets,
@@ -344,7 +347,9 @@ protocol layers needed by VoHive:
   tracking for the latest successful INVITE transaction
 - redacted trace fixture validation with reusable replay streams for ordered
   inbound/outbound SIP wire transcripts, preserving CRLF framing while checking
-  sensitive data before materialization
+  sensitive data before materialization, plus lightweight SIP semantic parsing
+  for request/status lines, compact headers, `CSeq`, and `Content-Length`
+  assertions
 
 ## Known Gaps
 

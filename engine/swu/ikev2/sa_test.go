@@ -83,6 +83,23 @@ func TestValidateSelectedSARejectsUnofferedESPAttribute(t *testing.T) {
 	}
 }
 
+func TestValidateSelectedSAAllowsAESGCMESPWithoutINTEG(t *testing.T) {
+	offered := aesGCMESPProposal([]byte{0xca, 0xfe, 0xba, 0xbe}, false)
+	selected := aesGCMESPProposal([]byte{0xde, 0xad, 0xbe, 0xef}, false)
+	if err := ValidateSelectedSA(offered, selected); err != nil {
+		t.Fatalf("ValidateSelectedSA() error = %v", err)
+	}
+}
+
+func TestValidateSelectedSARejectsAESGCMESPWithINTEG(t *testing.T) {
+	offered := aesGCMESPProposal([]byte{0xca, 0xfe, 0xba, 0xbe}, true)
+	selected := aesGCMESPProposal([]byte{0xde, 0xad, 0xbe, 0xef}, true)
+	err := ValidateSelectedSA(offered, selected)
+	if !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("ValidateSelectedSA() err=%v, want ErrUnsupportedSASelection", err)
+	}
+}
+
 func TestValidateSelectedSARejectsMissingRequiredTransforms(t *testing.T) {
 	offeredIKE := DefaultIKEProposal()
 	selectedIKE := DefaultIKEProposal()
@@ -103,4 +120,24 @@ func TestValidateSelectedSARejectsMissingRequiredTransforms(t *testing.T) {
 	if err := ValidateSelectedSA(offeredESP, selectedUnknown); !errors.Is(err, ErrUnsupportedSASelection) {
 		t.Fatalf("ValidateSelectedSA(unknown protocol) err=%v, want ErrUnsupportedSASelection", err)
 	}
+}
+
+func aesGCMESPProposal(spi []byte, includeINTEG bool) SecurityAssociation {
+	transforms := []Transform{
+		{Type: TransformENCR, ID: ENCR_AES_GCM_16, Attributes: []TransformAttribute{KeyLengthAttribute(128)}},
+		{Type: TransformESN, ID: ESNNo},
+	}
+	if includeINTEG {
+		transforms = []Transform{
+			{Type: TransformENCR, ID: ENCR_AES_GCM_16, Attributes: []TransformAttribute{KeyLengthAttribute(128)}},
+			{Type: TransformINTEG, ID: INTEG_HMAC_SHA2_256_128},
+			{Type: TransformESN, ID: ESNNo},
+		}
+	}
+	return SecurityAssociation{Proposals: []Proposal{{
+		Number:     1,
+		ProtocolID: ProtocolESP,
+		SPI:        append([]byte(nil), spi...),
+		Transforms: transforms,
+	}}}
 }
