@@ -19,6 +19,18 @@ func TestBuildSMSSubmitTPDUGSM7(t *testing.T) {
 	}
 }
 
+func TestBuildSMSSubmitTPDUSpecialAddressDigits(t *testing.T) {
+	tpdu, err := BuildSMSSubmitTPDU("*123#", SMSPart{Text: "ok", Encoding: "gsm7"}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU() error = %v", err)
+	}
+	got := strings.ToUpper(hex.EncodeToString(tpdu))
+	want := "010105811A32FB000002EF35"
+	if got != want {
+		t.Fatalf("TPDU=%s want %s", got, want)
+	}
+}
+
 func TestBuildSMSSubmitTPDURelativeValidityPeriod(t *testing.T) {
 	tpdu, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", Encoding: "gsm7", ValidityPeriod: time.Hour}, 1)
 	if err != nil {
@@ -356,6 +368,17 @@ func TestParseSMSDeliverTPDUAlphanumericSender(t *testing.T) {
 		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
 	}
 	if deliver.Sender != "Google" || deliver.Text != "hello" {
+		t.Fatalf("deliver=%+v", deliver)
+	}
+}
+
+func TestParseSMSDeliverTPDUSpecialAddressDigits(t *testing.T) {
+	tpdu := mustHex(t, "0005811A32FB00006270502143650002EF35")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	if deliver.Sender != "*123#" || deliver.Text != "ok" {
 		t.Fatalf("deliver=%+v", deliver)
 	}
 }

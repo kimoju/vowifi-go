@@ -88,6 +88,7 @@ protocol layers needed by VoHive:
   STATUS-REPORT cause mapping, RP-ACK user-data STATUS-REPORT handling,
   RP-ERROR diagnostics/user-data preservation, SMS-DELIVER TP-PID/TP-DCS and
   first-octet metadata preservation, alphanumeric SMS-DELIVER originator address decoding,
+  TP/RP address semi-octet support for `*`, `#`, `a`, `b`, and `c`,
   SMS-STATUS-REPORT TP-PI/PID/DCS/user-data optional parameter parsing,
   per-message SMS concatenation references with 8-bit and 16-bit UDH support,
   SMS-SUBMIT relative and absolute validity-period

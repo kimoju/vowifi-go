@@ -888,14 +888,14 @@ func encodeSMSAddress(number string) (digits int, toa byte, bcd []byte, err erro
 		return 0, 0, nil, errors.New("sms address has no digits")
 	}
 	for _, r := range number {
-		if r < '0' || r > '9' {
-			return 0, 0, nil, fmt.Errorf("sms address contains non-digit %q", r)
+		if _, ok := smsAddressSemiOctet(r); !ok {
+			return 0, 0, nil, fmt.Errorf("sms address contains unsupported digit %q", r)
 		}
 	}
 	digits = len(number)
 	bcd = make([]byte, (digits+1)/2)
 	for i := 0; i < digits; i++ {
-		d := number[i] - '0'
+		d, _ := smsAddressSemiOctet(rune(number[i]))
 		if i%2 == 0 {
 			bcd[i/2] |= d
 		} else {
@@ -906,6 +906,44 @@ func encodeSMSAddress(number string) (digits int, toa byte, bcd []byte, err erro
 		bcd[digits/2] |= 0xf0
 	}
 	return digits, toa, bcd, nil
+}
+
+func smsAddressSemiOctet(r rune) (byte, bool) {
+	switch {
+	case r >= '0' && r <= '9':
+		return byte(r - '0'), true
+	case r == '*':
+		return 0x0a, true
+	case r == '#':
+		return 0x0b, true
+	case r == 'a' || r == 'A':
+		return 0x0c, true
+	case r == 'b' || r == 'B':
+		return 0x0d, true
+	case r == 'c' || r == 'C':
+		return 0x0e, true
+	default:
+		return 0, false
+	}
+}
+
+func smsAddressSemiOctetDigit(nibble byte) (byte, bool) {
+	switch {
+	case nibble <= 9:
+		return '0' + nibble, true
+	case nibble == 0x0a:
+		return '*', true
+	case nibble == 0x0b:
+		return '#', true
+	case nibble == 0x0c:
+		return 'a', true
+	case nibble == 0x0d:
+		return 'b', true
+	case nibble == 0x0e:
+		return 'c', true
+	default:
+		return 0, false
+	}
 }
 
 func decodeSMSAddress(digits int, toa byte, bcd []byte) (string, error) {
@@ -928,10 +966,11 @@ func decodeSMSAddress(digits int, toa byte, bcd []byte) (string, error) {
 			if nibble == 0x0f {
 				return b.String(), nil
 			}
-			if nibble > 9 {
+			digit, ok := smsAddressSemiOctetDigit(nibble)
+			if !ok {
 				return "", fmt.Errorf("invalid BCD digit: 0x%x", nibble)
 			}
-			b.WriteByte('0' + nibble)
+			b.WriteByte(digit)
 			written++
 		}
 	}
