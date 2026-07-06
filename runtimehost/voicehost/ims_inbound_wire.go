@@ -124,6 +124,9 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		if !wireValidRequestCSeq(req) {
 			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(400, "Bad CSeq"))}, nil
 		}
+		if !wireHasRequiredRequestHeaders(req) {
+			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(400, "Bad Request"))}, nil
+		}
 		if code, reason, reject := wireMaxForwardsRejection(req); reject {
 			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(code, reason))}, nil
 		}
@@ -1121,6 +1124,15 @@ func wireValidRequestCSeq(req voiceclient.SIPIncomingRequest) bool {
 		return false
 	}
 	return strings.EqualFold(fields[1], method)
+}
+
+func wireHasRequiredRequestHeaders(req voiceclient.SIPIncomingRequest) bool {
+	for _, name := range []string{"Via", "From", "To", "Call-ID"} {
+		if firstVoiceHeader(req.Headers, name) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func wireMaxForwardsRejection(req voiceclient.SIPIncomingRequest) (int, string, bool) {

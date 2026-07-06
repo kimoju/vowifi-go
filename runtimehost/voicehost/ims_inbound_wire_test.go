@@ -609,14 +609,12 @@ func TestIMSInboundWireServerRejectsBadMaxForwards(t *testing.T) {
 	}
 	for _, tc := range tests {
 		handled = false
+		headers := wireIMSHeaders("bad-max-forwards-"+tc.name, "MESSAGE", 1)
+		headers["Max-Forwards"] = []string{tc.value}
 		responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
-			Method: "MESSAGE",
-			URI:    "sip:user@ims.example",
-			Headers: map[string][]string{
-				"Call-ID":      {"bad-max-forwards-" + tc.name},
-				"CSeq":         {"1 MESSAGE"},
-				"Max-Forwards": {tc.value},
-			},
+			Method:  "MESSAGE",
+			URI:     "sip:user@ims.example",
+			Headers: headers,
 		})
 		if err != nil {
 			t.Fatalf("%s HandleRequest() error = %v", tc.name, err)
@@ -630,6 +628,34 @@ func TestIMSInboundWireServerRejectsBadMaxForwards(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerRejectsMissingRequiredHeaders(t *testing.T) {
+	handled := false
+	server := &IMSInboundWireServer{
+		MessageHandler: IMSMessageHandlerFunc(func(ctx context.Context, req IMSMessageRequest) (IMSMessageResult, error) {
+			handled = true
+			return IMSMessageResult{StatusCode: 200, Reason: "OK"}, nil
+		}),
+	}
+	for _, missing := range []string{"Via", "From", "To", "Call-ID"} {
+		headers := wireIMSHeaders("bad-required-"+strings.ToLower(missing), "MESSAGE", 1)
+		delete(headers, missing)
+		responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
+			Method:  "MESSAGE",
+			URI:     "sip:user@ims.example",
+			Headers: headers,
+		})
+		if err != nil {
+			t.Fatalf("missing %s HandleRequest() error = %v", missing, err)
+		}
+		if len(responses) != 1 || responses[0].StatusCode != 400 || responses[0].Reason != "Bad Request" {
+			t.Fatalf("missing %s responses=%+v, want 400 Bad Request", missing, responses)
+		}
+	}
+	if handled {
+		t.Fatal("missing required header reached message handler")
+	}
+}
+
 func TestIMSInboundWireServerRejectsUnsupportedRequireOptions(t *testing.T) {
 	handled := false
 	server := &IMSInboundWireServer{
@@ -638,14 +664,12 @@ func TestIMSInboundWireServerRejectsUnsupportedRequireOptions(t *testing.T) {
 			return IMSMessageResult{StatusCode: 200, Reason: "OK"}, nil
 		}),
 	}
+	headers := wireIMSHeaders("bad-require-options", "MESSAGE", 1)
+	headers["Require"] = []string{"100rel, unknown-feature", "timer, another-feature, unknown-feature"}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
-		Method: "MESSAGE",
-		URI:    "sip:user@ims.example",
-		Headers: map[string][]string{
-			"Call-ID": {"bad-require-options"},
-			"CSeq":    {"1 MESSAGE"},
-			"Require": {"100rel, unknown-feature", "timer, another-feature, unknown-feature"},
-		},
+		Method:  "MESSAGE",
+		URI:     "sip:user@ims.example",
+		Headers: headers,
 	})
 	if err != nil {
 		t.Fatalf("HandleRequest() error = %v", err)
@@ -669,14 +693,12 @@ func TestIMSInboundWireServerAllowsSupportedRequireOptions(t *testing.T) {
 			return IMSMessageResult{StatusCode: 202, Reason: "Accepted"}, nil
 		}),
 	}
+	headers := wireIMSHeaders("supported-require-options", "MESSAGE", 1)
+	headers["Require"] = []string{"100REL, timer, replaces, outbound"}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
-		Method: "MESSAGE",
-		URI:    "sip:user@ims.example",
-		Headers: map[string][]string{
-			"Call-ID": {"supported-require-options"},
-			"CSeq":    {"1 MESSAGE"},
-			"Require": {"100REL, timer, replaces, outbound"},
-		},
+		Method:  "MESSAGE",
+		URI:     "sip:user@ims.example",
+		Headers: headers,
 	})
 	if err != nil {
 		t.Fatalf("HandleRequest() error = %v", err)
@@ -1330,8 +1352,11 @@ func TestIMSInboundWireServerRejectsUnsupportedMethod(t *testing.T) {
 		Method: "SUBSCRIBE",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
+			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-SUBSCRIBE"},
 			"Call-ID": {"call-options"},
 			"CSeq":    {"1 SUBSCRIBE"},
+			"From":    {"<sip:+18005551212@ims.example>;tag=ims-tag"},
+			"To":      {"<sip:user@ims.example>"},
 		},
 	})
 	if err != nil {
@@ -1359,6 +1384,7 @@ func TestIMSInboundWireServerDispatchesMessage(t *testing.T) {
 		Method: "MESSAGE",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
+			"Via":          {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-MESSAGE"},
 			"Call-ID":      {"sms-call-1"},
 			"CSeq":         {"3 MESSAGE"},
 			"From":         {"<sip:smsc@ims.example>;tag=net"},
@@ -1381,8 +1407,11 @@ func TestIMSInboundWireServerDispatchesMessage(t *testing.T) {
 		Method: "OPTIONS",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
+			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-OPTIONS"},
 			"Call-ID": {"options-call"},
 			"CSeq":    {"1 OPTIONS"},
+			"From":    {"<sip:+18005551212@ims.example>;tag=ims-tag"},
+			"To":      {"<sip:user@ims.example>"},
 		},
 	})
 	if err != nil {
@@ -1410,6 +1439,7 @@ func TestIMSInboundWireServerDispatchesInfoAndUSSDBye(t *testing.T) {
 		Method: "INFO",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
+			"Via":          {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-INFO"},
 			"Call-ID":      {"ussd-call-1"},
 			"CSeq":         {"2 INFO"},
 			"From":         {"<sip:ussd-as@ims.example>;tag=as"},
@@ -1433,6 +1463,7 @@ func TestIMSInboundWireServerDispatchesInfoAndUSSDBye(t *testing.T) {
 		Method: "BYE",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
+			"Via":          {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-BYE"},
 			"Call-ID":      {"ussd-call-1"},
 			"CSeq":         {"3 BYE"},
 			"From":         {"<sip:ussd-as@ims.example>;tag=as"},
@@ -1455,8 +1486,11 @@ func TestIMSInboundWireServerDispatchesInfoAndUSSDBye(t *testing.T) {
 		Method: "OPTIONS",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
+			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-OPTIONS"},
 			"Call-ID": {"options-info"},
 			"CSeq":    {"1 OPTIONS"},
+			"From":    {"<sip:+18005551212@ims.example>;tag=ims-tag"},
+			"To":      {"<sip:user@ims.example>"},
 		},
 	})
 	if err != nil {
@@ -1493,8 +1527,11 @@ func TestIMSInboundWireServerReturnsAgentByeCancelErrors(t *testing.T) {
 		Method: "BYE",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
+			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-BYE"},
 			"Call-ID": {"wire-error-call"},
 			"CSeq":    {"2 BYE"},
+			"From":    {"<sip:+18005551212@ims.example>;tag=ims-tag"},
+			"To":      {"<sip:user@ims.example>;tag=ue"},
 		},
 	})
 	if err == nil || !strings.Contains(err.Error(), "client BYE rejected") {
@@ -1515,6 +1552,8 @@ func TestIMSInboundWireServerReturnsAgentByeCancelErrors(t *testing.T) {
 		Headers: map[string][]string{
 			"Call-ID": {"wire-error-call"},
 			"CSeq":    {"1 CANCEL"},
+			"From":    {"<sip:+18005551212@ims.example>;tag=ims-tag"},
+			"To":      {"<sip:user@ims.example>"},
 			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-INVITE"},
 		},
 	})
@@ -1561,6 +1600,7 @@ func TestIMSInboundWireServerFallsBackToAgentForUnhandledNonUSSDInfo(t *testing.
 		Method: "INFO",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
+			"Via":          {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-INFO"},
 			"Call-ID":      {"dtmf-call"},
 			"CSeq":         {"9 INFO"},
 			"From":         {"<sip:+18005551212@ims.example>;tag=ims-tag"},
@@ -1591,8 +1631,11 @@ func TestIMSInboundWireServerRejectsMessageWithoutHandler(t *testing.T) {
 		Method: "MESSAGE",
 		URI:    "sip:user@ims.example",
 		Headers: map[string][]string{
+			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-MESSAGE"},
 			"Call-ID": {"sms-call-2"},
 			"CSeq":    {"1 MESSAGE"},
+			"From":    {"<sip:+18005551212@ims.example>;tag=ims-tag"},
+			"To":      {"<sip:user@ims.example>"},
 		},
 	})
 	if err != nil {
@@ -1766,6 +1809,24 @@ func (t *provisionalBlockingInboundTransport) respond(resp voiceclient.SIPRespon
 
 func wireIMSInvite(callID, method string, cseq int, body []byte) []byte {
 	return wireIMSRequest(callID, method, cseq, body)
+}
+
+func wireIMSHeaders(callID, method string, cseq int) map[string][]string {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = "INVITE"
+	}
+	branchMethod := method
+	if method == "CANCEL" {
+		branchMethod = "INVITE"
+	}
+	return map[string][]string{
+		"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-" + branchMethod},
+		"From":    {"<sip:+18005551212@ims.example>;tag=ims-tag"},
+		"To":      {"<sip:user@ims.example>"},
+		"Call-ID": {callID},
+		"CSeq":    {strconv.Itoa(cseq) + " " + method},
+	}
 }
 
 func wireIMSRequest(callID, method string, cseq int, body []byte, extraHeaders ...string) []byte {
