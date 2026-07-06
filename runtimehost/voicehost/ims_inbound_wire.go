@@ -120,6 +120,9 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		ctx = context.Background()
 	}
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	if method != "ACK" && !wireValidRequestCSeq(req) {
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(400, "Bad CSeq"))}, nil
+	}
 	key := wireTransactionKey(req)
 	if method != "ACK" && key != "" {
 		if responses, ok := s.cachedTransaction(key); ok {
@@ -1089,6 +1092,19 @@ func wireCSeq(req voiceclient.SIPIncomingRequest) int {
 		return 1
 	}
 	return cseq
+}
+
+func wireValidRequestCSeq(req voiceclient.SIPIncomingRequest) bool {
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	fields := strings.Fields(firstVoiceHeader(req.Headers, "CSeq"))
+	if method == "" || len(fields) != 2 {
+		return false
+	}
+	cseq, err := strconv.Atoi(fields[0])
+	if err != nil || cseq <= 0 {
+		return false
+	}
+	return strings.EqualFold(fields[1], method)
 }
 
 func wireHeaderURI(req voiceclient.SIPIncomingRequest, name string) string {

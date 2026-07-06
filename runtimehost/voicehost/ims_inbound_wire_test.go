@@ -529,6 +529,64 @@ func TestIMSInboundWireServerRejectsMalformedPrackRAck(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerRejectsMalformedCSeq(t *testing.T) {
+	transport := newWireInboundTransport(nil)
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{ClientTransport: transport},
+	}
+	tests := []struct {
+		name string
+		req  voiceclient.SIPIncomingRequest
+	}{
+		{
+			name: "missing",
+			req: voiceclient.SIPIncomingRequest{
+				Method: "MESSAGE",
+				URI:    "sip:user@ims.example",
+				Headers: map[string][]string{
+					"Call-ID": {"bad-cseq-missing"},
+				},
+			},
+		},
+		{
+			name: "bad_number",
+			req: voiceclient.SIPIncomingRequest{
+				Method: "INVITE",
+				URI:    "sip:user@ims.example",
+				Headers: map[string][]string{
+					"Call-ID": {"bad-cseq-number"},
+					"CSeq":    {"zero INVITE"},
+				},
+			},
+		},
+		{
+			name: "method_mismatch",
+			req: voiceclient.SIPIncomingRequest{
+				Method: "UPDATE",
+				URI:    "sip:user@ims.example",
+				Headers: map[string][]string{
+					"Call-ID": {"bad-cseq-method"},
+					"CSeq":    {"3 INVITE"},
+				},
+			},
+		},
+	}
+	for _, tc := range tests {
+		responses, err := server.HandleRequest(context.Background(), tc.req)
+		if err != nil {
+			t.Fatalf("%s HandleRequest() error = %v", tc.name, err)
+		}
+		if len(responses) != 1 || responses[0].StatusCode != 400 {
+			t.Fatalf("%s responses=%+v, want 400", tc.name, responses)
+		}
+	}
+	select {
+	case req := <-transport.requests:
+		t.Fatalf("unexpected client request for bad CSeq=%+v", req)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestIMSInboundWireServerCancelsPendingInvite(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
