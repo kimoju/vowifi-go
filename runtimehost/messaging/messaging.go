@@ -67,6 +67,7 @@ type IncomingSMS struct {
 	Timestamp              time.Time
 	ProtocolID             byte
 	DataCodingScheme       byte
+	DataCoding             SMSDataCodingInfo
 	UserDataHeader         bool
 	MoreMessagesToSend     bool
 	StatusReportIndication bool
@@ -91,6 +92,7 @@ type SMSDeliveryReport struct {
 	ParameterIndicator    byte
 	ProtocolID            byte
 	DataCodingScheme      byte
+	DataCoding            SMSDataCodingInfo
 	UserData              string
 }
 

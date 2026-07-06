@@ -40,6 +40,20 @@ type SMSConcatInfo struct {
 	Seq      int
 }
 
+type SMSDataCodingInfo struct {
+	Raw                   byte
+	Alphabet              string
+	Compressed            bool
+	AutoDelete            bool
+	HasMessageClass       bool
+	MessageClass          int
+	MessageWaiting        bool
+	MessageWaitingActive  bool
+	MessageWaitingDiscard bool
+	MessageWaitingType    string
+	Reserved              bool
+}
+
 type SMSDeliver struct {
 	Sender                 string
 	Recipient              string
@@ -49,6 +63,7 @@ type SMSDeliver struct {
 	FirstOctet             byte
 	ProtocolID             byte
 	DataCodingScheme       byte
+	DataCoding             SMSDataCodingInfo
 	UserDataLength         int
 	UserDataHeader         bool
 	MoreMessagesToSend     bool
@@ -74,6 +89,7 @@ type SMSStatusReport struct {
 	HasProtocolID         bool
 	DataCodingScheme      byte
 	HasDataCodingScheme   bool
+	DataCoding            SMSDataCodingInfo
 	UserDataLength        int
 	UserData              string
 	HasUserData           bool
@@ -171,10 +187,11 @@ func smsEncodingForDCS(dcs byte) string {
 }
 
 func validateSMSSubmitDataCodingScheme(dcs byte, encoding string) error {
-	if dcs&0xc0 == 0 && dcs&0x20 != 0 {
+	info := ParseSMSDataCodingScheme(dcs)
+	if info.Compressed {
 		return fmt.Errorf("sms compressed data coding scheme is unsupported: 0x%02x", dcs)
 	}
-	want := smsDCSAlphabet(dcs)
+	want := info.Alphabet
 	got := "gsm7"
 	switch encoding {
 	case "ucs2":
@@ -533,6 +550,7 @@ func ParseSMSDeliverTPDU(tpdu []byte) (SMSDeliver, error) {
 		FirstOctet:             firstOctet,
 		ProtocolID:             pid,
 		DataCodingScheme:       dcs,
+		DataCoding:             ParseSMSDataCodingScheme(dcs),
 		UserDataLength:         udl,
 		UserDataHeader:         firstOctet&0x40 != 0,
 		MoreMessagesToSend:     firstOctet&0x04 == 0,
@@ -625,6 +643,7 @@ func parseSMSStatusReportOptionalParameters(data []byte, report *SMSStatusReport
 			return errors.New("SMS-STATUS-REPORT DCS missing")
 		}
 		report.DataCodingScheme = data[i]
+		report.DataCoding = ParseSMSDataCodingScheme(report.DataCodingScheme)
 		report.HasDataCodingScheme = true
 		i++
 	}
@@ -1099,13 +1118,64 @@ func parseSMSConcatUDH(udh []byte) SMSConcatInfo {
 }
 
 func smsDCSAlphabet(dcs byte) string {
-	switch dcs & 0x0c {
-	case 0x08:
-		return "ucs2"
-	case 0x04:
-		return "8bit"
+	return ParseSMSDataCodingScheme(dcs).Alphabet
+}
+
+func ParseSMSDataCodingScheme(dcs byte) SMSDataCodingInfo {
+	info := SMSDataCodingInfo{Raw: dcs, Alphabet: "gsm7"}
+	group := dcs & 0xf0
+	switch {
+	case group <= 0x70:
+		info.AutoDelete = dcs&0x40 != 0
+		info.Compressed = dcs&0x20 != 0
+		if dcs&0x10 != 0 {
+			info.HasMessageClass = true
+			info.MessageClass = int(dcs & 0x03)
+		}
+		switch dcs & 0x0c {
+		case 0x04:
+			info.Alphabet = "8bit"
+		case 0x08:
+			info.Alphabet = "ucs2"
+		case 0x0c:
+			info.Reserved = true
+		}
+	case group >= 0x80 && group <= 0xb0:
+		info.Reserved = true
+	case group == 0xc0:
+		info.MessageWaiting = true
+		info.MessageWaitingActive = dcs&0x08 != 0
+		info.MessageWaitingDiscard = true
+		info.MessageWaitingType = smsMessageWaitingType(dcs)
+	case group == 0xd0:
+		info.MessageWaiting = true
+		info.MessageWaitingActive = dcs&0x08 != 0
+		info.MessageWaitingType = smsMessageWaitingType(dcs)
+	case group == 0xe0:
+		info.Alphabet = "ucs2"
+		info.MessageWaiting = true
+		info.MessageWaitingActive = dcs&0x08 != 0
+		info.MessageWaitingType = smsMessageWaitingType(dcs)
+	case group == 0xf0:
+		info.HasMessageClass = true
+		info.MessageClass = int(dcs & 0x03)
+		if dcs&0x04 != 0 {
+			info.Alphabet = "8bit"
+		}
+	}
+	return info
+}
+
+func smsMessageWaitingType(dcs byte) string {
+	switch dcs & 0x03 {
+	case 0:
+		return "voicemail"
+	case 1:
+		return "fax"
+	case 2:
+		return "email"
 	default:
-		return "gsm7"
+		return "other"
 	}
 }
 

@@ -126,6 +126,35 @@ func TestBuildSMSSubmitTPDURejectsConflictingDCS(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "compressed") {
 		t.Fatalf("BuildSMSSubmitTPDU() err=%v, want compressed DCS rejection", err)
 	}
+	_, err = BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", DataCodingScheme: 0x60}, 1)
+	if err == nil || !strings.Contains(err.Error(), "compressed") {
+		t.Fatalf("BuildSMSSubmitTPDU(auto-delete compressed) err=%v, want compressed DCS rejection", err)
+	}
+}
+
+func TestParseSMSDataCodingScheme(t *testing.T) {
+	tests := []struct {
+		name string
+		dcs  byte
+		want SMSDataCodingInfo
+	}{
+		{name: "gsm7 class0", dcs: 0x10, want: SMSDataCodingInfo{Raw: 0x10, Alphabet: "gsm7", HasMessageClass: true, MessageClass: 0}},
+		{name: "auto delete compressed", dcs: 0x60, want: SMSDataCodingInfo{Raw: 0x60, Alphabet: "gsm7", AutoDelete: true, Compressed: true}},
+		{name: "ucs2", dcs: 0x08, want: SMSDataCodingInfo{Raw: 0x08, Alphabet: "ucs2"}},
+		{name: "mwi discard inactive", dcs: 0xc0, want: SMSDataCodingInfo{Raw: 0xc0, Alphabet: "gsm7", MessageWaiting: true, MessageWaitingDiscard: true, MessageWaitingType: "voicemail"}},
+		{name: "mwi store active", dcs: 0xd8, want: SMSDataCodingInfo{Raw: 0xd8, Alphabet: "gsm7", MessageWaiting: true, MessageWaitingActive: true, MessageWaitingType: "voicemail"}},
+		{name: "mwi ucs2 fax", dcs: 0xe9, want: SMSDataCodingInfo{Raw: 0xe9, Alphabet: "ucs2", MessageWaiting: true, MessageWaitingActive: true, MessageWaitingType: "fax"}},
+		{name: "8bit class0", dcs: 0xf4, want: SMSDataCodingInfo{Raw: 0xf4, Alphabet: "8bit", HasMessageClass: true, MessageClass: 0}},
+		{name: "reserved coding", dcs: 0x8c, want: SMSDataCodingInfo{Raw: 0x8c, Alphabet: "gsm7", Reserved: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseSMSDataCodingScheme(tt.dcs)
+			if got != tt.want {
+				t.Fatalf("ParseSMSDataCodingScheme(0x%02x)=%+v want %+v", tt.dcs, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestEncodeSMSSubmitValidityPeriodRejectsConflicts(t *testing.T) {
@@ -403,11 +432,25 @@ func TestParseSMSDeliverTPDUPreservesProtocolMetadata(t *testing.T) {
 	if deliver.FirstOctet != 0xe4 || deliver.ProtocolID != 0x7f || deliver.DataCodingScheme != 0x08 || deliver.UserDataLength != 8 {
 		t.Fatalf("deliver metadata=%+v", deliver)
 	}
+	if deliver.DataCoding.Alphabet != "ucs2" || deliver.DataCoding.Raw != 0x08 {
+		t.Fatalf("deliver data coding=%+v", deliver.DataCoding)
+	}
 	if !deliver.UserDataHeader || !deliver.StatusReportIndication || !deliver.ReplyPath || deliver.MoreMessagesToSend {
 		t.Fatalf("deliver flags=%+v", deliver)
 	}
 	if deliver.Text != "你" || !deliver.Concat.IsConcat {
 		t.Fatalf("deliver content=%+v", deliver)
+	}
+}
+
+func TestParseSMSDeliverTPDUPreservesMWIDataCoding(t *testing.T) {
+	tpdu := mustHex(t, "0005810180F600D86270502143650002EF35")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	if deliver.Text != "ok" || !deliver.DataCoding.MessageWaiting || !deliver.DataCoding.MessageWaitingActive || deliver.DataCoding.MessageWaitingType != "voicemail" {
+		t.Fatalf("deliver=%+v dataCoding=%+v", deliver, deliver.DataCoding)
 	}
 }
 
@@ -450,6 +493,9 @@ func TestParseSMSStatusReportTPDUPreservesOptionalParameters(t *testing.T) {
 	}
 	if !report.HasParameterIndicator || report.ParameterIndicator != 0x07 || !report.HasProtocolID || report.ProtocolID != 0x7f || !report.HasDataCodingScheme || report.DataCodingScheme != 0x00 {
 		t.Fatalf("report optional fields=%+v", report)
+	}
+	if report.DataCoding.Raw != 0x00 || report.DataCoding.Alphabet != "gsm7" {
+		t.Fatalf("report data coding=%+v", report.DataCoding)
 	}
 	if !report.HasUserData || report.UserDataLength != 5 || report.UserData != "hello" {
 		t.Fatalf("report user data=%+v", report)

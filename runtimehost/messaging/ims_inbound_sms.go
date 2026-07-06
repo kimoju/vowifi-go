@@ -171,6 +171,7 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 			Timestamp:              deliver.Timestamp,
 			ProtocolID:             deliver.ProtocolID,
 			DataCodingScheme:       deliver.DataCodingScheme,
+			DataCoding:             deliver.DataCoding,
 			UserDataHeader:         deliver.UserDataHeader,
 			MoreMessagesToSend:     deliver.MoreMessagesToSend,
 			StatusReportIndication: deliver.StatusReportIndication,
@@ -244,6 +245,7 @@ func (s *Service) handleIMSSMSStatusReport(ctx context.Context, msg IMSMessageRe
 		ParameterIndicator:    reportTPDU.ParameterIndicator,
 		ProtocolID:            reportTPDU.ProtocolID,
 		DataCodingScheme:      reportTPDU.DataCodingScheme,
+		DataCoding:            reportTPDU.DataCoding,
 		UserData:              reportTPDU.UserData,
 	}
 	_, err := s.HandleSMSDeliveryReport(ctx, report)

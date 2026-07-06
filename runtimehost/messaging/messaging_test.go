@@ -456,6 +456,9 @@ func TestHandleIMSMessagePreservesDeliverProtocolMetadata(t *testing.T) {
 	if incoming.ProtocolID != 0x7f || incoming.DataCodingScheme != 0x00 {
 		t.Fatalf("incoming metadata=%+v", incoming)
 	}
+	if incoming.DataCoding.Raw != 0x00 || incoming.DataCoding.Alphabet != "gsm7" {
+		t.Fatalf("incoming data coding=%+v", incoming.DataCoding)
+	}
 	if incoming.UserDataHeader || !incoming.StatusReportIndication || !incoming.ReplyPath || incoming.MoreMessagesToSend {
 		t.Fatalf("incoming flags=%+v", incoming)
 	}
@@ -637,6 +640,9 @@ func TestHandleIMSMessagePreservesStatusReportOptionalParameters(t *testing.T) {
 	}
 	if report.ParameterIndicator != 0x07 || report.ProtocolID != 0x7f || report.DataCodingScheme != 0x00 || report.UserData != "hello" {
 		t.Fatalf("report optional fields=%+v", report)
+	}
+	if report.DataCoding.Raw != 0x00 || report.DataCoding.Alphabet != "gsm7" {
+		t.Fatalf("report data coding=%+v", report.DataCoding)
 	}
 }
 
