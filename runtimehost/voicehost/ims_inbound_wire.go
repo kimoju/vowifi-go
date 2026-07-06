@@ -26,11 +26,15 @@ type IMSInboundWireServer struct {
 	TransactionTTL  time.Duration
 	InviteFinalT1   time.Duration
 	InviteFinalT2   time.Duration
+	Reliable1xxT1   time.Duration
+	Reliable1xxT2   time.Duration
 
-	mu                sync.Mutex
-	transactions      map[string]imsInboundWireTransaction
-	inviteRetransmits map[string]imsInboundInviteRetransmit
-	inviteFinalAcks   map[string]time.Time
+	mu                    sync.Mutex
+	transactions          map[string]imsInboundWireTransaction
+	inviteRetransmits     map[string]imsInboundResponseRetransmit
+	inviteFinalAcks       map[string]time.Time
+	reliable1xxRetransmit map[string]imsInboundResponseRetransmit
+	reliable1xxAcks       map[string]time.Time
 }
 
 type IMSInboundWireResponse struct {
@@ -46,7 +50,7 @@ type imsInboundWireTransaction struct {
 	expires   time.Time
 }
 
-type imsInboundInviteRetransmit struct {
+type imsInboundResponseRetransmit struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -136,6 +140,7 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 	case "UPDATE":
 		responses, err = s.handleUpdate(ctx, req)
 	case "PRACK":
+		s.stopReliableProvisionalRetransmission(req)
 		responses, err = s.handlePrack(ctx, req)
 	case "INFO":
 		responses, err = s.handleInfo(ctx, req)
@@ -444,20 +449,32 @@ func (s *IMSInboundWireServer) handlePacket(ctx context.Context, pc net.PacketCo
 		_ = writePacketSIPResponse(pc, addr, voiceclient.SIPIncomingRequest{}, wireResponse(400, "Bad Request"))
 		return
 	}
-	responses, _ := s.handleRequest(ctx, req, func(resp IMSInboundWireResponse) error {
+	writeResponse := func(resp IMSInboundWireResponse) error {
 		if resp.NoResponse {
 			return nil
 		}
-		return writePacketSIPResponse(pc, addr, taggedWireRequest(req, s.localTag()), resp)
+		taggedReq := taggedWireRequest(req, s.localTag())
+		if err := writePacketSIPResponse(pc, addr, taggedReq, resp); err != nil {
+			return err
+		}
+		s.afterPacketResponse(ctx, pc, addr, taggedReq, resp)
+		return nil
+	}
+	responses, _ := s.handleRequest(ctx, req, func(resp IMSInboundWireResponse) error {
+		return writeResponse(resp)
 	})
 	for _, resp := range responses {
-		if resp.NoResponse {
-			continue
-		}
-		taggedReq := taggedWireRequest(req, s.localTag())
-		if err := writePacketSIPResponse(pc, addr, taggedReq, resp); err == nil && shouldRetransmitInviteFinal(req, resp) {
-			s.startInviteFinalRetransmission(ctx, pc, addr, taggedReq, resp)
-		}
+		_ = writeResponse(resp)
+	}
+}
+
+func (s *IMSInboundWireServer) afterPacketResponse(ctx context.Context, pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) {
+	if shouldRetransmitReliableProvisional(req, resp) {
+		s.startReliableProvisionalRetransmission(ctx, pc, addr, req, resp)
+	}
+	if shouldRetransmitInviteFinal(req, resp) {
+		s.stopReliableProvisionalsForInvite(req)
+		s.startInviteFinalRetransmission(ctx, pc, addr, req, resp)
 	}
 }
 
@@ -617,8 +634,29 @@ func (s *IMSInboundWireServer) inviteFinalT2() time.Duration {
 	return s.InviteFinalT2
 }
 
+func (s *IMSInboundWireServer) reliable1xxT1() time.Duration {
+	if s == nil || s.Reliable1xxT1 <= 0 {
+		return 500 * time.Millisecond
+	}
+	return s.Reliable1xxT1
+}
+
+func (s *IMSInboundWireServer) reliable1xxT2() time.Duration {
+	if s == nil || s.Reliable1xxT2 <= 0 {
+		return 4 * time.Second
+	}
+	return s.Reliable1xxT2
+}
+
 func shouldRetransmitInviteFinal(req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) bool {
 	return strings.EqualFold(strings.TrimSpace(req.Method), "INVITE") && resp.StatusCode >= 200 && !resp.NoResponse
+}
+
+func shouldRetransmitReliableProvisional(req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) bool {
+	if !strings.EqualFold(strings.TrimSpace(req.Method), "INVITE") || resp.NoResponse || resp.StatusCode <= 100 || resp.StatusCode >= 200 {
+		return false
+	}
+	return strings.TrimSpace(wireResponseHeader(resp, "RSeq")) != ""
 }
 
 func (s *IMSInboundWireServer) startInviteFinalRetransmission(ctx context.Context, pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) {
@@ -633,7 +671,7 @@ func (s *IMSInboundWireServer) startInviteFinalRetransmission(ctx context.Contex
 		return
 	}
 	childCtx, cancel := context.WithCancel(ctx)
-	entry := imsInboundInviteRetransmit{cancel: cancel, done: make(chan struct{})}
+	entry := imsInboundResponseRetransmit{cancel: cancel, done: make(chan struct{})}
 	s.mu.Lock()
 	now := time.Now()
 	s.pruneWireStateLocked(now)
@@ -643,7 +681,7 @@ func (s *IMSInboundWireServer) startInviteFinalRetransmission(ctx context.Contex
 		return
 	}
 	if s.inviteRetransmits == nil {
-		s.inviteRetransmits = make(map[string]imsInboundInviteRetransmit)
+		s.inviteRetransmits = make(map[string]imsInboundResponseRetransmit)
 	}
 	if _, exists := s.inviteRetransmits[key]; exists {
 		s.mu.Unlock()
@@ -652,14 +690,19 @@ func (s *IMSInboundWireServer) startInviteFinalRetransmission(ctx context.Contex
 	}
 	s.inviteRetransmits[key] = entry
 	s.mu.Unlock()
-	go s.runInviteFinalRetransmission(childCtx, key, entry.done, pc, addr, req, resp)
+	go s.runWireResponseRetransmission(childCtx, key, entry.done, pc, addr, req, resp, s.inviteFinalT1(), s.inviteFinalT2(), s.removeInviteFinalRetransmission)
 }
 
-func (s *IMSInboundWireServer) runInviteFinalRetransmission(ctx context.Context, key string, done chan struct{}, pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) {
+func (s *IMSInboundWireServer) runWireResponseRetransmission(ctx context.Context, key string, done chan struct{}, pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse, firstInterval time.Duration, maxInterval time.Duration, remove func(string, chan struct{})) {
 	defer close(done)
-	defer s.removeInviteFinalRetransmission(key, done)
-	interval := s.inviteFinalT1()
-	maxInterval := s.inviteFinalT2()
+	defer remove(key, done)
+	interval := firstInterval
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	if maxInterval <= 0 {
+		maxInterval = 4 * time.Second
+	}
 	if maxInterval < interval {
 		maxInterval = interval
 	}
@@ -694,6 +737,103 @@ func (s *IMSInboundWireServer) removeInviteFinalRetransmission(key string, done 
 		delete(s.inviteRetransmits, key)
 	}
 	s.mu.Unlock()
+}
+
+func (s *IMSInboundWireServer) startReliableProvisionalRetransmission(ctx context.Context, pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) {
+	if s == nil || pc == nil || addr == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key := wireReliableProvisionalKey(req, resp)
+	if key == "" {
+		return
+	}
+	childCtx, cancel := context.WithCancel(ctx)
+	entry := imsInboundResponseRetransmit{cancel: cancel, done: make(chan struct{})}
+	s.mu.Lock()
+	now := time.Now()
+	s.pruneWireStateLocked(now)
+	if expires, ok := s.reliable1xxAcks[key]; ok && now.Before(expires) {
+		s.mu.Unlock()
+		cancel()
+		return
+	}
+	if s.reliable1xxRetransmit == nil {
+		s.reliable1xxRetransmit = make(map[string]imsInboundResponseRetransmit)
+	}
+	if _, exists := s.reliable1xxRetransmit[key]; exists {
+		s.mu.Unlock()
+		cancel()
+		return
+	}
+	s.reliable1xxRetransmit[key] = entry
+	s.mu.Unlock()
+	go s.runWireResponseRetransmission(childCtx, key, entry.done, pc, addr, req, resp, s.reliable1xxT1(), s.reliable1xxT2(), s.removeReliableProvisionalRetransmission)
+}
+
+func (s *IMSInboundWireServer) removeReliableProvisionalRetransmission(key string, done chan struct{}) {
+	if s == nil || key == "" {
+		return
+	}
+	s.mu.Lock()
+	if entry, ok := s.reliable1xxRetransmit[key]; ok && entry.done == done {
+		delete(s.reliable1xxRetransmit, key)
+	}
+	s.mu.Unlock()
+}
+
+func (s *IMSInboundWireServer) stopReliableProvisionalRetransmission(req voiceclient.SIPIncomingRequest) {
+	if s == nil {
+		return
+	}
+	key := wireReliableProvisionalKeyFromRAck(req)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.reliable1xxAcks == nil {
+		s.reliable1xxAcks = make(map[string]time.Time)
+	}
+	s.reliable1xxAcks[key] = time.Now().Add(s.transactionTTL())
+	entry, ok := s.reliable1xxRetransmit[key]
+	if ok {
+		delete(s.reliable1xxRetransmit, key)
+	}
+	s.mu.Unlock()
+	if ok && entry.cancel != nil {
+		entry.cancel()
+	}
+}
+
+func (s *IMSInboundWireServer) stopReliableProvisionalsForInvite(req voiceclient.SIPIncomingRequest) {
+	if s == nil {
+		return
+	}
+	prefix := wireReliableProvisionalKeyPrefix(req)
+	if prefix == "" {
+		return
+	}
+	var entries []imsInboundResponseRetransmit
+	s.mu.Lock()
+	if s.reliable1xxAcks == nil {
+		s.reliable1xxAcks = make(map[string]time.Time)
+	}
+	expires := time.Now().Add(s.transactionTTL())
+	for key, entry := range s.reliable1xxRetransmit {
+		if strings.HasPrefix(key, prefix) {
+			s.reliable1xxAcks[key] = expires
+			entries = append(entries, entry)
+			delete(s.reliable1xxRetransmit, key)
+		}
+	}
+	s.mu.Unlock()
+	for _, entry := range entries {
+		if entry.cancel != nil {
+			entry.cancel()
+		}
+	}
 }
 
 func (s *IMSInboundWireServer) stopInviteFinalRetransmission(req voiceclient.SIPIncomingRequest) {
@@ -760,6 +900,11 @@ func (s *IMSInboundWireServer) pruneWireStateLocked(now time.Time) {
 			delete(s.inviteFinalAcks, key)
 		}
 	}
+	for key, expires := range s.reliable1xxAcks {
+		if !expires.IsZero() && now.After(expires) {
+			delete(s.reliable1xxAcks, key)
+		}
+	}
 }
 
 func cloneWireResponses(responses []IMSInboundWireResponse) []IMSInboundWireResponse {
@@ -814,6 +959,51 @@ func wireInviteRetransmissionKey(req voiceclient.SIPIncomingRequest) string {
 		return ""
 	}
 	return callID + "|" + strconv.Itoa(cseq) + "|" + fromTag
+}
+
+func wireReliableProvisionalKey(req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) string {
+	return wireReliableProvisionalKeyFromParts(wireCallID(req), sipHeaderTag(firstVoiceHeader(req.Headers, "From")), wireCSeq(req), wireResponseHeader(resp, "RSeq"))
+}
+
+func wireReliableProvisionalKeyFromRAck(req voiceclient.SIPIncomingRequest) string {
+	rack := firstVoiceHeader(req.Headers, "RAck")
+	fields := strings.Fields(rack)
+	if len(fields) < 3 || !strings.EqualFold(fields[2], "INVITE") {
+		return ""
+	}
+	inviteCSeq, err := strconv.Atoi(fields[1])
+	if err != nil || inviteCSeq <= 0 {
+		return ""
+	}
+	return wireReliableProvisionalKeyFromParts(wireCallID(req), sipHeaderTag(firstVoiceHeader(req.Headers, "From")), inviteCSeq, fields[0])
+}
+
+func wireReliableProvisionalKeyPrefix(req voiceclient.SIPIncomingRequest) string {
+	callID := strings.TrimSpace(wireCallID(req))
+	fromTag := sipHeaderTag(firstVoiceHeader(req.Headers, "From"))
+	cseq := wireCSeq(req)
+	if callID == "" || cseq <= 0 {
+		return ""
+	}
+	return callID + "|" + strconv.Itoa(cseq) + "|" + fromTag + "|"
+}
+
+func wireReliableProvisionalKeyFromParts(callID string, fromTag string, inviteCSeq int, rseq string) string {
+	callID = strings.TrimSpace(callID)
+	rseq = strings.TrimSpace(rseq)
+	if callID == "" || inviteCSeq <= 0 || rseq == "" {
+		return ""
+	}
+	return callID + "|" + strconv.Itoa(inviteCSeq) + "|" + strings.TrimSpace(fromTag) + "|" + rseq
+}
+
+func wireResponseHeader(resp IMSInboundWireResponse, name string) string {
+	for key, value := range resp.Headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func wireViaBranch(via string) string {
