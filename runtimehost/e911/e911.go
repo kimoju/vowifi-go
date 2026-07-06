@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -1524,9 +1525,9 @@ func appendEmergencyRoute(out *entitlementResult, route EmergencyRoute) {
 
 func normalizeEmergencyRoute(route EmergencyRoute) EmergencyRoute {
 	route.ServiceURN = normalizeEmergencyServiceURN(route.ServiceURN)
-	route.PCSCF = appendUniqueStrings(nil, route.PCSCF...)
-	route.ESRP = appendUniqueStrings(nil, route.ESRP...)
-	route.Endpoints = appendUniqueStrings(nil, route.Endpoints...)
+	route.PCSCF = sortedUniqueStrings(route.PCSCF...)
+	route.ESRP = sortedUniqueStrings(route.ESRP...)
+	route.Endpoints = sortedUniqueStrings(route.Endpoints...)
 	return route
 }
 
@@ -1555,6 +1556,14 @@ func appendUniqueStrings(dst []string, values ...string) []string {
 		}
 	}
 	return dst
+}
+
+func sortedUniqueStrings(values ...string) []string {
+	out := appendUniqueStrings(nil, values...)
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i]) < strings.ToLower(out[j])
+	})
+	return out
 }
 
 func stringsFromAny(value any) []string {

@@ -1,12 +1,15 @@
 package voiceclient
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/netip"
+	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ErrInvalidIMSSecurityXFRMPlan marks an install request that cannot be mapped to Linux XFRM.
@@ -28,6 +31,47 @@ type IMSSecurityAssociationXFRMCommand struct {
 	Args     []string
 	UndoArgs []string
 }
+
+type IMSSecurityAssociationXFRMState struct {
+	Plan IMSSecurityAssociationXFRMInstallPlan
+	undo []IMSSecurityAssociationXFRMCommand
+}
+
+type IMSSecurityXFRMCommandRunner interface {
+	RunIP(context.Context, ...string) error
+}
+
+type IMSSecurityXFRMCommandRunnerFunc func(context.Context, ...string) error
+
+func (f IMSSecurityXFRMCommandRunnerFunc) RunIP(ctx context.Context, args ...string) error {
+	return f(ctx, args...)
+}
+
+type ExecIMSSecurityXFRMCommandRunner struct {
+	Path string
+}
+
+func (r ExecIMSSecurityXFRMCommandRunner) RunIP(ctx context.Context, args ...string) error {
+	path := strings.TrimSpace(r.Path)
+	if path == "" {
+		path = "ip"
+	}
+	cmd := exec.CommandContext(ctx, path, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+type LinuxIMSSecurityXFRMInstaller struct {
+	Runner IMSSecurityXFRMCommandRunner
+
+	mu     sync.Mutex
+	states []IMSSecurityAssociationXFRMState
+}
+
+var _ SecurityPlanRequestInstaller = (*LinuxIMSSecurityXFRMInstaller)(nil)
 
 type imsSecurityXFRMParams struct {
 	reqID         string
@@ -65,6 +109,110 @@ func BuildIMSSecurityAssociationXFRMInstallPlan(req IMSSecurityAssociationInstal
 		RemoteAddress: params.remoteAddress,
 		Commands:      commands,
 	}, nil
+}
+
+func (i *LinuxIMSSecurityXFRMInstaller) InstallSecurityPlanRequest(ctx context.Context, req IMSSecurityAssociationInstallRequest) error {
+	_, err := i.Apply(ctx, req)
+	return err
+}
+
+func (i *LinuxIMSSecurityXFRMInstaller) Apply(ctx context.Context, req IMSSecurityAssociationInstallRequest) (IMSSecurityAssociationXFRMState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	plan, err := BuildIMSSecurityAssociationXFRMInstallPlan(req)
+	if err != nil {
+		return IMSSecurityAssociationXFRMState{}, err
+	}
+	state, err := applyIMSSecurityXFRMPlan(ctx, imssSecurityXFRMRunner(i.Runner), plan)
+	if err != nil {
+		return state, err
+	}
+	i.mu.Lock()
+	i.states = append(i.states, state)
+	i.mu.Unlock()
+	return state, nil
+}
+
+func (i *LinuxIMSSecurityXFRMInstaller) Cleanup(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	i.mu.Lock()
+	states := append([]IMSSecurityAssociationXFRMState(nil), i.states...)
+	i.mu.Unlock()
+
+	var err error
+	runner := imssSecurityXFRMRunner(i.Runner)
+	for idx := len(states) - 1; idx >= 0; idx-- {
+		err = errors.Join(err, cleanupIMSSecurityXFRMState(ctx, runner, states[idx]))
+	}
+	if err != nil {
+		return err
+	}
+	i.mu.Lock()
+	if len(i.states) >= len(states) {
+		i.states = append([]IMSSecurityAssociationXFRMState(nil), i.states[len(states):]...)
+	} else {
+		i.states = nil
+	}
+	i.mu.Unlock()
+	return nil
+}
+
+func (i *LinuxIMSSecurityXFRMInstaller) StateCount() int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return len(i.states)
+}
+
+func applyIMSSecurityXFRMPlan(ctx context.Context, runner IMSSecurityXFRMCommandRunner, plan IMSSecurityAssociationXFRMInstallPlan) (IMSSecurityAssociationXFRMState, error) {
+	state := IMSSecurityAssociationXFRMState{Plan: plan}
+	for _, command := range plan.Commands {
+		if err := runner.RunIP(ctx, command.Args...); err != nil {
+			rollbackErr := runIMSSecurityXFRMUndo(ctx, runner, state.undo)
+			if rollbackErr != nil {
+				return state, errors.Join(err, rollbackErr)
+			}
+			return state, err
+		}
+		if len(command.UndoArgs) > 0 {
+			state.undo = append(state.undo, cloneIMSSecurityXFRMCommand(command, true))
+		}
+	}
+	return state, nil
+}
+
+func cleanupIMSSecurityXFRMState(ctx context.Context, runner IMSSecurityXFRMCommandRunner, state IMSSecurityAssociationXFRMState) error {
+	return runIMSSecurityXFRMUndo(ctx, runner, state.undo)
+}
+
+func runIMSSecurityXFRMUndo(ctx context.Context, runner IMSSecurityXFRMCommandRunner, undo []IMSSecurityAssociationXFRMCommand) error {
+	var err error
+	for idx := len(undo) - 1; idx >= 0; idx-- {
+		if len(undo[idx].UndoArgs) == 0 {
+			continue
+		}
+		err = errors.Join(err, runner.RunIP(ctx, undo[idx].UndoArgs...))
+	}
+	return err
+}
+
+func imssSecurityXFRMRunner(runner IMSSecurityXFRMCommandRunner) IMSSecurityXFRMCommandRunner {
+	if runner != nil {
+		return runner
+	}
+	return ExecIMSSecurityXFRMCommandRunner{}
+}
+
+func cloneIMSSecurityXFRMCommand(command IMSSecurityAssociationXFRMCommand, undoOnly bool) IMSSecurityAssociationXFRMCommand {
+	out := IMSSecurityAssociationXFRMCommand{
+		UndoArgs: append([]string(nil), command.UndoArgs...),
+	}
+	if !undoOnly {
+		out.Args = append([]string(nil), command.Args...)
+	}
+	return out
 }
 
 func normalizeIMSSecurityAssociationXFRMRequest(req IMSSecurityAssociationInstallRequest) (imsSecurityXFRMParams, error) {

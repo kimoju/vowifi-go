@@ -1,6 +1,7 @@
 package voiceclient
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"reflect"
@@ -168,6 +169,100 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanRejectsInvalidInput(t *testin
 	}
 }
 
+func TestLinuxIMSSecurityXFRMInstallerApplyInstallAndCleanup(t *testing.T) {
+	req := validSecurityXFRMInstallRequest()
+	plan, err := BuildIMSSecurityAssociationXFRMInstallPlan(req)
+	if err != nil {
+		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
+	}
+	runner := &fakeIMSSecurityXFRMRunner{}
+	installer := &LinuxIMSSecurityXFRMInstaller{Runner: runner}
+	state, err := installer.Apply(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if installer.StateCount() != 1 || state.Plan.LocalAddress != "192.0.2.20" || len(state.undo) != len(plan.Commands) {
+		t.Fatalf("state=%+v count=%d", state, installer.StateCount())
+	}
+	if !reflect.DeepEqual(runner.commands, imsSecurityXFRMCommandArgs(plan.Commands, false)) {
+		t.Fatalf("apply commands=\n%v\nwant\n%v", runner.commands, imsSecurityXFRMCommandArgs(plan.Commands, false))
+	}
+
+	if err := installer.InstallSecurityPlanRequest(context.Background(), req); err != nil {
+		t.Fatalf("InstallSecurityPlanRequest() error = %v", err)
+	}
+	if installer.StateCount() != 2 {
+		t.Fatalf("StateCount()=%d, want 2", installer.StateCount())
+	}
+
+	want := append([][]string{}, imsSecurityXFRMCommandArgs(plan.Commands, false)...)
+	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, false)...)
+	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, true)...)
+	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, true)...)
+	if err := installer.Cleanup(context.Background()); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+	if installer.StateCount() != 0 {
+		t.Fatalf("StateCount(after cleanup)=%d, want 0", installer.StateCount())
+	}
+	if !reflect.DeepEqual(runner.commands, want) {
+		t.Fatalf("all commands=\n%v\nwant\n%v", runner.commands, want)
+	}
+}
+
+func TestLinuxIMSSecurityXFRMInstallerRollsBackOnFailure(t *testing.T) {
+	wantErr := errors.New("policy install failed")
+	req := validSecurityXFRMInstallRequest()
+	plan, err := BuildIMSSecurityAssociationXFRMInstallPlan(req)
+	if err != nil {
+		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
+	}
+	runner := &fakeIMSSecurityXFRMRunner{failAt: 2, err: wantErr}
+	installer := &LinuxIMSSecurityXFRMInstaller{Runner: runner}
+	_, err = installer.Apply(context.Background(), req)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Apply() err=%v, want policy failure", err)
+	}
+	if installer.StateCount() != 0 {
+		t.Fatalf("StateCount()=%d, want 0 after rollback", installer.StateCount())
+	}
+	want := [][]string{
+		plan.Commands[0].Args,
+		plan.Commands[1].Args,
+		plan.Commands[2].Args,
+		plan.Commands[1].UndoArgs,
+		plan.Commands[0].UndoArgs,
+	}
+	if !reflect.DeepEqual(runner.commands, want) {
+		t.Fatalf("commands=\n%v\nwant\n%v", runner.commands, want)
+	}
+}
+
+func TestLinuxIMSSecurityXFRMInstallerKeepsStateWhenCleanupFails(t *testing.T) {
+	req := validSecurityXFRMInstallRequest()
+	runner := &fakeIMSSecurityXFRMRunner{}
+	installer := &LinuxIMSSecurityXFRMInstaller{Runner: runner}
+	if _, err := installer.Apply(context.Background(), req); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	wantErr := errors.New("cleanup failed")
+	runner.failAt = len(runner.commands)
+	runner.err = wantErr
+	if err := installer.Cleanup(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("Cleanup() err=%v, want cleanup failure", err)
+	}
+	if installer.StateCount() != 1 {
+		t.Fatalf("StateCount()=%d, want state kept for retry", installer.StateCount())
+	}
+	runner.err = nil
+	if err := installer.Cleanup(context.Background()); err != nil {
+		t.Fatalf("Cleanup(retry) error = %v", err)
+	}
+	if installer.StateCount() != 0 {
+		t.Fatalf("StateCount(after retry)=%d, want 0", installer.StateCount())
+	}
+}
+
 func validSecurityXFRMInstallRequest() IMSSecurityAssociationInstallRequest {
 	return IMSSecurityAssociationInstallRequest{
 		Plan: IMSSecurityAssociationPlan{
@@ -220,4 +315,33 @@ func securityXFRMBytes(start byte, n int) []byte {
 
 func securityXFRMHexKey(key []byte) string {
 	return "0x" + hex.EncodeToString(key)
+}
+
+type fakeIMSSecurityXFRMRunner struct {
+	commands [][]string
+	failAt   int
+	err      error
+}
+
+func (r *fakeIMSSecurityXFRMRunner) RunIP(ctx context.Context, args ...string) error {
+	copied := append([]string(nil), args...)
+	r.commands = append(r.commands, copied)
+	if r.err != nil && len(r.commands)-1 == r.failAt {
+		return r.err
+	}
+	return nil
+}
+
+func imsSecurityXFRMCommandArgs(commands []IMSSecurityAssociationXFRMCommand, undo bool) [][]string {
+	out := make([][]string, 0, len(commands))
+	if !undo {
+		for _, command := range commands {
+			out = append(out, command.Args)
+		}
+		return out
+	}
+	for idx := len(commands) - 1; idx >= 0; idx-- {
+		out = append(out, commands[idx].UndoArgs)
+	}
+	return out
 }
