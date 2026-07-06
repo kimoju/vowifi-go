@@ -1437,6 +1437,95 @@ func TestBuildIMSDialogRequestsDigestAuthIntUsesBody(t *testing.T) {
 	}
 }
 
+func TestApplyDigestAuthenticationInfoUpdatesDialogSession(t *testing.T) {
+	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-dialog-info", Algorithm: "MD5", QOP: "auth"}
+	state := newDigestAuthState("Authorization", ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, "")
+	session := NewDigestAuthSession("Authorization", "", state)
+	cfg := DialogRequestConfig{
+		Profile: IMSProfile{IMPU: "sip:user@ims.example"},
+		Registration: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			AuthSession:    session,
+		},
+		RemoteURI:       "sip:+18005551212@ims.example",
+		RemoteTargetURI: "sip:+18005551212@pcscf.example",
+		CallID:          "call-info-auth",
+		CSeq:            4,
+	}
+	msg, err := BuildMessageRequest(cfg, "text/plain;charset=UTF-8", []byte("hello"))
+	if err != nil {
+		t.Fatalf("BuildMessageRequest() error = %v", err)
+	}
+	if !strings.Contains(msg.Headers["Authorization"], `nonce="nonce-dialog-info"`) || !strings.Contains(msg.Headers["Authorization"], `nc=00000002`) {
+		t.Fatalf("initial MESSAGE Authorization=%s", msg.Headers["Authorization"])
+	}
+	_, _, snapshot := session.Snapshot()
+	rspauth, err := digestRspauth(snapshot, "auth", []byte("accepted"))
+	if err != nil {
+		t.Fatalf("digestRspauth() error = %v", err)
+	}
+	if err := ApplyDigestAuthenticationInfo(msg, SIPResponse{
+		StatusCode: 202,
+		Reason:     "Accepted",
+		Headers:    map[string][]string{"Authentication-Info": {`nextnonce="nonce-dialog-next", qop=auth, rspauth="` + rspauth + `"`}},
+		Body:       []byte("accepted"),
+	}); err != nil {
+		t.Fatalf("ApplyDigestAuthenticationInfo() error = %v", err)
+	}
+	bye, err := BuildByeRequest(cfg)
+	if err != nil {
+		t.Fatalf("BuildByeRequest() error = %v", err)
+	}
+	if auth := bye.Headers["Authorization"]; !strings.Contains(auth, `nonce="nonce-dialog-next"`) || !strings.Contains(auth, `nc=00000001`) {
+		t.Fatalf("BYE Authorization after nextnonce=%s", auth)
+	}
+}
+
+func TestApplyDigestAuthenticationInfoRejectsRspauthMismatch(t *testing.T) {
+	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-dialog-bad", Algorithm: "MD5", QOP: "auth"}
+	state := newDigestAuthState("Authorization", ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, "")
+	session := NewDigestAuthSession("Authorization", "", state)
+	cfg := DialogRequestConfig{
+		Profile: IMSProfile{IMPU: "sip:user@ims.example"},
+		Registration: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			AuthSession:    session,
+		},
+		RemoteURI:       "sip:+18005551212@ims.example",
+		RemoteTargetURI: "sip:+18005551212@pcscf.example",
+		CallID:          "call-info-auth-bad",
+		CSeq:            5,
+	}
+	msg, err := BuildInfoRequest(cfg, "application/dtmf-relay", []byte("Signal=1\r\n"))
+	if err != nil {
+		t.Fatalf("BuildInfoRequest() error = %v", err)
+	}
+	err = ApplyDigestAuthenticationInfo(msg, SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"Authentication-Info": {`rspauth="bad"`}},
+	})
+	if !errors.Is(err, ErrInvalidAuthenticationInfo) {
+		t.Fatalf("ApplyDigestAuthenticationInfo() error=%v, want ErrInvalidAuthenticationInfo", err)
+	}
+}
+
 func TestRegisterSessionRejectsFailedSecondRegister(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{

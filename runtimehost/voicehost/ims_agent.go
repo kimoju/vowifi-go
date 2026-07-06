@@ -165,7 +165,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 			if err != nil || !ok {
 				return err
 			}
-			prackResp, err := a.Transport.RoundTripRequest(ctx, prack)
+			prackResp, err := a.roundTripRequest(ctx, prack)
 			if err != nil {
 				return fmt.Errorf("IMS PRACK failed: %w", err)
 			}
@@ -325,7 +325,7 @@ func (a *IMSOutboundAgent) EndVoiceCallWithResult(ctx context.Context, info Dial
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.Transport.RoundTripRequest(ctx, bye)
+	resp, err := a.roundTripRequest(ctx, bye)
 	if err != nil {
 		return DialogInfoResult{Accepted: false, Reason: "IMS BYE failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -382,7 +382,7 @@ func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoReq
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.Transport.RoundTripRequest(ctx, info)
+	resp, err := a.roundTripRequest(ctx, info)
 	if err != nil {
 		return DialogInfoResult{Accepted: false, Reason: "IMS INFO failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -425,7 +425,7 @@ func (a *IMSOutboundAgent) SendDialogMessage(ctx context.Context, req DialogMess
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.Transport.RoundTripRequest(ctx, msg)
+	resp, err := a.roundTripRequest(ctx, msg)
 	if err != nil {
 		return DialogMessageResult{Accepted: false, Reason: "IMS MESSAGE failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -497,7 +497,7 @@ func (a *IMSOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrackR
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.Transport.RoundTripRequest(ctx, prack)
+	resp, err := a.roundTripRequest(ctx, prack)
 	if err != nil {
 		return DialogPrackResult{Accepted: false, Reason: "IMS PRACK failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -565,7 +565,7 @@ func (a *IMSOutboundAgent) SendDialogOptions(ctx context.Context, req DialogOpti
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.Transport.RoundTripRequest(ctx, options)
+	resp, err := a.roundTripRequest(ctx, options)
 	if err != nil {
 		return DialogOptionsResult{Accepted: false, Reason: "IMS OPTIONS failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -612,7 +612,7 @@ func (a *IMSOutboundAgent) SendDialogRefer(ctx context.Context, req DialogReferR
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.Transport.RoundTripRequest(ctx, refer)
+	resp, err := a.roundTripRequest(ctx, refer)
 	if err != nil {
 		return DialogReferResult{Accepted: false, Reason: "IMS REFER failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -674,7 +674,7 @@ func (a *IMSOutboundAgent) SendDialogNotify(ctx context.Context, req DialogNotif
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.Transport.RoundTripRequest(ctx, notify)
+	resp, err := a.roundTripRequest(ctx, notify)
 	if err != nil {
 		return DialogNotifyResult{Accepted: false, Reason: "IMS NOTIFY failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -736,7 +736,7 @@ func (a *IMSOutboundAgent) SendDialogSubscribe(ctx context.Context, req DialogSu
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.Transport.RoundTripRequest(ctx, subscribe)
+	resp, err := a.roundTripRequest(ctx, subscribe)
 	if err != nil {
 		return DialogSubscribeResult{Accepted: false, Reason: "IMS SUBSCRIBE failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -807,7 +807,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
-	resp, err := a.Transport.RoundTripRequest(ctx, update)
+	resp, err := a.roundTripRequest(ctx, update)
 	if err != nil {
 		return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -831,7 +831,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 				a.dialogs[callID] = latest
 			}
 			a.mu.Unlock()
-			resp, err = a.Transport.RoundTripRequest(ctx, retryUpdate)
+			resp, err = a.roundTripRequest(ctx, retryUpdate)
 			if err != nil {
 				return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE retry failed", RegistrationRecoveryNeeded: true}, err
 			}
@@ -940,7 +940,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 		if err != nil || !ok {
 			return err
 		}
-		prackResp, err := a.Transport.RoundTripRequest(ctx, prack)
+		prackResp, err := a.roundTripRequest(ctx, prack)
 		if err != nil {
 			return fmt.Errorf("IMS re-INVITE PRACK failed: %w", err)
 		}
@@ -991,7 +991,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 				if err != nil || !ok {
 					return err
 				}
-				prackResp, err := a.Transport.RoundTripRequest(ctx, prack)
+				prackResp, err := a.roundTripRequest(ctx, prack)
 				if err != nil {
 					return fmt.Errorf("IMS re-INVITE retry PRACK failed: %w", err)
 				}
@@ -1180,7 +1180,7 @@ func (a *IMSOutboundAgent) CancelVoiceCallWithResult(ctx context.Context, info D
 	}
 	applyDialogUpdateHeaders(cancel.Headers, info.Headers)
 	copyDialogHeader(cancel.Headers, state.invite.Headers, "Via")
-	resp, err := a.Transport.RoundTripRequest(ctx, cancel)
+	resp, err := a.roundTripRequest(ctx, cancel)
 	if err != nil {
 		return DialogInfoResult{Accepted: false, Reason: "IMS CANCEL failed", RegistrationRecoveryNeeded: true}, err
 	}
@@ -1360,14 +1360,35 @@ func (a *IMSOutboundAgent) roundTripInvite(ctx context.Context, invite voiceclie
 		return voiceclient.SIPResponse{}, ErrIMSVoiceAgentNotReady
 	}
 	if inviteTransport, ok := a.Transport.(voiceclient.SIPInviteTransport); ok {
-		return inviteTransport.RoundTripInvite(ctx, invite, func(_ context.Context, _ voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
+		resp, err := inviteTransport.RoundTripInvite(ctx, invite, func(_ context.Context, _ voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
 			if onProvisional == nil {
 				return nil
 			}
 			return onProvisional(resp)
 		})
+		if err != nil {
+			return resp, err
+		}
+		if err := voiceclient.ApplyDigestAuthenticationInfo(invite, resp); err != nil {
+			return resp, err
+		}
+		return resp, nil
 	}
-	return a.Transport.RoundTripRequest(ctx, invite)
+	return a.roundTripRequest(ctx, invite)
+}
+
+func (a *IMSOutboundAgent) roundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	if a == nil || a.Transport == nil {
+		return voiceclient.SIPResponse{}, ErrIMSVoiceAgentNotReady
+	}
+	resp, err := a.Transport.RoundTripRequest(ctx, msg)
+	if err != nil {
+		return resp, err
+	}
+	if err := voiceclient.ApplyDigestAuthenticationInfo(msg, resp); err != nil {
+		return resp, err
+	}
+	return resp, nil
 }
 
 func buildReliableProvisionalPRACK(cfg voiceclient.DialogRequestConfig, resp voiceclient.SIPResponse, cseq int) (voiceclient.SIPRequestMessage, bool, error) {

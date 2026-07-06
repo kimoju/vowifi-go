@@ -16,10 +16,11 @@ const (
 )
 
 type SIPRequestMessage struct {
-	Method  string
-	URI     string
-	Headers map[string]string
-	Body    []byte
+	Method      string
+	URI         string
+	Headers     map[string]string
+	Body        []byte
+	AuthSession *DigestAuthSession
 }
 
 type SIPIncomingRequest struct {
@@ -290,7 +291,8 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 	if securityVerify := routeHeader(cfg.Registration.SecurityVerify); securityVerify != "" {
 		headers["Security-Verify"] = securityVerify
 	}
-	authHeaderName, authHeader, err := dialogDigestAuthorization(cfg, method, targetURI, body)
+	authSession := dialogDigestAuthSession(cfg)
+	authHeaderName, authHeader, err := dialogDigestAuthorization(cfg, authSession, method, targetURI, body)
 	if err != nil {
 		return SIPRequestMessage{}, err
 	}
@@ -298,18 +300,22 @@ func buildDialogRequest(method string, cfg DialogRequestConfig, body []byte) (SI
 		headers[authHeaderName] = authHeader
 	}
 	return SIPRequestMessage{
-		Method:  method,
-		URI:     targetURI,
-		Headers: headers,
-		Body:    append([]byte(nil), body...),
+		Method:      method,
+		URI:         targetURI,
+		Headers:     headers,
+		Body:        append([]byte(nil), body...),
+		AuthSession: authSession,
 	}, nil
 }
 
-func dialogDigestAuthorization(cfg DialogRequestConfig, method, targetURI string, body []byte) (string, string, error) {
-	session := cfg.AuthSession
-	if session == nil {
-		session = cfg.Registration.AuthSession
+func dialogDigestAuthSession(cfg DialogRequestConfig) *DigestAuthSession {
+	if cfg.AuthSession != nil {
+		return cfg.AuthSession
 	}
+	return cfg.Registration.AuthSession
+}
+
+func dialogDigestAuthorization(cfg DialogRequestConfig, session *DigestAuthSession, method, targetURI string, body []byte) (string, string, error) {
 	fallbackName := firstNonEmpty(cfg.AuthHeaderName, cfg.Registration.AuthHeaderName)
 	fallbackHeader := firstNonEmpty(cfg.AuthHeader, cfg.Registration.AuthHeader)
 	if session == nil {

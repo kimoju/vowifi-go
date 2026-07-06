@@ -59,6 +59,34 @@ func (s *DigestAuthSession) NextWithBody(method, uri string, body []byte) (heade
 	return s.headerName, authz, nil
 }
 
+func (s *DigestAuthSession) UpdateFromResponse(resp SIPResponse) error {
+	if s == nil || !isSIPSuccess(resp.StatusCode) {
+		return nil
+	}
+	return s.UpdateFromAuthenticationInfo(resp.Headers, resp.Body)
+}
+
+func (s *DigestAuthSession) UpdateFromAuthenticationInfo(headers map[string][]string, body []byte) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next, err := updateDigestAuthStateFromInfo(s.state, headers, s.headerName, body)
+	if err != nil {
+		return err
+	}
+	s.state = next
+	return nil
+}
+
+func ApplyDigestAuthenticationInfo(msg SIPRequestMessage, resp SIPResponse) error {
+	if msg.AuthSession == nil {
+		return nil
+	}
+	return msg.AuthSession.UpdateFromResponse(resp)
+}
+
 func bindDigestAuth(binding RegistrationBinding, headerName, header string, state DigestAuthState) RegistrationBinding {
 	binding.AuthHeaderName = firstNonEmpty(headerName, state.headerName, binding.AuthHeaderName)
 	binding.AuthHeader = firstNonEmpty(header, binding.AuthHeader)
