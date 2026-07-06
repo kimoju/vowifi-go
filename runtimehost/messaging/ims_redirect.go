@@ -3,7 +3,7 @@ package messaging
 import (
 	"strings"
 
-	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 const maxIMSMessagingRedirects = 4

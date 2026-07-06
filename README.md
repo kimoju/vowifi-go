@@ -36,7 +36,7 @@ When developing VoHive and vowifi-go side by side, VoHive can point at this
 checkout with a workspace replace:
 
 ```go
-replace github.com/iniwex5/vowifi-go v1.1.2 => ../vowifi-go
+replace github.com/boa-z/vowifi-go v1.1.2 => ../vowifi-go
 ```
 
 ## Documentation

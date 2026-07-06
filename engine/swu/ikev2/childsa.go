@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/iniwex5/vowifi-go/engine/swu/eapaka"
+	"github.com/boa-z/vowifi-go/engine/swu/eapaka"
 )
 
 var ErrInvalidChildSA = errors.New("invalid ikev2 child sa")

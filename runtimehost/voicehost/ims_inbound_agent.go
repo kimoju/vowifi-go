@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 var ErrIMSInboundAgentNotReady = errors.New("ims inbound voice agent not ready")

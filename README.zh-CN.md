@@ -29,7 +29,7 @@ make ci
 如果同时开发 VoHive 和 vowifi-go，可以在 VoHive 工作区中指向本地检出：
 
 ```go
-replace github.com/iniwex5/vowifi-go v1.1.2 => ../vowifi-go
+replace github.com/boa-z/vowifi-go v1.1.2 => ../vowifi-go
 ```
 
 ## 文档

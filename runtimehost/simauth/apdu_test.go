@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	swusim "github.com/iniwex5/vowifi-go/engine/sim"
+	swusim "github.com/boa-z/vowifi-go/engine/sim"
 )
 
 type fakeTransport struct {

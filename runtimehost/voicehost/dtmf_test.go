@@ -123,6 +123,36 @@ func TestBuildAndParseRTPDTMFPacket(t *testing.T) {
 	}
 }
 
+func TestRewriteRTPDTMFPayloadTypeScalesDuration(t *testing.T) {
+	packet, err := BuildRTPDTMFPacket(RTPDTMFPacket{PayloadType: 110, Marker: true, SequenceNumber: 7, Timestamp: 3200, SSRC: 0x01020304, Signal: "9", DurationSamples: 1600, ClockRate: 16000})
+	if err != nil {
+		t.Fatalf("BuildRTPDTMFPacket() error = %v", err)
+	}
+	rewritten, remapped, err := RewriteRTPDTMFPayloadType(packet, map[uint8]int{110: 16000}, map[uint8]int{101: 8000})
+	if err != nil {
+		t.Fatalf("RewriteRTPDTMFPayloadType() error = %v", err)
+	}
+	if !remapped {
+		t.Fatalf("RewriteRTPDTMFPayloadType() remapped=false")
+	}
+	if string(packet) == string(rewritten) {
+		t.Fatalf("RewriteRTPDTMFPayloadType() did not rewrite packet")
+	}
+	if packet[1]&0x7f != 110 {
+		t.Fatalf("source packet mutated: %x", packet)
+	}
+	event, ok, err := ParseRTPDTMFEvent(RTPDTMFClientToIMS, rewritten, map[uint8]int{101: 8000})
+	if err != nil || !ok {
+		t.Fatalf("ParseRTPDTMFEvent(rewritten) ok=%v err=%v", ok, err)
+	}
+	if event.PayloadType != 101 || event.DurationSamples != 800 || event.DurationMS != 100 || event.Signal != "9" || !event.Marker || event.Timestamp != 3200 {
+		t.Fatalf("event=%+v", event)
+	}
+	if same, remapped, err := RewriteRTPDTMFPayloadType(rewritten, map[uint8]int{101: 8000}, map[uint8]int{101: 8000}); err != nil || remapped || string(same) != string(rewritten) {
+		t.Fatalf("RewriteRTPDTMFPayloadType(same) remapped=%v err=%v", remapped, err)
+	}
+}
+
 func TestRTPDTMFRejectsInvalidValues(t *testing.T) {
 	if _, err := BuildRTPDTMFPacket(RTPDTMFPacket{PayloadType: 128, Signal: "1"}); !errors.Is(err, ErrInvalidDTMF) {
 		t.Fatalf("BuildRTPDTMFPacket(payload) err=%v, want ErrInvalidDTMF", err)

@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/iniwex5/vowifi-go/engine/swu/esp"
-	"github.com/iniwex5/vowifi-go/engine/swu/ikev2"
+	"github.com/boa-z/vowifi-go/engine/swu/esp"
+	"github.com/boa-z/vowifi-go/engine/swu/ikev2"
 )
 
 func TestPacketSessionSendsAndReceivesIPv4AndIPv6(t *testing.T) {

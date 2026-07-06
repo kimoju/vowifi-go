@@ -43,5 +43,5 @@ does not require a modem, root privileges, or a real TUN device in CI.
 VoHive can use this repository through its workspace:
 
 ```go
-replace github.com/iniwex5/vowifi-go v1.1.2 => ../vowifi-go
+replace github.com/boa-z/vowifi-go v1.1.2 => ../vowifi-go
 ```

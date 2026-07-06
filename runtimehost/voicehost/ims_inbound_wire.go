@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 type IMSInboundWireServer struct {

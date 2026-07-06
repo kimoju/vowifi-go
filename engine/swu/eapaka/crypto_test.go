@@ -8,7 +8,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/iniwex5/vowifi-go/engine/sim"
+	"github.com/boa-z/vowifi-go/engine/sim"
 )
 
 func TestDeriveKeysAndBuildChallengeResponse(t *testing.T) {

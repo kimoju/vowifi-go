@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
-	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
+	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 func TestIMSUSSDTransportExecuteAndContinue(t *testing.T) {

@@ -188,6 +188,7 @@ func TestSRTPMediaSessionReportsRTPDTMFInRelayTransform(t *testing.T) {
 	events := make(chan RTPDTMFEvent, 1)
 	cfg := testSRTPMediaConfig()
 	cfg.ClientRTPDTMFPayloads = map[uint8]int{110: 16000}
+	cfg.IMSRTPDTMFPayloads = map[uint8]int{101: 8000}
 	cfg.RTPDTMFHandler = func(event RTPDTMFEvent) {
 		events <- event
 	}
@@ -211,8 +212,12 @@ func TestSRTPMediaSessionReportsRTPDTMFInRelayTransform(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnprotectIMSRTP() error = %v", err)
 	}
-	if !bytes.Equal(plain, packet) {
-		t.Fatalf("RTP plain=%x, want %x", plain, packet)
+	wantPlain, remapped, err := RewriteRTPDTMFPayloadType(packet, cfg.ClientRTPDTMFPayloads, cfg.IMSRTPDTMFPayloads)
+	if err != nil || !remapped {
+		t.Fatalf("RewriteRTPDTMFPayloadType() remapped=%v err=%v", remapped, err)
+	}
+	if !bytes.Equal(plain, wantPlain) {
+		t.Fatalf("RTP plain=%x, want %x", plain, wantPlain)
 	}
 	event := readRTPDTMFEvent(t, events)
 	if event.Direction != RTPDTMFClientToIMS || event.PayloadType != 110 || event.Signal != "A" || event.DurationMS != 100 || !event.Marker {

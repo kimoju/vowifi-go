@@ -409,8 +409,12 @@ func TestRTPRelaySessionReportsRTPDTMFEvents(t *testing.T) {
 	if _, err := clientPeer.WriteToUDP(clientPacket, clientEndpoint); err != nil {
 		t.Fatalf("client WriteToUDP() error = %v", err)
 	}
-	if got, _ := readTestUDP(t, imsPeer); !bytes.Equal(got, clientPacket) {
-		t.Fatalf("IMS got=%x, want %x", got, clientPacket)
+	wantClientToIMS, remapped, err := RewriteRTPDTMFPayloadType(clientPacket, map[uint8]int{110: 16000}, map[uint8]int{101: 8000})
+	if err != nil || !remapped {
+		t.Fatalf("RewriteRTPDTMFPayloadType(client) remapped=%v err=%v", remapped, err)
+	}
+	if got, _ := readTestUDP(t, imsPeer); !bytes.Equal(got, wantClientToIMS) {
+		t.Fatalf("IMS got=%x, want %x", got, wantClientToIMS)
 	}
 	clientEvent := readRTPDTMFEvent(t, events)
 	if clientEvent.Direction != RTPDTMFClientToIMS || clientEvent.PayloadType != 110 || clientEvent.Signal != "5" || clientEvent.DurationMS != 100 {
@@ -424,8 +428,12 @@ func TestRTPRelaySessionReportsRTPDTMFEvents(t *testing.T) {
 	if _, err := imsPeer.WriteToUDP(imsPacket, imsEndpoint); err != nil {
 		t.Fatalf("ims WriteToUDP() error = %v", err)
 	}
-	if got, _ := readTestUDP(t, clientPeer); !bytes.Equal(got, imsPacket) {
-		t.Fatalf("client got=%x, want %x", got, imsPacket)
+	wantIMSToClient, remapped, err := RewriteRTPDTMFPayloadType(imsPacket, map[uint8]int{101: 8000}, map[uint8]int{110: 16000})
+	if err != nil || !remapped {
+		t.Fatalf("RewriteRTPDTMFPayloadType(ims) remapped=%v err=%v", remapped, err)
+	}
+	if got, _ := readTestUDP(t, clientPeer); !bytes.Equal(got, wantIMSToClient) {
+		t.Fatalf("client got=%x, want %x", got, wantIMSToClient)
 	}
 	imsEvent := readRTPDTMFEvent(t, events)
 	if imsEvent.Direction != RTPDTMFIMSToClient || imsEvent.PayloadType != 101 || imsEvent.Signal != "#" || !imsEvent.End || imsEvent.DurationMS != 100 {
@@ -435,7 +443,8 @@ func TestRTPRelaySessionReportsRTPDTMFEvents(t *testing.T) {
 	stats := waitRelayStats(t, relay, func(stats RTPRelayStats) bool {
 		return stats.RTPDTMFEvents == 2
 	})
-	if stats.RTPDTMFEvents != 2 || stats.RTPDTMFEndEvents != 1 || stats.RTPDTMFClientToIMSEvents != 1 || stats.RTPDTMFIMSToClientEvents != 1 || stats.RTPDTMFParseErrors != 0 {
+	if stats.RTPDTMFEvents != 2 || stats.RTPDTMFEndEvents != 1 || stats.RTPDTMFClientToIMSEvents != 1 || stats.RTPDTMFIMSToClientEvents != 1 ||
+		stats.RTPDTMFRemappedEvents != 2 || stats.RTPDTMFClientToIMSRemappedEvents != 1 || stats.RTPDTMFIMSToClientRemappedEvents != 1 || stats.RTPDTMFParseErrors != 0 {
 		t.Fatalf("stats=%+v", stats)
 	}
 }

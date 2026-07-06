@@ -12,7 +12,7 @@ import (
 	"hash"
 	"strings"
 
-	"github.com/iniwex5/vowifi-go/engine/sim"
+	"github.com/boa-z/vowifi-go/engine/sim"
 )
 
 const (

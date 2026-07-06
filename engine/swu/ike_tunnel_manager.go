@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/iniwex5/vowifi-go/engine/sim"
-	"github.com/iniwex5/vowifi-go/engine/swu/ikev2"
+	"github.com/boa-z/vowifi-go/engine/sim"
+	"github.com/boa-z/vowifi-go/engine/swu/ikev2"
 )
 
 var ErrInvalidIKETunnelManager = errors.New("invalid swu ike tunnel manager")

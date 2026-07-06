@@ -1,4 +1,4 @@
-module github.com/iniwex5/vowifi-go
+module github.com/boa-z/vowifi-go
 
 go 1.26.3
 

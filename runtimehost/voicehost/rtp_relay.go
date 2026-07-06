@@ -74,6 +74,9 @@ type RTPRelayStats struct {
 	RTPDTMFEndEvents                     uint64
 	RTPDTMFClientToIMSEvents             uint64
 	RTPDTMFIMSToClientEvents             uint64
+	RTPDTMFRemappedEvents                uint64
+	RTPDTMFClientToIMSRemappedEvents     uint64
+	RTPDTMFIMSToClientRemappedEvents     uint64
 	RTPDTMFParseErrors                   uint64
 }
 
@@ -138,6 +141,9 @@ type RTPRelaySession struct {
 	rtpDTMFEndEvents                     atomic.Uint64
 	rtpDTMFClientToIMSEvents             atomic.Uint64
 	rtpDTMFIMSToClientEvents             atomic.Uint64
+	rtpDTMFRemappedEvents                atomic.Uint64
+	rtpDTMFClientToIMSRemappedEvents     atomic.Uint64
+	rtpDTMFIMSToClientRemappedEvents     atomic.Uint64
 	rtpDTMFParseErrors                   atomic.Uint64
 }
 
@@ -211,10 +217,10 @@ func newRTPRelaySession(ctx context.Context, cfg RTPRelayConfig) (*RTPRelaySessi
 		s.bufferSize = 2048
 	}
 	s.wg.Add(4)
-	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, s.allowClientToIMSRTP, &s.clientToIMSRTPPackets, &s.clientToIMSRTPBytes, &s.clientToIMSRTPDrops, s.transforms.ClientToIMSRTP, "", RTPDTMFClientToIMS, s.currentClientRTPDTMFPayloads)
-	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, s.allowIMSToClientRTP, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes, &s.imsToClientRTPDrops, s.transforms.IMSToClientRTP, "", RTPDTMFIMSToClient, s.currentIMSRTPDTMFPayloads)
-	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, nil, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes, &s.clientToIMSRTCPDrops, s.transforms.ClientToIMSRTCP, RTCPFeedbackClientToIMS, "", nil)
-	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, nil, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes, &s.imsToClientRTCPDrops, s.transforms.IMSToClientRTCP, RTCPFeedbackIMSToClient, "", nil)
+	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, s.allowClientToIMSRTP, &s.clientToIMSRTPPackets, &s.clientToIMSRTPBytes, &s.clientToIMSRTPDrops, s.transforms.ClientToIMSRTP, "", RTPDTMFClientToIMS, s.currentClientRTPDTMFPayloads, s.currentIMSRTPDTMFPayloads)
+	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, s.allowIMSToClientRTP, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes, &s.imsToClientRTPDrops, s.transforms.IMSToClientRTP, "", RTPDTMFIMSToClient, s.currentIMSRTPDTMFPayloads, s.currentClientRTPDTMFPayloads)
+	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, nil, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes, &s.clientToIMSRTCPDrops, s.transforms.ClientToIMSRTCP, RTCPFeedbackClientToIMS, "", nil, nil)
+	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, nil, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes, &s.imsToClientRTCPDrops, s.transforms.IMSToClientRTCP, RTCPFeedbackIMSToClient, "", nil, nil)
 	return s, nil
 }
 
@@ -327,6 +333,9 @@ func (s *RTPRelaySession) Stats() RTPRelayStats {
 		RTPDTMFEndEvents:                     s.rtpDTMFEndEvents.Load(),
 		RTPDTMFClientToIMSEvents:             s.rtpDTMFClientToIMSEvents.Load(),
 		RTPDTMFIMSToClientEvents:             s.rtpDTMFIMSToClientEvents.Load(),
+		RTPDTMFRemappedEvents:                s.rtpDTMFRemappedEvents.Load(),
+		RTPDTMFClientToIMSRemappedEvents:     s.rtpDTMFClientToIMSRemappedEvents.Load(),
+		RTPDTMFIMSToClientRemappedEvents:     s.rtpDTMFIMSToClientRemappedEvents.Load(),
 		RTPDTMFParseErrors:                   s.rtpDTMFParseErrors.Load(),
 	}
 }
@@ -362,7 +371,7 @@ func (s *RTPRelaySession) Close() error {
 	return err
 }
 
-func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, allow func() bool, packets, bytes, drops *atomic.Uint64, transform RTPRelayTransform, rtcpDirection RTCPFeedbackDirection, dtmfDirection RTPDTMFDirection, dtmfPayloads func() map[uint8]int) {
+func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, allow func() bool, packets, bytes, drops *atomic.Uint64, transform RTPRelayTransform, rtcpDirection RTCPFeedbackDirection, dtmfDirection RTPDTMFDirection, dtmfPayloads, dtmfTargetPayloads func() map[uint8]int) {
 	defer s.wg.Done()
 	buf := make([]byte, s.bufferSize)
 	for {
@@ -396,7 +405,11 @@ func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn
 			s.inspectRTCPFeedback(rtcpDirection, packet)
 		}
 		if dtmfDirection != "" && transform == nil && dtmfPayloads != nil {
-			s.inspectRTPDTMF(dtmfDirection, packet, dtmfPayloads())
+			var targetPayloads map[uint8]int
+			if dtmfTargetPayloads != nil {
+				targetPayloads = dtmfTargetPayloads()
+			}
+			packet = s.processRTPDTMF(dtmfDirection, packet, dtmfPayloads(), targetPayloads)
 		}
 		if _, err := out.WriteToUDP(packet, dst); err != nil {
 			drops.Add(1)
@@ -405,6 +418,31 @@ func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn
 		packets.Add(1)
 		bytes.Add(uint64(len(packet)))
 	}
+}
+
+func (s *RTPRelaySession) processRTPDTMF(direction RTPDTMFDirection, packet []byte, sourcePayloads, targetPayloads map[uint8]int) []byte {
+	if s == nil || len(sourcePayloads) == 0 {
+		return packet
+	}
+	summary, err := InspectRTPDTMF(direction, packet, sourcePayloads, s.rtpDTMFHandler)
+	if err != nil {
+		s.rtpDTMFParseErrors.Add(1)
+		return packet
+	}
+	if summary.Events == 0 {
+		return packet
+	}
+	s.recordRTPDTMFSummary(direction, summary)
+	rewritten, remapped, err := RewriteRTPDTMFPayloadType(packet, sourcePayloads, targetPayloads)
+	if err != nil {
+		s.rtpDTMFParseErrors.Add(1)
+		return packet
+	}
+	if remapped {
+		s.recordRTPDTMFRemap(direction)
+		return rewritten
+	}
+	return packet
 }
 
 func (s *RTPRelaySession) inspectRTPDTMF(direction RTPDTMFDirection, packet []byte, payloads map[uint8]int) {
@@ -419,6 +457,13 @@ func (s *RTPRelaySession) inspectRTPDTMF(direction RTPDTMFDirection, packet []by
 	if summary.Events == 0 {
 		return
 	}
+	s.recordRTPDTMFSummary(direction, summary)
+}
+
+func (s *RTPRelaySession) recordRTPDTMFSummary(direction RTPDTMFDirection, summary RTPDTMFSummary) {
+	if s == nil {
+		return
+	}
 	s.rtpDTMFEvents.Add(summary.Events)
 	s.rtpDTMFEndEvents.Add(summary.EndEvents)
 	switch direction {
@@ -426,6 +471,19 @@ func (s *RTPRelaySession) inspectRTPDTMF(direction RTPDTMFDirection, packet []by
 		s.rtpDTMFClientToIMSEvents.Add(summary.Events)
 	case RTPDTMFIMSToClient:
 		s.rtpDTMFIMSToClientEvents.Add(summary.Events)
+	}
+}
+
+func (s *RTPRelaySession) recordRTPDTMFRemap(direction RTPDTMFDirection) {
+	if s == nil {
+		return
+	}
+	s.rtpDTMFRemappedEvents.Add(1)
+	switch direction {
+	case RTPDTMFClientToIMS:
+		s.rtpDTMFClientToIMSRemappedEvents.Add(1)
+	case RTPDTMFIMSToClient:
+		s.rtpDTMFIMSToClientRemappedEvents.Add(1)
 	}
 }
 

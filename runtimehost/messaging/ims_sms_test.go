@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 func TestIMSSMSTransportSendsSIPMessage(t *testing.T) {

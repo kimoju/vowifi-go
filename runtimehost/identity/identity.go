@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/iniwex5/vowifi-go/runtimehost/simauth"
+	"github.com/boa-z/vowifi-go/runtimehost/simauth"
 )
 
 const (

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 func TestIMSInboundAgentInviteAckAndBye(t *testing.T) {

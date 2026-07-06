@@ -164,6 +164,45 @@ func ParseRTPDTMFEvent(direction RTPDTMFDirection, packet []byte, payloadTypes m
 	}, true, nil
 }
 
+func RewriteRTPDTMFPayloadType(packet []byte, sourcePayloadTypes, targetPayloadTypes map[uint8]int) ([]byte, bool, error) {
+	if len(sourcePayloadTypes) == 0 || len(targetPayloadTypes) == 0 {
+		return packet, false, nil
+	}
+	header, payload, err := parseRTPPacket(packet)
+	if err != nil {
+		return packet, false, err
+	}
+	sourceClock, ok := sourcePayloadTypes[header.PayloadType]
+	if !ok {
+		return packet, false, nil
+	}
+	if sourceClock <= 0 {
+		sourceClock = DefaultRTPDTMFClockRate
+	}
+	if len(payload) < 4 {
+		return packet, false, fmt.Errorf("%w: RTP DTMF payload too short", ErrInvalidDTMF)
+	}
+	if RTPDTMFSignalFromEventCode(payload[0]) == "" {
+		return packet, false, fmt.Errorf("%w: unsupported RTP DTMF event %d", ErrInvalidDTMF, payload[0])
+	}
+	targetPayload, targetClock, ok := chooseRTPDTMFTargetPayload(header.PayloadType, sourceClock, targetPayloadTypes)
+	if !ok {
+		return packet, false, nil
+	}
+	if targetClock <= 0 {
+		targetClock = DefaultRTPDTMFClockRate
+	}
+	duration := binary.BigEndian.Uint16(payload[2:4])
+	targetDuration := scaleRTPDTMFDuration(duration, sourceClock, targetClock)
+	if header.PayloadType == targetPayload && duration == targetDuration {
+		return packet, false, nil
+	}
+	out := append([]byte(nil), packet...)
+	out[1] = (out[1] & 0x80) | (targetPayload & 0x7f)
+	binary.BigEndian.PutUint16(out[header.PayloadOffset+2:header.PayloadOffset+4], targetDuration)
+	return out, true, nil
+}
+
 func NormalizeRTPDTMFSignal(signal string) (string, error) {
 	signal = strings.ToUpper(strings.TrimSpace(signal))
 	if signal == "FLASH" {
@@ -229,6 +268,7 @@ type rtpPacketHeader struct {
 	SequenceNumber uint16
 	Timestamp      uint32
 	SSRC           uint32
+	PayloadOffset  int
 }
 
 func parseRTPPacket(packet []byte) (rtpPacketHeader, []byte, error) {
@@ -267,6 +307,7 @@ func parseRTPPacket(packet []byte) (rtpPacketHeader, []byte, error) {
 		SequenceNumber: binary.BigEndian.Uint16(packet[2:4]),
 		Timestamp:      binary.BigEndian.Uint32(packet[4:8]),
 		SSRC:           binary.BigEndian.Uint32(packet[8:12]),
+		PayloadOffset:  headerLen,
 	}, packet[headerLen:end], nil
 }
 
@@ -305,4 +346,60 @@ func cloneRTPDTMFPayloadTypes(in map[uint8]int) map[uint8]int {
 		out[payload] = clockRate
 	}
 	return out
+}
+
+func chooseRTPDTMFTargetPayload(sourcePayload uint8, sourceClock int, targetPayloadTypes map[uint8]int) (uint8, int, bool) {
+	if len(targetPayloadTypes) == 0 {
+		return 0, 0, false
+	}
+	if targetClock, ok := targetPayloadTypes[sourcePayload]; ok {
+		if targetClock <= 0 {
+			targetClock = DefaultRTPDTMFClockRate
+		}
+		return sourcePayload, targetClock, true
+	}
+	if sourceClock <= 0 {
+		sourceClock = DefaultRTPDTMFClockRate
+	}
+	var bestPayload uint8
+	var bestClock int
+	found := false
+	for payload, clock := range targetPayloadTypes {
+		if clock <= 0 {
+			clock = DefaultRTPDTMFClockRate
+		}
+		if clock == sourceClock && (!found || payload < bestPayload) {
+			bestPayload = payload
+			bestClock = clock
+			found = true
+		}
+	}
+	if found {
+		return bestPayload, bestClock, true
+	}
+	for payload, clock := range targetPayloadTypes {
+		if clock <= 0 {
+			clock = DefaultRTPDTMFClockRate
+		}
+		if !found || payload < bestPayload {
+			bestPayload = payload
+			bestClock = clock
+			found = true
+		}
+	}
+	return bestPayload, bestClock, found
+}
+
+func scaleRTPDTMFDuration(duration uint16, sourceClock, targetClock int) uint16 {
+	if duration == 0 || sourceClock <= 0 || targetClock <= 0 || sourceClock == targetClock {
+		return duration
+	}
+	scaled := (uint64(duration)*uint64(targetClock) + uint64(sourceClock/2)) / uint64(sourceClock)
+	if scaled == 0 {
+		return 1
+	}
+	if scaled > 0xffff {
+		return 0xffff
+	}
+	return uint16(scaled)
 }

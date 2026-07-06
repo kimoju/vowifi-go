@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/iniwex5/vowifi-go/engine/sim"
-	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
+	"github.com/boa-z/vowifi-go/engine/sim"
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 func TestIMSOutboundAgentAppliesDigestAuthenticationInfo(t *testing.T) {

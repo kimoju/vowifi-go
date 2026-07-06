@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
+	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
 )
 
 var ErrDeliveryNotFound = errors.New("delivery not found")

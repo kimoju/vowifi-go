@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
+	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
 )
 
 func TestSegmentSMSGSM7(t *testing.T) {

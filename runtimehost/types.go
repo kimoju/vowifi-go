@@ -10,13 +10,13 @@ import (
 	"sync"
 	"time"
 
-	swusim "github.com/iniwex5/vowifi-go/engine/sim"
-	"github.com/iniwex5/vowifi-go/engine/swu"
-	"github.com/iniwex5/vowifi-go/runtimehost/eventhost"
-	"github.com/iniwex5/vowifi-go/runtimehost/identity"
-	"github.com/iniwex5/vowifi-go/runtimehost/messaging"
-	"github.com/iniwex5/vowifi-go/runtimehost/voiceclient"
-	"github.com/iniwex5/vowifi-go/runtimehost/voicehost"
+	swusim "github.com/boa-z/vowifi-go/engine/sim"
+	"github.com/boa-z/vowifi-go/engine/swu"
+	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
+	"github.com/boa-z/vowifi-go/runtimehost/identity"
+	"github.com/boa-z/vowifi-go/runtimehost/messaging"
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
+	"github.com/boa-z/vowifi-go/runtimehost/voicehost"
 )
 
 var ErrAPDUBusy = errors.New("apdu busy")
