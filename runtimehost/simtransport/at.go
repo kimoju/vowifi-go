@@ -15,6 +15,7 @@ var (
 	hexTokenRE = regexp.MustCompile(`(?i)"([0-9a-f]+)"`)
 	cmeErrorRE = regexp.MustCompile(`(?i)\+CME ERROR:\s*([^\r\n]+)`)
 	cchoLineRE = regexp.MustCompile(`(?im)^\s*\+CCHO:\s*(\d+)\s*$`)
+	crsmLineRE = regexp.MustCompile(`(?im)^\s*\+CRSM:\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(?:"([0-9a-fA-F]*)"|([0-9a-fA-F]+)))?\s*$`)
 	intTokenRE = regexp.MustCompile(`[-+]?\d+`)
 )
 
@@ -34,6 +35,12 @@ type APDUResult struct {
 	SW2  byte
 }
 
+type CRSMResult struct {
+	Data string
+	SW1  byte
+	SW2  byte
+}
+
 func (r APDUResult) Status() uint16 {
 	return uint16(r.SW1)<<8 | uint16(r.SW2)
 }
@@ -43,6 +50,18 @@ func (r APDUResult) StatusString() string {
 }
 
 func (r APDUResult) Success() bool {
+	return r.SW1 == 0x90 && r.SW2 == 0x00
+}
+
+func (r CRSMResult) Status() uint16 {
+	return uint16(r.SW1)<<8 | uint16(r.SW2)
+}
+
+func (r CRSMResult) StatusString() string {
+	return fmt.Sprintf("%02X%02X", r.SW1, r.SW2)
+}
+
+func (r CRSMResult) Success() bool {
 	return r.SW1 == 0x90 && r.SW2 == 0x00
 }
 
@@ -118,6 +137,22 @@ func (a *Adapter) TransmitAPDU(channel int, hexAPDU string) (string, error) {
 	return resp.Hex, nil
 }
 
+func (a *Adapter) ReadCRSMBinary(fileID uint16, offset, length int, pathID string) (CRSMResult, error) {
+	if offset < 0 || offset > 0xffff {
+		return CRSMResult{}, fmt.Errorf("invalid CRSM offset: %d", offset)
+	}
+	p3 := crsmLengthByte(length)
+	return a.runCRSM(176, int(fileID), offset>>8, offset&0xff, p3, "", pathID)
+}
+
+func (a *Adapter) ReadCRSMRecord(fileID uint16, record, length int, pathID string) (CRSMResult, error) {
+	if record <= 0 || record > 0xff {
+		return CRSMResult{}, fmt.Errorf("invalid CRSM record: %d", record)
+	}
+	p3 := crsmLengthByte(length)
+	return a.runCRSM(178, int(fileID), record, 4, p3, "", pathID)
+}
+
 func ParseAPDUResult(out string) (APDUResult, error) {
 	if err := parseATError(out); err != nil {
 		return APDUResult{}, err
@@ -141,6 +176,65 @@ func ParseAPDUResult(out string) (APDUResult, error) {
 		SW1:  byte(sw1),
 		SW2:  byte(sw2),
 	}, nil
+}
+
+func ParseCRSMResult(out string) (CRSMResult, error) {
+	if err := parseATError(out); err != nil {
+		return CRSMResult{}, err
+	}
+	m := crsmLineRE.FindStringSubmatch(out)
+	if len(m) == 0 {
+		return CRSMResult{}, fmt.Errorf("parse CRSM result from %q", compactAT(out))
+	}
+	sw1, err := parseCRSMStatusByte(m[1])
+	if err != nil {
+		return CRSMResult{}, fmt.Errorf("invalid CRSM SW1: %w", err)
+	}
+	sw2, err := parseCRSMStatusByte(m[2])
+	if err != nil {
+		return CRSMResult{}, fmt.Errorf("invalid CRSM SW2: %w", err)
+	}
+	data := firstNonEmpty(m[3], m[4])
+	if data != "" {
+		var normalizeErr error
+		data, normalizeErr = normalizeHex(data)
+		if normalizeErr != nil {
+			return CRSMResult{}, fmt.Errorf("invalid CRSM data: %w", normalizeErr)
+		}
+	}
+	return CRSMResult{Data: data, SW1: sw1, SW2: sw2}, nil
+}
+
+func (a *Adapter) runCRSM(command, fileID, p1, p2, p3 int, data, pathID string) (CRSMResult, error) {
+	if a == nil || a.Control == nil {
+		return CRSMResult{}, errors.New("nil AT control")
+	}
+	if fileID <= 0 || fileID > 0xffff {
+		return CRSMResult{}, fmt.Errorf("invalid CRSM file ID: %d", fileID)
+	}
+	if !validCRSMByte(command) || !validCRSMByte(p1) || !validCRSMByte(p2) || !validCRSMByte(p3) {
+		return CRSMResult{}, fmt.Errorf("invalid CRSM command parameters: command=%d p1=%d p2=%d p3=%d", command, p1, p2, p3)
+	}
+	cmd := fmt.Sprintf("AT+CRSM=%d,%d,%d,%d,%d", command, fileID, p1, p2, p3)
+	if strings.TrimSpace(data) != "" || strings.TrimSpace(pathID) != "" {
+		hexData, err := normalizeOptionalHex(data)
+		if err != nil {
+			return CRSMResult{}, fmt.Errorf("invalid CRSM data: %w", err)
+		}
+		cmd += fmt.Sprintf(`,"%s"`, hexData)
+	}
+	if strings.TrimSpace(pathID) != "" {
+		path, err := normalizeOptionalHex(pathID)
+		if err != nil {
+			return CRSMResult{}, fmt.Errorf("invalid CRSM path ID: %w", err)
+		}
+		cmd += fmt.Sprintf(`,"%s"`, path)
+	}
+	out, err := a.Control.ExecuteATSilent(cmd, a.timeout())
+	if err != nil {
+		return CRSMResult{}, err
+	}
+	return ParseCRSMResult(out)
 }
 
 func (a *Adapter) timeout() time.Duration {
@@ -174,6 +268,31 @@ func parseCCHOChannel(out string) (int, bool) {
 	return parseFirstInt(out)
 }
 
+func parseCRSMStatusByte(value string) (byte, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 || n > 0xff {
+		return 0, fmt.Errorf("out of range: %d", n)
+	}
+	return byte(n), nil
+}
+
+func crsmLengthByte(length int) int {
+	if length <= 0 || length > 256 {
+		return 0
+	}
+	if length == 256 {
+		return 0
+	}
+	return length
+}
+
+func validCRSMByte(n int) bool {
+	return n >= 0 && n <= 0xff
+}
+
 func extractResponseHex(out string) (string, bool) {
 	if m := hexTokenRE.FindAllStringSubmatch(out, -1); len(m) > 0 {
 		return m[len(m)-1][1], true
@@ -195,6 +314,13 @@ func parseFirstInt(out string) (int, bool) {
 	}
 	n, err := strconv.Atoi(token)
 	return n, err == nil
+}
+
+func normalizeOptionalHex(in string) (string, error) {
+	if strings.TrimSpace(in) == "" {
+		return "", nil
+	}
+	return normalizeHex(in)
 }
 
 func normalizeHex(in string) (string, error) {
@@ -222,6 +348,15 @@ func looksHex(s string) bool {
 		return false
 	}
 	return true
+}
+
+func firstNonEmpty(items ...string) string {
+	for _, item := range items {
+		if strings.TrimSpace(item) != "" {
+			return strings.TrimSpace(item)
+		}
+	}
+	return ""
 }
 
 func compactAT(out string) string {

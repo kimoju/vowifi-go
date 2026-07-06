@@ -1,11 +1,13 @@
 package identity
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/boa-z/vowifi-go/runtimehost/simauth"
+	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
 )
 
 const (
@@ -256,6 +258,107 @@ func ReadISIMIdentity(access interface {
 		return id, nil
 	}
 	return Identity{}, errors.Join(readErrs...)
+}
+
+func ReadISIMIdentityCRSM(access interface {
+	ReadCRSMBinary(fileID uint16, offset, length int, pathID string) (simtransport.CRSMResult, error)
+	ReadCRSMRecord(fileID uint16, record, length int, pathID string) (simtransport.CRSMResult, error)
+}, pathID string) (Identity, error) {
+	if access == nil {
+		return Identity{}, errors.New("nil ISIM CRSM access")
+	}
+	var id Identity
+	var readErrs []error
+
+	if raw, _, err := readCRSMTransparentEF(access, 0x6F02, pathID); err == nil {
+		id.IMPI = decodeISIMString(raw)
+	} else {
+		readErrs = append(readErrs, fmt.Errorf("CRSM read EF_IMPI: %w", err))
+	}
+	if raw, _, err := readCRSMTransparentEF(access, 0x6F03, pathID); err == nil {
+		id.Domain = decodeISIMString(raw)
+	} else {
+		readErrs = append(readErrs, fmt.Errorf("CRSM read EF_DOMAIN: %w", err))
+	}
+	if records, _, err := readCRSMLinearFixedEF(access, 0x6F04, pathID, 16); err == nil {
+		for _, rec := range records {
+			if impu := decodeISIMString(rec); impu != "" && !containsString(id.IMPU, impu) {
+				id.IMPU = append(id.IMPU, impu)
+			}
+		}
+	} else {
+		readErrs = append(readErrs, fmt.Errorf("CRSM read EF_IMPU: %w", err))
+	}
+
+	if strings.TrimSpace(id.IMPI) != "" || strings.TrimSpace(id.Domain) != "" || len(id.IMPU) > 0 {
+		return id, nil
+	}
+	return Identity{}, errors.Join(readErrs...)
+}
+
+func readCRSMTransparentEF(access interface {
+	ReadCRSMBinary(fileID uint16, offset, length int, pathID string) (simtransport.CRSMResult, error)
+}, fid uint16, pathID string) ([]byte, simtransport.CRSMResult, error) {
+	resp, err := access.ReadCRSMBinary(fid, 0, 256, pathID)
+	if err != nil {
+		return nil, resp, err
+	}
+	if !resp.Success() {
+		return nil, resp, fmt.Errorf("READ BINARY %04X failed: SW=%s", fid, resp.StatusString())
+	}
+	raw, err := decodeCRSMHex(resp.Data)
+	if err != nil {
+		return nil, resp, err
+	}
+	return raw, resp, nil
+}
+
+func readCRSMLinearFixedEF(access interface {
+	ReadCRSMRecord(fileID uint16, record, length int, pathID string) (simtransport.CRSMResult, error)
+}, fid uint16, pathID string, maxRecords int) ([][]byte, simtransport.CRSMResult, error) {
+	if maxRecords <= 0 {
+		maxRecords = 16
+	}
+	var records [][]byte
+	var last simtransport.CRSMResult
+	for rec := 1; rec <= maxRecords; rec++ {
+		resp, err := access.ReadCRSMRecord(fid, rec, 256, pathID)
+		last = resp
+		if err != nil {
+			return nil, resp, err
+		}
+		if isCRSMRecordNotFound(resp.SW1, resp.SW2) {
+			break
+		}
+		if !resp.Success() {
+			return nil, resp, fmt.Errorf("READ RECORD %04X #%d failed: SW=%s", fid, rec, resp.StatusString())
+		}
+		raw, err := decodeCRSMHex(resp.Data)
+		if err != nil {
+			return nil, resp, err
+		}
+		if len(raw) == 0 {
+			break
+		}
+		records = append(records, raw)
+	}
+	return records, last, nil
+}
+
+func decodeCRSMHex(data string) ([]byte, error) {
+	if strings.TrimSpace(data) == "" {
+		return nil, nil
+	}
+	raw, err := hex.DecodeString(strings.TrimSpace(data))
+	if err != nil {
+		return nil, fmt.Errorf("decode CRSM data: %w", err)
+	}
+	return raw, nil
+}
+
+func isCRSMRecordNotFound(sw1, sw2 byte) bool {
+	return (sw1 == 0x6A && (sw2 == 0x82 || sw2 == 0x83)) ||
+		(sw2 == 0x6A && (sw1 == 0x82 || sw1 == 0x83))
 }
 
 func decodeISIMString(raw []byte) string {

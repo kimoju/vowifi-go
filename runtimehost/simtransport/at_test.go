@@ -106,6 +106,82 @@ func TestAdapterCSIMOnBasicChannel(t *testing.T) {
 	}
 }
 
+func TestAdapterCRSMReadsTransparentAndRecordEFs(t *testing.T) {
+	at := &fakeAT{responses: []string{
+		"\r\n+CRSM: 144,0,\"8003616263\"\r\n\r\nOK\r\n",
+		"\r\n+CRSM: 106,130,\"\"\r\n\r\nOK\r\n",
+	}}
+	adapter := NewAdapter(at)
+
+	binary, err := adapter.ReadCRSMBinary(0x6F02, 258, 3, "7fff")
+	if err != nil {
+		t.Fatalf("ReadCRSMBinary() error = %v", err)
+	}
+	if binary.Data != "8003616263" || binary.StatusString() != "9000" || !binary.Success() {
+		t.Fatalf("binary=%+v", binary)
+	}
+	record, err := adapter.ReadCRSMRecord(0x6F04, 2, 256, "")
+	if err != nil {
+		t.Fatalf("ReadCRSMRecord() error = %v", err)
+	}
+	if record.Data != "" || record.StatusString() != "6A82" || record.Success() {
+		t.Fatalf("record=%+v", record)
+	}
+
+	want := []string{
+		`AT+CRSM=176,28418,1,2,3,"","7FFF"`,
+		`AT+CRSM=178,28420,2,4,0`,
+	}
+	if !reflect.DeepEqual(at.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", at.calls, want)
+	}
+}
+
+func TestParseCRSMResultVariants(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		data string
+		sw   string
+	}{
+		{name: "quoted data", in: "\r\n+CRSM: 144,0,\"DEADBEEF\"\r\nOK\r\n", data: "DEADBEEF", sw: "9000"},
+		{name: "unquoted data", in: "+CRSM: 98,131,beef", data: "BEEF", sw: "6283"},
+		{name: "no data", in: "+CRSM: 106,130", data: "", sw: "6A82"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseCRSMResult(tt.in)
+			if err != nil {
+				t.Fatalf("ParseCRSMResult() error = %v", err)
+			}
+			if got.Data != tt.data || got.StatusString() != tt.sw {
+				t.Fatalf("result=%+v, want data=%s sw=%s", got, tt.data, tt.sw)
+			}
+		})
+	}
+}
+
+func TestCRSMErrorsAndValidation(t *testing.T) {
+	if _, err := ParseCRSMResult("\r\n+CME ERROR: SIM failure\r\n"); err == nil || err.Error() != "AT CME ERROR: SIM failure" {
+		t.Fatalf("ParseCRSMResult(CME) err=%v", err)
+	}
+	if _, err := ParseCRSMResult("+CRSM: 144,300"); err == nil || !strings.Contains(err.Error(), "invalid CRSM SW2") {
+		t.Fatalf("ParseCRSMResult(bad sw) err=%v", err)
+	}
+	if _, err := ParseCRSMResult("+CRSM: 144,0,\"ABC\""); err == nil || !strings.Contains(err.Error(), "invalid CRSM data") {
+		t.Fatalf("ParseCRSMResult(bad data) err=%v", err)
+	}
+	if _, err := NewAdapter(&fakeAT{}).ReadCRSMBinary(0x6F02, -1, 1, ""); err == nil {
+		t.Fatal("ReadCRSMBinary(negative offset) err=nil, want error")
+	}
+	if _, err := NewAdapter(&fakeAT{}).ReadCRSMRecord(0x6F04, 0, 1, ""); err == nil {
+		t.Fatal("ReadCRSMRecord(record 0) err=nil, want error")
+	}
+	if _, err := NewAdapter(&fakeAT{}).ReadCRSMBinary(0x6F02, 0, 1, "bad-path"); err == nil || !strings.Contains(err.Error(), "invalid CRSM path ID") {
+		t.Fatalf("ReadCRSMBinary(bad path) err=%v", err)
+	}
+}
+
 func TestParseAPDUResultVariants(t *testing.T) {
 	tests := []struct {
 		name string

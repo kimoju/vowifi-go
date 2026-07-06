@@ -3,8 +3,11 @@ package identity
 import (
 	"encoding/hex"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
 )
 
 type isimTransportFake struct {
@@ -143,6 +146,93 @@ type partialAccess struct {
 
 func (a partialAccess) GetISIMIdentity() (Identity, error) { return a.id, nil }
 
+type crsmIdentityFake struct {
+	binaryCalls []string
+	recordCalls []string
+	binary      []simtransport.CRSMResult
+	records     []simtransport.CRSMResult
+}
+
+func (f *crsmIdentityFake) ReadCRSMBinary(fileID uint16, offset, length int, pathID string) (simtransport.CRSMResult, error) {
+	f.binaryCalls = append(f.binaryCalls, crsmCall(fileID, offset, length, pathID))
+	if len(f.binary) == 0 {
+		return simtransport.CRSMResult{SW1: 0x6A, SW2: 0x82}, nil
+	}
+	resp := f.binary[0]
+	f.binary = f.binary[1:]
+	return resp, nil
+}
+
+func (f *crsmIdentityFake) ReadCRSMRecord(fileID uint16, record, length int, pathID string) (simtransport.CRSMResult, error) {
+	f.recordCalls = append(f.recordCalls, crsmCall(fileID, record, length, pathID))
+	if len(f.records) == 0 {
+		return simtransport.CRSMResult{SW1: 0x6A, SW2: 0x82}, nil
+	}
+	resp := f.records[0]
+	f.records = f.records[1:]
+	return resp, nil
+}
+
+func TestReadISIMIdentityCRSMReadsIMPIIMPUAndDomain(t *testing.T) {
+	ft := &crsmIdentityFake{
+		binary: []simtransport.CRSMResult{
+			crsmOK(isimTLVString("001010123456789@private.example.test")),
+			crsmOK(isimLengthString("ims.example.test")),
+		},
+		records: []simtransport.CRSMResult{
+			crsmOK(padRecord(isimTLVString("sip:001010123456789@ims.example.test"), 48)),
+			crsmOK(padRecord(isimLengthString("tel:+15550101000"), 48)),
+			{SW1: 0x6A, SW2: 0x83},
+		},
+	}
+
+	id, err := ReadISIMIdentityCRSM(ft, "7fff")
+	if err != nil {
+		t.Fatalf("ReadISIMIdentityCRSM() error = %v", err)
+	}
+	if id.IMPI != "001010123456789@private.example.test" || id.Domain != "ims.example.test" {
+		t.Fatalf("identity = %+v", id)
+	}
+	wantIMPU := []string{"sip:001010123456789@ims.example.test", "tel:+15550101000"}
+	if !reflect.DeepEqual(id.IMPU, wantIMPU) {
+		t.Fatalf("IMPU = %#v, want %#v", id.IMPU, wantIMPU)
+	}
+	if want := []string{"6F02/0/256/7fff", "6F03/0/256/7fff"}; !reflect.DeepEqual(ft.binaryCalls, want) {
+		t.Fatalf("binary calls = %#v, want %#v", ft.binaryCalls, want)
+	}
+	if want := []string{"6F04/1/256/7fff", "6F04/2/256/7fff", "6F04/3/256/7fff"}; !reflect.DeepEqual(ft.recordCalls, want) {
+		t.Fatalf("record calls = %#v, want %#v", ft.recordCalls, want)
+	}
+}
+
+func TestReadISIMIdentityCRSMReturnsPartialIdentity(t *testing.T) {
+	ft := &crsmIdentityFake{
+		binary: []simtransport.CRSMResult{
+			crsmOK(isimTLVString("001010123456789@private.example.test")),
+			{SW1: 0x6A, SW2: 0x82},
+		},
+		records: []simtransport.CRSMResult{{SW1: 0x6A, SW2: 0x82}},
+	}
+	id, err := ReadISIMIdentityCRSM(ft, "")
+	if err != nil {
+		t.Fatalf("ReadISIMIdentityCRSM() error = %v", err)
+	}
+	if id.IMPI == "" || id.Domain != "" || len(id.IMPU) != 0 {
+		t.Fatalf("identity = %+v, want partial IMPI only", id)
+	}
+}
+
+func TestReadISIMIdentityCRSMReturnsErrorWhenNoEFCanBeRead(t *testing.T) {
+	ft := &crsmIdentityFake{}
+	_, err := ReadISIMIdentityCRSM(ft, "")
+	if err == nil {
+		t.Fatal("ReadISIMIdentityCRSM() err=nil, want joined read error")
+	}
+	if !strings.Contains(err.Error(), "CRSM read EF_IMPI") {
+		t.Fatalf("err = %v, want CRSM EF read context", err)
+	}
+}
+
 func TestReadISIMIdentityReturnsErrorWhenNoEFCanBeRead(t *testing.T) {
 	ft := &isimTransportFake{responses: []string{"6A82", "6A82", "6A82"}}
 	_, err := ReadISIMIdentity(ft)
@@ -165,6 +255,19 @@ func isimLengthString(s string) []byte {
 func hexResponse(body []byte) string {
 	out := append(append([]byte(nil), body...), 0x90, 0x00)
 	return strings.ToUpper(hex.EncodeToString(out))
+}
+
+func crsmOK(body []byte) simtransport.CRSMResult {
+	return simtransport.CRSMResult{Data: strings.ToUpper(hex.EncodeToString(body)), SW1: 0x90, SW2: 0x00}
+}
+
+func crsmCall(fileID uint16, p1, length int, pathID string) string {
+	return strings.ToUpper(hex.EncodeToString([]byte{byte(fileID >> 8), byte(fileID)})) + "/" +
+		strings.Join([]string{
+			strconv.Itoa(p1),
+			strconv.Itoa(length),
+			pathID,
+		}, "/")
 }
 
 func padRecord(body []byte, n int) []byte {
