@@ -141,6 +141,158 @@ func TestParseEntitlementResponseExtractsEmergencyXMLVariants(t *testing.T) {
 	}
 }
 
+func TestParseEntitlementResponseCapturesTS43JSONVariants(t *testing.T) {
+	body := []byte(`{
+		"entitlementStatus": "1000",
+		"responseId": "json-response",
+		"websheet": {"url": "https://example.test/e911/json"},
+		"userDataToken": "json-token",
+		"mime-type": "text/html; charset=utf-8",
+		"websheetTitle": "Update emergency address",
+		"emergency-address": {
+			"address-line1": "1 Main St",
+			"address_line2": "Apt 9",
+			"locality": "Atlanta",
+			"region": "GA",
+			"postal-code": "30301",
+			"country-code": "US",
+			"unknown-address-field": "ignored"
+		},
+		"emergency-pdn": {
+			"name": "ims-emergency",
+			"type": "IPv4v6",
+			"apn": "sos",
+			"realm": "ims.mnc410.mcc310.3gppnetwork.org"
+		},
+		"location-validation-status": "validated",
+		"unknown-field": {"nested": "ignored"}
+	}`)
+
+	result, err := parseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("parseEntitlementResponse() error = %v", err)
+	}
+	if result.Status != 1000 || result.ResponseID != "json-response" {
+		t.Fatalf("status=%d responseID=%v", result.Status, result.ResponseID)
+	}
+	if result.WebsheetURL != "https://example.test/e911/json" || result.UserData != "json-token" {
+		t.Fatalf("websheet=%q token=%q", result.WebsheetURL, result.UserData)
+	}
+	if result.ContentType != "text/html; charset=utf-8" || result.Title != "Update emergency address" {
+		t.Fatalf("contentType=%q title=%q", result.ContentType, result.Title)
+	}
+	if got := result.EmergencyAddress["street"]; got != "1 Main St" {
+		t.Fatalf("street=%q", got)
+	}
+	if got := result.EmergencyAddress["unit"]; got != "Apt 9" {
+		t.Fatalf("unit=%q", got)
+	}
+	if got := result.EmergencyAddress["city"]; got != "Atlanta" {
+		t.Fatalf("city=%q", got)
+	}
+	if got := result.EmergencyAddress["state"]; got != "GA" {
+		t.Fatalf("state=%q", got)
+	}
+	if got := result.EmergencyAddress["postal_code"]; got != "30301" {
+		t.Fatalf("postal_code=%q", got)
+	}
+	if got := result.EmergencyAddress["country"]; got != "US" {
+		t.Fatalf("country=%q", got)
+	}
+	if _, ok := result.EmergencyAddress["unknown-address-field"]; ok {
+		t.Fatalf("unknown emergency address field was retained: %+v", result.EmergencyAddress)
+	}
+	if result.PDN != "ims-emergency" || result.PDNType != "IPv4v6" || result.APN != "sos" || result.Realm != "ims.mnc410.mcc310.3gppnetwork.org" {
+		t.Fatalf("pdn=%q type=%q apn=%q realm=%q", result.PDN, result.PDNType, result.APN, result.Realm)
+	}
+	if result.LocationValidationStatus != "validated" {
+		t.Fatalf("validation status=%q", result.LocationValidationStatus)
+	}
+}
+
+func TestParseEntitlementResponseCapturesTS43XMLVariants(t *testing.T) {
+	body := []byte(`
+		<ts43:response xmlns:ts43="urn:test">
+			<status-code>1000</status-code>
+			<response-id>xml-response</response-id>
+			<endpoint>https://example.test/e911/xml</endpoint>
+			<auth-token>xml-token</auth-token>
+			<content-type>text/html</content-type>
+			<title>XML emergency address</title>
+			<emergency-address>
+				<street-address>22 Market St</street-address>
+				<city>Denver</city>
+				<state>CO</state>
+				<zip>80202</zip>
+				<country>US</country>
+			</emergency-address>
+			<pdn name="ims-emergency" type="IPv6" apn="sos" realm="ims.mnc260.mcc310.3gppnetwork.org"/>
+			<validation-status>pending</validation-status>
+			<unknown name="ignored"/>
+		</ts43:response>`)
+
+	result, err := parseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("parseEntitlementResponse() error = %v", err)
+	}
+	if result.Status != 1000 || result.ResponseID != "xml-response" {
+		t.Fatalf("status=%d responseID=%v", result.Status, result.ResponseID)
+	}
+	if result.Endpoint != "https://example.test/e911/xml" || result.UserData != "xml-token" {
+		t.Fatalf("endpoint=%q token=%q", result.Endpoint, result.UserData)
+	}
+	if got := result.EmergencyAddress["street"]; got != "22 Market St" {
+		t.Fatalf("street=%q", got)
+	}
+	if got := result.EmergencyAddress["city"]; got != "Denver" {
+		t.Fatalf("city=%q", got)
+	}
+	if got := result.EmergencyAddress["postal_code"]; got != "80202" {
+		t.Fatalf("postal_code=%q", got)
+	}
+	if result.PDN != "ims-emergency" || result.PDNType != "IPv6" || result.APN != "sos" || result.Realm != "ims.mnc260.mcc310.3gppnetwork.org" {
+		t.Fatalf("pdn=%q type=%q apn=%q realm=%q", result.PDN, result.PDNType, result.APN, result.Realm)
+	}
+	if result.LocationValidationStatus != "pending" {
+		t.Fatalf("validation status=%q", result.LocationValidationStatus)
+	}
+	ws := websheetFromEntitlement("", result)
+	if ws.URL != "https://example.test/e911/xml" || ws.UserData != "xml-token" || ws.Title != "XML emergency address" {
+		t.Fatalf("websheet=%+v", ws)
+	}
+}
+
+func TestParseEntitlementResponseHandlesEmptyAndUnknownFields(t *testing.T) {
+	body := []byte(`[{
+		"status": 1000,
+		"token": "",
+		"websheet-url": "",
+		"content-type": "",
+		"title": "",
+		"emergency-address": {
+			"line1": "",
+			"city": ""
+		},
+		"unknown-field": {
+			"nested": "ignored"
+		}
+	}]`)
+
+	result, err := parseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("parseEntitlementResponse() error = %v", err)
+	}
+	if result.UserData != "" || result.WebsheetURL != "" {
+		t.Fatalf("websheet=%q token=%q", result.WebsheetURL, result.UserData)
+	}
+	if result.ContentType != "text/html" || result.Title != "Emergency address" {
+		t.Fatalf("defaults contentType=%q title=%q", result.ContentType, result.Title)
+	}
+	if len(result.EmergencyAddress) != 0 {
+		t.Fatalf("empty emergency address fields should be ignored: %+v", result.EmergencyAddress)
+	}
+}
+
 func TestStartEmergencyAddressUpdateSendsCachedTokenToEntitlement(t *testing.T) {
 	client := &fakeHTTPClient{responses: []*HTTPResponse{{
 		StatusCode: 200,

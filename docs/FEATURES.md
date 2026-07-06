@@ -33,11 +33,13 @@ protocol layers needed by VoHive:
   reading, and USIM/ISIM AKA AUTHENTICATE primitives
 - carrier presets and JSON carrier overrides, including AT&T TS.43/E911
   configuration for native `310/280` and `310/410` profiles
-- TS.43-style E911 entitlement bootstrap, token/websheet handling, RAND/AUTN
-  challenge response through the AKA provider, and EAP-AKA/AKA' relay packet
-  response generation with Any/FullAuth/Permanent Identity selection, KDF
-  negotiation, Notification ACK, and terminal Success/Failure handling, plus
-  Client-Error handling for entitlement challenges
+- TS.43-style E911 entitlement bootstrap, JSON/XML response parsing for common
+  emergency address, PDN/APN/realm, endpoint, and location validation status
+  variants, token/websheet handling, RAND/AUTN challenge response through the
+  AKA provider, and EAP-AKA/AKA' relay packet response generation with
+  Any/FullAuth/Permanent Identity selection, KDF negotiation, Notification ACK,
+  and terminal Success/Failure handling, plus Client-Error handling for
+  entitlement challenges
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
   AKA nonce extraction, Digest/AKAv1-MD5 and AKAv2-MD5 authorization material,
   IMS `Security-Client` proposal generation, `Security-Server` parsing/
@@ -200,7 +202,9 @@ protocol layers needed by VoHive:
   protection during media transforms
 - RTP stream quality helpers for per-SSRC packet/loss/duplicate/out-of-order,
   extended-sequence, and interarrival-jitter tracking, plus RTCP Receiver
-  Report block generation from observed RTP streams
+  Report block generation from observed RTP streams, relay-side clear-RTP
+  reception snapshots, and generated Receiver Report send paths toward IMS or
+  client media legs
 - RTP telephone-event DTMF helpers for RFC 4733-style packet construction,
   RFC 4733-style packet-train generation with marker/sequence/timestamp/end
   repetition semantics, SDP dynamic payload discovery, relay-side event

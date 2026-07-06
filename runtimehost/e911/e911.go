@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 
 	"github.com/boa-z/vowifi-go/engine/sim"
@@ -600,7 +599,11 @@ func consumeEntitlementField(key string, value any, out *entitlementResult) {
 
 func normalizeEntitlementKey(key string) string {
 	key = strings.ToLower(strings.TrimSpace(key))
+	if i := strings.LastIndex(key, ":"); i >= 0 {
+		key = key[i+1:]
+	}
 	var b strings.Builder
+	b.Grow(len(key))
 	for _, r := range key {
 		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
 			b.WriteRune(r)
@@ -610,7 +613,7 @@ func normalizeEntitlementKey(key string) string {
 }
 
 func looksXMLBody(body []byte) bool {
-	return strings.HasPrefix(strings.TrimSpace(string(body)), "<")
+	return bytes.HasPrefix(bytes.TrimSpace(body), []byte("<"))
 }
 
 func setString(dst *string, value any) {
@@ -646,18 +649,18 @@ func boolValue(v any) (bool, bool) {
 		return x != 0, true
 	case int:
 		return x != 0, true
+	case int64:
+		return x != 0, true
 	case json.Number:
-		n, err := strconv.ParseInt(string(x), 10, 64)
-		if err == nil {
-			return n != 0, true
-		}
+		n, err := x.Int64()
+		return n != 0, err == nil
 	}
 	return false, false
 }
 
 func isEmergencyAddressKey(canonical string) bool {
 	switch canonical {
-	case "emergencyaddress", "e911address", "address", "civicaddress", "serviceaddress", "registeredaddress":
+	case "emergencyaddress", "e911address", "address", "civicaddress", "serviceaddress", "registeredaddress", "locationaddress":
 		return true
 	default:
 		return false
@@ -666,7 +669,7 @@ func isEmergencyAddressKey(canonical string) bool {
 
 func isPDNKey(canonical string) bool {
 	switch canonical {
-	case "pdn", "pdninfo", "pdnconnection", "emergencypdn", "emergencybearer", "imsbearer":
+	case "pdn", "pdninfo", "pdnconfiguration", "pdnconnection", "emergencypdn", "emergencybearer", "imsbearer":
 		return true
 	default:
 		return false
@@ -695,7 +698,7 @@ func consumePDNField(key string, value any, out *entitlementResult) {
 	switch normalizeEntitlementKey(key) {
 	case "name", "id", "pdn", "pdnname", "pdnid", "emergencypdn":
 		setString(&out.PDN, value)
-	case "type", "pdntype", "emergencypdntype":
+	case "type", "pdntype", "emergencypdntype", "iptype":
 		setString(&out.PDNType, value)
 	case "apn", "accesspointname", "emergencyapn", "imsapn":
 		setString(&out.APN, value)
@@ -711,10 +714,20 @@ func parseEmergencyAddress(value any, out *entitlementResult) {
 	case map[string]any:
 		for key, item := range x {
 			collectEmergencyAddressField(key, item, out)
+			parseEmergencyAddress(item, out)
 		}
 	case []any:
 		for _, item := range x {
 			parseEmergencyAddress(item, out)
+		}
+	case string:
+		if s := strings.TrimSpace(x); s != "" {
+			if out.EmergencyAddress == nil {
+				out.EmergencyAddress = make(map[string]string)
+			}
+			if out.EmergencyAddress["formatted"] == "" {
+				out.EmergencyAddress["formatted"] = s
+			}
 		}
 	}
 }
@@ -729,18 +742,24 @@ func collectEmergencyAddressField(key string, value any, out *entitlementResult)
 		return
 	}
 	switch canonical {
-	case "street", "street1", "streetaddress", "addressline1":
+	case "street", "street1", "streetaddress", "addressline1", "address1", "line1":
 		canonical = "street"
-	case "street2", "addressline2", "unit", "apartment", "suite":
+	case "street2", "addressline2", "address2", "line2", "unit", "apartment", "apt", "suite":
 		canonical = "unit"
-	case "city", "locality":
+	case "city", "locality", "municipality":
 		canonical = "city"
 	case "state", "region", "province":
 		canonical = "state"
-	case "postalcode", "zip", "zipcode":
+	case "postalcode", "postcode", "zip", "zipcode":
 		canonical = "postal_code"
 	case "country", "countrycode":
 		canonical = "country"
+	case "latitude", "lat":
+		canonical = "latitude"
+	case "longitude", "lon", "lng":
+		canonical = "longitude"
+	case "formatted", "formattedaddress", "fulladdress", "displayaddress":
+		canonical = "formatted"
 	default:
 		return
 	}
@@ -1103,6 +1122,8 @@ func numberValue(v any) (int, bool) {
 		return int(x), true
 	case int:
 		return x, true
+	case int64:
+		return int(x), true
 	case json.Number:
 		n, err := x.Int64()
 		return int(n), err == nil
@@ -1119,6 +1140,10 @@ func stringValue(v any) string {
 	switch x := v.(type) {
 	case string:
 		return x
+	case json.Number:
+		return x.String()
+	case fmt.Stringer:
+		return x.String()
 	default:
 		return ""
 	}
