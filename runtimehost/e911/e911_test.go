@@ -256,6 +256,49 @@ func TestStartEmergencyAddressUpdateHandlesEAPRelayAuthenticationReject(t *testi
 	}
 }
 
+func TestStartEmergencyAddressUpdateHandlesEAPRelayBiddingDown(t *testing.T) {
+	identity := "310280233641503@private.att.net"
+	relayPacket := signedEAPRelayChallengeWithEncryptedAttrs(t, identity, e911AKAResult(), eapaka.BiddingAttribute(true))
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{StatusCode: 200, Body: []byte(`{"status":6004,"response-id":24,"eap-relay-packet":"` + relayPacket + `"}`)},
+		{StatusCode: 200, Body: []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=1"}`)},
+	}}
+	aka := &fakeAKAProvider{}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity:    Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280", SIPUsername: identity},
+		AKAProvider: aka,
+		Client:      client,
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=1" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	if aka.calls != 1 || len(client.requests) != 2 {
+		t.Fatalf("AKA calls=%d requests=%d", aka.calls, len(client.requests))
+	}
+	answer := decodeEntitlementAnswer(t, client.requests[1].Body)
+	if _, ok := answer["aka-res"]; ok {
+		t.Fatalf("bidding-down answer must not include AKA RES: %s", client.requests[1].Body)
+	}
+	if _, ok := answer["aka-ck"]; ok {
+		t.Fatalf("bidding-down answer must not include AKA CK: %s", client.requests[1].Body)
+	}
+	packet := decodeRelayPacket(t, answer)
+	if packet.Code != eapaka.CodeResponse || packet.Subtype != eapaka.SubtypeAuthenticationReject || len(packet.Attributes) != 0 {
+		t.Fatalf("bidding-down relay response=%+v", packet)
+	}
+}
+
 func TestStartEmergencyAddressUpdateHandlesEAPRelayIdentityThenChallenge(t *testing.T) {
 	identity := "310280233641503@private.att.net"
 	identityRequest, identityRequestRaw := eapRelayIdentityRequestRaw(t)

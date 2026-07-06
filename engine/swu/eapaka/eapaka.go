@@ -56,6 +56,7 @@ const (
 	AttributeNextReauthID    uint8 = 133
 	AttributeCheckcode       uint8 = 134
 	AttributeResultInd       uint8 = 135
+	AttributeBidding         uint8 = 136
 )
 
 const (
@@ -252,6 +253,14 @@ func SelectedVersionAttribute(version uint16) Attribute {
 	return Attribute{Type: AttributeSelectedVersion, Data: b[:]}
 }
 
+func BiddingAttribute(preferAKAPrime bool) Attribute {
+	data := []byte{0, 0}
+	if preferAKAPrime {
+		data[0] = 0x80
+	}
+	return Attribute{Type: AttributeBidding, Data: data}
+}
+
 func RESAttribute(res []byte) Attribute {
 	bits := len(res) * 8
 	data := make([]byte, 2, 2+len(res))
@@ -408,6 +417,13 @@ func (a Attribute) VersionListValue() ([]uint16, error) {
 
 func (a Attribute) SelectedVersionValue() (uint16, error) {
 	return a.directUint16Value()
+}
+
+func (a Attribute) BiddingValue() (bool, error) {
+	if len(a.Data) != 2 {
+		return false, fmt.Errorf("%w: bidding value length %d", ErrInvalidAttribute, len(a.Data))
+	}
+	return a.Data[0]&0x80 != 0, nil
 }
 
 func (a Attribute) RESValue() ([]byte, uint16, error) {

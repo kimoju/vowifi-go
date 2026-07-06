@@ -118,6 +118,44 @@ func TestBuildChallengeResponseEchoesResultInd(t *testing.T) {
 	}
 }
 
+func TestBuildChallengeResponseRejectsBiddingDown(t *testing.T) {
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	req := signedChallengeRequestWithEncryptedAttrs(t, identity, aka, BiddingAttribute(true))
+	_, _, err := BuildChallengeResponse(identity, req, aka)
+	if !errors.Is(err, ErrBiddingDown) {
+		t.Fatalf("BuildChallengeResponse() err=%v, want ErrBiddingDown", err)
+	}
+}
+
+func TestBuildChallengeResponseIgnoresNonPreferredBidding(t *testing.T) {
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	req := signedChallengeRequestWithEncryptedAttrs(t, identity, aka, BiddingAttribute(false))
+	resp, keys, err := BuildChallengeResponse(identity, req, aka)
+	if err != nil {
+		t.Fatalf("BuildChallengeResponse() error = %v", err)
+	}
+	if _, ok := FindAttribute(resp.Attributes, AttributeRES); !ok {
+		t.Fatalf("response missing AT_RES: %+v", resp)
+	}
+	raw, err := resp.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	if err := VerifyMAC(keys.KAut, raw, nil); err != nil {
+		t.Fatalf("VerifyMAC(response) error = %v", err)
+	}
+}
+
 func TestBuildIdentityResponseSelectsSupportedVersion(t *testing.T) {
 	request := Packet{
 		Code:       CodeRequest,

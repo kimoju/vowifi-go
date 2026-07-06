@@ -507,16 +507,22 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 				return AKAChallengeResult{}, fmt.Errorf("%w: identity is empty", ErrInvalidAuthConfig)
 			}
 			eapResp, eapKeys, err = eapaka.BuildChallengeResponseWithCheckcode(identity, cfg.Request, aka, cfg.IdentityTranscript)
+			if errors.Is(err, eapaka.ErrBiddingDown) {
+				eapResp, err = eapaka.BuildAuthenticationRejectResponse(cfg.Request)
+				authFailure = true
+			}
 			if err != nil {
 				return AKAChallengeResult{}, err
 			}
-			if attrs, _, err := eapaka.DecryptChallengeEncryptedAttributes(cfg.Request, eapKeys); err != nil {
-				return AKAChallengeResult{}, err
-			} else if len(attrs) > 0 {
-				encryptedAttributes = attrs
-				identityState, err = eapaka.IdentityStateFromAttributes(attrs)
-				if err != nil {
+			if !authFailure {
+				if attrs, _, err := eapaka.DecryptChallengeEncryptedAttributes(cfg.Request, eapKeys); err != nil {
 					return AKAChallengeResult{}, err
+				} else if len(attrs) > 0 {
+					encryptedAttributes = attrs
+					identityState, err = eapaka.IdentityStateFromAttributes(attrs)
+					if err != nil {
+						return AKAChallengeResult{}, err
+					}
 				}
 			}
 		}

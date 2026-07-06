@@ -32,6 +32,7 @@ var (
 	ErrInvalidMAC           = errors.New("invalid eap-aka mac")
 	ErrInvalidKeyMaterial   = errors.New("invalid eap-aka key material")
 	ErrInvalidReauth        = errors.New("invalid eap-aka reauthentication")
+	ErrBiddingDown          = errors.New("eap-aka bidding down detected")
 	ErrUnsupportedKDF       = errors.New("unsupported eap-aka prime kdf")
 )
 
@@ -130,6 +131,11 @@ func BuildChallengeResponseWithCheckcode(identity string, request Packet, aka si
 	}
 	if err := verifyChallengeMAC(request.Type, keys.KAut, requestRaw); err != nil {
 		return Packet{}, Keys{}, err
+	}
+	if biddingDown, err := challengeBiddingDown(request); err != nil {
+		return Packet{}, Keys{}, err
+	} else if biddingDown {
+		return Packet{}, Keys{}, ErrBiddingDown
 	}
 	includeCheckcode, err := verifyChallengeCheckcode(request, identityPackets)
 	if err != nil {
@@ -292,6 +298,21 @@ func supportsVersion(versions []uint16, supported uint16) bool {
 		}
 	}
 	return false
+}
+
+func challengeBiddingDown(request Packet) (bool, error) {
+	if request.Type != 0 && request.Type != TypeAKA {
+		return false, nil
+	}
+	attr, ok := FindAttribute(request.Attributes, AttributeBidding)
+	if !ok {
+		return false, nil
+	}
+	preferAKAPrime, err := attr.BiddingValue()
+	if err != nil {
+		return false, err
+	}
+	return preferAKAPrime, nil
 }
 
 func BuildSynchronizationFailureResponse(request Packet, auts []byte) (Packet, error) {

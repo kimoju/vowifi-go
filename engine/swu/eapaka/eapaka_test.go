@@ -207,6 +207,49 @@ func TestVersionAttributes(t *testing.T) {
 	}
 }
 
+func TestBiddingAttribute(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		preferAKAPrime     bool
+		want               string
+		wantPreferAKAPrime bool
+	}{
+		{
+			name:               "prefer AKA prime",
+			preferAKAPrime:     true,
+			want:               "88018000",
+			wantPreferAKAPrime: true,
+		},
+		{
+			name:               "no preference",
+			preferAKAPrime:     false,
+			want:               "88010000",
+			wantPreferAKAPrime: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := BiddingAttribute(tc.preferAKAPrime).MarshalBinary()
+			if err != nil {
+				t.Fatalf("MarshalBinary() error = %v", err)
+			}
+			if hex.EncodeToString(raw) != tc.want {
+				t.Fatalf("AT_BIDDING=%x, want %s", raw, tc.want)
+			}
+			attrs, err := ParseAttributes(raw)
+			if err != nil {
+				t.Fatalf("ParseAttributes() error = %v", err)
+			}
+			got, err := attrs[0].BiddingValue()
+			if err != nil {
+				t.Fatalf("BiddingValue() error = %v", err)
+			}
+			if got != tc.wantPreferAKAPrime {
+				t.Fatalf("prefer AKA'=%t, want %t", got, tc.wantPreferAKAPrime)
+			}
+		})
+	}
+}
+
 func TestCheckcodeAttribute(t *testing.T) {
 	packets := [][]byte{
 		{CodeRequest, 1, 0, 8, TypeAKA, SubtypeIdentity, 0, 0},
