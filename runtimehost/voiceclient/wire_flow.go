@@ -346,10 +346,10 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 		if !sipResponseMatchesRequest(resp, msg) {
 			continue
 		}
-		if !isProvisionalResponse(resp.StatusCode, msg.Method) {
+		if !isSIPProvisionalResponse(resp.StatusCode) {
 			return resp, nil
 		}
-		if onProvisional != nil {
+		if onProvisional != nil && shouldReportSIPProvisionalResponse(msg.Method) {
 			if err := onProvisional(ctx, msg, resp); err != nil {
 				return SIPResponse{}, err
 			}

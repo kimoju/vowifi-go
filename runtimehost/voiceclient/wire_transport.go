@@ -145,8 +145,13 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 	maxInterval := sipMaxRetransmitInterval(timeout, t.MaxRetransmitInterval)
 	deadline := time.Now().Add(timeout)
 	retransmits := 0
+	gotResponse := false
 	for {
-		if err := conn.SetReadDeadline(nextSIPReadDeadline(deadline, interval)); err != nil {
+		readInterval := interval
+		if gotResponse {
+			readInterval = time.Until(deadline)
+		}
+		if err := conn.SetReadDeadline(nextSIPReadDeadline(deadline, readInterval)); err != nil {
 			return RegisterResponse{}, err
 		}
 		n, err := conn.Read(buf)
@@ -161,6 +166,10 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 			if !sipResponseMatchesRequest(resp, attempt) {
 				continue
 			}
+			if isSIPProvisionalResponse(resp.StatusCode) {
+				gotResponse = true
+				continue
+			}
 			return resp, nil
 		}
 		if ctx.Err() != nil {
@@ -169,7 +178,7 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 		if !isSIPTimeout(err) || !time.Now().Before(deadline) {
 			return RegisterResponse{}, err
 		}
-		if shouldSIPRetransmit(retransmits, t.MaxRetransmits) {
+		if !gotResponse && shouldSIPRetransmit(retransmits, t.MaxRetransmits) {
 			if _, writeErr := conn.Write(wire); writeErr != nil {
 				return RegisterResponse{}, writeErr
 			}
@@ -215,6 +224,9 @@ func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target
 			return RegisterResponse{}, err
 		}
 		if sipResponseMatchesRequest(resp, attempt) {
+			if isSIPProvisionalResponse(resp.StatusCode) {
+				continue
+			}
 			return resp, nil
 		}
 	}

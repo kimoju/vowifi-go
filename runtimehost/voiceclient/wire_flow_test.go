@@ -377,6 +377,83 @@ func TestWireSIPFlowRegisterFailsOverRecoverableResponse(t *testing.T) {
 	}
 }
 
+func TestWireSIPFlowWaitsForNonInviteFinalAfterProvisional(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	serverErr := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			serverErr <- "read error: " + err.Error()
+			return
+		}
+		req, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			serverErr <- "parse request error: " + err.Error()
+			return
+		}
+		trying, err := BuildSIPResponseWire(req, 100, "Trying", nil, nil)
+		if err != nil {
+			serverErr <- "build trying error: " + err.Error()
+			return
+		}
+		if _, err := pc.WriteTo(trying, addr); err != nil {
+			serverErr <- "write trying error: " + err.Error()
+			return
+		}
+		_ = pc.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+		n, _, err = pc.ReadFrom(buf)
+		if err == nil {
+			serverErr <- "unexpected retransmit after 100 Trying: " + string(append([]byte(nil), buf[:n]...))
+			return
+		}
+		accepted, err := BuildSIPResponseWire(req, 202, "Accepted", nil, nil)
+		if err != nil {
+			serverErr <- "build accepted error: " + err.Error()
+			return
+		}
+		if _, err := pc.WriteTo(accepted, addr); err != nil {
+			serverErr <- "write accepted error: " + err.Error()
+			return
+		}
+		serverErr <- ""
+	}()
+
+	flow := &WireSIPFlow{
+		Network:               "udp",
+		ServerAddr:            pc.LocalAddr().String(),
+		Timeout:               time.Second,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+	}
+	defer flow.Close()
+	resp, err := flow.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sip:+18005551212@example",
+		Headers: map[string]string{
+			"To":           "<sip:+18005551212@example>",
+			"From":         "<sip:user@example>;tag=sms",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-provisional-message",
+			"CSeq":         "1 MESSAGE",
+			"Max-Forwards": "70",
+		},
+		Body: []byte("hello"),
+	})
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequest() response=%+v err=%v", resp, err)
+	}
+	if msg := <-serverErr; msg != "" {
+		t.Fatal(msg)
+	}
+}
+
 func TestWireSIPFlowIgnoresStaleMatchedHeadersOnReusedUDPFlow(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

@@ -452,6 +452,79 @@ func TestWireRegisterTransportRetransmitsUDPRegister(t *testing.T) {
 	}
 }
 
+func TestWireRegisterTransportWaitsForFinalAfterProvisional(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	serverErr := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			serverErr <- "read error: " + err.Error()
+			return
+		}
+		req, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			serverErr <- "parse request error: " + err.Error()
+			return
+		}
+		trying, err := BuildSIPResponseWire(req, 100, "Trying", nil, nil)
+		if err != nil {
+			serverErr <- "build trying error: " + err.Error()
+			return
+		}
+		if _, err := pc.WriteTo(trying, addr); err != nil {
+			serverErr <- "write trying error: " + err.Error()
+			return
+		}
+		_ = pc.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+		n, _, err = pc.ReadFrom(buf)
+		if err == nil {
+			serverErr <- "unexpected retransmit after 100 Trying: " + string(append([]byte(nil), buf[:n]...))
+			return
+		}
+		ok, err := BuildSIPResponseWire(req, 200, "OK", nil, nil)
+		if err != nil {
+			serverErr <- "build ok error: " + err.Error()
+			return
+		}
+		if _, err := pc.WriteTo(ok, addr); err != nil {
+			serverErr <- "write ok error: " + err.Error()
+			return
+		}
+		serverErr <- ""
+	}()
+
+	resp, err := WireRegisterTransport{
+		Network:               "udp",
+		ServerAddr:            pc.LocalAddr().String(),
+		Timeout:               time.Second,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+	}.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "provisional-register",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("RoundTripRegister() response=%+v err=%v", resp, err)
+	}
+	if msg := <-serverErr; msg != "" {
+		t.Fatal(msg)
+	}
+}
+
 func TestWireRegisterTransportIgnoresMismatchedUDPResponse(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -744,6 +817,80 @@ func TestWireSIPTransportIgnoresUDPKeepaliveBeforeResponse(t *testing.T) {
 	}
 	if resp.StatusCode != 202 {
 		t.Fatalf("response=%+v", resp)
+	}
+}
+
+func TestWireSIPTransportWaitsForNonInviteFinalAfterProvisional(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	serverErr := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			serverErr <- "read error: " + err.Error()
+			return
+		}
+		req, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			serverErr <- "parse request error: " + err.Error()
+			return
+		}
+		trying, err := BuildSIPResponseWire(req, 100, "Trying", nil, nil)
+		if err != nil {
+			serverErr <- "build trying error: " + err.Error()
+			return
+		}
+		if _, err := pc.WriteTo(trying, addr); err != nil {
+			serverErr <- "write trying error: " + err.Error()
+			return
+		}
+		_ = pc.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+		n, _, err = pc.ReadFrom(buf)
+		if err == nil {
+			serverErr <- "unexpected retransmit after 100 Trying: " + string(append([]byte(nil), buf[:n]...))
+			return
+		}
+		accepted, err := BuildSIPResponseWire(req, 202, "Accepted", nil, nil)
+		if err != nil {
+			serverErr <- "build accepted error: " + err.Error()
+			return
+		}
+		if _, err := pc.WriteTo(accepted, addr); err != nil {
+			serverErr <- "write accepted error: " + err.Error()
+			return
+		}
+		serverErr <- ""
+	}()
+
+	resp, err := WireSIPTransport{
+		Network:               "udp",
+		ServerAddr:            pc.LocalAddr().String(),
+		Timeout:               time.Second,
+		RetransmitInterval:    20 * time.Millisecond,
+		MaxRetransmitInterval: 20 * time.Millisecond,
+	}.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"To":           "<sip:callee@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Call-ID":      "provisional-message",
+			"CSeq":         "1 MESSAGE",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequest() response=%+v err=%v", resp, err)
+	}
+	if msg := <-serverErr; msg != "" {
+		t.Fatal(msg)
 	}
 }
 

@@ -146,10 +146,10 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 		if !sipResponseMatchesRequest(resp, attempt) {
 			continue
 		}
-		if !isProvisionalResponse(resp.StatusCode, attempt.Method) {
+		if !isSIPProvisionalResponse(resp.StatusCode) {
 			return resp, nil
 		}
-		if onProvisional != nil {
+		if onProvisional != nil && shouldReportSIPProvisionalResponse(attempt.Method) {
 			if err := onProvisional(ctx, attempt, resp); err != nil {
 				return SIPResponse{}, err
 			}
@@ -237,10 +237,10 @@ func readFinalSIPResponse(ctx context.Context, reader *bufio.Reader, msg SIPRequ
 		if !sipResponseMatchesRequest(resp, msg) {
 			continue
 		}
-		if !isProvisionalResponse(resp.StatusCode, msg.Method) {
+		if !isSIPProvisionalResponse(resp.StatusCode) {
 			return resp, nil
 		}
-		if onProvisional != nil {
+		if onProvisional != nil && shouldReportSIPProvisionalResponse(msg.Method) {
 			if err := onProvisional(ctx, msg, resp); err != nil {
 				return SIPResponse{}, err
 			}
@@ -248,8 +248,12 @@ func readFinalSIPResponse(ctx context.Context, reader *bufio.Reader, msg SIPRequ
 	}
 }
 
-func isProvisionalResponse(code int, method string) bool {
-	return strings.EqualFold(strings.TrimSpace(method), "INVITE") && code >= 100 && code < 200
+func isSIPProvisionalResponse(code int) bool {
+	return code >= 100 && code < 200
+}
+
+func shouldReportSIPProvisionalResponse(method string) bool {
+	return strings.EqualFold(strings.TrimSpace(method), "INVITE")
 }
 
 func transportName(network string) string {
