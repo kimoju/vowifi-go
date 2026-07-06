@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"strings"
 
 	"github.com/iniwex5/vowifi-go/engine/sim"
 )
@@ -225,6 +226,37 @@ func BuildAuthenticationRejectResponse(request Packet) (Packet, error) {
 	}, nil
 }
 
+func BuildIdentityResponse(identity string, request Packet) (Packet, error) {
+	if request.Code != CodeRequest || request.Subtype != SubtypeIdentity {
+		return Packet{}, fmt.Errorf("%w: not an AKA identity request", ErrInvalidAKAChallenge)
+	}
+	if !isAKAType(request.Type) {
+		return Packet{}, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
+	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return Packet{}, fmt.Errorf("%w: identity is empty", ErrInvalidKeyMaterial)
+	}
+	attrs := []Attribute{IdentityAttribute(identity)}
+	if versionAttr, ok := FindAttribute(request.Attributes, AttributeVersionList); ok {
+		versions, err := versionAttr.VersionListValue()
+		if err != nil {
+			return BuildClientErrorResponse(request, ClientErrorUnableToProcessPacket)
+		}
+		if !supportsVersion(versions, SupportedVersion) {
+			return BuildClientErrorResponse(request, ClientErrorUnsupportedVersion)
+		}
+		attrs = append(attrs, SelectedVersionAttribute(SupportedVersion))
+	}
+	return Packet{
+		Code:       CodeResponse,
+		Identifier: request.Identifier,
+		Type:       request.Type,
+		Subtype:    SubtypeIdentity,
+		Attributes: attrs,
+	}, nil
+}
+
 func BuildNotificationResponse(request Packet) (Packet, bool, error) {
 	return buildNotificationResponse(request, nil, false)
 }
@@ -251,6 +283,15 @@ func BuildClientErrorResponse(request Packet, code uint16) (Packet, error) {
 		Subtype:    SubtypeClientError,
 		Attributes: []Attribute{ClientErrorCodeAttribute(code)},
 	}, nil
+}
+
+func supportsVersion(versions []uint16, supported uint16) bool {
+	for _, version := range versions {
+		if version == supported {
+			return true
+		}
+	}
+	return false
 }
 
 func BuildSynchronizationFailureResponse(request Packet, auts []byte) (Packet, error) {

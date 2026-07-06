@@ -515,12 +515,9 @@ func buildEAPRelayIdentityAnswer(result entitlementResult, opts eapRelayIdentity
 	if identity == "" {
 		return "", nil, true, ErrChallengeNotImplemented
 	}
-	packet := eapaka.Packet{
-		Code:       eapaka.CodeResponse,
-		Identifier: request.Identifier,
-		Type:       request.Type,
-		Subtype:    eapaka.SubtypeIdentity,
-		Attributes: []eapaka.Attribute{eapaka.IdentityAttribute(identity)},
+	packet, err := eapaka.BuildIdentityResponse(identity, request)
+	if err != nil {
+		return "", nil, true, err
 	}
 	raw, err := packet.MarshalBinary()
 	if err != nil {

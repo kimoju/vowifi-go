@@ -118,6 +118,68 @@ func TestBuildChallengeResponseEchoesResultInd(t *testing.T) {
 	}
 }
 
+func TestBuildIdentityResponseSelectsSupportedVersion(t *testing.T) {
+	request := Packet{
+		Code:       CodeRequest,
+		Identifier: 4,
+		Type:       TypeAKA,
+		Subtype:    SubtypeIdentity,
+		Attributes: []Attribute{
+			FullAuthIDReqAttribute(),
+			VersionListAttribute(2, SupportedVersion),
+		},
+	}
+	response, err := BuildIdentityResponse("310280233641503@private.att.net", request)
+	if err != nil {
+		t.Fatalf("BuildIdentityResponse() error = %v", err)
+	}
+	if response.Code != CodeResponse || response.Identifier != request.Identifier || response.Subtype != SubtypeIdentity {
+		t.Fatalf("response=%+v", response)
+	}
+	if _, ok := FindAttribute(response.Attributes, AttributeIdentity); !ok {
+		t.Fatal("missing AT_IDENTITY")
+	}
+	selectedAttr, ok := FindAttribute(response.Attributes, AttributeSelectedVersion)
+	if !ok {
+		t.Fatalf("missing AT_SELECTED_VERSION: %+v", response.Attributes)
+	}
+	selected, err := selectedAttr.SelectedVersionValue()
+	if err != nil {
+		t.Fatalf("SelectedVersionValue() error = %v", err)
+	}
+	if selected != SupportedVersion {
+		t.Fatalf("selected=%d", selected)
+	}
+}
+
+func TestBuildIdentityResponseRejectsUnsupportedVersionList(t *testing.T) {
+	request := Packet{
+		Code:       CodeRequest,
+		Identifier: 5,
+		Type:       TypeAKA,
+		Subtype:    SubtypeIdentity,
+		Attributes: []Attribute{VersionListAttribute(2, 3)},
+	}
+	response, err := BuildIdentityResponse("310280233641503@private.att.net", request)
+	if err != nil {
+		t.Fatalf("BuildIdentityResponse() error = %v", err)
+	}
+	if response.Code != CodeResponse || response.Subtype != SubtypeClientError {
+		t.Fatalf("response=%+v", response)
+	}
+	attr, ok := FindAttribute(response.Attributes, AttributeClientErrorCode)
+	if !ok {
+		t.Fatalf("missing AT_CLIENT_ERROR_CODE: %+v", response.Attributes)
+	}
+	code, err := attr.ClientErrorCodeValue()
+	if err != nil {
+		t.Fatalf("ClientErrorCodeValue() error = %v", err)
+	}
+	if code != ClientErrorUnsupportedVersion {
+		t.Fatalf("client error=%d", code)
+	}
+}
+
 func TestEncryptDecryptAttributes(t *testing.T) {
 	kEncr := bytes.Repeat([]byte{0x11}, 16)
 	iv := bytes.Repeat([]byte{0x22}, 16)

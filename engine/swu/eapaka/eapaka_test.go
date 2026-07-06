@@ -179,6 +179,34 @@ func TestNotificationAndClientErrorAttributes(t *testing.T) {
 	}
 }
 
+func TestVersionAttributes(t *testing.T) {
+	raw, err := MarshalAttributes([]Attribute{
+		VersionListAttribute(2, SupportedVersion),
+		SelectedVersionAttribute(SupportedVersion),
+	})
+	if err != nil {
+		t.Fatalf("MarshalAttributes() error = %v", err)
+	}
+	attrs, err := ParseAttributes(raw)
+	if err != nil {
+		t.Fatalf("ParseAttributes() error = %v", err)
+	}
+	versions, err := attrs[0].VersionListValue()
+	if err != nil {
+		t.Fatalf("VersionListValue() error = %v", err)
+	}
+	if len(versions) != 2 || versions[0] != 2 || versions[1] != SupportedVersion {
+		t.Fatalf("versions=%v", versions)
+	}
+	selected, err := attrs[1].SelectedVersionValue()
+	if err != nil {
+		t.Fatalf("SelectedVersionValue() error = %v", err)
+	}
+	if selected != SupportedVersion {
+		t.Fatalf("selected=%d", selected)
+	}
+}
+
 func TestCheckcodeAttribute(t *testing.T) {
 	packets := [][]byte{
 		{CodeRequest, 1, 0, 8, TypeAKA, SubtypeIdentity, 0, 0},

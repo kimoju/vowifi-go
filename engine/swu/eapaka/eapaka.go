@@ -74,6 +74,8 @@ const (
 	ClientErrorRANDNotFresh           uint16 = 3
 )
 
+const SupportedVersion uint16 = 1
+
 var (
 	ErrInvalidPacket    = errors.New("invalid eap-aka packet")
 	ErrInvalidAttribute = errors.New("invalid eap-aka attribute")
@@ -234,6 +236,22 @@ func IdentityAttribute(identity string) Attribute {
 	return VariableAttribute(AttributeIdentity, []byte(identity))
 }
 
+func VersionListAttribute(versions ...uint16) Attribute {
+	value := make([]byte, 0, len(versions)*2)
+	for _, version := range versions {
+		var b [2]byte
+		binary.BigEndian.PutUint16(b[:], version)
+		value = append(value, b[:]...)
+	}
+	return VariableAttribute(AttributeVersionList, value)
+}
+
+func SelectedVersionAttribute(version uint16) Attribute {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], version)
+	return Attribute{Type: AttributeSelectedVersion, Data: b[:]}
+}
+
 func RESAttribute(res []byte) Attribute {
 	bits := len(res) * 8
 	data := make([]byte, 2, 2+len(res))
@@ -371,6 +389,25 @@ func (a Attribute) IdentityValue() (string, error) {
 		return "", err
 	}
 	return string(value), nil
+}
+
+func (a Attribute) VersionListValue() ([]uint16, error) {
+	value, err := a.VariableValue()
+	if err != nil {
+		return nil, err
+	}
+	if len(value) == 0 || len(value)%2 != 0 {
+		return nil, fmt.Errorf("%w: version list length %d", ErrInvalidAttribute, len(value))
+	}
+	out := make([]uint16, 0, len(value)/2)
+	for offset := 0; offset < len(value); offset += 2 {
+		out = append(out, binary.BigEndian.Uint16(value[offset:offset+2]))
+	}
+	return out, nil
+}
+
+func (a Attribute) SelectedVersionValue() (uint16, error) {
+	return a.directUint16Value()
 }
 
 func (a Attribute) RESValue() ([]byte, uint16, error) {

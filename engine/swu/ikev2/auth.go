@@ -217,13 +217,11 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	if identity == "" {
 		return AuthResult{}, fmt.Errorf("%w: eap identity is empty", ErrInvalidAuthConfig)
 	}
-	identityPacket, err := (eapaka.Packet{
-		Code:       eapaka.CodeResponse,
-		Identifier: eapReq.Identifier,
-		Type:       eapReq.Type,
-		Subtype:    eapaka.SubtypeIdentity,
-		Attributes: []eapaka.Attribute{eapaka.IdentityAttribute(identity)},
-	}).MarshalBinary()
+	identityResponse, err := eapaka.BuildIdentityResponse(identity, eapReq)
+	if err != nil {
+		return AuthResult{}, err
+	}
+	identityPacket, err := identityResponse.MarshalBinary()
 	if err != nil {
 		return AuthResult{}, err
 	}
@@ -734,12 +732,9 @@ func runIKEAuthIdentityExchange(ctx context.Context, cfg identityExchangeConfig)
 		}
 		requestRaw = encoded
 	}
-	response := eapaka.Packet{
-		Code:       eapaka.CodeResponse,
-		Identifier: cfg.Request.Identifier,
-		Type:       cfg.Request.Type,
-		Subtype:    eapaka.SubtypeIdentity,
-		Attributes: []eapaka.Attribute{eapaka.IdentityAttribute(identity)},
+	response, err := eapaka.BuildIdentityResponse(identity, cfg.Request)
+	if err != nil {
+		return EAPIdentityExchange{}, err
 	}
 	raw, err := response.MarshalBinary()
 	if err != nil {

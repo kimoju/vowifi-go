@@ -407,6 +407,80 @@ func TestBuildEntitlementChallengeAnswerSelectsEAPRelayIdentity(t *testing.T) {
 	}
 }
 
+func TestBuildEntitlementChallengeAnswerHandlesEAPRelayVersionList(t *testing.T) {
+	identity := "310280233641503@private.att.net"
+	for _, tc := range []struct {
+		name           string
+		versions       []uint16
+		wantSubtype    uint8
+		wantSelected   bool
+		wantClientCode uint16
+	}{
+		{
+			name:         "supported version",
+			versions:     []uint16{2, eapaka.SupportedVersion},
+			wantSubtype:  eapaka.SubtypeIdentity,
+			wantSelected: true,
+		},
+		{
+			name:           "unsupported version",
+			versions:       []uint16{2, 3},
+			wantSubtype:    eapaka.SubtypeClientError,
+			wantClientCode: eapaka.ClientErrorUnsupportedVersion,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			packet := eapaka.Packet{
+				Code:       eapaka.CodeRequest,
+				Identifier: 6,
+				Type:       eapaka.TypeAKA,
+				Subtype:    eapaka.SubtypeIdentity,
+				Attributes: []eapaka.Attribute{
+					eapaka.AnyIDReqAttribute(),
+					eapaka.VersionListAttribute(tc.versions...),
+				},
+			}
+			result := entitlementResult{EAPPacket: &packet}
+			answer, _, _, _, _, _, err := buildEntitlementChallengeAnswer(Request{
+				Identity: Identity{IMSI: "310280233641503", SIPUsername: identity},
+			}, result, nil, nil, swu.EAPReauthenticationState{})
+			if err != nil {
+				t.Fatalf("buildEntitlementChallengeAnswer() error = %v", err)
+			}
+			response := decodeRelayPacket(t, answer)
+			if response.Subtype != tc.wantSubtype {
+				t.Fatalf("response subtype=%d, want %d: %+v", response.Subtype, tc.wantSubtype, response)
+			}
+			if tc.wantSelected {
+				attr, ok := eapaka.FindAttribute(response.Attributes, eapaka.AttributeSelectedVersion)
+				if !ok {
+					t.Fatalf("missing AT_SELECTED_VERSION: %+v", response.Attributes)
+				}
+				selected, err := attr.SelectedVersionValue()
+				if err != nil {
+					t.Fatalf("SelectedVersionValue() error = %v", err)
+				}
+				if selected != eapaka.SupportedVersion {
+					t.Fatalf("selected=%d", selected)
+				}
+			}
+			if tc.wantClientCode != 0 {
+				attr, ok := eapaka.FindAttribute(response.Attributes, eapaka.AttributeClientErrorCode)
+				if !ok {
+					t.Fatalf("missing AT_CLIENT_ERROR_CODE: %+v", response.Attributes)
+				}
+				code, err := attr.ClientErrorCodeValue()
+				if err != nil {
+					t.Fatalf("ClientErrorCodeValue() error = %v", err)
+				}
+				if code != tc.wantClientCode {
+					t.Fatalf("client error=%d, want %d", code, tc.wantClientCode)
+				}
+			}
+		})
+	}
+}
+
 func TestStartEmergencyAddressUpdateHandlesEAPRelayAKAPrimeKDFNegotiation(t *testing.T) {
 	identity := "310280233641503@private.att.net"
 	kdfOffer := eapRelayAKAPrimeKDFOffer(t, "WLAN", []uint16{99, eapaka.AKAPrimeKDFDefault})

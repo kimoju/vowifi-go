@@ -39,7 +39,10 @@ func (f *authFakeTransport) ExchangeIKE(ctx context.Context, request []byte) ([]
 			Identifier: 9,
 			Type:       eapaka.TypeAKA,
 			Subtype:    eapaka.SubtypeIdentity,
-			Attributes: []eapaka.Attribute{eapaka.FullAuthIDReqAttribute()},
+			Attributes: []eapaka.Attribute{
+				eapaka.FullAuthIDReqAttribute(),
+				eapaka.VersionListAttribute(2, eapaka.SupportedVersion),
+			},
 		}).MarshalBinary()
 		if err != nil {
 			return nil, err
@@ -74,6 +77,17 @@ func (f *authFakeTransport) ExchangeIKE(ctx context.Context, request []byte) ([]
 			return nil, err
 		}
 		f.identity = identity
+		selectedAttr, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeSelectedVersion)
+		if !ok {
+			f.t.Fatal("missing AT_SELECTED_VERSION")
+		}
+		selected, err := selectedAttr.SelectedVersionValue()
+		if err != nil {
+			return nil, err
+		}
+		if selected != eapaka.SupportedVersion {
+			f.t.Fatalf("selected version=%d", selected)
+		}
 		challenge, err := (eapaka.Packet{
 			Code:       eapaka.CodeRequest,
 			Identifier: 10,
