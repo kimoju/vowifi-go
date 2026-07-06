@@ -1381,14 +1381,7 @@ func (a *IMSOutboundAgent) roundTripRequest(ctx context.Context, msg voiceclient
 	if a == nil || a.Transport == nil {
 		return voiceclient.SIPResponse{}, ErrIMSVoiceAgentNotReady
 	}
-	resp, err := a.Transport.RoundTripRequest(ctx, msg)
-	if err != nil {
-		return resp, err
-	}
-	if err := voiceclient.ApplyDigestAuthenticationInfo(msg, resp); err != nil {
-		return resp, err
-	}
-	return resp, nil
+	return voiceclient.RoundTripRequestWithDigestAuth(ctx, a.Transport, msg)
 }
 
 func buildReliableProvisionalPRACK(cfg voiceclient.DialogRequestConfig, resp voiceclient.SIPResponse, cseq int) (voiceclient.SIPRequestMessage, bool, error) {

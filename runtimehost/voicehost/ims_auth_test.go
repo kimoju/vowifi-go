@@ -55,6 +55,60 @@ func TestIMSOutboundAgentAppliesDigestAuthenticationInfo(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentRetriesDialogDigestChallenge(t *testing.T) {
+	binding := testVoiceDigestBinding(t, "nonce-voice-retry")
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 407,
+			Reason:     "Proxy Authentication Required",
+			Headers: map[string][]string{
+				"Proxy-Authenticate": {`Digest realm="ims.example", nonce="nonce-voice-bye", algorithm=MD5, qop="auth"`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport:    transport,
+		Profile:      voiceclient.IMSProfile{IMPI: "impi@example", IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: binding,
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-auth-retry",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-auth-retry"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 3 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	initial := transport.requests[1]
+	retry := transport.requests[2]
+	if initial.Method != "BYE" || retry.Method != "BYE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if auth := retry.Headers["Proxy-Authorization"]; !strings.Contains(auth, `nonce="nonce-voice-bye"`) ||
+		!strings.Contains(auth, `uri="sip:carrier@198.51.100.1:5060"`) ||
+		!strings.Contains(auth, `nc=00000001`) {
+		t.Fatalf("retry BYE Proxy-Authorization=%s", auth)
+	}
+	if retry.Headers["Authorization"] != "" {
+		t.Fatalf("retry BYE kept Authorization: %+v", retry.Headers)
+	}
+}
+
 func testVoiceDigestBinding(t *testing.T, nonce string) voiceclient.RegistrationBinding {
 	t.Helper()
 	transport := &fakeVoiceRegisterTransport{responses: []voiceclient.RegisterResponse{

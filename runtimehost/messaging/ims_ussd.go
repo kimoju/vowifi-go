@@ -65,12 +65,9 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 		return USSDResult{SessionID: sessionID, Done: true}, err
 	}
 	prepareUSSDInvite(&invite, boundary)
-	resp, err := t.Transport.RoundTripRequest(ctx, invite)
+	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, invite)
 	if err != nil {
 		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
-	}
-	if err := voiceclient.ApplyDigestAuthenticationInfo(invite, resp); err != nil {
-		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
 	}
 	cfg.RemoteTag = sipHeaderTagValue(firstHeaderValue(resp.Headers, "To"))
 	if contact := sipHeaderURIValue(firstHeaderValue(resp.Headers, "Contact")); contact != "" {
@@ -136,13 +133,9 @@ func (t *IMSUSSDTransport) ContinueUSSD(ctx context.Context, req USSDRequest) (U
 		return USSDResult{SessionID: sessionID, Done: true}, err
 	}
 	prepareUSSDInfo(&info)
-	resp, err := t.Transport.RoundTripRequest(ctx, info)
+	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, info)
 	if err != nil {
 		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
-	}
-	if err := voiceclient.ApplyDigestAuthenticationInfo(info, resp); err != nil {
-		t.clearSession(sessionID)
-		return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
 	}
 	result, parseErr := ussdResultFromSIPResponse(sessionID, resp, false)
 	result.RegistrationRecoveryNeeded = IMSRegistrationRecoveryNeededStatus(resp.StatusCode)
@@ -185,13 +178,10 @@ func (t *IMSUSSDTransport) CancelUSSD(ctx context.Context, req USSDRequest) erro
 	if err != nil {
 		return err
 	}
-	resp, err := t.Transport.RoundTripRequest(ctx, bye)
+	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, bye)
 	t.clearSession(sessionID)
 	if err != nil {
 		return IMSRegistrationRecoveryError{Err: err, StatusCode: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}
-	}
-	if err := voiceclient.ApplyDigestAuthenticationInfo(bye, resp); err != nil {
-		return err
 	}
 	if resp.StatusCode >= 300 {
 		err := fmt.Errorf("IMS USSD BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))

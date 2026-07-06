@@ -64,10 +64,7 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 	if err != nil {
 		return SMSSendResult{State: "failed", ErrorText: err.Error()}, err
 	}
-	resp, err := t.Transport.RoundTripRequest(ctx, msg)
-	if err == nil {
-		err = voiceclient.ApplyDigestAuthenticationInfo(msg, resp)
-	}
+	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, msg)
 	result := SMSSendResult{CallID: callID, RPMR: cseq, SIPCode: resp.StatusCode, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}
 	if err != nil {
 		result.State = "failed"

@@ -1526,6 +1526,109 @@ func TestApplyDigestAuthenticationInfoRejectsRspauthMismatch(t *testing.T) {
 	}
 }
 
+func TestDigestChallengeRetryRequestUpdatesSession(t *testing.T) {
+	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-dialog-old", Algorithm: "MD5", QOP: "auth"}
+	state := newDigestAuthState("Authorization", ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, "")
+	session := NewDigestAuthSession("Authorization", "", state)
+	msg := SIPRequestMessage{
+		Method:      "MESSAGE",
+		URI:         "sip:+18005551212@pcscf.example",
+		Headers:     map[string]string{"Authorization": "Digest old", "Proxy-Authorization": "Digest old-proxy"},
+		Body:        []byte("hello"),
+		AuthSession: session,
+	}
+	retry, ok, err := DigestChallengeRetryRequest(msg, SIPResponse{
+		StatusCode: 407,
+		Reason:     "Proxy Authentication Required",
+		Headers: map[string][]string{
+			"Proxy-Authenticate": {`Digest realm="ims.example", nonce="nonce-dialog-new", algorithm=MD5, qop="auth"`},
+		},
+	})
+	if err != nil || !ok {
+		t.Fatalf("DigestChallengeRetryRequest() ok=%v err=%v", ok, err)
+	}
+	if retry.Headers["Authorization"] != "" {
+		t.Fatalf("retry kept Authorization: %+v", retry.Headers)
+	}
+	auth := retry.Headers["Proxy-Authorization"]
+	if !strings.Contains(auth, `nonce="nonce-dialog-new"`) ||
+		!strings.Contains(auth, `uri="sip:+18005551212@pcscf.example"`) ||
+		!strings.Contains(auth, `nc=00000001`) {
+		t.Fatalf("retry Proxy-Authorization=%s", auth)
+	}
+	next, err := BuildByeRequest(DialogRequestConfig{
+		Profile: IMSProfile{IMPU: "sip:user@ims.example"},
+		Registration: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			AuthSession:    session,
+		},
+		RemoteURI:       "sip:+18005551212@ims.example",
+		RemoteTargetURI: "sip:+18005551212@pcscf.example",
+		CallID:          "call-rechallenge",
+		CSeq:            3,
+	})
+	if err != nil {
+		t.Fatalf("BuildByeRequest() error = %v", err)
+	}
+	if auth := next.Headers["Proxy-Authorization"]; !strings.Contains(auth, `nonce="nonce-dialog-new"`) || !strings.Contains(auth, `nc=00000002`) {
+		t.Fatalf("next BYE auth=%s", auth)
+	}
+}
+
+func TestRoundTripRequestWithDigestAuthRetriesChallenge(t *testing.T) {
+	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-roundtrip-old", Algorithm: "MD5", QOP: "auth"}
+	state := newDigestAuthState("Authorization", ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, "")
+	transport := &fakeSIPRequestRoundTripTransport{responses: []SIPResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers:    map[string][]string{"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-roundtrip-new", algorithm=MD5, qop="auth"`}},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	resp, err := RoundTripRequestWithDigestAuth(context.Background(), transport, SIPRequestMessage{
+		Method:      "INFO",
+		URI:         "sip:remote@ims.example",
+		Headers:     map[string]string{"Authorization": "Digest old"},
+		Body:        []byte("Signal=1\r\n"),
+		AuthSession: NewDigestAuthSession("Authorization", "", state),
+	})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("RoundTripRequestWithDigestAuth() resp=%+v err=%v", resp, err)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if auth := transport.requests[1].Headers["Authorization"]; !strings.Contains(auth, `nonce="nonce-roundtrip-new"`) || !strings.Contains(auth, `nc=00000001`) {
+		t.Fatalf("retry Authorization=%s", auth)
+	}
+}
+
+func TestDigestChallengeRetryRequestSkipsInvite(t *testing.T) {
+	retry, ok, err := DigestChallengeRetryRequest(SIPRequestMessage{
+		Method:      "INVITE",
+		AuthSession: NewDigestAuthSession("Authorization", "", DigestAuthState{}),
+	}, SIPResponse{StatusCode: 401})
+	if err != nil || ok || retry.Method != "" {
+		t.Fatalf("DigestChallengeRetryRequest(INVITE) retry=%+v ok=%v err=%v", retry, ok, err)
+	}
+}
+
 func TestRegisterSessionRejectsFailedSecondRegister(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{
@@ -1564,6 +1667,26 @@ func (f *fakeRegisterTransport) RoundTripRegister(ctx context.Context, msg Regis
 	resp := f.responses[0]
 	f.responses = f.responses[1:]
 	return resp, nil
+}
+
+type fakeSIPRequestRoundTripTransport struct {
+	requests  []SIPRequestMessage
+	responses []SIPResponse
+}
+
+func (t *fakeSIPRequestRoundTripTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMessage) (SIPResponse, error) {
+	t.requests = append(t.requests, cloneSIPRequestMessage(msg))
+	if len(t.responses) == 0 {
+		return SIPResponse{StatusCode: 500, Reason: "empty"}, nil
+	}
+	resp := t.responses[0]
+	t.responses = t.responses[1:]
+	return resp, nil
+}
+
+func (t *fakeSIPRequestRoundTripTransport) WriteRequest(ctx context.Context, msg SIPRequestMessage) error {
+	t.requests = append(t.requests, cloneSIPRequestMessage(msg))
+	return nil
 }
 
 type registerAKAProvider struct {
