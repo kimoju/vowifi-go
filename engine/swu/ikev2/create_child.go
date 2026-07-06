@@ -57,6 +57,13 @@ func RunCREATE_CHILD_SA(ctx context.Context, cfg CreateChildSAConfig) (CreateChi
 	if err != nil {
 		return CreateChildSAResult{}, err
 	}
+	offeredSA, ok, err := firstSecurityAssociation(payloads)
+	if err != nil {
+		return CreateChildSAResult{}, err
+	}
+	if !ok {
+		return CreateChildSAResult{}, fmt.Errorf("%w: missing request SA", ErrInvalidCreateChild)
+	}
 	iv, err := createChildIV(cfg.Random, keys.Profile, cfg.IV)
 	if err != nil {
 		return CreateChildSAResult{}, err
@@ -79,7 +86,7 @@ func RunCREATE_CHILD_SA(ctx context.Context, cfg CreateChildSAConfig) (CreateChi
 	}
 	parseInit := cfg.Init
 	parseInit.Keys = keys
-	child, err := ParseChildSAResultWithNonces(parseInit, inner, localSPI, requestNonce, responseNonce)
+	child, err := parseChildSAResultWithNonces(parseInit, inner, localSPI, requestNonce, responseNonce, &offeredSA)
 	if err != nil {
 		return CreateChildSAResult{}, err
 	}

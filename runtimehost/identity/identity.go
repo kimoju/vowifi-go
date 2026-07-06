@@ -232,26 +232,26 @@ func ReadISIMIdentity(access interface {
 	var id Identity
 	var readErrs []error
 
-	if raw, _, err := simauth.ReadTransparentEF(access, channel, 0x6F02); err == nil {
+	if raw, resp, err := simauth.ReadTransparentEF(access, channel, 0x6F02); err == nil {
 		id.IMPI = decodeISIMString(raw)
 	} else {
-		readErrs = append(readErrs, fmt.Errorf("read EF_IMPI: %w", err))
+		readErrs = append(readErrs, classifyAPDUEFReadError("read EF_IMPI", resp, err))
 	}
 
-	if raw, _, err := simauth.ReadTransparentEF(access, channel, 0x6F03); err == nil {
+	if raw, resp, err := simauth.ReadTransparentEF(access, channel, 0x6F03); err == nil {
 		id.Domain = decodeISIMString(raw)
 	} else {
-		readErrs = append(readErrs, fmt.Errorf("read EF_DOMAIN: %w", err))
+		readErrs = append(readErrs, classifyAPDUEFReadError("read EF_DOMAIN", resp, err))
 	}
 
-	if records, _, err := simauth.ReadLinearFixedEF(access, channel, 0x6F04, 16); err == nil {
+	if records, resp, err := simauth.ReadLinearFixedEF(access, channel, 0x6F04, 16); err == nil {
 		for _, rec := range records {
 			if impu := decodeISIMString(rec); impu != "" && !containsString(id.IMPU, impu) {
 				id.IMPU = append(id.IMPU, impu)
 			}
 		}
 	} else {
-		readErrs = append(readErrs, fmt.Errorf("read EF_IMPU: %w", err))
+		readErrs = append(readErrs, classifyAPDUEFReadError("read EF_IMPU", resp, err))
 	}
 
 	if strings.TrimSpace(id.IMPI) != "" || strings.TrimSpace(id.Domain) != "" || len(id.IMPU) > 0 {
@@ -270,24 +270,24 @@ func ReadISIMIdentityCRSM(access interface {
 	var id Identity
 	var readErrs []error
 
-	if raw, _, err := readCRSMTransparentEF(access, 0x6F02, pathID); err == nil {
+	if raw, resp, err := readCRSMTransparentEF(access, 0x6F02, pathID); err == nil {
 		id.IMPI = decodeISIMString(raw)
 	} else {
-		readErrs = append(readErrs, fmt.Errorf("CRSM read EF_IMPI: %w", err))
+		readErrs = append(readErrs, classifyCRSMEFReadError("CRSM read EF_IMPI", resp, err))
 	}
-	if raw, _, err := readCRSMTransparentEF(access, 0x6F03, pathID); err == nil {
+	if raw, resp, err := readCRSMTransparentEF(access, 0x6F03, pathID); err == nil {
 		id.Domain = decodeISIMString(raw)
 	} else {
-		readErrs = append(readErrs, fmt.Errorf("CRSM read EF_DOMAIN: %w", err))
+		readErrs = append(readErrs, classifyCRSMEFReadError("CRSM read EF_DOMAIN", resp, err))
 	}
-	if records, _, err := readCRSMLinearFixedEF(access, 0x6F04, pathID, 16); err == nil {
+	if records, resp, err := readCRSMLinearFixedEF(access, 0x6F04, pathID, 16); err == nil {
 		for _, rec := range records {
 			if impu := decodeISIMString(rec); impu != "" && !containsString(id.IMPU, impu) {
 				id.IMPU = append(id.IMPU, impu)
 			}
 		}
 	} else {
-		readErrs = append(readErrs, fmt.Errorf("CRSM read EF_IMPU: %w", err))
+		readErrs = append(readErrs, classifyCRSMEFReadError("CRSM read EF_IMPU", resp, err))
 	}
 
 	if strings.TrimSpace(id.IMPI) != "" || strings.TrimSpace(id.Domain) != "" || len(id.IMPU) > 0 {
@@ -301,6 +301,21 @@ func emptyISIMIdentityError(readErrs []error) error {
 		return newISIMIdentityReadError(simtransport.ClassifyError(err), err)
 	}
 	return newISIMIdentityReadError(simtransport.RecoveryClassEmptyEF, ErrISIMIdentityDataEmpty)
+}
+
+func classifyAPDUEFReadError(context string, resp simauth.Response, err error) error {
+	if err == nil {
+		return nil
+	}
+	class := simtransport.StatusRecoveryClass(resp.SW1, resp.SW2)
+	return newClassifiedReadError(class, fmt.Errorf("%s: %w", context, err))
+}
+
+func classifyCRSMEFReadError(context string, resp simtransport.CRSMResult, err error) error {
+	if err == nil {
+		return nil
+	}
+	return newClassifiedReadError(resp.RecoveryClass(), fmt.Errorf("%s: %w", context, err))
 }
 
 func readCRSMTransparentEF(access interface {

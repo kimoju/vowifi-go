@@ -37,7 +37,10 @@ const (
 	AttributeKeyLength uint16 = 14
 )
 
-var ErrInvalidSA = errors.New("invalid ikev2 sa payload")
+var (
+	ErrInvalidSA              = errors.New("invalid ikev2 sa payload")
+	ErrUnsupportedSASelection = errors.New("unsupported ikev2 selected sa")
+)
 
 type TransformAttribute struct {
 	Type  uint16
@@ -159,6 +162,105 @@ func SecurityAssociationPayload(sa SecurityAssociation) (Payload, error) {
 		return Payload{}, err
 	}
 	return Payload{Type: PayloadSA, Body: body}, nil
+}
+
+func ValidateSelectedSA(offered, selected SecurityAssociation) error {
+	if len(offered.Proposals) == 0 {
+		return fmt.Errorf("%w: no offered proposals", ErrUnsupportedSASelection)
+	}
+	if len(selected.Proposals) == 0 {
+		return fmt.Errorf("%w: no selected proposals", ErrUnsupportedSASelection)
+	}
+	if len(selected.Proposals) != 1 {
+		return fmt.Errorf("%w: selected proposal count %d", ErrUnsupportedSASelection, len(selected.Proposals))
+	}
+	selectedProposal := selected.Proposals[0]
+	if len(selectedProposal.Transforms) == 0 {
+		return fmt.Errorf("%w: selected proposal has no transforms", ErrUnsupportedSASelection)
+	}
+	if err := validateSelectedProposalRequiredTransforms(selectedProposal); err != nil {
+		return err
+	}
+	for _, offeredProposal := range offered.Proposals {
+		if proposalSupportsSelection(offeredProposal, selectedProposal) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: proposal %d protocol %d", ErrUnsupportedSASelection, selectedProposal.Number, selectedProposal.ProtocolID)
+}
+
+func validateSelectedProposalRequiredTransforms(proposal Proposal) error {
+	var required []uint8
+	switch proposal.ProtocolID {
+	case ProtocolIKE:
+		required = []uint8{TransformENCR, TransformPRF, TransformINTEG, TransformDHRGroup}
+	case ProtocolESP:
+		required = []uint8{TransformENCR, TransformINTEG, TransformESN}
+	default:
+		return fmt.Errorf("%w: protocol %d", ErrUnsupportedSASelection, proposal.ProtocolID)
+	}
+	for _, transformType := range required {
+		if !proposalHasTransformType(proposal, transformType) {
+			return fmt.Errorf("%w: missing transform type %d", ErrUnsupportedSASelection, transformType)
+		}
+	}
+	return nil
+}
+
+func proposalSupportsSelection(offered, selected Proposal) bool {
+	if offered.ProtocolID != selected.ProtocolID {
+		return false
+	}
+	for _, selectedTransform := range selected.Transforms {
+		if !proposalHasTransform(offered, selectedTransform) {
+			return false
+		}
+	}
+	return true
+}
+
+func proposalHasTransform(proposal Proposal, target Transform) bool {
+	for _, transform := range proposal.Transforms {
+		if transformsEqual(transform, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func proposalHasTransformType(proposal Proposal, transformType uint8) bool {
+	for _, transform := range proposal.Transforms {
+		if transform.Type == transformType {
+			return true
+		}
+	}
+	return false
+}
+
+func transformsEqual(a, b Transform) bool {
+	return a.Type == b.Type && a.ID == b.ID && transformAttributesEqual(a.Attributes, b.Attributes)
+}
+
+func transformAttributesEqual(a, b []TransformAttribute) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	used := make([]bool, len(b))
+	for _, attrA := range a {
+		found := false
+		for i, attrB := range b {
+			if used[i] || attrA.Type != attrB.Type || !bytesEqual(attrA.Value, attrB.Value) {
+				continue
+			}
+			used[i] = true
+			found = true
+			break
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func (p Proposal) marshalBody() ([]byte, error) {

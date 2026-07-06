@@ -140,6 +140,139 @@ func TestBuildDigestAuthorizationIncludesAUTS(t *testing.T) {
 	}
 }
 
+func TestDigestAuthorizationRoundTripAKAv1(t *testing.T) {
+	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	ch, err := ParseWWWAuthenticate(`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth,auth-int", opaque="opq"`)
+	if err != nil {
+		t.Fatalf("ParseWWWAuthenticate() error = %v", err)
+	}
+	password, err := BuildAKADigestPassword(ch.Algorithm, sim.AKAResult{RES: []byte{0x11, 0x22, 0x33, 0x44}})
+	if err != nil {
+		t.Fatalf("BuildAKADigestPassword() error = %v", err)
+	}
+	authz, err := BuildDigestAuthorization(ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: password,
+		CNonce:   "cnonce",
+		NC:       7,
+	})
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization() error = %v", err)
+	}
+	parsed, ok, err := VerifyDigestAuthorization(authz, ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: password,
+	})
+	if err != nil || !ok {
+		t.Fatalf("VerifyDigestAuthorization() parsed=%+v ok=%v err=%v header=%s", parsed, ok, err, authz)
+	}
+	if parsed.Username != "impi@example" || parsed.NC != 7 || parsed.NCText != "00000007" ||
+		parsed.QOP != "auth" || parsed.Opaque != "opq" || parsed.Response == "" {
+		t.Fatalf("parsed Authorization=%+v", parsed)
+	}
+	if _, ok, err := VerifyDigestAuthorization(authz, ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "wrong-password",
+	}); err != nil || ok {
+		t.Fatalf("VerifyDigestAuthorization(wrong password) ok=%v err=%v", ok, err)
+	}
+}
+
+func TestDigestAuthorizationRoundTripWithoutQOPIgnoresCallerNonceState(t *testing.T) {
+	ch := DigestChallenge{
+		Realm:     "ims.example",
+		Nonce:     "nonce-no-qop",
+		Algorithm: "MD5",
+	}
+	authz, err := BuildDigestAuthorization(ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce-not-emitted",
+		NC:       9,
+	})
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization() error = %v", err)
+	}
+	if strings.Contains(authz, "cnonce") || strings.Contains(authz, "nc=") {
+		t.Fatalf("qop-less Authorization should not include nonce state: %s", authz)
+	}
+	parsed, ok, err := VerifyDigestAuthorization(authz, ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "caller-state",
+		NC:       12,
+	})
+	if err != nil || !ok {
+		t.Fatalf("VerifyDigestAuthorization(no qop) parsed=%+v ok=%v err=%v header=%s", parsed, ok, err, authz)
+	}
+}
+
+func TestDigestAuthorizationRoundTripAUTS(t *testing.T) {
+	ch := DigestChallenge{
+		Realm:     "ims.example",
+		Nonce:     base64.StdEncoding.EncodeToString(append(bytesFrom(0x20, 16), bytesFrom(0x50, 16)...)),
+		Algorithm: "AKAv1-MD5",
+		QOP:       "auth",
+	}
+	auts := bytesFrom(0xA0, 14)
+	authz, err := BuildDigestAuthorization(ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "ignored-for-sync-failure",
+		CNonce:   "cnonce",
+		NC:       1,
+		AUTS:     auts,
+	})
+	if err != nil {
+		t.Fatalf("BuildDigestAuthorization() error = %v", err)
+	}
+	parsed, ok, err := VerifyDigestAuthorization(authz, ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "wrong-password-is-ignored-when-auts-is-present",
+		AUTS:     auts,
+	})
+	if err != nil || !ok {
+		t.Fatalf("VerifyDigestAuthorization(AUTS) parsed=%+v ok=%v err=%v header=%s", parsed, ok, err, authz)
+	}
+	if !bytesEqual(parsed.AUTS, auts) {
+		t.Fatalf("parsed AUTS=%x, want %x", parsed.AUTS, auts)
+	}
+	if _, ok, err := VerifyDigestAuthorization(authz, ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "wrong-password-is-not-ignored-without-expected-auts",
+	}); err != nil || ok {
+		t.Fatalf("VerifyDigestAuthorization(unexpected AUTS) ok=%v err=%v", ok, err)
+	}
+}
+
+func TestParseDigestAuthorizationRejectsInvalidHeaders(t *testing.T) {
+	for _, header := range []string{
+		`Basic realm="ims.example"`,
+		`Digest username="impi@example", realm="ims.example", nonce="nonce", uri="sip:ims.example"`,
+		`Digest username="impi@example", realm="ims.example", nonce="nonce", uri="sip:ims.example", response="abcd", qop=auth, nc=1, cnonce="cnonce"`,
+		`Digest username="impi@example", realm="ims.example", nonce="nonce", uri="sip:ims.example", response="abcd", auts="not-base64***"`,
+	} {
+		if _, err := ParseDigestAuthorization(header); !errors.Is(err, ErrInvalidAuthorization) {
+			t.Fatalf("ParseDigestAuthorization(%q) error=%v, want ErrInvalidAuthorization", header, err)
+		}
+	}
+}
+
 func TestBuildRegisterHeaders(t *testing.T) {
 	headers := BuildRegisterHeaders(IMSProfile{
 		IMPI:      "310280233641503@private.att.net",

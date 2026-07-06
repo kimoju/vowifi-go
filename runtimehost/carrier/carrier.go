@@ -16,11 +16,18 @@ type E911Config struct {
 	EntitlementEndpoint string `json:"entitlement_endpoint"`
 }
 
+type NetworkConfig struct {
+	IMSRealm string `json:"ims_realm"`
+	NAIRealm string `json:"nai_realm"`
+	EPDGFQDN string `json:"epdg_fqdn"`
+}
+
 type EffectiveCarrierConfig struct {
-	MCC      string     `json:"mcc"`
-	MNC      string     `json:"mnc"`
-	PresetID string     `json:"preset_id"`
-	E911     E911Config `json:"e911"`
+	MCC      string        `json:"mcc"`
+	MNC      string        `json:"mnc"`
+	PresetID string        `json:"preset_id"`
+	E911     E911Config    `json:"e911"`
+	Network  NetworkConfig `json:"network"`
 }
 
 type EffectiveCarrierConfigInput struct {
@@ -120,7 +127,7 @@ func ClearCarrierOverrides() {
 }
 
 func ResolveEffectiveCarrierConfig(in EffectiveCarrierConfigInput) EffectiveCarrierConfig {
-	mcc := strings.TrimSpace(in.MCC)
+	mcc := normalizeMCC(in.MCC)
 	mnc := normalizeMNC(in.MNC)
 	key := presetKey(mcc, mnc)
 	overridesMu.RLock()
@@ -148,7 +155,7 @@ var blockedMCC = map[string]struct{}{
 }
 
 func IsVoWiFiBlockedMCC(mcc string) bool {
-	_, ok := blockedMCC[strings.TrimSpace(mcc)]
+	_, ok := blockedMCC[normalizeMCC(mcc)]
 	return ok
 }
 
@@ -161,7 +168,7 @@ func (e VoWiFiBlockedMCCError) Error() string {
 }
 
 func NewVoWiFiBlockedMCCError(mcc string) error {
-	return VoWiFiBlockedMCCError{MCC: strings.TrimSpace(mcc)}
+	return VoWiFiBlockedMCCError{MCC: normalizeMCC(mcc)}
 }
 
 func IsVoWiFiPolicyBlockedError(err error) bool {
@@ -170,7 +177,7 @@ func IsVoWiFiPolicyBlockedError(err error) bool {
 }
 
 func normalizeConfig(cfg EffectiveCarrierConfig) EffectiveCarrierConfig {
-	cfg.MCC = strings.TrimSpace(cfg.MCC)
+	cfg.MCC = normalizeMCC(cfg.MCC)
 	cfg.MNC = normalizeMNC(cfg.MNC)
 	if cfg.PresetID == "" {
 		cfg.PresetID = presetKey(cfg.MCC, cfg.MNC)
@@ -180,7 +187,58 @@ func normalizeConfig(cfg EffectiveCarrierConfig) EffectiveCarrierConfig {
 	cfg.E911.Provider = strings.ToLower(strings.TrimSpace(cfg.E911.Provider))
 	cfg.E911.Websheet = strings.TrimSpace(cfg.E911.Websheet)
 	cfg.E911.EntitlementEndpoint = strings.TrimSpace(cfg.E911.EntitlementEndpoint)
+	cfg.Network = normalizeNetworkConfig(cfg.MCC, cfg.MNC, cfg.Network)
 	return cfg
+}
+
+func DefaultIMSRealm(mcc, mnc string) string {
+	mcc = normalizeMCC(mcc)
+	mnc = normalizeMNC(mnc)
+	if mcc == "" || mnc == "" {
+		return ""
+	}
+	return fmt.Sprintf("ims.mnc%s.mcc%s.3gppnetwork.org", mnc, mcc)
+}
+
+func DefaultNAIRealm(mcc, mnc string) string {
+	mcc = normalizeMCC(mcc)
+	mnc = normalizeMNC(mnc)
+	if mcc == "" || mnc == "" {
+		return ""
+	}
+	return fmt.Sprintf("nai.epc.mnc%s.mcc%s.3gppnetwork.org", mnc, mcc)
+}
+
+func DefaultEPDGFQDN(mcc, mnc string) string {
+	mcc = normalizeMCC(mcc)
+	mnc = normalizeMNC(mnc)
+	if mcc == "" || mnc == "" {
+		return ""
+	}
+	return fmt.Sprintf("epdg.epc.mnc%s.mcc%s.pub.3gppnetwork.org", mnc, mcc)
+}
+
+func normalizeNetworkConfig(mcc, mnc string, cfg NetworkConfig) NetworkConfig {
+	cfg.IMSRealm = normalizeDomainName(cfg.IMSRealm)
+	cfg.NAIRealm = normalizeDomainName(cfg.NAIRealm)
+	cfg.EPDGFQDN = normalizeDomainName(cfg.EPDGFQDN)
+	if mcc == "" || mnc == "" {
+		return cfg
+	}
+	if cfg.IMSRealm == "" {
+		cfg.IMSRealm = DefaultIMSRealm(mcc, mnc)
+	}
+	if cfg.NAIRealm == "" {
+		cfg.NAIRealm = DefaultNAIRealm(mcc, mnc)
+	}
+	if cfg.EPDGFQDN == "" {
+		cfg.EPDGFQDN = DefaultEPDGFQDN(mcc, mnc)
+	}
+	return cfg
+}
+
+func normalizeMCC(mcc string) string {
+	return strings.TrimSpace(mcc)
 }
 
 func normalizeMNC(mnc string) string {
@@ -191,8 +249,13 @@ func normalizeMNC(mnc string) string {
 	return mnc
 }
 
+func normalizeDomainName(domain string) string {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	return strings.TrimSuffix(domain, ".")
+}
+
 func presetKey(mcc, mnc string) string {
-	mcc = strings.TrimSpace(mcc)
+	mcc = normalizeMCC(mcc)
 	mnc = normalizeMNC(mnc)
 	if mcc == "" || mnc == "" {
 		return ""

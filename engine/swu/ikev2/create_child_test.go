@@ -102,12 +102,41 @@ func TestRunCREATECHILDSARejectsMissingResponseNonce(t *testing.T) {
 	}
 }
 
+func TestRunCREATECHILDSARejectsUnsupportedSelectedSA(t *testing.T) {
+	init := fakeInitResult(t)
+	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
+	remoteSPI := []byte{0xde, 0xad, 0xbe, 0xef}
+	selected := DefaultESPProposal(remoteSPI)
+	selected.Proposals[0].Transforms[1].ID = INTEG_HMAC_SHA2_512_256
+	transport := &createChildTransport{
+		t:             t,
+		init:          init,
+		messageID:     8,
+		localSPI:      localSPI,
+		remoteSPI:     remoteSPI,
+		responseNonce: bytes.Repeat([]byte{0x66}, 32),
+		responseSA:    selected,
+	}
+	_, err := RunCREATE_CHILD_SA(context.Background(), CreateChildSAConfig{
+		Transport: transport,
+		Init:      init,
+		ChildSPI:  localSPI,
+		Nonce:     bytes.Repeat([]byte{0x45}, 32),
+		MessageID: 8,
+		IV:        bytes.Repeat([]byte{0x94}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("RunCREATE_CHILD_SA() err=%v, want ErrUnsupportedSASelection", err)
+	}
+}
+
 type createChildTransport struct {
 	t                 *testing.T
 	init              InitResult
 	messageID         uint32
 	localSPI          []byte
 	remoteSPI         []byte
+	responseSA        SecurityAssociation
 	responseNonce     []byte
 	omitResponseNonce bool
 	requests          int
@@ -150,7 +179,11 @@ func (tr *createChildTransport) ExchangeIKE(ctx context.Context, request []byte)
 			tr.sawTSr = true
 		}
 	}
-	saPayload, err := SecurityAssociationPayload(DefaultESPProposal(tr.remoteSPI))
+	responseSA := tr.responseSA
+	if len(responseSA.Proposals) == 0 {
+		responseSA = DefaultESPProposal(tr.remoteSPI)
+	}
+	saPayload, err := SecurityAssociationPayload(responseSA)
 	if err != nil {
 		tr.t.Fatalf("SecurityAssociationPayload() error = %v", err)
 	}

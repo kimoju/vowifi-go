@@ -40,6 +40,58 @@ run() {
 	"$@"
 }
 
+go_mod_version() {
+	awk '$1 == "go" { print $2; exit }' go.mod
+}
+
+parse_go_version() {
+	local raw major minor patch
+	raw="${1#go}"
+	raw="${raw%%[!0-9.]*}"
+	IFS=. read -r major minor patch _ <<< "$raw"
+	patch="${patch:-0}"
+	if [[ ! "$major" =~ ^[0-9]+$ || ! "$minor" =~ ^[0-9]+$ || ! "$patch" =~ ^[0-9]+$ ]]; then
+		return 1
+	fi
+	printf '%s %s %s\n' "$major" "$minor" "$patch"
+}
+
+go_version_ge() {
+	local have_major have_minor have_patch want_major want_minor want_patch
+	read -r have_major have_minor have_patch < <(parse_go_version "$1") || return 1
+	read -r want_major want_minor want_patch < <(parse_go_version "$2") || return 1
+
+	if ((have_major != want_major)); then
+		((have_major > want_major))
+		return
+	fi
+	if ((have_minor != want_minor)); then
+		((have_minor > want_minor))
+		return
+	fi
+	((have_patch >= want_patch))
+}
+
+version_check() {
+	local current required
+	required="$(go_mod_version)"
+	current="$("$GO_BIN" env GOVERSION 2>/dev/null || true)"
+
+	if [[ -n "$required" ]]; then
+		printf '\n==> go.mod requires Go %s or newer\n' "$required"
+	fi
+	if [[ -n "$current" ]]; then
+		printf 'Current Go runtime: %s\n' "$current"
+	fi
+	if [[ -n "$required" && -n "$current" ]]; then
+		if go_version_ge "$current" "$required"; then
+			return
+		fi
+		printf 'Go runtime %s is older than go.mod requirement %s\n' "$current" "$required" >&2
+		return 1
+	fi
+}
+
 fmt_check() {
 	mapfile -d '' files < <(find . -name '*.go' -not -path './.git/*' -print0)
 	if [[ ${#files[@]} -eq 0 ]]; then
@@ -67,6 +119,15 @@ vet() {
 	run "$GO_BIN" vet ./...
 }
 
+smoke() {
+	read -r -a packages <<< "${CI_SMOKE_PACKAGES:-./...}"
+	if [[ ${#packages[@]} -eq 0 ]]; then
+		printf '\n==> no packages configured for smoke check\n'
+		return
+	fi
+	run "$GO_BIN" test -run "${CI_SMOKE_RUN:-^$}" -count=1 "${packages[@]}"
+}
+
 test_all() {
 	run "$GO_BIN" test -count=1 ./...
 }
@@ -80,20 +141,55 @@ race() {
 	run "$GO_BIN" test -race -count=1 "${packages[@]}"
 }
 
+coverage() {
+	local cleanup coverage_file coverage_mode
+	read -r -a packages <<< "${CI_COVERAGE_PACKAGES:-./...}"
+	if [[ ${#packages[@]} -eq 0 ]]; then
+		printf '\n==> no packages configured for coverage\n'
+		return
+	fi
+
+	cleanup=0
+	coverage_file="${CI_COVERAGE_FILE:-}"
+	if [[ -z "$coverage_file" ]]; then
+		coverage_file="$(mktemp "${TMPDIR:-/tmp}/vowifi-go-coverage-XXXXXX")"
+		cleanup=1
+	else
+		mkdir -p "$(dirname "$coverage_file")"
+	fi
+	coverage_mode="${CI_COVERAGE_MODE:-atomic}"
+
+	run "$GO_BIN" test -count=1 -covermode="$coverage_mode" -coverprofile="$coverage_file" "${packages[@]}"
+	run "$GO_BIN" tool cover -func="$coverage_file"
+	if [[ "$cleanup" == "1" ]]; then
+		rm -f "$coverage_file"
+	else
+		printf '\n==> coverage profile: %s\n' "$coverage_file"
+	fi
+}
+
 usage() {
 	cat <<'USAGE'
-Usage: scripts/ci.sh [all|download|fmt|tidy|vet|test|race ...]
+Usage: scripts/ci.sh [all|version|download|fmt|tidy|vet|smoke|test|race|coverage ...]
 
 Environment:
-  GO_BIN             path to go binary when it is not on PATH
-  GOFMT_BIN          path to gofmt binary
-  SKIP_RACE=1        skip race tests
-  CI_RACE_PACKAGES   package pattern(s) for race tests, default: ./...
+  GO_BIN               path to go binary when it is not on PATH
+  GOFMT_BIN            path to gofmt binary
+  CI_SMOKE_PACKAGES    package pattern(s) for smoke tests, default: ./...
+  CI_SMOKE_RUN         go test -run pattern for smoke tests, default: ^$
+  SKIP_RACE=1          skip race tests
+  CI_RACE_PACKAGES     package pattern(s) for race tests, default: ./...
+  CI_COVERAGE_PACKAGES package pattern(s) for coverage tests, default: ./...
+  CI_COVERAGE_FILE     coverage profile path; default: temporary file
+  CI_COVERAGE_MODE     Go coverage mode, default: atomic
+
+Default all runs version/download/fmt/tidy/vet/smoke/test. Race and coverage
+are opt-in so the main local and GitHub CI path stays lightweight.
 USAGE
 }
 
 if [[ $# -eq 0 || "${1:-}" == "all" ]]; then
-	tasks=(download fmt tidy vet test race)
+	tasks=(version download fmt tidy vet smoke test)
 else
 	tasks=("$@")
 fi
@@ -103,12 +199,15 @@ printf 'Using gofmt: %s\n' "$GOFMT_BIN"
 
 for task in "${tasks[@]}"; do
 	case "$task" in
+		version | go-version) version_check ;;
 		download) download ;;
 		fmt | fmt-check) fmt_check ;;
 		tidy | tidy-check) tidy_check ;;
 		vet) vet ;;
+		smoke) smoke ;;
 		test) test_all ;;
 		race) race ;;
+		coverage) coverage ;;
 		-h | --help | help)
 			usage
 			exit 0

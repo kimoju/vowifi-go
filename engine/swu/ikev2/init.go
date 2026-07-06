@@ -185,6 +185,9 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 	if err != nil {
 		return InitResult{}, err
 	}
+	if err := ValidateSelectedSA(sa, parsed.sa); err != nil {
+		return InitResult{}, err
+	}
 	respPub, err := ecdh.X25519().NewPublicKey(parsed.keyExchange.KeyData)
 	if err != nil {
 		return InitResult{}, fmt.Errorf("%w: responder KE: %w", ErrInvalidInitResponse, err)

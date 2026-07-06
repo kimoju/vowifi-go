@@ -16,25 +16,39 @@ make ci
 
 Useful focused targets are:
 
+- `make go-version`
 - `make fmt-check`
 - `make tidy-check`
 - `make vet`
+- `make smoke`
 - `make test`
 - `make race`
+- `make coverage`
 - `make download`
 - `make compat-vohive`
 
-If Go is installed outside `PATH`, pass it explicitly:
+The default `make ci` path stays lightweight: it checks the Go version required
+by `go.mod`, downloads modules, verifies formatting and module tidiness, runs
+`go vet`, compiles packages/tests with a zero-test smoke pass, then runs the
+unit suite. Race and coverage runs are opt-in:
 
 ```sh
-GO=/usr/local/go/bin/go make ci
+make race
+make coverage
+```
+
+If Go or gofmt is installed outside `PATH`, pass them explicitly:
+
+```sh
+GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt make ci
 ```
 
 ## GitHub Actions
 
 GitHub Actions runs `.github/workflows/ci.yml` on Ubuntu with the Go version
-from `go.mod`, calling `scripts/ci.sh` for formatting, module tidiness, vet,
-unit tests, and race tests.
+pinned by `go.mod`, calling `make ci` so local validation and the default CI
+job share the same entry point. The workflow can also be started manually with
+optional race and coverage inputs, matching `make race` and `make coverage`.
 
 The manual `.github/workflows/vohive-compat.yml` workflow checks this module
 against an older VoHive consumer checkout. It asks for the VoHive repository

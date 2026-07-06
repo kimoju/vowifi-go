@@ -1,6 +1,7 @@
 package voiceclient
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
@@ -17,6 +18,7 @@ import (
 )
 
 var ErrInvalidChallenge = errors.New("invalid SIP digest challenge")
+var ErrInvalidAuthorization = errors.New("invalid SIP digest authorization")
 var ErrInvalidAuthenticationInfo = errors.New("invalid SIP digest authentication-info")
 var ErrRegistrationRejected = errors.New("IMS registration rejected")
 
@@ -36,6 +38,22 @@ type DigestChallenge struct {
 	QOP       string
 	Opaque    string
 	Stale     bool
+}
+
+type DigestAuthorization struct {
+	Scheme    string
+	Username  string
+	Realm     string
+	Nonce     string
+	URI       string
+	Response  string
+	Algorithm string
+	QOP       string
+	NC        int
+	NCText    string
+	CNonce    string
+	Opaque    string
+	AUTS      []byte
 }
 
 type DigestAuthInput struct {
@@ -207,6 +225,135 @@ func ParseWWWAuthenticate(header string) (DigestChallenge, error) {
 		ch.Algorithm = "MD5"
 	}
 	return ch, nil
+}
+
+func ParseDigestAuthorization(header string) (DigestAuthorization, error) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return DigestAuthorization{}, ErrInvalidAuthorization
+	}
+	scheme, rest, ok := strings.Cut(header, " ")
+	if !ok {
+		return DigestAuthorization{}, ErrInvalidAuthorization
+	}
+	auth := DigestAuthorization{Scheme: strings.TrimSpace(scheme)}
+	if !strings.EqualFold(auth.Scheme, "Digest") {
+		return DigestAuthorization{}, ErrInvalidAuthorization
+	}
+	for _, part := range splitAuthParams(rest) {
+		key, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = unquote(strings.TrimSpace(value))
+		switch key {
+		case "username":
+			auth.Username = value
+		case "realm":
+			auth.Realm = value
+		case "nonce":
+			auth.Nonce = value
+		case "uri":
+			auth.URI = value
+		case "response":
+			auth.Response = strings.ToLower(strings.TrimSpace(value))
+		case "algorithm":
+			auth.Algorithm = value
+		case "qop":
+			auth.QOP = strings.ToLower(strings.TrimSpace(value))
+		case "nc":
+			ncText := strings.ToLower(strings.TrimSpace(value))
+			nc, err := parseDigestNonceCount(ncText)
+			if err != nil {
+				return DigestAuthorization{}, err
+			}
+			auth.NCText = ncText
+			auth.NC = nc
+		case "cnonce":
+			auth.CNonce = value
+		case "opaque":
+			auth.Opaque = value
+		case "auts":
+			auts, err := decodeDigestAUTS(value)
+			if err != nil {
+				return DigestAuthorization{}, err
+			}
+			auth.AUTS = auts
+		}
+	}
+	if auth.Username == "" || auth.Realm == "" || auth.Nonce == "" || auth.URI == "" || auth.Response == "" {
+		return DigestAuthorization{}, ErrInvalidAuthorization
+	}
+	if !validDigestHex(auth.Response, 32) {
+		return DigestAuthorization{}, fmt.Errorf("%w: invalid response", ErrInvalidAuthorization)
+	}
+	if auth.Algorithm == "" {
+		auth.Algorithm = "MD5"
+	}
+	if auth.QOP != "" && (auth.NC <= 0 || auth.CNonce == "") {
+		return DigestAuthorization{}, ErrInvalidAuthorization
+	}
+	return auth, nil
+}
+
+func VerifyDigestAuthorization(header string, ch DigestChallenge, in DigestAuthInput) (DigestAuthorization, bool, error) {
+	auth, err := ParseDigestAuthorization(header)
+	if err != nil {
+		return DigestAuthorization{}, false, err
+	}
+	if ch.Realm == "" || ch.Nonce == "" {
+		return auth, false, ErrInvalidChallenge
+	}
+	algorithm := strings.TrimSpace(ch.Algorithm)
+	if algorithm == "" {
+		algorithm = "MD5"
+	}
+	if !strings.EqualFold(auth.Algorithm, algorithm) ||
+		auth.Realm != ch.Realm ||
+		auth.Nonce != ch.Nonce ||
+		(ch.Opaque != "" && auth.Opaque != ch.Opaque) {
+		return auth, false, nil
+	}
+	qop := firstQOP(ch.QOP)
+	if qop != auth.QOP {
+		return auth, false, nil
+	}
+	if expected := strings.TrimSpace(in.Username); expected != "" && expected != auth.Username {
+		return auth, false, nil
+	}
+	if expected := strings.TrimSpace(in.URI); expected != "" && expected != auth.URI {
+		return auth, false, nil
+	}
+	if qop != "" {
+		if expected := strings.TrimSpace(in.CNonce); expected != "" && expected != auth.CNonce {
+			return auth, false, nil
+		}
+		if in.NC > 0 && in.NC != auth.NC {
+			return auth, false, nil
+		}
+	}
+	if len(auth.AUTS) > 0 && len(in.AUTS) == 0 {
+		return auth, false, nil
+	}
+	if len(in.AUTS) > 0 && !bytes.Equal(in.AUTS, auth.AUTS) {
+		return auth, false, nil
+	}
+	input := cloneDigestAuthInput(in)
+	input.Username = auth.Username
+	input.URI = auth.URI
+	input.CNonce = auth.CNonce
+	input.NC = auth.NC
+	input.AUTS = append([]byte(nil), auth.AUTS...)
+	expected, err := BuildDigestAuthorization(ch, input)
+	if err != nil {
+		return auth, false, err
+	}
+	expectedAuth, err := ParseDigestAuthorization(expected)
+	if err != nil {
+		return auth, false, err
+	}
+	return auth, strings.EqualFold(auth.Response, expectedAuth.Response), nil
 }
 
 func ExtractAKAChallengeNonce(nonce string) (rand16, autn16 []byte, ok bool) {
@@ -1288,6 +1435,44 @@ func splitAuthParams(s string) []string {
 		out = append(out, part)
 	}
 	return out
+}
+
+func parseDigestNonceCount(value string) (int, error) {
+	if len(value) != 8 {
+		return 0, fmt.Errorf("%w: invalid nonce count", ErrInvalidAuthorization)
+	}
+	n, err := strconv.ParseUint(value, 16, 32)
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("%w: invalid nonce count", ErrInvalidAuthorization)
+	}
+	return int(n), nil
+}
+
+func validDigestHex(value string, size int) bool {
+	if len(value) != size {
+		return false
+	}
+	for _, r := range value {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func decodeDigestAUTS(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, fmt.Errorf("%w: invalid auts", ErrInvalidAuthorization)
+	}
+	if raw, err := base64.StdEncoding.DecodeString(value); err == nil {
+		return raw, nil
+	}
+	if raw, err := base64.RawStdEncoding.DecodeString(value); err == nil {
+		return raw, nil
+	}
+	return nil, fmt.Errorf("%w: invalid auts", ErrInvalidAuthorization)
 }
 
 func firstQOP(qop string) string {

@@ -28,6 +28,9 @@ func TestEntitlementCacheSnapshotRefreshAndRoutes(t *testing.T) {
 	if snapshot.RefreshRequired {
 		t.Fatalf("RefreshRequired=%v reason=%q", snapshot.RefreshRequired, snapshot.RefreshReason)
 	}
+	if !snapshot.Usable() {
+		t.Fatalf("snapshot should be usable: %+v", snapshot)
+	}
 	if snapshot.Token != "token-1" {
 		t.Fatalf("Token=%q", snapshot.Token)
 	}
@@ -59,9 +62,15 @@ func TestEntitlementCacheSnapshotRefreshAndRoutes(t *testing.T) {
 	if !refreshing.RefreshRequired || refreshing.RefreshReason != entitlementRefreshReasonRefreshWindow {
 		t.Fatalf("refreshing=%+v", refreshing)
 	}
+	if !refreshing.Usable() {
+		t.Fatalf("refresh-window snapshot should remain usable: %+v", refreshing)
+	}
 	expired := cache.Snapshot(base.Add(5 * time.Minute))
 	if !expired.RefreshRequired || expired.RefreshReason != entitlementRefreshReasonExpired {
 		t.Fatalf("expired=%+v", expired)
+	}
+	if expired.Usable() {
+		t.Fatalf("expired snapshot should not be usable: %+v", expired)
 	}
 }
 
@@ -107,15 +116,77 @@ func TestEntitlementCacheRequiresRefreshWithoutUsableData(t *testing.T) {
 	if snapshot := cache.Snapshot(now); !snapshot.RefreshRequired || snapshot.RefreshReason != entitlementRefreshReasonNoCache {
 		t.Fatalf("empty snapshot=%+v", snapshot)
 	}
+	if cache.Usable(now) {
+		t.Fatal("empty cache should not be usable")
+	}
 
 	statusSnapshot := cache.Store(EntitlementInfo{Status: 6004, UserData: "token-1"}, now)
 	if !statusSnapshot.RefreshRequired || statusSnapshot.RefreshReason != entitlementRefreshReasonStatus {
 		t.Fatalf("status snapshot=%+v", statusSnapshot)
 	}
+	if statusSnapshot.Usable() {
+		t.Fatalf("non-cacheable status snapshot should not be usable: %+v", statusSnapshot)
+	}
 
 	emptySnapshot := cache.Store(EntitlementInfo{Status: 1000}, now)
 	if !emptySnapshot.RefreshRequired || emptySnapshot.RefreshReason != entitlementRefreshReasonEmpty {
 		t.Fatalf("empty data snapshot=%+v", emptySnapshot)
+	}
+	if emptySnapshot.Usable() {
+		t.Fatalf("empty data snapshot should not be usable: %+v", emptySnapshot)
+	}
+}
+
+func TestEntitlementCacheUsableViewsRejectExpiredOrFailedEntitlement(t *testing.T) {
+	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	info := EntitlementInfo{
+		Status:      1000,
+		UserData:    "token-1",
+		ServiceURNs: []string{"fire"},
+		Routes: []EmergencyRoute{
+			{ServiceURN: "fire", PCSCF: []string{"pcscf-fire.ims.example"}},
+			{Endpoints: []string{"sips:any@example.test"}},
+		},
+		CacheMaxAge: 5 * time.Minute,
+	}
+	cache := NewEntitlementCache(EntitlementCachePolicy{RefreshBefore: time.Minute})
+	snapshot := cache.Store(info, base)
+
+	if !snapshot.Usable() {
+		t.Fatalf("fresh snapshot should be usable: %+v", snapshot)
+	}
+	if !sameStrings(snapshot.UsableServiceURNs(), []string{"urn:service:sos.fire"}) {
+		t.Fatalf("usable service URNs=%+v", snapshot.UsableServiceURNs())
+	}
+	if routes := cache.UsableRoutes("fire", base.Add(4*time.Minute)); len(routes) != 2 {
+		t.Fatalf("refresh-window routes=%+v, want service and generic routes", routes)
+	}
+
+	expired := cache.Snapshot(base.Add(5 * time.Minute))
+	if expired.Usable() {
+		t.Fatalf("expired snapshot should not be usable: %+v", expired)
+	}
+	if routes := expired.UsableRoutes("fire"); len(routes) != 0 {
+		t.Fatalf("expired usable routes=%+v, want none", routes)
+	}
+	if urns := expired.UsableServiceURNs(); len(urns) != 0 {
+		t.Fatalf("expired usable service URNs=%+v, want none", urns)
+	}
+	if routes := expired.AvailableRoutes("fire"); len(routes) != 2 {
+		t.Fatalf("available routes should preserve legacy view, got %+v", routes)
+	}
+
+	failed := cache.Store(EntitlementInfo{
+		Status:      6004,
+		UserData:    "token-2",
+		ServiceURNs: []string{"police"},
+		Routes:      []EmergencyRoute{{ServiceURN: "police", PCSCF: []string{"pcscf-police.ims.example"}}},
+	}, base.Add(time.Minute))
+	if failed.Usable() {
+		t.Fatalf("failed entitlement snapshot should not be usable: %+v", failed)
+	}
+	if routes := cache.UsableRoutes("police", base.Add(2*time.Minute)); len(routes) != 0 {
+		t.Fatalf("failed entitlement usable routes=%+v, want none", routes)
 	}
 }
 

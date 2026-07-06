@@ -316,6 +316,12 @@ func (s *PacketSession) SendInnerPacketWithNextHeader(ctx context.Context, nextH
 		s.mu.Unlock()
 		return fmt.Errorf("%w: outbound sa or transport is nil", ErrInvalidPacketTunnel)
 	}
+	if err := validateInnerPacketNextHeader(nextHeader, innerCopy); err != nil {
+		s.stats.OutboundErrors++
+		s.stats.UnsupportedDrops++
+		s.mu.Unlock()
+		return err
+	}
 	packet, err := s.outbound.Seal(nextHeader, innerCopy, esp.SealOptions{Random: s.random})
 	transport := s.transport
 	if err != nil {
@@ -360,6 +366,10 @@ func (s *PacketSession) ReceiveESPPacket(ctx context.Context, packet []byte) (Pa
 	}
 	out, err := s.inbound.Open(packetCopy)
 	if err != nil {
+		s.recordInboundErrorLocked(err)
+		return PacketTunnelPacket{}, err
+	}
+	if err := validateInnerPacketNextHeader(out.NextHeader, out.Payload); err != nil {
 		s.recordInboundErrorLocked(err)
 		return PacketTunnelPacket{}, err
 	}
@@ -414,6 +424,17 @@ func (s *PacketSession) PacketStats() PacketTunnelStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stats
+}
+
+func validateInnerPacketNextHeader(nextHeader uint8, packet []byte) error {
+	detected, err := NextHeaderForInnerPacket(packet)
+	if err != nil {
+		return err
+	}
+	if detected != nextHeader {
+		return fmt.Errorf("%w: next header %d does not match inner packet", ErrUnsupportedInnerPacket, nextHeader)
+	}
+	return nil
 }
 
 func (s *PacketSession) recordOutboundError(unsupported bool) {

@@ -165,6 +165,49 @@ func TestRunIKESAInitRejectsMissingNonce(t *testing.T) {
 	}
 }
 
+func TestRunIKESAInitRejectsUnsupportedSelectedSA(t *testing.T) {
+	responderKey := bytes.Repeat([]byte{0x22}, 32)
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		req, err := ParseMessage(request)
+		if err != nil {
+			return nil, err
+		}
+		selected := DefaultIKEProposal()
+		selected.Proposals[0].Transforms[1].ID = PRF_HMAC_SHA2_512
+		saPayload, err := SecurityAssociationPayload(selected)
+		if err != nil {
+			return nil, err
+		}
+		privR, err := ecdh.X25519().NewPrivateKey(responderKey)
+		if err != nil {
+			return nil, err
+		}
+		resp := Message{
+			Header: Header{
+				InitiatorSPI: req.Header.InitiatorSPI,
+				ResponderSPI: 0x1112131415161718,
+				ExchangeType: ExchangeIKE_SA_INIT,
+				Flags:        FlagResponse,
+			},
+			Payloads: []Payload{
+				saPayload,
+				KeyExchangePayload(DHGroupCurve25519, privR.PublicKey().Bytes()),
+				NoncePayload(bytes.Repeat([]byte{0xb2}, 32)),
+			},
+		}
+		return resp.MarshalBinary()
+	})
+	_, err := RunIKE_SA_INIT(context.Background(), InitConfig{
+		Transport:        transport,
+		InitiatorSPI:     1,
+		NonceI:           bytes.Repeat([]byte{0x01}, 32),
+		X25519PrivateKey: bytes.Repeat([]byte{0x02}, 32),
+	})
+	if !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("RunIKE_SA_INIT() err=%v, want ErrUnsupportedSASelection", err)
+	}
+}
+
 func TestUDPTransportExchangesWithNonESPMarker(t *testing.T) {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

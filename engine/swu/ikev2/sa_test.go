@@ -54,3 +54,53 @@ func TestSecurityAssociationRejectsBadTransformCount(t *testing.T) {
 		t.Fatalf("ParseSecurityAssociation() err=%v, want ErrInvalidSA", err)
 	}
 }
+
+func TestValidateSelectedSAAllowsOfferedESPWithResponderSPI(t *testing.T) {
+	offered := DefaultESPProposal([]byte{0xca, 0xfe, 0xba, 0xbe})
+	selected := DefaultESPProposal([]byte{0xde, 0xad, 0xbe, 0xef})
+	if err := ValidateSelectedSA(offered, selected); err != nil {
+		t.Fatalf("ValidateSelectedSA() error = %v", err)
+	}
+}
+
+func TestValidateSelectedSARejectsUnofferedIKETransform(t *testing.T) {
+	offered := DefaultIKEProposal()
+	selected := DefaultIKEProposal()
+	selected.Proposals[0].Transforms[1].ID = PRF_HMAC_SHA2_512
+	err := ValidateSelectedSA(offered, selected)
+	if !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("ValidateSelectedSA() err=%v, want ErrUnsupportedSASelection", err)
+	}
+}
+
+func TestValidateSelectedSARejectsUnofferedESPAttribute(t *testing.T) {
+	offered := DefaultESPProposal([]byte{0xca, 0xfe, 0xba, 0xbe})
+	selected := DefaultESPProposal([]byte{0xde, 0xad, 0xbe, 0xef})
+	selected.Proposals[0].Transforms[0].Attributes = []TransformAttribute{KeyLengthAttribute(256)}
+	err := ValidateSelectedSA(offered, selected)
+	if !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("ValidateSelectedSA() err=%v, want ErrUnsupportedSASelection", err)
+	}
+}
+
+func TestValidateSelectedSARejectsMissingRequiredTransforms(t *testing.T) {
+	offeredIKE := DefaultIKEProposal()
+	selectedIKE := DefaultIKEProposal()
+	selectedIKE.Proposals[0].Transforms = selectedIKE.Proposals[0].Transforms[:3]
+	if err := ValidateSelectedSA(offeredIKE, selectedIKE); !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("ValidateSelectedSA(IKE missing DH) err=%v, want ErrUnsupportedSASelection", err)
+	}
+
+	offeredESP := DefaultESPProposal([]byte{0xca, 0xfe, 0xba, 0xbe})
+	selectedESP := DefaultESPProposal([]byte{0xde, 0xad, 0xbe, 0xef})
+	selectedESP.Proposals[0].Transforms = selectedESP.Proposals[0].Transforms[:2]
+	if err := ValidateSelectedSA(offeredESP, selectedESP); !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("ValidateSelectedSA(ESP missing ESN) err=%v, want ErrUnsupportedSASelection", err)
+	}
+
+	selectedUnknown := DefaultESPProposal([]byte{0xde, 0xad, 0xbe, 0xef})
+	selectedUnknown.Proposals[0].ProtocolID = ProtocolAH
+	if err := ValidateSelectedSA(offeredESP, selectedUnknown); !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("ValidateSelectedSA(unknown protocol) err=%v, want ErrUnsupportedSASelection", err)
+	}
+}

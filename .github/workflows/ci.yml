@@ -6,9 +6,23 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_race:
+        description: Run optional race tests after the default CI suite.
+        required: false
+        type: boolean
+        default: false
+      run_coverage:
+        description: Run optional coverage tests after the default CI suite.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+env:
+  GO_VERSION_FILE: go.mod
 
 jobs:
   go:
@@ -20,11 +34,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
+      - name: Set up pinned Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: ${{ env.GO_VERSION_FILE }}
           cache: true
+          cache-dependency-path: go.sum
 
-      - name: Run local CI script
-        run: ./scripts/ci.sh
+      - name: Run local CI entry point
+        env:
+          GO: go
+          GOFMT: gofmt
+        run: make ci
+
+      - name: Run optional race tests
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_race == true }}
+        env:
+          GO: go
+          GOFMT: gofmt
+        run: make race
+
+      - name: Run optional coverage tests
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_coverage == true }}
+        env:
+          GO: go
+          GOFMT: gofmt
+          CI_COVERAGE_FILE: ${{ runner.temp }}/coverage.out
+        run: make coverage

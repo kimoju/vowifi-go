@@ -431,6 +431,9 @@ func (a Attribute) VariableValue() ([]byte, error) {
 	if length > len(a.Data)-2 {
 		return nil, fmt.Errorf("%w: value length %d > %d", ErrInvalidAttribute, length, len(a.Data)-2)
 	}
+	if err := requireZeroBytes(a.Data[2+length:], "variable value padding"); err != nil {
+		return nil, err
+	}
 	return append([]byte(nil), a.Data[2:2+length]...), nil
 }
 
@@ -464,6 +467,9 @@ func (a Attribute) SelectedVersionValue() (uint16, error) {
 func (a Attribute) BiddingValue() (bool, error) {
 	if len(a.Data) != 2 {
 		return false, fmt.Errorf("%w: bidding value length %d", ErrInvalidAttribute, len(a.Data))
+	}
+	if a.Data[0]&0x7f != 0 || a.Data[1] != 0 {
+		return false, fmt.Errorf("%w: non-zero bidding reserved bits", ErrInvalidAttribute)
 	}
 	return a.Data[0]&0x80 != 0, nil
 }
@@ -503,6 +509,9 @@ func (a Attribute) FixedValue(size int) ([]byte, error) {
 	if size < 0 || len(a.Data) < 2+size {
 		return nil, ErrInvalidAttribute
 	}
+	if err := requireReservedZero(a.Data, "fixed value reserved bytes"); err != nil {
+		return nil, err
+	}
 	return append([]byte(nil), a.Data[2:2+size]...), nil
 }
 
@@ -538,7 +547,7 @@ func (a Attribute) ResultIndValue() error {
 	if len(a.Data) != 2 {
 		return fmt.Errorf("%w: result-ind value length %d", ErrInvalidAttribute, len(a.Data))
 	}
-	return nil
+	return requireReservedZero(a.Data, "result-ind reserved bytes")
 }
 
 func (a Attribute) KDFInputValue() (string, error) {
@@ -575,7 +584,7 @@ func (a Attribute) CounterTooSmallValue() error {
 	if len(a.Data) != 2 {
 		return fmt.Errorf("%w: counter-too-small value length %d", ErrInvalidAttribute, len(a.Data))
 	}
-	return nil
+	return requireReservedZero(a.Data, "counter-too-small reserved bytes")
 }
 
 func (a Attribute) NonceSValue() ([]byte, error) {
@@ -589,6 +598,9 @@ func (a Attribute) IVValue() ([]byte, error) {
 func (a Attribute) EncrDataValue() ([]byte, error) {
 	if len(a.Data) < 2 {
 		return nil, ErrInvalidAttribute
+	}
+	if err := requireReservedZero(a.Data, "encrypted-data reserved bytes"); err != nil {
+		return nil, err
 	}
 	return append([]byte(nil), a.Data[2:]...), nil
 }
@@ -633,8 +645,14 @@ func IdentityStateFromAttributes(attrs []Attribute) (EncryptedIdentityState, err
 func (a Attribute) CheckcodeValue() ([]byte, error) {
 	switch len(a.Data) {
 	case 2:
+		if err := requireReservedZero(a.Data, "checkcode reserved bytes"); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	case 22:
+		if err := requireReservedZero(a.Data, "checkcode reserved bytes"); err != nil {
+			return nil, err
+		}
 		return append([]byte(nil), a.Data[2:]...), nil
 	default:
 		return nil, fmt.Errorf("%w: checkcode value length %d", ErrInvalidAttribute, len(a.Data))
@@ -695,15 +713,16 @@ func (a Attribute) fixedValueExact(size int) ([]byte, error) {
 	if size < 0 || len(a.Data) < 2 {
 		return nil, ErrInvalidAttribute
 	}
+	if err := requireReservedZero(a.Data, "fixed value reserved bytes"); err != nil {
+		return nil, err
+	}
 	baseLength := 2 + size
 	paddedLength := baseLength + paddingFor4(2+baseLength)
 	if len(a.Data) != baseLength && len(a.Data) != paddedLength {
 		return nil, fmt.Errorf("%w: fixed value length %d for %d-byte value", ErrInvalidAttribute, len(a.Data), size)
 	}
-	for _, b := range a.Data[baseLength:] {
-		if b != 0 {
-			return nil, fmt.Errorf("%w: non-zero fixed value padding", ErrInvalidAttribute)
-		}
+	if err := requireZeroBytes(a.Data[baseLength:], "fixed value padding"); err != nil {
+		return nil, err
 	}
 	return append([]byte(nil), a.Data[2:baseLength]...), nil
 }
@@ -711,6 +730,9 @@ func (a Attribute) fixedValueExact(size int) ([]byte, error) {
 func fixed16Values(a Attribute) ([][]byte, error) {
 	if len(a.Data) < 2 || (len(a.Data)-2)%16 != 0 {
 		return nil, ErrInvalidAttribute
+	}
+	if err := requireReservedZero(a.Data, "fixed value reserved bytes"); err != nil {
+		return nil, err
 	}
 	var out [][]byte
 	for offset := 2; offset < len(a.Data); offset += 16 {
@@ -720,6 +742,22 @@ func fixed16Values(a Attribute) ([][]byte, error) {
 		return nil, ErrInvalidAttribute
 	}
 	return out, nil
+}
+
+func requireReservedZero(data []byte, name string) error {
+	if len(data) < 2 {
+		return ErrInvalidAttribute
+	}
+	return requireZeroBytes(data[:2], name)
+}
+
+func requireZeroBytes(data []byte, name string) error {
+	for _, b := range data {
+		if b != 0 {
+			return fmt.Errorf("%w: non-zero %s", ErrInvalidAttribute, name)
+		}
+	}
+	return nil
 }
 
 func paddingFor4(n int) int {

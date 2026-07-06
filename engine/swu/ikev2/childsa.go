@@ -118,6 +118,14 @@ func ParseChildSAResult(init InitResult, inner []Payload, localSPI []byte) (Chil
 }
 
 func ParseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, nonceI, nonceR []byte) (ChildSAResult, error) {
+	return parseChildSAResultWithNonces(init, inner, localSPI, nonceI, nonceR, nil)
+}
+
+func parseChildSAResultWithOfferedSA(init InitResult, inner []Payload, localSPI []byte, offeredSA SecurityAssociation) (ChildSAResult, error) {
+	return parseChildSAResultWithNonces(init, inner, localSPI, init.NonceI, init.NonceR, &offeredSA)
+}
+
+func parseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, nonceI, nonceR []byte, offeredSA *SecurityAssociation) (ChildSAResult, error) {
 	var out ChildSAResult
 	for _, p := range inner {
 		switch p.Type {
@@ -156,6 +164,11 @@ func ParseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, no
 	if len(out.SelectedSA.Proposals) == 0 {
 		return ChildSAResult{}, fmt.Errorf("%w: missing SA", ErrInvalidChildSA)
 	}
+	if offeredSA != nil {
+		if err := ValidateSelectedSA(*offeredSA, out.SelectedSA); err != nil {
+			return ChildSAResult{}, err
+		}
+	}
 	if len(out.SelectedSA.Proposals[0].SPI) == 0 {
 		return ChildSAResult{}, fmt.Errorf("%w: missing responder ESP SPI", ErrInvalidChildSA)
 	}
@@ -173,6 +186,20 @@ func ParseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, no
 	out.RemoteSPI = append([]byte(nil), out.SelectedSA.Proposals[0].SPI...)
 	out.Keys = keys
 	return out, nil
+}
+
+func firstSecurityAssociation(payloads []Payload) (SecurityAssociation, bool, error) {
+	for _, payload := range payloads {
+		if payload.Type != PayloadSA {
+			continue
+		}
+		sa, err := ParseSecurityAssociation(payload.Body)
+		if err != nil {
+			return SecurityAssociation{}, false, err
+		}
+		return sa, true, nil
+	}
+	return SecurityAssociation{}, false, nil
 }
 
 func splitESPKeys(profile ESPKeyProfile, material []byte) ESPKeys {

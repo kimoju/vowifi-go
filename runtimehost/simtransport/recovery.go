@@ -3,6 +3,7 @@ package simtransport
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 )
 
@@ -55,6 +56,19 @@ func StatusRecoveryClass(sw1, sw2 byte) RecoveryClass {
 	}
 }
 
+func StatusStringRecoveryClass(status string) RecoveryClass {
+	s := strings.TrimSpace(status)
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X")
+	if len(s) != 4 || !looksHex(s) {
+		return RecoveryClassNone
+	}
+	n, err := strconv.ParseUint(s, 16, 16)
+	if err != nil {
+		return RecoveryClassNone
+	}
+	return StatusRecoveryClass(byte(n>>8), byte(n))
+}
+
 func (r APDUResult) RecoveryClass() RecoveryClass {
 	return StatusRecoveryClass(r.SW1, r.SW2)
 }
@@ -65,7 +79,7 @@ func (r CRSMResult) RecoveryClass() RecoveryClass {
 
 func classifyErrorText(text string) RecoveryClass {
 	s := strings.ToLower(strings.TrimSpace(text))
-	switch {
+	switch statusClass := statusTextRecoveryClass(s); {
 	case s == "":
 		return RecoveryClassNone
 	case strings.Contains(s, "isim identity data empty") ||
@@ -81,6 +95,8 @@ func classifyErrorText(text string) RecoveryClass {
 		strings.Contains(s, " 6a82") ||
 		strings.Contains(s, " 6a83"):
 		return RecoveryClassFileNotFound
+	case statusClass != RecoveryClassNone:
+		return statusClass
 	case strings.Contains(s, "sim busy") ||
 		strings.Contains(s, "apdu busy") ||
 		strings.Contains(s, "sim is busy") ||
@@ -108,4 +124,15 @@ func classifyErrorText(text string) RecoveryClass {
 	default:
 		return RecoveryClassNone
 	}
+}
+
+func statusTextRecoveryClass(text string) RecoveryClass {
+	for _, token := range strings.FieldsFunc(text, func(r rune) bool {
+		return !('0' <= r && r <= '9' || 'a' <= r && r <= 'f' || 'A' <= r && r <= 'F')
+	}) {
+		if class := StatusStringRecoveryClass(token); class != RecoveryClassNone {
+			return class
+		}
+	}
+	return RecoveryClassNone
 }

@@ -111,14 +111,30 @@ func (c *EntitlementCache) NeedRefresh(now time.Time) bool {
 	return c.Snapshot(now).RefreshRequired
 }
 
-// AvailableServiceURNs returns the emergency service URNs currently usable by the cache.
+// Usable reports whether cached entitlement data can still be used locally.
+func (c *EntitlementCache) Usable(now time.Time) bool {
+	return c.Snapshot(now).Usable()
+}
+
+// AvailableServiceURNs returns cached emergency service URNs without validating freshness.
 func (c *EntitlementCache) AvailableServiceURNs(now time.Time) []string {
 	return c.Snapshot(now).AvailableServiceURNs()
 }
 
-// AvailableRoutes returns cached emergency routes for service. An empty service returns all routes.
+// UsableServiceURNs returns cached service URNs only when entitlement data is still valid.
+func (c *EntitlementCache) UsableServiceURNs(now time.Time) []string {
+	return c.Snapshot(now).UsableServiceURNs()
+}
+
+// AvailableRoutes returns cached emergency routes without validating freshness.
+// An empty service returns all routes.
 func (c *EntitlementCache) AvailableRoutes(service string, now time.Time) []EmergencyRoute {
 	return c.Snapshot(now).AvailableRoutes(service)
+}
+
+// UsableRoutes returns cached emergency routes only when entitlement data is still valid.
+func (c *EntitlementCache) UsableRoutes(service string, now time.Time) []EmergencyRoute {
+	return c.Snapshot(now).UsableRoutes(service)
 }
 
 // Reset drops cached entitlement state.
@@ -138,13 +154,38 @@ func (s EntitlementSnapshot) NeedsRefresh() bool {
 	return s.RefreshRequired
 }
 
+// Usable reports whether this snapshot can be reused for local emergency routing.
+// A snapshot in the refresh window remains usable until its expiry or max-age.
+func (s EntitlementSnapshot) Usable() bool {
+	if !s.Cached {
+		return false
+	}
+	if !entitlementInfoCacheableStatus(s.Info) || !entitlementInfoHasData(s.Info) {
+		return false
+	}
+	switch s.RefreshReason {
+	case entitlementRefreshReasonNone, entitlementRefreshReasonRefreshWindow:
+		return true
+	default:
+		return false
+	}
+}
+
 // AvailableServiceURNs returns a defensive copy of the snapshot service URNs.
 func (s EntitlementSnapshot) AvailableServiceURNs() []string {
 	return copyStringSlice(s.ServiceURNs)
 }
 
-// AvailableRoutes returns cached routes matching service. Generic routes without
-// a service URN match any requested emergency service.
+// UsableServiceURNs returns a defensive copy of service URNs when this snapshot is usable.
+func (s EntitlementSnapshot) UsableServiceURNs() []string {
+	if !s.Usable() {
+		return nil
+	}
+	return s.AvailableServiceURNs()
+}
+
+// AvailableRoutes returns cached routes matching service without validating freshness.
+// Generic routes without a service URN match any requested emergency service.
 func (s EntitlementSnapshot) AvailableRoutes(service string) []EmergencyRoute {
 	if len(s.Routes) == 0 {
 		return nil
@@ -157,6 +198,14 @@ func (s EntitlementSnapshot) AvailableRoutes(service string) []EmergencyRoute {
 		}
 	}
 	return copyEmergencyRoutes(out)
+}
+
+// UsableRoutes returns matching cached routes only when this snapshot is usable.
+func (s EntitlementSnapshot) UsableRoutes(service string) []EmergencyRoute {
+	if !s.Usable() {
+		return nil
+	}
+	return s.AvailableRoutes(service)
 }
 
 func entitlementSnapshot(info EntitlementInfo, storedAt, now time.Time, cached bool, policy EntitlementCachePolicy) EntitlementSnapshot {

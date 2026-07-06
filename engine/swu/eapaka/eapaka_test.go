@@ -482,6 +482,46 @@ func TestAKAAttributeBoundaryValidation(t *testing.T) {
 	}
 }
 
+func TestAKAAttributeRejectsNonZeroReservedAndPadding(t *testing.T) {
+	raw, err := IdentityAttribute("abcde").MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary(AT_IDENTITY) error = %v", err)
+	}
+	raw[len(raw)-1] = 0x7f
+	attrs, err := ParseAttributes(raw)
+	if err != nil {
+		t.Fatalf("ParseAttributes(AT_IDENTITY) error = %v", err)
+	}
+	if _, err := attrs[0].IdentityValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("IdentityValue(non-zero padding) err=%v, want ErrInvalidAttribute", err)
+	}
+
+	if _, err := (Attribute{Type: AttributeRAND, Data: append([]byte{0x01, 0x00}, make([]byte, RANDLength)...)}).RANDValues(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("RANDValues(non-zero reserved) err=%v, want ErrInvalidAttribute", err)
+	}
+	if _, err := (Attribute{Type: AttributeAUTN, Data: append([]byte{0x00, 0x01}, make([]byte, AUTNLength)...)}).AUTNValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("AUTNValue(non-zero reserved) err=%v, want ErrInvalidAttribute", err)
+	}
+	if _, err := (Attribute{Type: AttributeEncrData, Data: []byte{0x00, 0x01, 0xaa}}).EncrDataValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("EncrDataValue(non-zero reserved) err=%v, want ErrInvalidAttribute", err)
+	}
+	if _, err := (Attribute{Type: AttributeCheckcode, Data: append([]byte{0x00, 0x01}, make([]byte, 20)...)}).CheckcodeValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("CheckcodeValue(non-zero reserved) err=%v, want ErrInvalidAttribute", err)
+	}
+	if err := (Attribute{Type: AttributeResultInd, Data: []byte{0x00, 0x01}}).ResultIndValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ResultIndValue(non-zero reserved) err=%v, want ErrInvalidAttribute", err)
+	}
+	if err := (Attribute{Type: AttributeCounterTooSmall, Data: []byte{0x01, 0x00}}).CounterTooSmallValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("CounterTooSmallValue(non-zero reserved) err=%v, want ErrInvalidAttribute", err)
+	}
+	if _, err := (Attribute{Type: AttributeBidding, Data: []byte{0x40, 0x00}}).BiddingValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("BiddingValue(non-zero first reserved bit) err=%v, want ErrInvalidAttribute", err)
+	}
+	if _, err := (Attribute{Type: AttributeBidding, Data: []byte{0x80, 0x01}}).BiddingValue(); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("BiddingValue(non-zero second reserved byte) err=%v, want ErrInvalidAttribute", err)
+	}
+}
+
 func TestParseRejectsInvalidLengths(t *testing.T) {
 	if _, err := ParsePacket([]byte{1, 2, 0, 3}); !errors.Is(err, ErrInvalidPacket) {
 		t.Fatalf("ParsePacket() err=%v, want ErrInvalidPacket", err)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"mime"
 	"net/textproto"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -60,20 +61,31 @@ func ParseIMSCPIMMessage(body []byte) (IMSCPIMMessage, error) {
 }
 
 func BuildIMSCPIMMessage(from, to, contentType string, body []byte) ([]byte, error) {
-	contentType = strings.TrimSpace(contentType)
-	if contentType == "" {
-		return nil, errors.New("CPIM content type is empty")
-	}
-	var out bytes.Buffer
+	messageHeaders := make(map[string][]string, 2)
 	if strings.TrimSpace(from) != "" {
-		fmt.Fprintf(&out, "From: %s\r\n", strings.TrimSpace(from))
+		messageHeaders["From"] = []string{strings.TrimSpace(from)}
 	}
 	if strings.TrimSpace(to) != "" {
-		fmt.Fprintf(&out, "To: %s\r\n", strings.TrimSpace(to))
+		messageHeaders["To"] = []string{strings.TrimSpace(to)}
+	}
+	return BuildIMSCPIMMessageWithHeaders(messageHeaders, map[string][]string{"Content-Type": {contentType}}, body)
+}
+
+func BuildIMSCPIMMessageWithHeaders(messageHeaders, contentHeaders map[string][]string, body []byte) ([]byte, error) {
+	contentType := firstCPIMHeaderValue(contentHeaders, "Content-Type")
+	if strings.TrimSpace(contentType) == "" {
+		return nil, errors.New("CPIM content type is empty")
+	}
+	contentHeaders = cloneCPIMHeaders(contentHeaders)
+	setCPIMHeader(contentHeaders, "Content-Length", strconv.Itoa(len(body)))
+	var out bytes.Buffer
+	if err := writeCPIMHeaders(&out, messageHeaders); err != nil {
+		return nil, err
 	}
 	out.WriteString("\r\n")
-	fmt.Fprintf(&out, "Content-Type: %s\r\n", contentType)
-	fmt.Fprintf(&out, "Content-Length: %d\r\n", len(body))
+	if err := writeCPIMHeaders(&out, contentHeaders); err != nil {
+		return nil, err
+	}
 	out.WriteString("\r\n")
 	out.Write(body)
 	return out.Bytes(), nil
@@ -118,4 +130,79 @@ func normalizedIMSMessageContentType(contentType string) string {
 		contentType = contentType[:semi]
 	}
 	return strings.ToLower(strings.TrimSpace(contentType))
+}
+
+func cloneCPIMHeaders(headers map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(headers))
+	for key, values := range headers {
+		out[key] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func firstCPIMHeaderValue(headers map[string][]string, key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	for candidate, values := range headers {
+		if strings.ToLower(strings.TrimSpace(candidate)) == key {
+			for _, value := range values {
+				if strings.TrimSpace(value) != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func setCPIMHeader(headers map[string][]string, key, value string) {
+	for candidate := range headers {
+		if strings.EqualFold(strings.TrimSpace(candidate), key) {
+			delete(headers, candidate)
+		}
+	}
+	headers[key] = []string{value}
+}
+
+func writeCPIMHeaders(out *bytes.Buffer, headers map[string][]string) error {
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		keys = append(keys, key)
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		return strings.ToLower(strings.TrimSpace(keys[i])) < strings.ToLower(strings.TrimSpace(keys[j]))
+	})
+	for _, key := range keys {
+		name := strings.TrimSpace(key)
+		if !validCPIMHeaderName(name) {
+			return fmt.Errorf("invalid CPIM header name: %q", key)
+		}
+		for _, value := range headers[key] {
+			if strings.ContainsAny(value, "\r\n") {
+				return fmt.Errorf("invalid CPIM header %s value contains line break", name)
+			}
+			if strings.TrimSpace(value) == "" {
+				continue
+			}
+			fmt.Fprintf(out, "%s: %s\r\n", name, strings.TrimSpace(value))
+		}
+	}
+	return nil
+}
+
+func validCPIMHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			continue
+		case r == '!', r == '#', r == '$', r == '%', r == '&', r == '\'', r == '*', r == '+',
+			r == '-', r == '.', r == '^', r == '_', r == '`', r == '|', r == '~':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }

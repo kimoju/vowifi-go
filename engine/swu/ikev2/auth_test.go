@@ -1610,6 +1610,29 @@ func TestBuildIKEAuthInitialPayloadsRejectsMissingID(t *testing.T) {
 	}
 }
 
+func TestParseIKEAuthChildSARejectsUnsupportedSelectedSA(t *testing.T) {
+	init := fakeInitResult(t)
+	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
+	selected := DefaultESPProposal([]byte{0xde, 0xad, 0xbe, 0xef})
+	selected.Proposals[0].Transforms[1].ID = INTEG_HMAC_SHA2_512_256
+	saPayload, err := SecurityAssociationPayload(selected)
+	if err != nil {
+		t.Fatalf("SecurityAssociationPayload() error = %v", err)
+	}
+	tsiPayload, err := TrafficSelectorsPayload(PayloadTSi, IPv4AnyTrafficSelectors())
+	if err != nil {
+		t.Fatalf("TrafficSelectorsPayload(TSi) error = %v", err)
+	}
+	tsrPayload, err := TrafficSelectorsPayload(PayloadTSr, IPv4AnyTrafficSelectors())
+	if err != nil {
+		t.Fatalf("TrafficSelectorsPayload(TSr) error = %v", err)
+	}
+	_, ok, err := parseChildSAIfPresent(init, []Payload{saPayload, tsiPayload, tsrPayload}, localSPI, 2, DefaultESPProposal(localSPI))
+	if ok || !errors.Is(err, ErrUnsupportedSASelection) {
+		t.Fatalf("parseChildSAIfPresent() ok=%t err=%v, want ErrUnsupportedSASelection", ok, err)
+	}
+}
+
 func fakeInitResult(t *testing.T) InitResult {
 	t.Helper()
 	profile, err := KeyMaterialProfileFromSA(DefaultIKEProposal())

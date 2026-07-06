@@ -2,43 +2,56 @@ SHELL := /usr/bin/env bash
 .RECIPEPREFIX := >
 
 GO ?= $(shell command -v go 2>/dev/null || printf /usr/local/go/bin/go)
+GOFMT ?= $(shell command -v gofmt 2>/dev/null || printf /usr/local/go/bin/gofmt)
 CI := ./scripts/ci.sh
 VOHIVE_COMPAT := ./scripts/compat-vohive.sh
 
-.PHONY: help ci download fmt-check tidy-check vet test race compat-vohive
+.PHONY: help ci go-version download fmt-check tidy-check vet smoke test race coverage compat-vohive
 
 help:
 > @printf 'Targets:\n'
-> @printf '  make ci          run the full local CI suite\n'
+> @printf '  make ci          run the default local CI suite used by GitHub Actions\n'
+> @printf '  make go-version  check current Go against the go.mod version pin\n'
 > @printf '  make download    download Go module dependencies\n'
 > @printf '  make fmt-check   check gofmt formatting\n'
 > @printf '  make tidy-check  check go.mod/go.sum tidiness\n'
 > @printf '  make vet         run go vet ./...\n'
+> @printf '  make smoke       compile packages/tests without running the full test suite\n'
 > @printf '  make test        run go test -count=1 ./...\n'
-> @printf '  make race        run go test -race -count=1 ./...\n'
+> @printf '  make race        run optional go test -race -count=1 ./...\n'
+> @printf '  make coverage    run optional coverage tests and print a summary\n'
 > @printf '  make compat-vohive run old VoHive compatibility checks with VOHIVE_DIR\n'
-> @printf '\nOverride Go with: GO=/usr/local/go/bin/go make ci\n'
+> @printf '\nOverride tools with: GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt make ci\n'
 
 ci:
-> GO_BIN="$(GO)" $(CI)
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI)
+
+go-version:
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) version
 
 download:
-> GO_BIN="$(GO)" $(CI) download
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) download
 
 fmt-check:
-> GO_BIN="$(GO)" $(CI) fmt
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) fmt
 
 tidy-check:
-> GO_BIN="$(GO)" $(CI) tidy
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) tidy
 
 vet:
-> GO_BIN="$(GO)" $(CI) vet
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) vet
+
+smoke:
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) smoke
 
 test:
-> GO_BIN="$(GO)" $(CI) test
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) test
 
 race:
-> GO_BIN="$(GO)" $(CI) race
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) race
+
+coverage:
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) coverage
 
 compat-vohive:
 > GO_BIN="$(GO)" $(VOHIVE_COMPAT)

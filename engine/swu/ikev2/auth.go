@@ -296,7 +296,8 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		FinalResponseBytes: append([]byte(nil), finalBytes...),
 		FinalResponseInner: clonePayloads(finalInner),
 	}
-	if child, ok, err := parseChildSAIfPresent(cfg.Init, finalInner, localChildSPI, out.NextMessageID); err != nil {
+	offeredChildSA := authOfferedChildSA(cfg.ChildSA, localChildSPI)
+	if child, ok, err := parseChildSAIfPresent(cfg.Init, finalInner, localChildSPI, out.NextMessageID, offeredChildSA); err != nil {
 		return FullAuthResult{}, err
 	} else if ok {
 		out.ChildSA = &child
@@ -312,7 +313,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		}
 		out.EAPLast = cloneEAPPacketPtr(next)
 		if next.Code == eapaka.CodeSuccess {
-			if child, ok, err := parseChildSAIfPresent(cfg.Init, out.FinalResponseInner, localChildSPI, out.NextMessageID); err != nil {
+			if child, ok, err := parseChildSAIfPresent(cfg.Init, out.FinalResponseInner, localChildSPI, out.NextMessageID, offeredChildSA); err != nil {
 				return FullAuthResult{}, err
 			} else if ok {
 				out.ChildSA = &child
@@ -355,7 +356,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			out.NextMessageID = exchange.NextMessageID
 			out.FinalResponseBytes = append([]byte(nil), exchange.ResponseBytes...)
 			out.FinalResponseInner = clonePayloads(exchange.ResponseInner)
-			if child, ok, err := parseChildSAIfPresent(cfg.Init, out.FinalResponseInner, localChildSPI, out.NextMessageID); err != nil {
+			if child, ok, err := parseChildSAIfPresent(cfg.Init, out.FinalResponseInner, localChildSPI, out.NextMessageID, offeredChildSA); err != nil {
 				return FullAuthResult{}, err
 			} else if ok {
 				out.ChildSA = &child
@@ -368,7 +369,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		if next.Subtype == eapaka.SubtypeReauthentication && strings.TrimSpace(cfg.EAPReauthIdentity) != "" {
 			challengeIdentity = strings.TrimSpace(cfg.EAPReauthIdentity)
 		}
-		challenge, err := RunIKE_AUTH_AKAChallenge(ctx, AKAChallengeConfig{
+		challenge, err := runIKE_AUTH_AKAChallenge(ctx, AKAChallengeConfig{
 			Transport:          cfg.Transport,
 			Init:               cfg.Init,
 			Keys:               cfg.Keys,
@@ -383,7 +384,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			EAPReauthIV:        cfg.EAPReauthIV,
 			EAPReauthCounter:   cfg.EAPReauthCounter,
 			EAPReauthCounterOK: cfg.EAPReauthCounterOK,
-		})
+		}, offeredChildSA)
 		if err != nil {
 			return FullAuthResult{}, err
 		}
@@ -426,6 +427,14 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 }
 
 func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAChallengeResult, error) {
+	var offeredChildSA SecurityAssociation
+	if len(cfg.ChildSPI) > 0 {
+		offeredChildSA = DefaultESPProposal(cfg.ChildSPI)
+	}
+	return runIKE_AUTH_AKAChallenge(ctx, cfg, offeredChildSA)
+}
+
+func runIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig, offeredChildSA SecurityAssociation) (AKAChallengeResult, error) {
 	if cfg.Transport == nil {
 		return AKAChallengeResult{}, fmt.Errorf("%w: transport is nil", ErrInvalidAuthConfig)
 	}
@@ -612,7 +621,13 @@ func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAC
 		out.EAPNext = &next
 	}
 	if hasPayload(finalInner, PayloadSA) {
-		child, err := ParseChildSAResult(cfg.Init, finalInner, cfg.ChildSPI)
+		var child ChildSAResult
+		var err error
+		if len(offeredChildSA.Proposals) > 0 {
+			child, err = parseChildSAResultWithOfferedSA(cfg.Init, finalInner, cfg.ChildSPI, offeredChildSA)
+		} else {
+			child, err = ParseChildSAResult(cfg.Init, finalInner, cfg.ChildSPI)
+		}
 		if err != nil {
 			return AKAChallengeResult{}, err
 		}
@@ -957,11 +972,17 @@ func authNextEAP(auth AuthResult) *eapaka.Packet {
 	return nil
 }
 
-func parseChildSAIfPresent(init InitResult, inner []Payload, localSPI []byte, nextMessageID uint32) (ChildSAResult, bool, error) {
+func parseChildSAIfPresent(init InitResult, inner []Payload, localSPI []byte, nextMessageID uint32, offeredSA SecurityAssociation) (ChildSAResult, bool, error) {
 	if !hasPayload(inner, PayloadSA) {
 		return ChildSAResult{}, false, nil
 	}
-	child, err := ParseChildSAResult(init, inner, localSPI)
+	var child ChildSAResult
+	var err error
+	if len(offeredSA.Proposals) > 0 {
+		child, err = parseChildSAResultWithOfferedSA(init, inner, localSPI, offeredSA)
+	} else {
+		child, err = ParseChildSAResult(init, inner, localSPI)
+	}
 	if err != nil {
 		return ChildSAResult{}, false, err
 	}
@@ -984,6 +1005,16 @@ func fullAuthLocalChildSPI(cfg FullAuthConfig) ([]byte, error) {
 		random = rand.Reader
 	}
 	return randomBytes(random, 4)
+}
+
+func authOfferedChildSA(sa SecurityAssociation, localSPI []byte) SecurityAssociation {
+	if len(sa.Proposals) == 0 {
+		if len(localSPI) == 0 {
+			return SecurityAssociation{}
+		}
+		return DefaultESPProposal(localSPI)
+	}
+	return cloneSecurityAssociation(sa)
 }
 
 func authIV(random io.Reader, profile KeyMaterialProfile, override []byte) ([]byte, error) {

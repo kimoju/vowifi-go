@@ -187,6 +187,49 @@ func TestPacketSessionCountsUnsupportedInnerPacket(t *testing.T) {
 	}
 }
 
+func TestPacketSessionRejectsOutboundNextHeaderMismatchAndCountsDrop(t *testing.T) {
+	transport := &captureESPPacketTransport{}
+	session, err := NewPacketSession(PacketSessionConfig{ChildSA: packetChildSA(true), Transport: transport})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	if err := session.SendInnerPacketWithNextHeader(context.Background(), esp.NextHeaderIPv6, []byte{0x45, 0x00}); !errors.Is(err, ErrUnsupportedInnerPacket) {
+		t.Fatalf("SendInnerPacketWithNextHeader() err=%v, want ErrUnsupportedInnerPacket", err)
+	}
+	if len(transport.packets) != 0 {
+		t.Fatalf("captured packets=%d, want 0", len(transport.packets))
+	}
+	stats := session.PacketStats()
+	if stats.OutboundErrors != 1 || stats.UnsupportedDrops != 1 || stats.OutboundESPPackets != 0 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+func TestPacketSessionRejectsInboundNextHeaderMismatchAndCountsDrop(t *testing.T) {
+	sealer, err := esp.NewOutboundSAFromChild(packetChildSA(true))
+	if err != nil {
+		t.Fatalf("NewOutboundSAFromChild() error = %v", err)
+	}
+	packet, err := sealer.Seal(esp.NextHeaderIPv6, []byte{0x45, 0x00, 0x00, 0x14}, esp.SealOptions{
+		Sequence: 1,
+		IV:       bytes.Repeat([]byte{0x77}, 16),
+	})
+	if err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+	session, err := NewPacketSession(PacketSessionConfig{ChildSA: packetChildSA(false), Transport: &captureESPPacketTransport{}})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	if _, err := session.ReceiveESPPacket(context.Background(), packet); !errors.Is(err, ErrUnsupportedInnerPacket) {
+		t.Fatalf("ReceiveESPPacket() err=%v, want ErrUnsupportedInnerPacket", err)
+	}
+	stats := session.PacketStats()
+	if stats.InboundErrors != 1 || stats.UnsupportedDrops != 1 || stats.InboundInnerPackets != 0 || stats.InboundESPPackets != 0 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
 func TestPacketSessionCountsTransportFailure(t *testing.T) {
 	wantErr := errors.New("send failed")
 	session, err := NewPacketSession(PacketSessionConfig{

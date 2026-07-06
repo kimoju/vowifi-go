@@ -270,6 +270,45 @@ func TestReadISIMIdentityReturnsErrorWhenNoEFCanBeRead(t *testing.T) {
 	}
 }
 
+func TestReadISIMIdentityClassifiesAPDUStatusFailures(t *testing.T) {
+	ft := &isimTransportFake{responses: []string{"9300", "9300", "9300"}}
+	_, err := ReadISIMIdentity(ft)
+	if err == nil {
+		t.Fatal("ReadISIMIdentity() err=nil, want SIM busy read error")
+	}
+	var readErr *ISIMIdentityReadError
+	if !errors.As(err, &readErr) || readErr.Class != simtransport.RecoveryClassSIMBusy {
+		t.Fatalf("ReadISIMIdentity() readErr=%+v err=%v, want SIM busy class", readErr, err)
+	}
+	if got := simtransport.ClassifyError(err); got != simtransport.RecoveryClassSIMBusy {
+		t.Fatalf("ClassifyError(ReadISIMIdentity err) = %q, want SIM busy", got)
+	}
+	if !strings.Contains(err.Error(), "SW=9300") {
+		t.Fatalf("err = %v, want status context", err)
+	}
+}
+
+func TestReadISIMIdentityCRSMClassifiesStatusFailures(t *testing.T) {
+	ft := &crsmIdentityFake{
+		binary:  []simtransport.CRSMResult{{SW1: 0x93, SW2: 0x00}, {SW1: 0x93, SW2: 0x00}},
+		records: []simtransport.CRSMResult{{SW1: 0x93, SW2: 0x00}},
+	}
+	_, err := ReadISIMIdentityCRSM(ft, "")
+	if err == nil {
+		t.Fatal("ReadISIMIdentityCRSM() err=nil, want SIM busy read error")
+	}
+	var readErr *ISIMIdentityReadError
+	if !errors.As(err, &readErr) || readErr.Class != simtransport.RecoveryClassSIMBusy {
+		t.Fatalf("ReadISIMIdentityCRSM() readErr=%+v err=%v, want SIM busy class", readErr, err)
+	}
+	if got := simtransport.ClassifyError(err); got != simtransport.RecoveryClassSIMBusy {
+		t.Fatalf("ClassifyError(ReadISIMIdentityCRSM err) = %q, want SIM busy", got)
+	}
+	if !strings.Contains(err.Error(), "SW=9300") {
+		t.Fatalf("err = %v, want status context", err)
+	}
+}
+
 func isimTLVString(s string) []byte {
 	return append([]byte{0x80, byte(len(s))}, []byte(s)...)
 }
