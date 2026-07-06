@@ -332,6 +332,81 @@ func TestStartEmergencyAddressUpdateHandlesEAPRelayIdentityThenChallenge(t *test
 	}
 }
 
+func TestBuildEntitlementChallengeAnswerSelectsEAPRelayIdentity(t *testing.T) {
+	identity := "310280233641503@private.att.net"
+	keys, err := eapaka.DeriveKeys(identity, e911AKAResult())
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	usableReauth := swu.EAPReauthenticationState{
+		Identity:      "reauth-e911",
+		NextPseudonym: "pseudo-e911",
+		CounterOK:     true,
+		Keys:          keys,
+	}
+	unusableReauth := swu.EAPReauthenticationState{
+		Identity:      "reauth-without-keys",
+		NextPseudonym: "pseudo-e911",
+	}
+	for _, tc := range []struct {
+		name  string
+		attrs []eapaka.Attribute
+		state swu.EAPReauthenticationState
+		want  string
+	}{
+		{
+			name:  "any id uses usable reauth identity",
+			attrs: []eapaka.Attribute{eapaka.AnyIDReqAttribute()},
+			state: usableReauth,
+			want:  "reauth-e911",
+		},
+		{
+			name:  "any id skips unusable reauth identity",
+			attrs: []eapaka.Attribute{eapaka.AnyIDReqAttribute()},
+			state: unusableReauth,
+			want:  "pseudo-e911",
+		},
+		{
+			name:  "fullauth id uses pseudonym",
+			attrs: []eapaka.Attribute{eapaka.FullAuthIDReqAttribute()},
+			state: usableReauth,
+			want:  "pseudo-e911",
+		},
+		{
+			name:  "permanent id uses configured identity",
+			attrs: []eapaka.Attribute{eapaka.PermanentIDReqAttribute()},
+			state: usableReauth,
+			want:  identity,
+		},
+		{
+			name:  "plain identity request preserves existing fallback",
+			attrs: nil,
+			state: usableReauth,
+			want:  identity,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			packet := eapaka.Packet{
+				Code:       eapaka.CodeRequest,
+				Identifier: 6,
+				Type:       eapaka.TypeAKA,
+				Subtype:    eapaka.SubtypeIdentity,
+				Attributes: tc.attrs,
+			}
+			result := entitlementResult{EAPPacket: &packet}
+			answer, _, _, _, _, _, err := buildEntitlementChallengeAnswer(Request{
+				Identity: Identity{IMSI: "310280233641503", SIPUsername: identity},
+			}, result, nil, nil, tc.state)
+			if err != nil {
+				t.Fatalf("buildEntitlementChallengeAnswer() error = %v", err)
+			}
+			if got := relayIdentityValue(t, answer); got != tc.want {
+				t.Fatalf("identity=%q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStartEmergencyAddressUpdateHandlesEAPRelayAKAPrimeKDFNegotiation(t *testing.T) {
 	identity := "310280233641503@private.att.net"
 	kdfOffer := eapRelayAKAPrimeKDFOffer(t, "WLAN", []uint16{99, eapaka.AKAPrimeKDFDefault})
@@ -1127,6 +1202,20 @@ func decodeRelayPacket(t *testing.T, payload map[string]any) eapaka.Packet {
 		t.Fatalf("relay response parse error = %v", err)
 	}
 	return packet
+}
+
+func relayIdentityValue(t *testing.T, payload map[string]any) string {
+	t.Helper()
+	packet := decodeRelayPacket(t, payload)
+	attr, ok := eapaka.FindAttribute(packet.Attributes, eapaka.AttributeIdentity)
+	if !ok {
+		t.Fatalf("relay response missing AT_IDENTITY: %+v", packet)
+	}
+	identity, err := attr.IdentityValue()
+	if err != nil {
+		t.Fatalf("IdentityValue() error = %v", err)
+	}
+	return identity
 }
 
 func decryptedEAPRelayReauthenticationResponseAttrs(t *testing.T, keys eapaka.Keys, packet eapaka.Packet) []eapaka.Attribute {

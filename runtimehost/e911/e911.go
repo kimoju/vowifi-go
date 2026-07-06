@@ -265,7 +265,10 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 	if isEAPRelayTerminalPacket(result) {
 		return answerBody, nil, nextIdentityTranscript, eapaka.EncryptedIdentityState{}, reauthState, false, nil
 	}
-	if relay, raw, ok, err := buildEAPRelayIdentityAnswer(result, firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI)); err != nil {
+	if relay, raw, ok, err := buildEAPRelayIdentityAnswer(result, eapRelayIdentityOptions{
+		PermanentIdentity: firstNonEmpty(req.Identity.SIPUsername, req.Identity.IMSI),
+		ReauthState:       reauthState,
+	}); err != nil {
 		return nil, nil, nil, eapaka.EncryptedIdentityState{}, swu.EAPReauthenticationState{}, false, err
 	} else if ok {
 		answerBody["eap-relay-packet"] = relay
@@ -495,7 +498,12 @@ func parseEAPRelayPacket(v any, out *entitlementResult) {
 	}
 }
 
-func buildEAPRelayIdentityAnswer(result entitlementResult, identity string) (string, []byte, bool, error) {
+type eapRelayIdentityOptions struct {
+	PermanentIdentity string
+	ReauthState       swu.EAPReauthenticationState
+}
+
+func buildEAPRelayIdentityAnswer(result entitlementResult, opts eapRelayIdentityOptions) (string, []byte, bool, error) {
 	if result.EAPPacket == nil {
 		return "", nil, false, nil
 	}
@@ -503,7 +511,7 @@ func buildEAPRelayIdentityAnswer(result entitlementResult, identity string) (str
 	if request.Code != eapaka.CodeRequest || request.Subtype != eapaka.SubtypeIdentity {
 		return "", nil, false, nil
 	}
-	identity = strings.TrimSpace(identity)
+	identity := eapRelayRequestedIdentity(request, opts)
 	if identity == "" {
 		return "", nil, true, ErrChallengeNotImplemented
 	}
@@ -519,6 +527,30 @@ func buildEAPRelayIdentityAnswer(result entitlementResult, identity string) (str
 		return "", nil, true, err
 	}
 	return base64.StdEncoding.EncodeToString(raw), raw, true, nil
+}
+
+func eapRelayRequestedIdentity(request eapaka.Packet, opts eapRelayIdentityOptions) string {
+	permanent := strings.TrimSpace(opts.PermanentIdentity)
+	state := cloneEAPReauthenticationState(opts.ReauthState)
+	pseudonym := strings.TrimSpace(state.NextPseudonym)
+	switch {
+	case eapRelayHasIdentityRequest(request, eapaka.AttributePermanentIDReq):
+		return permanent
+	case eapRelayHasIdentityRequest(request, eapaka.AttributeFullAuthIDReq):
+		return firstNonEmpty(pseudonym, permanent)
+	case eapRelayHasIdentityRequest(request, eapaka.AttributeAnyIDReq):
+		if state.Usable() {
+			return firstNonEmpty(state.Identity, pseudonym, permanent)
+		}
+		return firstNonEmpty(pseudonym, permanent)
+	default:
+		return permanent
+	}
+}
+
+func eapRelayHasIdentityRequest(request eapaka.Packet, typ uint8) bool {
+	_, ok := eapaka.FindAttribute(request.Attributes, typ)
+	return ok
 }
 
 func buildEAPRelayAnswer(result entitlementResult, aka sim.AKAResult, identity string, syncFailure bool, identityTranscript [][]byte) (string, *eapaka.Keys, eapaka.EncryptedIdentityState, error) {

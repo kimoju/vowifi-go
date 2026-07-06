@@ -35,9 +35,9 @@ protocol layers needed by VoHive:
   configuration for native `310/280` and `310/410` profiles
 - TS.43-style E911 entitlement bootstrap, token/websheet handling, RAND/AUTN
   challenge response through the AKA provider, and EAP-AKA/AKA' relay packet
-  response generation with Identity/KDF negotiation, Notification ACK, and
-  terminal Success/Failure handling, plus Client-Error handling for entitlement
-  challenges
+  response generation with Any/FullAuth/Permanent Identity selection, KDF
+  negotiation, Notification ACK, and terminal Success/Failure handling, plus
+  Client-Error handling for entitlement challenges
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
   AKA nonce extraction, Digest/AKAv1-MD5 and AKAv2-MD5 authorization material,
   IMS `Security-Client` proposal generation, `Security-Server` parsing/
