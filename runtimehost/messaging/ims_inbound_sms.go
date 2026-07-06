@@ -88,6 +88,22 @@ func (s *Service) handleIMS3GPPSMS(ctx context.Context, msg IMSMessageRequest) (
 	case SMSRPDUKindData:
 		return s.handleIMSRPData(ctx, msg, rpdu, out)
 	case SMSRPDUKindAck:
+		if len(rpdu.TPDU) > 0 && rpdu.TPDU[0]&0x03 == 0x02 {
+			reportTPDU, err := ParseSMSStatusReportTPDU(rpdu.TPDU)
+			if err != nil {
+				out.StatusCode = 400
+				out.Reason = err.Error()
+				return out, err
+			}
+			report, err := s.handleIMSSMSStatusReport(ctx, msg, reportTPDU)
+			out.DeliveryReport = &report
+			if err != nil && !errors.Is(err, ErrDeliveryNotFound) {
+				out.StatusCode = 500
+				out.Reason = err.Error()
+				return out, err
+			}
+			return out, nil
+		}
 		report := SMSDeliveryReport{
 			CallID:   msg.CallID,
 			RPMR:     int(rpdu.MR),
@@ -190,26 +206,7 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 			out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseTemporaryFailure)
 			return out, err
 		}
-		report := SMSDeliveryReport{
-			CallID:                msg.CallID,
-			RPMR:                  int(reportTPDU.Reference),
-			State:                 reportTPDU.State,
-			SIPCode:               200,
-			RPCause:               int(reportTPDU.Status),
-			ReportAt:              reportTPDU.DoneAt,
-			ErrorText:             smsStatusReportError(reportTPDU),
-			Recipient:             reportTPDU.Recipient,
-			SentAt:                reportTPDU.Timestamp,
-			FirstOctet:            reportTPDU.FirstOctet,
-			MoreMessagesToSend:    reportTPDU.MoreMessagesToSend,
-			StatusReportQualifier: reportTPDU.StatusReportQualifier,
-			UserDataHeader:        reportTPDU.UserDataHeader,
-			ParameterIndicator:    reportTPDU.ParameterIndicator,
-			ProtocolID:            reportTPDU.ProtocolID,
-			DataCodingScheme:      reportTPDU.DataCodingScheme,
-			UserData:              reportTPDU.UserData,
-		}
-		_, err = s.HandleSMSDeliveryReport(ctx, report)
+		report, err := s.handleIMSSMSStatusReport(ctx, msg, reportTPDU)
 		out.DeliveryReport = &report
 		out.ReplyContentType = IMS3GPPSMSContentType
 		out.ReplyBody = BuildSMSRPAck(rpdu.MR)
@@ -227,6 +224,30 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 		out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseTemporaryFailure)
 		return out, err
 	}
+}
+
+func (s *Service) handleIMSSMSStatusReport(ctx context.Context, msg IMSMessageRequest, reportTPDU SMSStatusReport) (SMSDeliveryReport, error) {
+	report := SMSDeliveryReport{
+		CallID:                msg.CallID,
+		RPMR:                  int(reportTPDU.Reference),
+		State:                 reportTPDU.State,
+		SIPCode:               200,
+		RPCause:               int(reportTPDU.Status),
+		ReportAt:              reportTPDU.DoneAt,
+		ErrorText:             smsStatusReportError(reportTPDU),
+		Recipient:             reportTPDU.Recipient,
+		SentAt:                reportTPDU.Timestamp,
+		FirstOctet:            reportTPDU.FirstOctet,
+		MoreMessagesToSend:    reportTPDU.MoreMessagesToSend,
+		StatusReportQualifier: reportTPDU.StatusReportQualifier,
+		UserDataHeader:        reportTPDU.UserDataHeader,
+		ParameterIndicator:    reportTPDU.ParameterIndicator,
+		ProtocolID:            reportTPDU.ProtocolID,
+		DataCodingScheme:      reportTPDU.DataCodingScheme,
+		UserData:              reportTPDU.UserData,
+	}
+	_, err := s.HandleSMSDeliveryReport(ctx, report)
+	return report, err
 }
 
 func (s *Service) collectSMSConcatPart(incoming IncomingSMS, concat SMSConcatInfo, now time.Time) (IncomingSMS, bool) {

@@ -22,13 +22,14 @@ const (
 )
 
 type SMSRPDU struct {
-	Kind        SMSRPDUKind
-	RawType     byte
-	MR          byte
-	Cause       int
-	Originator  string
-	Destination string
-	TPDU        []byte
+	Kind             SMSRPDUKind
+	RawType          byte
+	MR               byte
+	Cause            int
+	CauseDiagnostics []byte
+	Originator       string
+	Destination      string
+	TPDU             []byte
 }
 
 type SMSConcatInfo struct {
@@ -298,13 +299,24 @@ func ParseSMSRPDU(body []byte) (SMSRPDU, error) {
 		rpdu.TPDU = tpdu
 	case 0x02, 0x03:
 		rpdu.Kind = SMSRPDUKindAck
+		tpdu, err := parseSMSRPUserData(body, 2, "RP-ACK")
+		if err != nil {
+			return SMSRPDU{}, err
+		}
+		rpdu.TPDU = tpdu
 	case 0x04, 0x05:
 		rpdu.Kind = SMSRPDUKindError
-		cause, err := ParseSMSRPErrorCause(body)
+		cause, diagnostics, next, err := parseSMSRPErrorCauseFields(body)
 		if err != nil {
 			return SMSRPDU{}, err
 		}
 		rpdu.Cause = int(cause)
+		rpdu.CauseDiagnostics = diagnostics
+		tpdu, err := parseSMSRPUserData(body, next, "RP-ERROR")
+		if err != nil {
+			return SMSRPDU{}, err
+		}
+		rpdu.TPDU = tpdu
 	default:
 		return SMSRPDU{}, fmt.Errorf("unsupported RPDU type: 0x%02x", body[0])
 	}
@@ -353,24 +365,57 @@ func parseSMSRPDataFields(body []byte) (originator string, destination string, t
 }
 
 func ParseSMSRPErrorCause(body []byte) (byte, error) {
+	cause, _, _, err := parseSMSRPErrorCauseFields(body)
+	return cause, err
+}
+
+func parseSMSRPErrorCauseFields(body []byte) (cause byte, diagnostics []byte, next int, err error) {
 	if len(body) < 4 {
-		return 0, errors.New("RP-ERROR too short")
+		return 0, nil, 0, errors.New("RP-ERROR too short")
 	}
 	if body[0] != 0x04 && body[0] != 0x05 {
-		return 0, fmt.Errorf("not RP-ERROR: 0x%02x", body[0])
+		return 0, nil, 0, fmt.Errorf("not RP-ERROR: 0x%02x", body[0])
 	}
 	causeLen := int(body[2])
 	if causeLen <= 0 {
-		return 0, errors.New("RP-ERROR cause IE empty")
+		return 0, nil, 0, errors.New("RP-ERROR cause IE empty")
 	}
 	if 3+causeLen > len(body) {
-		return 0, errors.New("RP-ERROR cause IE truncated")
+		return 0, nil, 0, errors.New("RP-ERROR cause IE truncated")
 	}
-	return body[3] & 0x7f, nil
+	if causeLen > 1 {
+		diagnostics = append([]byte(nil), body[4:3+causeLen]...)
+	}
+	return body[3] & 0x7f, diagnostics, 3 + causeLen, nil
+}
+
+func parseSMSRPUserData(body []byte, offset int, label string) ([]byte, error) {
+	if offset >= len(body) {
+		return nil, nil
+	}
+	udLen := int(body[offset])
+	offset++
+	if offset+udLen > len(body) {
+		return nil, fmt.Errorf("%s user data truncated", label)
+	}
+	if udLen == 0 {
+		return nil, nil
+	}
+	return append([]byte(nil), body[offset:offset+udLen]...), nil
 }
 
 func BuildSMSRPAck(rpMR byte) []byte {
 	return []byte{0x02, rpMR}
+}
+
+func BuildSMSRPAckWithTPDU(rpMR byte, tpdu []byte) ([]byte, error) {
+	if len(tpdu) > 255 {
+		return nil, fmt.Errorf("SMS TPDU too long: %d", len(tpdu))
+	}
+	out := make([]byte, 0, 3+len(tpdu))
+	out = append(out, 0x02, rpMR, byte(len(tpdu)))
+	out = append(out, tpdu...)
+	return out, nil
 }
 
 func BuildSMSRPError(rpMR byte, cause byte) []byte {

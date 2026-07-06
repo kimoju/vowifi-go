@@ -640,6 +640,38 @@ func TestHandleIMSMessagePreservesStatusReportOptionalParameters(t *testing.T) {
 	}
 }
 
+func TestHandleIMSMessageMarksStatusReportFromRPAck(t *testing.T) {
+	store := &fakeDeliveryStore{match: DeliveryPartMatch{MessageID: "msg-1", PartNo: 1, State: "delivered"}}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000000")
+	body, err := BuildSMSRPAckWithTPDU(0x66, tpdu)
+	if err != nil {
+		t.Fatalf("BuildSMSRPAckWithTPDU() error = %v", err)
+	}
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		CallID:      "status-report-in-ack",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        body,
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.StatusCode != 200 || result.DeliveryReport == nil || len(result.ReplyBody) != 0 {
+		t.Fatalf("result=%+v", result)
+	}
+	report := result.DeliveryReport
+	if report.RPMR != 7 || report.State != "delivered" || report.Recipient != "+18005551212" {
+		t.Fatalf("report=%+v", report)
+	}
+	if store.reportCallID != "status-report-in-ack" || store.reportRPMR != 7 || store.reportState != "delivered" || store.reportRPCause != 0 {
+		t.Fatalf("store=%+v", store)
+	}
+	if store.recomputedMessageID != "msg-1" {
+		t.Fatalf("recomputedMessageID=%q", store.recomputedMessageID)
+	}
+}
+
 type fakeSMSTransport struct {
 	requests []SMSSendRequest
 	failPart int

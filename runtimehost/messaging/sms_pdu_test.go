@@ -293,6 +293,47 @@ func TestParseSMSRPDUAckAndError(t *testing.T) {
 	}
 }
 
+func TestParseSMSRPDUAckWithUserData(t *testing.T) {
+	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000000")
+	body, err := BuildSMSRPAckWithTPDU(0x55, tpdu)
+	if err != nil {
+		t.Fatalf("BuildSMSRPAckWithTPDU() error = %v", err)
+	}
+	rpdu, err := ParseSMSRPDU(body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPDU(ack with user data) error = %v", err)
+	}
+	if rpdu.Kind != SMSRPDUKindAck || rpdu.MR != 0x55 || string(rpdu.TPDU) != string(tpdu) {
+		t.Fatalf("rpdu=%+v tpdu=%x", rpdu, rpdu.TPDU)
+	}
+	report, err := ParseSMSStatusReportTPDU(rpdu.TPDU)
+	if err != nil {
+		t.Fatalf("ParseSMSStatusReportTPDU() error = %v", err)
+	}
+	if report.Reference != 7 || report.State != "delivered" {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
+func TestParseSMSRPDUErrorPreservesDiagnosticsAndUserData(t *testing.T) {
+	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000046")
+	body := append([]byte{0x04, 0x56, 0x02, SMSRPCauseTemporaryFailure, 0x80, byte(len(tpdu))}, tpdu...)
+	rpdu, err := ParseSMSRPDU(body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPDU(error with user data) error = %v", err)
+	}
+	if rpdu.Kind != SMSRPDUKindError || rpdu.MR != 0x56 || rpdu.Cause != int(SMSRPCauseTemporaryFailure) {
+		t.Fatalf("rpdu=%+v", rpdu)
+	}
+	if string(rpdu.CauseDiagnostics) != string([]byte{0x80}) || string(rpdu.TPDU) != string(tpdu) {
+		t.Fatalf("diagnostics=%x tpdu=%x", rpdu.CauseDiagnostics, rpdu.TPDU)
+	}
+	cause, err := ParseSMSRPErrorCause(body)
+	if err != nil || cause != SMSRPCauseTemporaryFailure {
+		t.Fatalf("ParseSMSRPErrorCause() cause=%d err=%v", cause, err)
+	}
+}
+
 func TestParseSMSDeliverTPDUGSM7(t *testing.T) {
 	tpdu := mustHex(t, "0005810180F600006270502143650005E8329BFD06")
 	deliver, err := ParseSMSDeliverTPDU(tpdu)
