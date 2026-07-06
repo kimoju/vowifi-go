@@ -482,6 +482,53 @@ func TestIMSInboundWireServerRetransmitsReliableProvisionalUntilPrack(t *testing
 	}
 }
 
+func TestIMSInboundWireServerRejectsMalformedPrackRAck(t *testing.T) {
+	transport := newWireInboundTransport(nil)
+	agent := &IMSInboundAgent{ClientTransport: transport}
+	agent.storeInboundDialog("wire-call-bad-prack-1", imsInboundDialogState{
+		clientCfg: voiceclient.DialogRequestConfig{
+			RemoteTargetURI: "sip:client@127.0.0.1:5070",
+			CallID:          "wire-call-bad-prack-1",
+			CSeq:            1,
+		},
+	})
+	agent.storeInboundDialog("wire-call-bad-prack-2", imsInboundDialogState{
+		clientCfg: voiceclient.DialogRequestConfig{
+			RemoteTargetURI: "sip:client@127.0.0.1:5070",
+			CallID:          "wire-call-bad-prack-2",
+			CSeq:            1,
+		},
+	})
+	server := &IMSInboundWireServer{Agent: agent}
+	tests := []struct {
+		name string
+		req  voiceclient.SIPIncomingRequest
+	}{
+		{
+			name: "missing",
+			req:  parseWireIncoming(t, wireIMSRequest("wire-call-bad-prack-1", "PRACK", 2, nil)),
+		},
+		{
+			name: "bad_numbers",
+			req:  parseWireIncoming(t, wireIMSRequest("wire-call-bad-prack-2", "PRACK", 2, nil, "RAck: seven 1 INVITE\r\n")),
+		},
+	}
+	for _, tc := range tests {
+		responses, err := server.HandleRequest(context.Background(), tc.req)
+		if err != nil {
+			t.Fatalf("%s HandleRequest(PRACK) error = %v", tc.name, err)
+		}
+		if len(responses) != 1 || responses[0].StatusCode != 400 {
+			t.Fatalf("%s responses=%+v, want 400", tc.name, responses)
+		}
+	}
+	select {
+	case req := <-transport.requests:
+		t.Fatalf("unexpected client PRACK request=%+v", req)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestIMSInboundWireServerCancelsPendingInvite(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

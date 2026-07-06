@@ -140,6 +140,10 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 	case "UPDATE":
 		responses, err = s.handleUpdate(ctx, req)
 	case "PRACK":
+		if !wireValidRAckHeader(firstVoiceHeader(req.Headers, "RAck")) {
+			responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(400, "Bad RAck"))}
+			break
+		}
 		s.stopReliableProvisionalRetransmission(req)
 		responses, err = s.handlePrack(ctx, req)
 	case "INFO":
@@ -1009,8 +1013,11 @@ func wireReliableProvisionalKey(req voiceclient.SIPIncomingRequest, resp IMSInbo
 
 func wireReliableProvisionalKeyFromRAck(req voiceclient.SIPIncomingRequest) string {
 	rack := firstVoiceHeader(req.Headers, "RAck")
+	if !wireValidRAckHeader(rack) {
+		return ""
+	}
 	fields := strings.Fields(rack)
-	if len(fields) < 3 || !strings.EqualFold(fields[2], "INVITE") {
+	if !strings.EqualFold(fields[2], "INVITE") {
 		return ""
 	}
 	inviteCSeq, err := strconv.Atoi(fields[1])
@@ -1018,6 +1025,19 @@ func wireReliableProvisionalKeyFromRAck(req voiceclient.SIPIncomingRequest) stri
 		return ""
 	}
 	return wireReliableProvisionalKeyFromParts(wireCallID(req), sipHeaderTag(firstVoiceHeader(req.Headers, "From")), inviteCSeq, fields[0])
+}
+
+func wireValidRAckHeader(rack string) bool {
+	fields := strings.Fields(strings.TrimSpace(rack))
+	if len(fields) != 3 || !strings.EqualFold(fields[2], "INVITE") {
+		return false
+	}
+	rseq, err := strconv.Atoi(fields[0])
+	if err != nil || rseq <= 0 {
+		return false
+	}
+	cseq, err := strconv.Atoi(fields[1])
+	return err == nil && cseq > 0
 }
 
 func wireReliableProvisionalKeyPrefix(req voiceclient.SIPIncomingRequest) string {
