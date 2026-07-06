@@ -290,6 +290,99 @@ func TestIMSInboundAgentForwardsProvisionalInviteResponses(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentUsesProvisionalDialogStateForPrack(t *testing.T) {
+	transport := newReliableProvisionalInboundTransport([]voiceclient.SIPResponse{
+		{
+			StatusCode: 183,
+			Reason:     "Session Progress",
+			Headers: map[string][]string{
+				"To":           {"<sip:user@ims.example>;tag=early-tag"},
+				"Contact":      {"<sip:client@192.0.2.70:5060>"},
+				"Record-Route": {"<sip:client-proxy1.example;lr>, <sip:client-proxy2.example;lr>"},
+				"Require":      {"100rel"},
+				"RSeq":         {"42"},
+			},
+			Body: []byte(sampleSDP("192.0.2.70", 4002)),
+		},
+	})
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	type inviteResult struct {
+		result InboundCallResult
+		err    error
+	}
+	resultCh := make(chan inviteResult, 1)
+	go func() {
+		result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+			CallID:    "in-call-provisional-prack",
+			CallerURI: "sip:+18005551212@ims.example",
+			CalleeURI: "sip:user@ims.example",
+			CSeq:      1,
+			RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+			onProvisional: func(result InboundCallResult) error {
+				return nil
+			},
+		})
+		resultCh <- inviteResult{result: result, err: err}
+	}()
+	if req := transport.readInvite(t); req.Method != "INVITE" {
+		t.Fatalf("client INVITE=%+v", req)
+	}
+	transport.waitProvisionals(t)
+
+	prackCh := make(chan struct {
+		result InboundCallResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := agent.HandleInboundPrack(context.Background(), InboundDialogRequest{
+			CallID: "in-call-provisional-prack",
+			CSeq:   2,
+			RAck:   "42 1 INVITE",
+		})
+		prackCh <- struct {
+			result InboundCallResult
+			err    error
+		}{result: result, err: err}
+	}()
+	prack := transport.readRequest(t)
+	if prack.Method != "PRACK" || prack.URI != "sip:client@192.0.2.70:5060" ||
+		prack.Headers["RAck"] != "42 1 INVITE" ||
+		!strings.Contains(prack.Headers["To"], "early-tag") {
+		t.Fatalf("PRACK=%+v", prack)
+	}
+	if prack.Headers["Route"] != "<sip:client-proxy2.example;lr>, <sip:client-proxy1.example;lr>" {
+		t.Fatalf("PRACK Route=%q", prack.Headers["Route"])
+	}
+	transport.respondRequest(voiceclient.SIPResponse{StatusCode: 200, Reason: "OK"})
+	select {
+	case got := <-prackCh:
+		if got.err != nil || !got.result.Accepted || got.result.StatusCode != 200 {
+			t.Fatalf("HandleInboundPrack() result=%+v err=%v", got.result, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HandleInboundPrack() did not return")
+	}
+
+	transport.respondInvite(voiceclient.SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=final-tag"}},
+		Body:       []byte(sampleSDP("192.0.2.70", 4004)),
+	})
+	select {
+	case got := <-resultCh:
+		if got.err != nil || !got.result.Accepted {
+			t.Fatalf("HandleInboundInvite() result=%+v err=%v", got.result, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HandleInboundInvite() did not return")
+	}
+}
+
 func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
@@ -990,4 +1083,99 @@ func (t *cancelAwareInboundTransport) respondInvite(resp voiceclient.SIPResponse
 
 func (t *cancelAwareInboundTransport) respondCancel(resp voiceclient.SIPResponse) {
 	t.cancelResps <- resp
+}
+
+type reliableProvisionalInboundTransport struct {
+	invites          chan voiceclient.SIPRequestMessage
+	requests         chan voiceclient.SIPRequestMessage
+	writes           chan voiceclient.SIPRequestMessage
+	inviteResps      chan voiceclient.SIPResponse
+	requestResps     chan voiceclient.SIPResponse
+	provisionals     []voiceclient.SIPResponse
+	provisionalsDone chan struct{}
+}
+
+func newReliableProvisionalInboundTransport(provisionals []voiceclient.SIPResponse) *reliableProvisionalInboundTransport {
+	return &reliableProvisionalInboundTransport{
+		invites:          make(chan voiceclient.SIPRequestMessage, 8),
+		requests:         make(chan voiceclient.SIPRequestMessage, 8),
+		writes:           make(chan voiceclient.SIPRequestMessage, 8),
+		inviteResps:      make(chan voiceclient.SIPResponse, 8),
+		requestResps:     make(chan voiceclient.SIPResponse, 8),
+		provisionals:     append([]voiceclient.SIPResponse(nil), provisionals...),
+		provisionalsDone: make(chan struct{}),
+	}
+}
+
+func (t *reliableProvisionalInboundTransport) RoundTripInvite(ctx context.Context, msg voiceclient.SIPRequestMessage, onProvisional voiceclient.ProvisionalResponseHandler) (voiceclient.SIPResponse, error) {
+	t.invites <- msg
+	for _, resp := range t.provisionals {
+		if onProvisional != nil {
+			if err := onProvisional(ctx, msg, resp); err != nil {
+				close(t.provisionalsDone)
+				return voiceclient.SIPResponse{}, err
+			}
+		}
+	}
+	close(t.provisionalsDone)
+	select {
+	case resp := <-t.inviteResps:
+		return resp, nil
+	case <-ctx.Done():
+		return voiceclient.SIPResponse{}, ctx.Err()
+	}
+}
+
+func (t *reliableProvisionalInboundTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	t.requests <- msg
+	select {
+	case resp := <-t.requestResps:
+		return resp, nil
+	case <-ctx.Done():
+		return voiceclient.SIPResponse{}, ctx.Err()
+	}
+}
+
+func (t *reliableProvisionalInboundTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
+	t.writes <- msg
+	return nil
+}
+
+func (t *reliableProvisionalInboundTransport) readInvite(tb testing.TB) voiceclient.SIPRequestMessage {
+	tb.Helper()
+	select {
+	case msg := <-t.invites:
+		return msg
+	case <-time.After(time.Second):
+		tb.Fatalf("timed out waiting for client INVITE")
+		return voiceclient.SIPRequestMessage{}
+	}
+}
+
+func (t *reliableProvisionalInboundTransport) readRequest(tb testing.TB) voiceclient.SIPRequestMessage {
+	tb.Helper()
+	select {
+	case msg := <-t.requests:
+		return msg
+	case <-time.After(time.Second):
+		tb.Fatalf("timed out waiting for client request")
+		return voiceclient.SIPRequestMessage{}
+	}
+}
+
+func (t *reliableProvisionalInboundTransport) waitProvisionals(tb testing.TB) {
+	tb.Helper()
+	select {
+	case <-t.provisionalsDone:
+	case <-time.After(time.Second):
+		tb.Fatalf("timed out waiting for provisionals")
+	}
+}
+
+func (t *reliableProvisionalInboundTransport) respondInvite(resp voiceclient.SIPResponse) {
+	t.inviteResps <- resp
+}
+
+func (t *reliableProvisionalInboundTransport) respondRequest(resp voiceclient.SIPResponse) {
+	t.requestResps <- resp
 }

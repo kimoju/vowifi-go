@@ -137,7 +137,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		}
 		ensureInboundClientInviteVia(&invite, cfg)
 		a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay, early: true})
-		resp, err = a.roundTripClientInvite(ctx, invite, inboundProvisionalHandler(req.onProvisional, relay))
+		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, relay, req.onProvisional))
 		if err != nil {
 			a.deleteInboundDialog(callID)
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client INVITE failed"}, err
@@ -247,7 +247,7 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 		ensureInboundClientInviteVia(&invite, cfg)
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		a.storeInboundDialog(callID, state)
-		resp, err = a.roundTripClientInvite(ctx, invite, inboundProvisionalHandler(req.onProvisional, state.relay))
+		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, state.relay, req.onProvisional))
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client re-INVITE failed"}, err
 		}
@@ -393,10 +393,7 @@ func cloneSIPRequestMessage(msg voiceclient.SIPRequestMessage) voiceclient.SIPRe
 	return out
 }
 
-func inboundProvisionalHandler(onProvisional func(InboundCallResult) error, relay *RTPRelaySession) func(voiceclient.SIPResponse) error {
-	if onProvisional == nil {
-		return nil
-	}
+func (a *IMSInboundAgent) inboundProvisionalHandler(callID string, relay *RTPRelaySession, onProvisional func(InboundCallResult) error) func(voiceclient.SIPResponse) error {
 	return func(resp voiceclient.SIPResponse) error {
 		if resp.StatusCode <= 100 || resp.StatusCode >= 200 {
 			return nil
@@ -425,8 +422,31 @@ func inboundProvisionalHandler(onProvisional func(InboundCallResult) error, rela
 			}
 			result.LocalSDP = localSDP
 		}
+		a.applyInboundProvisionalDialogState(callID, resp.Headers)
+		if onProvisional == nil {
+			return nil
+		}
 		return onProvisional(result)
 	}
+}
+
+func (a *IMSInboundAgent) applyInboundProvisionalDialogState(callID string, headers map[string][]string) {
+	state, ok := a.inboundDialog(callID)
+	if !ok {
+		return
+	}
+	cfg := state.clientCfg
+	if tag := sipHeaderTag(firstVoiceHeader(headers, "To")); tag != "" {
+		cfg.RemoteTag = tag
+	}
+	if contact := sipHeaderURI(firstVoiceHeader(headers, "Contact")); contact != "" {
+		cfg.RemoteTargetURI = contact
+	}
+	if routeSet := recordRouteSet(headers); len(routeSet) > 0 {
+		cfg.RouteSet = routeSet
+	}
+	state.clientCfg = cfg
+	a.storeInboundDialog(callID, state)
 }
 
 func applyInboundSessionIntervalHeaders(cfg *voiceclient.DialogRequestConfig, headers map[string][]string) {
