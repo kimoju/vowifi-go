@@ -49,6 +49,11 @@ type DialogReinviter interface {
 	SendDialogReinvite(context.Context, DialogReinviteRequest) (DialogReinviteResult, error)
 }
 
+type DialogHoldController interface {
+	SendDialogHold(context.Context, DialogHoldRequest) (DialogUpdateResult, error)
+	SendDialogResume(context.Context, DialogResumeRequest) (DialogUpdateResult, error)
+}
+
 type OutboundCallRequest struct {
 	DeviceID  string
 	CallID    string
@@ -139,6 +144,21 @@ type DialogReinviteResult struct {
 	ContentType                string
 	Body                       []byte
 	Headers                    map[string]string
+}
+
+type DialogHoldRequest struct {
+	DeviceID    string
+	CallID      string
+	Direction   string
+	ContentType string
+	Headers     map[string]string
+}
+
+type DialogResumeRequest struct {
+	DeviceID    string
+	CallID      string
+	ContentType string
+	Headers     map[string]string
 }
 
 type Gateway struct {

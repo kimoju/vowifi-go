@@ -86,6 +86,7 @@ type imsDialogState struct {
 	cfg          voiceclient.DialogRequestConfig
 	invite       voiceclient.SIPRequestMessage
 	relay        *RTPRelaySession
+	localSDPBody []byte
 	early        bool
 	refreshTimer *time.Timer
 	refreshSeq   uint64
@@ -120,6 +121,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		SessionRefresher: normalizeSessionRefresher(a.SessionRefresher),
 	}
 	inviteBody := append([]byte(nil), req.RawSDP...)
+	localSDPBody := dialogLocalSDPBody(req.RawSDP, req.RemoteSDP)
 	var relay *RTPRelaySession
 	if a.MediaRelay != nil {
 		createdRelay, relayErr := NewRTPRelaySession(ctx, *a.MediaRelay, req.RemoteSDP)
@@ -149,7 +151,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		if err != nil {
 			return OutboundCallResult{Accepted: false, Reason: "build IMS INVITE failed"}, err
 		}
-		a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: cfg, invite: invite, relay: relay, early: true})
+		a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: cfg, invite: invite, relay: relay, localSDPBody: localSDPBody, early: true})
 		provisionalSDP = SDPInfo{}
 		provisionalAnswer = nil
 		resp, err = a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
@@ -259,7 +261,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	}
 	byeCfg := cfg
 	byeCfg.CSeq = nextCSeq
-	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: byeCfg, relay: relay})
+	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: byeCfg, relay: relay, localSDPBody: localSDPBody})
 	a.scheduleDialogSessionRefresh(strings.TrimSpace(req.CallID))
 	closeRelayOnError = false
 	return OutboundCallResult{
@@ -369,6 +371,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 		return DialogUpdateResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
 	}
 	body := append([]byte(nil), req.Body...)
+	localSDPBody := append([]byte(nil), req.Body...)
 	a.mu.Lock()
 	state, ok := a.dialogs[callID]
 	if !ok {
@@ -448,6 +451,9 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 			if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 				latest.cfg.RemoteTargetURI = contact
 			}
+			if len(localSDPBody) > 0 {
+				latest.localSDPBody = append([]byte(nil), localSDPBody...)
+			}
 			applyNegotiatedSessionInterval(&latest.cfg, resp.Headers)
 			a.dialogs[callID] = latest
 		}
@@ -466,6 +472,18 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 	}, nil
 }
 
+func (a *IMSOutboundAgent) SendDialogHold(ctx context.Context, req DialogHoldRequest) (DialogUpdateResult, error) {
+	direction := strings.TrimSpace(req.Direction)
+	if direction == "" {
+		direction = "sendonly"
+	}
+	return a.sendDialogDirectionUpdate(ctx, req.CallID, direction, firstVoiceNonEmpty(req.ContentType, "application/sdp"), req.Headers)
+}
+
+func (a *IMSOutboundAgent) SendDialogResume(ctx context.Context, req DialogResumeRequest) (DialogUpdateResult, error) {
+	return a.sendDialogDirectionUpdate(ctx, req.CallID, "sendrecv", firstVoiceNonEmpty(req.ContentType, "application/sdp"), req.Headers)
+}
+
 func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogReinviteRequest) (DialogReinviteResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -478,6 +496,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 		return DialogReinviteResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
 	}
 	body := append([]byte(nil), req.Body...)
+	localSDPBody := append([]byte(nil), req.Body...)
 	a.mu.Lock()
 	state, ok := a.dialogs[callID]
 	if !ok {
@@ -634,6 +653,9 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			latest.cfg.RemoteTargetURI = ackCfg.RemoteTargetURI
 			latest.cfg.RemoteTag = ackCfg.RemoteTag
 		}
+		if len(localSDPBody) > 0 {
+			latest.localSDPBody = append([]byte(nil), localSDPBody...)
+		}
 		applyNegotiatedSessionInterval(&latest.cfg, resp.Headers)
 		a.dialogs[callID] = latest
 	}
@@ -649,6 +671,44 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 	}, nil
 }
 
+func (a *IMSOutboundAgent) sendDialogDirectionUpdate(ctx context.Context, callID, direction, contentType string, headers map[string]string) (DialogUpdateResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.Transport == nil {
+		return DialogUpdateResult{Accepted: false, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
+	}
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return DialogUpdateResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
+	}
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		a.mu.Unlock()
+		return DialogUpdateResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	if state.early {
+		a.mu.Unlock()
+		return DialogUpdateResult{Accepted: false, StatusCode: 491, Reason: "dialog not established"}, nil
+	}
+	body := append([]byte(nil), state.localSDPBody...)
+	a.mu.Unlock()
+	if len(body) == 0 {
+		return DialogUpdateResult{Accepted: false, StatusCode: 488, Reason: "dialog SDP unavailable"}, errors.New("dialog SDP unavailable")
+	}
+	body, err := RewriteSDPMediaDirection(body, direction)
+	if err != nil {
+		return DialogUpdateResult{Accepted: false, StatusCode: 400, Reason: err.Error()}, err
+	}
+	return a.SendDialogUpdate(ctx, DialogUpdateRequest{
+		CallID:      callID,
+		ContentType: contentType,
+		Body:        body,
+		Headers:     headers,
+	})
+}
+
 func (a *IMSOutboundAgent) ackRejectedInvite(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
 	ackCfg := cfg
 	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
@@ -658,6 +718,16 @@ func (a *IMSOutboundAgent) ackRejectedInvite(ctx context.Context, cfg voiceclien
 	}
 	copyDialogHeader(ack.Headers, invite.Headers, "Via")
 	return a.Transport.WriteRequest(ctx, ack)
+}
+
+func dialogLocalSDPBody(raw []byte, info SDPInfo) []byte {
+	if len(raw) > 0 {
+		return append([]byte(nil), raw...)
+	}
+	if strings.TrimSpace(info.ConnectionIP) == "" && info.MediaPort <= 0 && len(info.Payloads) == 0 {
+		return nil
+	}
+	return BuildSDPAnswer(info)
 }
 
 func (a *IMSOutboundAgent) CancelVoiceCall(ctx context.Context, info DialogInfo) error {

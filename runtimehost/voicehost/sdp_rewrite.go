@@ -1,10 +1,13 @@
 package voicehost
 
 import (
+	"errors"
 	"net"
 	"strconv"
 	"strings"
 )
+
+var ErrInvalidSDPDirection = errors.New("invalid SDP media direction")
 
 func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 	if len(body) == 0 || strings.TrimSpace(endpoint.ConnectionIP) == "" || endpoint.MediaPort <= 0 {
@@ -90,6 +93,60 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 		out[insertAt] = "a=rtcp:" + strconv.Itoa(endpoint.RTCPPort) + " IN " + rtcpIPVersion + " " + rtcpIP
 	}
 	return []byte(strings.Join(out, "\r\n") + "\r\n")
+}
+
+func RewriteSDPMediaDirection(body []byte, direction string) ([]byte, error) {
+	direction, err := normalizeExplicitSDPDirection(direction)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := ParseSDP(body); err != nil {
+		return nil, err
+	}
+	text := strings.ReplaceAll(string(body), "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines)+1)
+	replaced := false
+	inserted := false
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		if isSDPDirectionLine(line) {
+			if !replaced {
+				out = append(out, "a="+direction)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, line)
+		if !replaced && !inserted && strings.HasPrefix(line, "m=audio ") {
+			out = append(out, "a="+direction)
+			inserted = true
+		}
+	}
+	if !replaced && !inserted {
+		out = append(out, "a="+direction)
+	}
+	return []byte(strings.Join(out, "\r\n") + "\r\n"), nil
+}
+
+func normalizeExplicitSDPDirection(direction string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(direction)) {
+	case "sendrecv", "sendonly", "recvonly", "inactive":
+		return strings.ToLower(strings.TrimSpace(direction)), nil
+	default:
+		return "", ErrInvalidSDPDirection
+	}
+}
+
+func isSDPDirectionLine(line string) bool {
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive":
+		return true
+	default:
+		return false
+	}
 }
 
 func sdpAudioPortDisabled(lines []string) bool {

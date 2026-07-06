@@ -628,6 +628,34 @@ func (i *Instance) SendDialogUpdate(ctx context.Context, req voicehost.DialogUpd
 	return result, err
 }
 
+func (i *Instance) SendDialogHold(ctx context.Context, req voicehost.DialogHoldRequest) (voicehost.DialogUpdateResult, error) {
+	agent := i.dialogHoldController()
+	if agent == nil {
+		return voicehost.DialogUpdateResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
+	}
+	result, err := agent.SendDialogHold(ctx, req)
+	if result.RegistrationRecoveryNeeded {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter); recoveryErr != nil {
+			return result, runtimeOperationRecoveryError(err, recoveryErr)
+		}
+	}
+	return result, err
+}
+
+func (i *Instance) SendDialogResume(ctx context.Context, req voicehost.DialogResumeRequest) (voicehost.DialogUpdateResult, error) {
+	agent := i.dialogHoldController()
+	if agent == nil {
+		return voicehost.DialogUpdateResult{Accepted: false, Reason: "IMS voice agent unavailable"}, voicehost.ErrIMSVoiceAgentNotReady
+	}
+	result, err := agent.SendDialogResume(ctx, req)
+	if result.RegistrationRecoveryNeeded {
+		if _, _, recoveryErr := i.recoverIMSRegistration(ctx, result.Reason, true, result.RetryAfter); recoveryErr != nil {
+			return result, runtimeOperationRecoveryError(err, recoveryErr)
+		}
+	}
+	return result, err
+}
+
 func (i *Instance) SendDialogReinvite(ctx context.Context, req voicehost.DialogReinviteRequest) (voicehost.DialogReinviteResult, error) {
 	agent := i.dialogReinviter()
 	if agent == nil {
@@ -952,6 +980,20 @@ func (i *Instance) dialogUpdater() voicehost.DialogUpdater {
 	}
 	i.mu.RLock()
 	agent, _ := i.voice.(voicehost.DialogUpdater)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogHoldController() voicehost.DialogHoldController {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogHoldController)
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {

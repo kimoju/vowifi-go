@@ -217,7 +217,8 @@ protocol layers needed by VoHive:
 - local softphone in-dialog SIP UPDATE forwarding to IMS dialogs, including
   session refresh/media renegotiation SDP validation, RTP relay endpoint
   rewriting, response body/header mapping, remote Contact refresh, and dialog
-  CSeq advancement
+  CSeq advancement, plus outbound IMS hold/resume helpers that rewrite SDP
+  media direction over UPDATE
 - local softphone in-dialog re-INVITE forwarding to IMS dialogs for media
   renegotiation, including SDP validation, RTP relay rewriting, final response
   ACK handling, remote Contact refresh, response header/body mapping, and CSeq

@@ -1,6 +1,7 @@
 package voicehost
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -61,5 +62,44 @@ func TestParseSDPKeepsSeparateRTCPAddress(t *testing.T) {
 	}
 	if info.ConnectionIP != "192.0.2.10" || info.RTCPIP != "198.51.100.20" || info.RTCPPort != 5005 {
 		t.Fatalf("info=%+v", info)
+	}
+}
+
+func TestRewriteSDPMediaDirectionReplacesDirection(t *testing.T) {
+	raw := []byte("v=0\r\n" +
+		"c=IN IP4 192.0.2.10\r\n" +
+		"m=audio 4002 RTP/AVP 0 101\r\n" +
+		"a=rtcp:4003 IN IP4 192.0.2.10\r\n" +
+		"a=sendrecv\r\n" +
+		"a=rtpmap:101 telephone-event/8000\r\n")
+	got, err := RewriteSDPMediaDirection(raw, "sendonly")
+	if err != nil {
+		t.Fatalf("RewriteSDPMediaDirection() error = %v", err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "m=audio 4002 RTP/AVP 0 101\r\n") ||
+		!strings.Contains(text, "a=sendonly\r\n") ||
+		!strings.Contains(text, "a=rtpmap:101 telephone-event/8000\r\n") ||
+		strings.Contains(text, "a=sendrecv") {
+		t.Fatalf("rewritten SDP:\n%s", text)
+	}
+}
+
+func TestRewriteSDPMediaDirectionInsertsMissingDirection(t *testing.T) {
+	raw := []byte("v=0\r\nc=IN IP4 192.0.2.10\r\nm=audio 4002 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n")
+	got, err := RewriteSDPMediaDirection(raw, "inactive")
+	if err != nil {
+		t.Fatalf("RewriteSDPMediaDirection() error = %v", err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "m=audio 4002 RTP/AVP 0\r\na=inactive\r\na=rtpmap:0 PCMU/8000\r\n") {
+		t.Fatalf("rewritten SDP:\n%s", text)
+	}
+}
+
+func TestRewriteSDPMediaDirectionRejectsInvalidDirection(t *testing.T) {
+	_, err := RewriteSDPMediaDirection([]byte("v=0\r\nc=IN IP4 192.0.2.10\r\nm=audio 4002 RTP/AVP 0\r\n"), "hold")
+	if !errors.Is(err, ErrInvalidSDPDirection) {
+		t.Fatalf("RewriteSDPMediaDirection() err=%v, want ErrInvalidSDPDirection", err)
 	}
 }

@@ -208,6 +208,73 @@ func TestIMSOutboundAgentSendsDialogDTMF(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentSendsDialogHoldAndResume(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"hold-ok"}}},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"X-IMS": {"resume-ok"}}},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-hold",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	hold, err := agent.SendDialogHold(context.Background(), DialogHoldRequest{
+		CallID:  "call-hold",
+		Headers: map[string]string{"X-Hold": "yes"},
+	})
+	if err != nil || !hold.Accepted || hold.Headers["X-IMS"] != "hold-ok" {
+		t.Fatalf("SendDialogHold() result=%+v err=%v", hold, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "UPDATE" {
+		t.Fatalf("requests after hold=%+v", transport.requests)
+	}
+	holdReq := transport.requests[1]
+	if holdReq.Headers["CSeq"] != "2 UPDATE" || holdReq.Headers["Content-Type"] != "application/sdp" ||
+		holdReq.Headers["X-Hold"] != "yes" || !strings.Contains(string(holdReq.Body), "a=sendonly\r\n") ||
+		strings.Contains(string(holdReq.Body), "a=sendrecv") {
+		t.Fatalf("hold UPDATE=%+v body=%q", holdReq, holdReq.Body)
+	}
+	resume, err := agent.SendDialogResume(context.Background(), DialogResumeRequest{CallID: "call-hold"})
+	if err != nil || !resume.Accepted || resume.Headers["X-IMS"] != "resume-ok" {
+		t.Fatalf("SendDialogResume() result=%+v err=%v", resume, err)
+	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "UPDATE" {
+		t.Fatalf("requests after resume=%+v", transport.requests)
+	}
+	resumeReq := transport.requests[2]
+	if resumeReq.Headers["CSeq"] != "3 UPDATE" || resumeReq.Headers["Content-Type"] != "application/sdp" ||
+		!strings.Contains(string(resumeReq.Body), "a=sendrecv\r\n") || strings.Contains(string(resumeReq.Body), "a=sendonly") {
+		t.Fatalf("resume UPDATE=%+v body=%q", resumeReq, resumeReq.Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-hold"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	if len(transport.requests) != 4 || transport.requests[3].Method != "BYE" || transport.requests[3].Headers["CSeq"] != "4 BYE" {
+		t.Fatalf("BYE after hold/resume=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentDialogInfo481RequestsRegistrationRecovery(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
