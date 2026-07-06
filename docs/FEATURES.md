@@ -96,6 +96,8 @@ protocol layers needed by VoHive:
   TS 23.038 national language single-shift and locking-shift table support via
   SMS UDH NLI IEs, inbound parsing of Special SMS Message Indication, SMSC
   Control Parameters, UDH Source Indicator, and RFC 822 email-header length IEs,
+  ACK handling for control-only SMS-DELIVER payloads that carry UDH metadata
+  without user-visible text,
   SMS-SUBMIT relative and absolute validity-period
   encoding, SMS-SUBMIT TP-PID/TP-DCS overrides with alphabet validation,
   SMS-SUBMIT Reply-Path and Reject-Duplicates first-octet flags, USSD dialog

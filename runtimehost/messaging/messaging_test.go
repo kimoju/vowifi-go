@@ -470,6 +470,35 @@ func TestHandleIncomingSMSDispatchesEvent(t *testing.T) {
 	}
 }
 
+func TestHandleIncomingSMSAcceptsEmptyControlUDH(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+
+	err := svc.HandleIncomingSMS(context.Background(), IncomingSMS{
+		Sender:         "+10086",
+		UserDataHeader: true,
+		UserDataHeaderInfo: SMSUserDataHeaderInfo{
+			Raw: []byte{0x04, 0x01, 0x02, 0x80, 0x02},
+			SpecialMessageIndications: []SMSSpecialMessageIndication{{
+				MessageType: "voicemail",
+				Count:       2,
+				Active:      true,
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleIncomingSMS() error = %v", err)
+	}
+	if len(dispatch.events) != 0 {
+		t.Fatalf("events=%+v, want none for empty control-only SMS", dispatch.events)
+	}
+
+	err = svc.HandleIncomingSMS(context.Background(), IncomingSMS{Sender: "+10086"})
+	if err == nil || !strings.Contains(err.Error(), "content is empty") {
+		t.Fatalf("HandleIncomingSMS(empty without UDH) err=%v, want empty content error", err)
+	}
+}
+
 func TestHandleIMSMessageDispatchesRPDataAndReturnsAck(t *testing.T) {
 	dispatch := &fakeDispatcher{}
 	svc := NewService("dev-1", "310280233641503", nil, dispatch)
@@ -598,6 +627,32 @@ func TestHandleIMSMessagePreservesUDHMessageIndicationMetadata(t *testing.T) {
 	}
 	if !header.HasSMSCControl || !header.SMSCControl.StatusReportTransactionCompleted || !header.SMSCControl.IncludeOriginalUDHInStatusReport {
 		t.Fatalf("SMSC control=%+v", header.SMSCControl)
+	}
+}
+
+func TestHandleIMSMessageAcksEmptyMessageIndicationSMS(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+	tpdu := deliverTPDUWithUserData(t, []byte{0x04, 0x01, 0x02, 0x80, 0x02}, "", 0, 0)
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x3a, tpdu),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage() error = %v", err)
+	}
+	if result.StatusCode != 200 || result.Incoming == nil || result.Incoming.Content != "" || string(result.ReplyBody) != string(BuildSMSRPAck(0x3a)) {
+		t.Fatalf("result=%+v", result)
+	}
+	header := result.Incoming.UserDataHeaderInfo
+	if len(header.SpecialMessageIndications) != 1 || header.SpecialMessageIndications[0].MessageType != "voicemail" || header.SpecialMessageIndications[0].Count != 2 {
+		t.Fatalf("special indications=%+v", header.SpecialMessageIndications)
+	}
+	if len(dispatch.events) != 0 {
+		t.Fatalf("events=%+v, want none for empty control-only SMS", dispatch.events)
 	}
 }
 

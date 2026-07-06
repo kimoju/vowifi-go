@@ -434,14 +434,14 @@ func (s *Service) HandleIncomingSMS(ctx context.Context, msg IncomingSMS) error 
 	if sender == "" {
 		return errors.New("incoming sms sender is empty")
 	}
-	if strings.TrimSpace(content) == "" {
+	if content == "" && !incomingSMSHasUserDataHeader(msg) {
 		return errors.New("incoming sms content is empty")
 	}
 	at := msg.Timestamp
 	if at.IsZero() {
 		at = time.Now()
 	}
-	if s != nil && s.dispatch != nil {
+	if content != "" && s != nil && s.dispatch != nil {
 		s.dispatch.Dispatch(ctx, eventhost.SMSReceived{
 			DevID:   s.deviceID,
 			Sender:  sender,
@@ -450,6 +450,13 @@ func (s *Service) HandleIncomingSMS(ctx context.Context, msg IncomingSMS) error 
 		})
 	}
 	return nil
+}
+
+func incomingSMSHasUserDataHeader(msg IncomingSMS) bool {
+	if msg.UserDataHeader {
+		return true
+	}
+	return len(msg.UserDataHeaderInfo.Raw) > 0 || len(msg.UserDataHeaderInfo.Elements) > 0
 }
 
 func (s *Service) HandleSMSDeliveryReport(ctx context.Context, report SMSDeliveryReport) (DeliveryPartMatch, error) {
