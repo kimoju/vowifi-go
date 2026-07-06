@@ -153,6 +153,71 @@ func TestRewriteRTPDTMFPayloadTypeScalesDuration(t *testing.T) {
 	}
 }
 
+func TestBuildRTPDTMFSequence(t *testing.T) {
+	packets, err := BuildRTPDTMFSequence(RTPDTMFSequenceConfig{
+		PayloadType:    110,
+		Signal:         "A",
+		DurationMS:     160,
+		StepMS:         50,
+		EndPacketCount: 3,
+		Volume:         7,
+		SequenceNumber: 100,
+		Timestamp:      0x01020304,
+		SSRC:           0x11223344,
+		ClockRate:      8000,
+	})
+	if err != nil {
+		t.Fatalf("BuildRTPDTMFSequence() error = %v", err)
+	}
+	if len(packets) != 6 {
+		t.Fatalf("packets=%d, want 6", len(packets))
+	}
+	wantDurations := []uint16{400, 800, 1200, 1280, 1280, 1280}
+	for i, packet := range packets {
+		event, ok, err := ParseRTPDTMFEvent(RTPDTMFClientToIMS, packet, map[uint8]int{110: 8000})
+		if err != nil || !ok {
+			t.Fatalf("ParseRTPDTMFEvent(%d) ok=%v err=%v", i, ok, err)
+		}
+		if event.Signal != "A" || event.PayloadType != 110 || event.Volume != 7 || event.Timestamp != 0x01020304 || event.SSRC != 0x11223344 {
+			t.Fatalf("event[%d]=%+v", i, event)
+		}
+		if event.SequenceNumber != uint16(100+i) || event.DurationSamples != wantDurations[i] {
+			t.Fatalf("event[%d] seq/duration=%d/%d", i, event.SequenceNumber, event.DurationSamples)
+		}
+		if event.Marker != (i == 0) {
+			t.Fatalf("event[%d] marker=%v", i, event.Marker)
+		}
+		if event.End != (i >= 3) {
+			t.Fatalf("event[%d] end=%v", i, event.End)
+		}
+	}
+}
+
+func TestBuildRTPDTMFSequenceDefaultsAndRejectsOversizedDuration(t *testing.T) {
+	packets, err := BuildRTPDTMFSequence(RTPDTMFSequenceConfig{Signal: "5", DurationMS: 30, StepMS: 50, SequenceNumber: 1})
+	if err != nil {
+		t.Fatalf("BuildRTPDTMFSequence(defaults) error = %v", err)
+	}
+	if len(packets) != 4 {
+		t.Fatalf("packets=%d, want 4", len(packets))
+	}
+	for i, packet := range packets {
+		event, ok, err := ParseRTPDTMFEvent(RTPDTMFClientToIMS, packet, map[uint8]int{DefaultRTPDTMFPayloadType: DefaultRTPDTMFClockRate})
+		if err != nil || !ok {
+			t.Fatalf("ParseRTPDTMFEvent(%d) ok=%v err=%v", i, ok, err)
+		}
+		if event.DurationSamples != 240 || event.DurationMS != 30 || event.SequenceNumber != uint16(i+1) || event.End != (i >= 1) {
+			t.Fatalf("event[%d]=%+v", i, event)
+		}
+	}
+	if _, err := BuildRTPDTMFSequence(RTPDTMFSequenceConfig{Signal: "5", DurationMS: 9000, ClockRate: 8000}); !errors.Is(err, ErrInvalidDTMF) {
+		t.Fatalf("BuildRTPDTMFSequence(long) err=%v, want ErrInvalidDTMF", err)
+	}
+	if _, err := BuildRTPDTMFSequence(RTPDTMFSequenceConfig{Signal: "5", DurationMS: 5000, ClockRate: 48000}); !errors.Is(err, ErrInvalidDTMF) {
+		t.Fatalf("BuildRTPDTMFSequence(samples) err=%v, want ErrInvalidDTMF", err)
+	}
+}
+
 func TestRTPDTMFRejectsInvalidValues(t *testing.T) {
 	if _, err := BuildRTPDTMFPacket(RTPDTMFPacket{PayloadType: 128, Signal: "1"}); !errors.Is(err, ErrInvalidDTMF) {
 		t.Fatalf("BuildRTPDTMFPacket(payload) err=%v, want ErrInvalidDTMF", err)

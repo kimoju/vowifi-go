@@ -10,6 +10,8 @@ const (
 	DefaultRTPDTMFPayloadType = 101
 	DefaultRTPDTMFClockRate   = 8000
 	DefaultRTPDTMFVolume      = 10
+	DefaultRTPDTMFStepMS      = 50
+	DefaultRTPDTMFEndPackets  = 3
 )
 
 type RTPDTMFDirection string
@@ -32,6 +34,19 @@ type RTPDTMFPacket struct {
 	Volume          uint8
 	DurationSamples uint16
 	ClockRate       int
+}
+
+type RTPDTMFSequenceConfig struct {
+	PayloadType    uint8
+	Signal         string
+	DurationMS     int
+	StepMS         int
+	EndPacketCount int
+	Volume         uint8
+	SequenceNumber uint16
+	Timestamp      uint32
+	SSRC           uint32
+	ClockRate      int
 }
 
 type RTPDTMFEvent struct {
@@ -103,6 +118,94 @@ func BuildRTPDTMFPacket(in RTPDTMFPacket) ([]byte, error) {
 	}
 	binary.BigEndian.PutUint16(packet[14:16], durationSamples)
 	return packet, nil
+}
+
+func BuildRTPDTMFSequence(cfg RTPDTMFSequenceConfig) ([][]byte, error) {
+	signal, err := NormalizeRTPDTMFSignal(cfg.Signal)
+	if err != nil {
+		return nil, err
+	}
+	clockRate := cfg.ClockRate
+	if clockRate <= 0 {
+		clockRate = DefaultRTPDTMFClockRate
+	}
+	durationMS := cfg.DurationMS
+	if durationMS <= 0 {
+		durationMS = DefaultDTMFDurationMS
+	}
+	if durationMS > MaxDTMFDurationMS {
+		return nil, fmt.Errorf("%w: duration %dms exceeds %dms", ErrInvalidDTMF, durationMS, MaxDTMFDurationMS)
+	}
+	stepMS := cfg.StepMS
+	if stepMS <= 0 {
+		stepMS = DefaultRTPDTMFStepMS
+	}
+	if stepMS > durationMS {
+		stepMS = durationMS
+	}
+	endPackets := cfg.EndPacketCount
+	if endPackets <= 0 {
+		endPackets = DefaultRTPDTMFEndPackets
+	}
+	totalSamples, err := rtpDTMFSamplesForDuration(durationMS, clockRate)
+	if err != nil {
+		return nil, err
+	}
+	stepSamples, err := rtpDTMFSamplesForDuration(stepMS, clockRate)
+	if err != nil {
+		return nil, err
+	}
+	if stepSamples <= 0 {
+		stepSamples = 1
+	}
+	var packets [][]byte
+	sequence := cfg.SequenceNumber
+	current := stepSamples
+	if current > totalSamples {
+		current = totalSamples
+	}
+	for len(packets) == 0 || current < totalSamples {
+		packet, err := BuildRTPDTMFPacket(RTPDTMFPacket{
+			PayloadType:     cfg.PayloadType,
+			Marker:          len(packets) == 0,
+			SequenceNumber:  sequence,
+			Timestamp:       cfg.Timestamp,
+			SSRC:            cfg.SSRC,
+			Signal:          signal,
+			Volume:          cfg.Volume,
+			DurationSamples: uint16(current),
+			ClockRate:       clockRate,
+		})
+		if err != nil {
+			return nil, err
+		}
+		packets = append(packets, packet)
+		sequence++
+		current += stepSamples
+		if current > totalSamples {
+			current = totalSamples
+		}
+	}
+	for i := 0; i < endPackets; i++ {
+		packet, err := BuildRTPDTMFPacket(RTPDTMFPacket{
+			PayloadType:     cfg.PayloadType,
+			Marker:          len(packets) == 0,
+			SequenceNumber:  sequence,
+			Timestamp:       cfg.Timestamp,
+			SSRC:            cfg.SSRC,
+			Signal:          signal,
+			End:             true,
+			Volume:          cfg.Volume,
+			DurationSamples: uint16(totalSamples),
+			ClockRate:       clockRate,
+		})
+		if err != nil {
+			return nil, err
+		}
+		packets = append(packets, packet)
+		sequence++
+	}
+	return packets, nil
 }
 
 func InspectRTPDTMF(direction RTPDTMFDirection, packet []byte, payloadTypes map[uint8]int, handler RTPDTMFHandler) (RTPDTMFSummary, error) {
@@ -402,4 +505,21 @@ func scaleRTPDTMFDuration(duration uint16, sourceClock, targetClock int) uint16 
 		return 0xffff
 	}
 	return uint16(scaled)
+}
+
+func rtpDTMFSamplesForDuration(durationMS, clockRate int) (int, error) {
+	if durationMS <= 0 {
+		return 0, fmt.Errorf("%w: duration is empty", ErrInvalidDTMF)
+	}
+	if clockRate <= 0 {
+		clockRate = DefaultRTPDTMFClockRate
+	}
+	samples := (durationMS * clockRate) / 1000
+	if samples <= 0 {
+		samples = 1
+	}
+	if samples > 0xffff {
+		return 0, fmt.Errorf("%w: RTP DTMF duration %d samples exceeds 65535", ErrInvalidDTMF, samples)
+	}
+	return samples, nil
 }
