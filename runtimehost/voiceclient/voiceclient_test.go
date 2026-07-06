@@ -471,6 +471,9 @@ func TestBuildRegisterHeaders(t *testing.T) {
 		!strings.Contains(headers["Security-Client"], "port-c=5062") || !strings.Contains(headers["Security-Client"], "port-s=5063") {
 		t.Fatalf("Security-Client has invalid default proposal: %q", headers["Security-Client"])
 	}
+	if strings.Contains(headers["Security-Client"], SecurityAlgorithmHMACMD596) || strings.Count(headers["Security-Client"], "ipsec-3gpp") != 1 {
+		t.Fatalf("Security-Client default should stay SHA1-only: %q", headers["Security-Client"])
+	}
 	if !strings.Contains(headers["Allow"], "INFO") || !strings.Contains(headers["Allow"], "NOTIFY") || !strings.Contains(headers["Allow"], "SUBSCRIBE") {
 		t.Fatalf("Allow=%q", headers["Allow"])
 	}
@@ -493,6 +496,33 @@ func TestParseAndSelectSecurityAgreement(t *testing.T) {
 	client := BuildSecurityClientHeader(SecurityAgreement{SPIClient: 7001, SPIServer: 7002, PortClient: 6000, PortServer: 6001})
 	if client != "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=7001;spi-s=7002;port-c=6000;port-s=6001" {
 		t.Fatalf("Security-Client=%q", client)
+	}
+}
+
+func TestBuildAndSelectSecurityClientProposals(t *testing.T) {
+	clients := []SecurityAgreement{
+		{Algorithm: DefaultSecurityAlgorithm, SPIClient: 7001, SPIServer: 7002, PortClient: 6000, PortServer: 6001},
+		{Algorithm: SecurityAlgorithmHMACMD596, SPIClient: 8001, SPIServer: 8002, PortClient: 6002, PortServer: 6003},
+	}
+	header := BuildSecurityClientHeaderList(clients)
+	want := "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=7001;spi-s=7002;port-c=6000;port-s=6001, " +
+		"ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=8001;spi-s=8002;port-c=6002;port-s=6003"
+	if header != want {
+		t.Fatalf("Security-Client=%q, want %q", header, want)
+	}
+	selected, ok := SelectSecurityAgreementForClients([]string{
+		`ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`,
+	}, clients)
+	if !ok {
+		t.Fatal("SelectSecurityAgreementForClients() ok=false")
+	}
+	if selected.Algorithm != SecurityAlgorithmHMACMD596 || selected.SPIClient != 333 || selected.SPIServer != 444 {
+		t.Fatalf("selected=%+v", selected)
+	}
+	if selected, ok := SelectSecurityAgreement([]string{
+		`ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`,
+	}, clients[0]); ok {
+		t.Fatalf("SelectSecurityAgreement() selected unoffered algorithm: %+v", selected)
 	}
 }
 
@@ -751,6 +781,59 @@ func TestRegisterSessionInstallsSecurityPlanBeforeAuthenticatedRegister(t *testi
 	}
 	if got := transport.requests[1].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=111") {
 		t.Fatalf("Security-Verify=%q", got)
+	}
+}
+
+func TestRegisterSessionOffersMultipleSecurityClientProposals(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce", algorithm=MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065;q=0.9`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	installer := &fakeSecurityPlanInstaller{transport: transport}
+	result, err := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CNonce:       "cnonce",
+		SecurityClients: []SecurityAgreement{
+			{Algorithm: DefaultSecurityAlgorithm},
+			{Algorithm: SecurityAlgorithmHMACMD596},
+		},
+		SecurityPlanInstaller: installer,
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", result, len(transport.requests))
+	}
+	firstSecurityClient := transport.requests[0].Headers["Security-Client"]
+	secondSecurityClient := transport.requests[1].Headers["Security-Client"]
+	if firstSecurityClient == "" || firstSecurityClient != secondSecurityClient {
+		t.Fatalf("Security-Client not stable: first=%q second=%q", firstSecurityClient, secondSecurityClient)
+	}
+	if strings.Count(firstSecurityClient, "ipsec-3gpp") != 2 ||
+		!strings.Contains(firstSecurityClient, "alg=hmac-sha-1-96") || !strings.Contains(firstSecurityClient, "alg=hmac-md5-96") ||
+		!strings.Contains(firstSecurityClient, "port-c=5062") || !strings.Contains(firstSecurityClient, "port-s=5063") ||
+		strings.Contains(firstSecurityClient, "spi-c=0") || strings.Contains(firstSecurityClient, "spi-s=0") {
+		t.Fatalf("Security-Client proposals=%q", firstSecurityClient)
+	}
+	if len(installer.calls) != 1 || installer.calls[0].Algorithm != SecurityAlgorithmHMACMD596 || installer.calls[0].SPIClient != 333 {
+		t.Fatalf("installer calls=%+v", installer.calls)
+	}
+	if got := transport.requests[1].Headers["Security-Verify"]; !strings.Contains(got, "alg=hmac-md5-96") || !strings.Contains(got, "spi-c=333") {
+		t.Fatalf("Security-Verify=%q", got)
+	}
+	if result.Binding.SecurityClient != firstSecurityClient || result.Binding.SecurityAgreement.Algorithm != SecurityAlgorithmHMACMD596 || result.Binding.SecurityPlan.Algorithm != SecurityAlgorithmHMACMD596 {
+		t.Fatalf("security binding=%+v", result.Binding)
 	}
 }
 

@@ -29,6 +29,11 @@ VoHive:
 The current implementation includes the runtime boundary plus the first real
 protocol layers needed by VoHive:
 
+- CI and compatibility validation with a shared local/GitHub Actions `make ci`
+  entry point, module-path and privacy guards, formatting/tidy/vet/test checks,
+  opt-in race and coverage targets, a manual old-VoHive compatibility workflow,
+  and a lightweight temporary-consumer self-test for the compatibility rewrite
+  and local replace flow
 - logical-channel SIM/ISIM APDU helpers, AT `CCHO`/`CGLA`/`CCHC` and basic
   `CSIM`/`CRSM` transport helpers, FCP/BER-TLV parsing with multi-byte
   definite length support, ISIM identity EF reading with long-form string
@@ -36,6 +41,8 @@ protocol layers needed by VoHive:
   over logical-channel APDUs or CRSM, runtime modem-access fallback from
   explicit identity readers to APDU/CRSM/AT+CRSM identity reads, SIM/ISIM
   recovery error classification with opt-in non-destructive retry hooks,
+  human-readable APDU/CRSM status-word descriptions for common SIM/USIM/ISIM
+  success, warning, procedure, and checking-error responses,
   reusable ISIM identity, USIM EF_IMSI, and EF_AD MNC-length decoders, and
   USIM/ISIM AKA AUTHENTICATE primitives
 - carrier presets and JSON carrier overrides, including AT&T TS.43/E911
@@ -53,12 +60,14 @@ protocol layers needed by VoHive:
   provider, and EAP-AKA/AKA' relay packet response generation with
   Any/FullAuth/Permanent Identity selection, KDF negotiation, Notification ACK,
   and terminal Success/Failure handling, plus Client-Error handling for
-  entitlement challenges
+  entitlement challenges and HTTP `WWW-Authenticate`/`Proxy-Authenticate`
+  challenge parsing/classification without leaking nonce material in errors
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
   AKA nonce extraction, Digest MD5/MD5-sess/SHA-256/SHA-512-256 plus
   AKAv1-MD5 and AKAv2-MD5 authorization material,
-  IMS `Security-Client` proposal generation, `Security-Server` parsing/
-  selection, direction-aware IMS IPsec SA plan extraction, Security-Verify
+  IMS single- and multi-value `Security-Client` proposal generation,
+  `Security-Server` parsing/selection against the offered client algorithms,
+  direction-aware IMS IPsec SA plan extraction, Security-Verify
   echoing, Linux XFRM install planning for SHA1/MD5 96-bit HMAC IMS ESP
   transport SAs, folded/compact SIP header parsing, strict
   Content-Length body and duplicate-length validation, SIP response status-code
@@ -138,6 +147,8 @@ protocol layers needed by VoHive:
   security parsing/building for RTP/SAVP/SAVPF, SDES crypto, DTLS fingerprint/
   setup attributes, IMS INVITE/ACK/BYE/CANCEL request construction with MMTel
   service identification headers,
+  IMS audio SDP media parsing/validation for AMR, AMR-WB, telephone-event,
+  RTCP, and RTCP mux attributes,
   route-set application, UDP/TCP SIP request transport, outbound IMS voice
   agent, ACK/BYE/CANCEL dialog handling with release Reason/body forwarding,
   IMS BYE/CANCEL response status/body/header capture and local softphone

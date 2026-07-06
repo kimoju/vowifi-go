@@ -214,6 +214,10 @@ smoke() {
 	run "$GO_BIN" test -run "${CI_SMOKE_RUN:-^$}" -count=1 "${packages[@]}"
 }
 
+compat_selftest() {
+	GO_BIN="$GO_BIN" "$ROOT/scripts/compat-vohive-selftest.sh"
+}
+
 test_all() {
 	run "$GO_BIN" test -count=1 ./...
 }
@@ -256,7 +260,7 @@ coverage() {
 
 usage() {
 	cat <<'USAGE'
-Usage: scripts/ci.sh [all|version|module-path|privacy|download|fmt|tidy|vet|smoke|test|race|coverage ...]
+Usage: scripts/ci.sh [all|version|module-path|privacy|download|fmt|tidy|vet|smoke|compat-selftest|test|race|coverage ...]
 
 Environment:
   GO_BIN               path to go binary when it is not on PATH
@@ -273,13 +277,14 @@ Environment:
   CI_COVERAGE_FILE     coverage profile path; default: temporary file
   CI_COVERAGE_MODE     Go coverage mode, default: atomic
 
-Default all runs version/module-path/privacy/download/fmt/tidy/vet/smoke/test. Race
-and coverage are opt-in so the main local and GitHub CI path stays lightweight.
+Default all runs version/module-path/privacy/download/fmt/tidy/vet/smoke/
+compat-selftest/test. Race and coverage are opt-in so the main local and
+GitHub CI path stays lightweight.
 USAGE
 }
 
 if [[ $# -eq 0 || "${1:-}" == "all" ]]; then
-	tasks=(version module-path privacy download fmt tidy vet smoke test)
+	tasks=(version module-path privacy download fmt tidy vet smoke compat-selftest test)
 else
 	tasks=("$@")
 fi
@@ -297,6 +302,7 @@ for task in "${tasks[@]}"; do
 		tidy | tidy-check) tidy_check ;;
 		vet) vet ;;
 		smoke) smoke ;;
+		compat-selftest | compat-vohive-selftest) compat_selftest ;;
 		test) test_all ;;
 		race) race ;;
 		coverage) coverage ;;

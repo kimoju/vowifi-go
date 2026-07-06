@@ -45,6 +45,7 @@ type HTTPRequest struct {
 
 type HTTPResponse struct {
 	StatusCode int
+	Headers    []HeaderPair
 	Body       []byte
 }
 
@@ -85,7 +86,7 @@ func (c defaultHTTPClient) Do(req *HTTPRequest) (*HTTPResponse, error) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	return &HTTPResponse{StatusCode: resp.StatusCode, Body: body}, nil
+	return &HTTPResponse{StatusCode: resp.StatusCode, Headers: responseHeaderPairs(resp.Header), Body: body}, nil
 }
 
 type Identity struct {
@@ -515,6 +516,9 @@ func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req 
 		return nil, errors.New("e911 entitlement HTTP client returned nil response")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if err := httpAuthenticationChallengeError(resp); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("e911 entitlement HTTP status %d", resp.StatusCode)
 	}
 	return resp, nil

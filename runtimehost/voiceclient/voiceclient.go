@@ -131,6 +131,7 @@ type RegisterSession struct {
 	CNonce                string
 	Expires               int
 	SecurityClient        SecurityAgreement
+	SecurityClients       []SecurityAgreement
 	SecurityRandom        io.Reader
 	SecurityPlanInstaller SecurityPlanInstaller
 	SecurityLocalAddr     string
@@ -611,8 +612,8 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if expires <= 0 {
 		expires = 3600
 	}
-	securityClient := s.securityClientAgreement()
-	securityClientHeader := BuildSecurityClientHeader(securityClient)
+	securityClients := s.securityClientAgreements()
+	securityClientHeader := BuildSecurityClientHeaderList(securityClients)
 
 	attempts := 0
 	cseq := 1
@@ -669,7 +670,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 			StatusCode: resp.StatusCode,
 			Reason:     resp.Reason,
 			Attempts:   attempts,
-			Binding:    buildRegistrationBinding(s.Profile, contactURI, resp, expires, securityClient, nil),
+			Binding:    buildRegistrationBindingForClients(s.Profile, contactURI, resp, expires, securityClients, nil),
 			NextCSeq:   cseq + 1,
 		}, nil
 	}
@@ -700,7 +701,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if err != nil {
 		return registerFailureResult(resp, attempts, ch, ""), err
 	}
-	if err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClient, akaKeys); err != nil {
+	if err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClients, akaKeys); err != nil {
 		return RegisterResult{StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts, Challenge: ch, AuthHeader: authz, AuthHeaderName: authzHeader}, err
 	}
 
@@ -718,7 +719,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		if isSIPSuccess(resp2.StatusCode) {
 			authState := newDigestAuthState(authzHeader, ch, currentAuthInput, authz)
 			authState, err = updateDigestAuthStateFromInfo(authState, resp2.Headers, authzHeader, resp2.Body)
-			binding := bindDigestAuthWithChallengeInput(buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders), authzHeader, authz, authState, s.digestChallengeInputFunc())
+			binding := bindDigestAuthWithChallengeInput(buildRegistrationBindingForClients(s.Profile, contactURI, resp2, expires, securityClients, securityHeaders), authzHeader, authz, authState, s.digestChallengeInputFunc())
 			result := RegisterResult{
 				Registered:     true,
 				StatusCode:     resp2.StatusCode,
@@ -766,7 +767,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		currentAuthInput = nextAuthInput
 		nextChallengeHeaders := resp2.Headers
 		securityHeaders = nextChallengeHeaders
-		if err := s.installChallengeSecurityPlan(ctx, nextChallengeHeaders, securityClient, nextAKAKeys); err != nil {
+		if err := s.installChallengeSecurityPlan(ctx, nextChallengeHeaders, securityClients, nextAKAKeys); err != nil {
 			return RegisterResult{StatusCode: resp2.StatusCode, Reason: resp2.Reason, Attempts: attempts, Challenge: ch, AuthHeader: authz, AuthHeaderName: authzHeader}, err
 		}
 		cseq++
@@ -787,7 +788,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		Attempts:       attempts,
 		RetryAfter:     SIPResponseRetryAfter(resp2),
 		Challenge:      ch,
-		Binding:        buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClient, securityHeaders),
+		Binding:        buildRegistrationBindingForClients(s.Profile, contactURI, resp2, expires, securityClients, securityHeaders),
 		AuthHeader:     authz,
 		AuthHeaderName: authzHeader,
 		AuthState:      newDigestAuthState(authzHeader, ch, currentAuthInput, authz),
@@ -1004,7 +1005,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		return RefreshResult{Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 	}
 	if isSIPSuccess(resp.StatusCode) {
-		binding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp, expires, securityClientFromBinding(req.Binding), nil))
+		binding := mergeRefreshBinding(req.Binding, buildRegistrationBindingForClients(s.Profile, contactURI, resp, expires, securityClientsFromBinding(req.Binding), nil))
 		authState, err = updateDigestAuthStateFromInfo(authState, resp.Headers, authHeaderName, resp.Body)
 		binding = bindDigestAuthWithChallengeInput(binding, authHeaderName, authz, authState, s.digestChallengeInputFunc())
 		result := RefreshResult{
@@ -1083,7 +1084,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if err != nil {
 		return RefreshResult{Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 	}
-	resultBinding := mergeRefreshBinding(req.Binding, buildRegistrationBinding(s.Profile, contactURI, resp2, expires, securityClientFromBinding(req.Binding), challengeHeaders))
+	resultBinding := mergeRefreshBinding(req.Binding, buildRegistrationBindingForClients(s.Profile, contactURI, resp2, expires, securityClientsFromBinding(req.Binding), challengeHeaders))
 	result := RefreshResult{
 		Refreshed:      isSIPSuccess(resp2.StatusCode),
 		StatusCode:     resp2.StatusCode,
@@ -1108,18 +1109,21 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	return result, nil
 }
 
-func (s RegisterSession) securityClientAgreement() SecurityAgreement {
-	if isZeroSecurityAgreement(s.SecurityClient) {
-		return DefaultSecurityClientAgreement(s.SecurityRandom)
+func (s RegisterSession) securityClientAgreements() []SecurityAgreement {
+	if len(s.SecurityClients) > 0 {
+		return completeSecurityClientAgreements(s.SecurityClients, s.SecurityRandom)
 	}
-	return completeSecurityAgreement(s.SecurityClient)
+	if !isZeroSecurityAgreement(s.SecurityClient) {
+		return []SecurityAgreement{completeSecurityAgreement(s.SecurityClient)}
+	}
+	return []SecurityAgreement{DefaultSecurityClientAgreement(s.SecurityRandom)}
 }
 
-func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, client SecurityAgreement, akaKeys IMSSecurityAKAKeys) error {
+func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, clients []SecurityAgreement, akaKeys IMSSecurityAKAKeys) error {
 	if s.SecurityPlanInstaller == nil {
 		return nil
 	}
-	agreement, plan, ok := securityPlanFromChallenge(headers, client)
+	agreement, plan, ok := securityPlanFromChallenge(headers, clients)
 	if !ok {
 		return nil
 	}
@@ -1251,10 +1255,15 @@ func digestRspauth(state DigestAuthState, qop string, body []byte) (string, erro
 }
 
 func securityClientFromBinding(binding RegistrationBinding) SecurityAgreement {
-	if agreement, ok := parseSecurityAgreement(binding.SecurityClient); ok {
-		return agreement
+	agreements := securityClientsFromBinding(binding)
+	if len(agreements) > 0 {
+		return agreements[0]
 	}
 	return SecurityAgreement{}
+}
+
+func securityClientsFromBinding(binding RegistrationBinding) []SecurityAgreement {
+	return ParseSecurityAgreements([]string{binding.SecurityClient})
 }
 
 func mergeRefreshBinding(previous, next RegistrationBinding) RegistrationBinding {
@@ -1428,6 +1437,14 @@ func BuildRegistrationBinding(profile IMSProfile, contactURI string, resp Regist
 }
 
 func buildRegistrationBinding(profile IMSProfile, contactURI string, resp RegisterResponse, requestedExpires int, securityClient SecurityAgreement, securityFallback map[string][]string) RegistrationBinding {
+	var securityClients []SecurityAgreement
+	if !isZeroSecurityAgreement(securityClient) {
+		securityClients = []SecurityAgreement{securityClient}
+	}
+	return buildRegistrationBindingForClients(profile, contactURI, resp, requestedExpires, securityClients, securityFallback)
+}
+
+func buildRegistrationBindingForClients(profile IMSProfile, contactURI string, resp RegisterResponse, requestedExpires int, securityClients []SecurityAgreement, securityFallback map[string][]string) RegistrationBinding {
 	associated := normalizeAddressValues(headerListValues(resp.Headers, "P-Associated-URI"))
 	securityServer := trimHeaderValues(headerListValues(resp.Headers, "Security-Server"))
 	if len(securityServer) == 0 && securityFallback != nil {
@@ -1435,8 +1452,8 @@ func buildRegistrationBinding(profile IMSProfile, contactURI string, resp Regist
 	}
 	securityVerify := append([]string(nil), securityServer...)
 	securityClientHeader := ""
-	if !isZeroSecurityAgreement(securityClient) {
-		securityClientHeader = BuildSecurityClientHeader(securityClient)
+	if len(securityClients) > 0 {
+		securityClientHeader = BuildSecurityClientHeaderList(securityClients)
 	}
 	registrarContact := registrationContactHeader(resp.Headers, contactURI)
 	binding := RegistrationBinding{
@@ -1451,7 +1468,7 @@ func buildRegistrationBinding(profile IMSProfile, contactURI string, resp Regist
 		Expires:          registrationExpires(resp.Headers, contactURI, requestedExpires),
 		RegistrarContact: registrarContact,
 	}
-	if selected, ok := SelectSecurityAgreement(binding.SecurityServer, securityClient); ok {
+	if selected, ok := SelectSecurityAgreementForClients(binding.SecurityServer, securityClients); ok {
 		binding.SecurityAgreement = selected
 		if plan, ok := BuildIMSSecurityAssociationPlan(selected); ok {
 			binding.SecurityPlan = plan
@@ -2003,12 +2020,12 @@ func securityVerifyFromChallenge(headers map[string][]string) string {
 	return strings.Join(values, ", ")
 }
 
-func securityPlanFromChallenge(headers map[string][]string, client SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
-	return securityPlanFromValues(headerListValues(headers, "Security-Server"), client)
+func securityPlanFromChallenge(headers map[string][]string, clients []SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
+	return securityPlanFromValues(headerListValues(headers, "Security-Server"), clients)
 }
 
-func securityPlanFromValues(values []string, client SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
-	selected, ok := SelectSecurityAgreement(values, client)
+func securityPlanFromValues(values []string, clients []SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
+	selected, ok := SelectSecurityAgreementForClients(values, clients)
 	if !ok {
 		return SecurityAgreement{}, IMSSecurityAssociationPlan{}, false
 	}

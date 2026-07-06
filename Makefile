@@ -5,8 +5,9 @@ GO ?= $(shell command -v go 2>/dev/null || printf /usr/local/go/bin/go)
 GOFMT ?= $(shell command -v gofmt 2>/dev/null || printf /usr/local/go/bin/gofmt)
 CI := ./scripts/ci.sh
 VOHIVE_COMPAT := ./scripts/compat-vohive.sh
+VOHIVE_COMPAT_SELFTEST := ./scripts/compat-vohive-selftest.sh
 
-.PHONY: help ci go-version module-path privacy-check download fmt-check tidy-check vet smoke test race coverage compat-vohive
+.PHONY: help ci go-version module-path privacy-check download fmt-check tidy-check vet smoke test race coverage compat-vohive compat-vohive-selftest
 
 help:
 > @printf 'Targets:\n'
@@ -23,6 +24,7 @@ help:
 > @printf '  make race        run optional go test -race -count=1 ./...\n'
 > @printf '  make coverage    run optional coverage tests and print a summary\n'
 > @printf '  make compat-vohive run old VoHive compatibility and module-path checks\n'
+> @printf '  make compat-vohive-selftest run a lightweight local compatibility rewrite self-test\n'
 > @printf '\nOverride tools with: GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt make ci\n'
 
 ci:
@@ -63,3 +65,6 @@ coverage:
 
 compat-vohive:
 > GO_BIN="$(GO)" $(VOHIVE_COMPAT)
+
+compat-vohive-selftest:
+> GO_BIN="$(GO)" $(VOHIVE_COMPAT_SELFTEST)

@@ -87,9 +87,35 @@ func DefaultSecurityClientAgreement(random io.Reader) SecurityAgreement {
 	}
 }
 
+func DefaultSecurityClientAgreements(random io.Reader, algorithms ...string) []SecurityAgreement {
+	if len(algorithms) == 0 {
+		algorithms = []string{DefaultSecurityAlgorithm}
+	}
+	out := make([]SecurityAgreement, 0, len(algorithms))
+	for _, algorithm := range algorithms {
+		agreement := DefaultSecurityClientAgreement(random)
+		if strings.TrimSpace(algorithm) != "" {
+			agreement.Algorithm = strings.ToLower(strings.TrimSpace(algorithm))
+		}
+		out = append(out, completeSecurityAgreement(agreement))
+	}
+	return out
+}
+
 func BuildSecurityClientHeader(agreement SecurityAgreement) string {
 	agreement = completeSecurityAgreement(agreement)
 	return agreement.HeaderValue()
+}
+
+func BuildSecurityClientHeaderList(agreements []SecurityAgreement) string {
+	parts := make([]string, 0, len(agreements))
+	for _, agreement := range agreements {
+		header := strings.TrimSpace(BuildSecurityClientHeader(agreement))
+		if header != "" {
+			parts = append(parts, header)
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 func ParseSecurityAgreements(values []string) []SecurityAgreement {
@@ -106,24 +132,38 @@ func ParseSecurityAgreements(values []string) []SecurityAgreement {
 }
 
 func SelectSecurityAgreement(values []string, client SecurityAgreement) (SecurityAgreement, bool) {
+	return SelectSecurityAgreementForClients(values, []SecurityAgreement{client})
+}
+
+func SelectSecurityAgreementForClients(values []string, clients []SecurityAgreement) (SecurityAgreement, bool) {
 	offers := ParseSecurityAgreements(values)
 	if len(offers) == 0 {
 		return SecurityAgreement{}, false
 	}
-	client = completeSecurityAgreement(client)
+	if len(clients) == 0 {
+		clients = []SecurityAgreement{{}}
+	}
+	completedClients := make([]SecurityAgreement, 0, len(clients))
+	for _, client := range clients {
+		completedClients = append(completedClients, completeSecurityAgreement(client))
+	}
 	bestIndex := -1
+	bestClientIndex := len(completedClients)
 	bestScore := -1
 	var best SecurityAgreement
 	for i, offer := range offers {
 		offer = completeSecurityAgreement(offer)
-		if !securityAgreementCompatible(offer, client) {
-			continue
-		}
-		score := securityAgreementScore(offer, client)
-		if score > bestScore {
-			bestIndex = i
-			bestScore = score
-			best = offer
+		for j, client := range completedClients {
+			if !securityAgreementCompatible(offer, client) {
+				continue
+			}
+			score := securityAgreementScore(offer, client)
+			if score > bestScore || (score == bestScore && j < bestClientIndex) {
+				bestIndex = i
+				bestClientIndex = j
+				bestScore = score
+				best = offer
+			}
 		}
 	}
 	if bestIndex < 0 {
@@ -214,6 +254,37 @@ func completeSecurityAgreement(a SecurityAgreement) SecurityAgreement {
 		a.PortServer = 0
 	}
 	return a
+}
+
+func completeSecurityClientAgreement(a SecurityAgreement, random io.Reader) SecurityAgreement {
+	a = completeSecurityAgreement(a)
+	if random == nil {
+		random = cryptorand.Reader
+	}
+	if a.SPIClient == 0 {
+		a.SPIClient = randomSecuritySPI(random)
+	}
+	if a.SPIServer == 0 {
+		a.SPIServer = randomSecuritySPI(random)
+	}
+	if a.PortClient == 0 {
+		a.PortClient = DefaultSecurityPortC
+	}
+	if a.PortServer == 0 {
+		a.PortServer = DefaultSecurityPortS
+	}
+	return a
+}
+
+func completeSecurityClientAgreements(agreements []SecurityAgreement, random io.Reader) []SecurityAgreement {
+	if len(agreements) == 0 {
+		return nil
+	}
+	out := make([]SecurityAgreement, 0, len(agreements))
+	for _, agreement := range agreements {
+		out = append(out, completeSecurityClientAgreement(agreement, random))
+	}
+	return out
 }
 
 func isZeroSecurityAgreement(a SecurityAgreement) bool {
@@ -507,12 +578,18 @@ func randomSecuritySPI(random io.Reader) uint32 {
 }
 
 func validateSecurityClientHeader(header string) error {
-	agreement, ok := parseSecurityAgreement(header)
-	if !ok {
+	items := splitSIPHeaderValues(header)
+	if len(items) == 0 {
 		return fmt.Errorf("invalid Security-Client header")
 	}
-	if !strings.EqualFold(agreement.Protocol, DefaultSecurityProtocol) {
-		return fmt.Errorf("unsupported Security-Client protocol %q", agreement.Protocol)
+	for _, item := range items {
+		agreement, ok := parseSecurityAgreement(item)
+		if !ok {
+			return fmt.Errorf("invalid Security-Client header")
+		}
+		if !strings.EqualFold(agreement.Protocol, DefaultSecurityProtocol) {
+			return fmt.Errorf("unsupported Security-Client protocol %q", agreement.Protocol)
+		}
 	}
 	return nil
 }
