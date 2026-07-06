@@ -529,6 +529,32 @@ func TestIMSInboundWireServerRejectsMalformedPrackRAck(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerRejectsUnmatchedPrackRAck(t *testing.T) {
+	transport := newWireInboundTransport(nil)
+	agent := &IMSInboundAgent{ClientTransport: transport}
+	agent.storeInboundDialog("wire-call-unmatched-prack", imsInboundDialogState{
+		clientCfg: voiceclient.DialogRequestConfig{
+			RemoteTargetURI: "sip:client@127.0.0.1:5070",
+			CallID:          "wire-call-unmatched-prack",
+			CSeq:            1,
+		},
+	})
+	server := &IMSInboundWireServer{Agent: agent}
+	req := parseWireIncoming(t, wireIMSRequest("wire-call-unmatched-prack", "PRACK", 2, nil, "RAck: 7 1 INVITE\r\n"))
+	responses, err := server.HandleRequest(context.Background(), req)
+	if err != nil {
+		t.Fatalf("HandleRequest(PRACK) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 481 {
+		t.Fatalf("responses=%+v, want 481", responses)
+	}
+	select {
+	case req := <-transport.requests:
+		t.Fatalf("unexpected client PRACK request=%+v", req)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestIMSInboundWireServerRejectsMalformedCSeq(t *testing.T) {
 	transport := newWireInboundTransport(nil)
 	server := &IMSInboundWireServer{
@@ -1172,6 +1198,10 @@ func TestIMSInboundWireServerDispatchesPrackUpdateAndOptions(t *testing.T) {
 		t.Fatalf("INVITE responses=%+v", responses)
 	}
 	_ = transport.readRequest(t)
+	reliableProvisional := wireResponse(183, "Session Progress")
+	reliableProvisional.Headers["RSeq"] = "1"
+	reliableProvisional.Headers["Require"] = "100rel"
+	server.trackReliableProvisional(invite, reliableProvisional)
 
 	prack := parseWireIncoming(t, wireIMSRequest("wire-call-dialog", "PRACK", 2, nil, "RAck: 1 1 INVITE\r\n"))
 	responses, err = server.HandleRequest(context.Background(), prack)

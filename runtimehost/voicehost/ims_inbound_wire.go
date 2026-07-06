@@ -33,6 +33,7 @@ type IMSInboundWireServer struct {
 	transactions          map[string]imsInboundWireTransaction
 	inviteRetransmits     map[string]imsInboundResponseRetransmit
 	inviteFinalAcks       map[string]time.Time
+	reliable1xxPending    map[string]time.Time
 	reliable1xxRetransmit map[string]imsInboundResponseRetransmit
 	reliable1xxAcks       map[string]time.Time
 }
@@ -158,6 +159,10 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 	case "PRACK":
 		if !wireValidRAckHeader(firstVoiceHeader(req.Headers, "RAck")) {
 			responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(400, "Bad RAck"))}
+			break
+		}
+		if !s.hasPendingReliableProvisionalForPrack(req) {
+			responses = []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(481, "Call/Transaction Does Not Exist"))}
 			break
 		}
 		s.stopReliableProvisionalRetransmission(req)
@@ -400,9 +405,14 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 			s.storeTransaction(key, pendingResponses)
 		}
 		if emit != nil {
-			return emit(provisional)
+			if err := emit(provisional); err != nil {
+				return err
+			}
+			s.trackReliableProvisional(req, provisional)
+			return nil
 		}
 		provisionals = append(provisionals, provisional)
+		s.trackReliableProvisional(req, provisional)
 		return nil
 	})
 	responses = append(responses, provisionals...)
@@ -803,6 +813,42 @@ func (s *IMSInboundWireServer) startReliableProvisionalRetransmission(ctx contex
 	go s.runWireResponseRetransmission(childCtx, key, entry.done, pc, addr, req, resp, s.reliable1xxT1(), s.reliable1xxT2(), s.removeReliableProvisionalRetransmission)
 }
 
+func (s *IMSInboundWireServer) trackReliableProvisional(req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) {
+	if s == nil || !shouldRetransmitReliableProvisional(req, resp) {
+		return
+	}
+	key := wireReliableProvisionalKey(req, resp)
+	if key == "" {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	s.pruneWireStateLocked(now)
+	if s.reliable1xxPending == nil {
+		s.reliable1xxPending = make(map[string]time.Time)
+	}
+	if expires, ok := s.reliable1xxAcks[key]; !ok || !now.Before(expires) {
+		s.reliable1xxPending[key] = now.Add(s.transactionTTL())
+	}
+	s.mu.Unlock()
+}
+
+func (s *IMSInboundWireServer) hasPendingReliableProvisionalForPrack(req voiceclient.SIPIncomingRequest) bool {
+	if s == nil {
+		return false
+	}
+	key := wireReliableProvisionalKeyFromRAck(req)
+	if key == "" {
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneWireStateLocked(now)
+	expires, ok := s.reliable1xxPending[key]
+	return ok && (expires.IsZero() || now.Before(expires))
+}
+
 func (s *IMSInboundWireServer) removeReliableProvisionalRetransmission(key string, done chan struct{}) {
 	if s == nil || key == "" {
 		return
@@ -827,6 +873,7 @@ func (s *IMSInboundWireServer) stopReliableProvisionalRetransmission(req voicecl
 		s.reliable1xxAcks = make(map[string]time.Time)
 	}
 	s.reliable1xxAcks[key] = time.Now().Add(s.transactionTTL())
+	delete(s.reliable1xxPending, key)
 	entry, ok := s.reliable1xxRetransmit[key]
 	if ok {
 		delete(s.reliable1xxRetransmit, key)
@@ -851,6 +898,11 @@ func (s *IMSInboundWireServer) stopReliableProvisionalsForInvite(req voiceclient
 		s.reliable1xxAcks = make(map[string]time.Time)
 	}
 	expires := time.Now().Add(s.transactionTTL())
+	for key := range s.reliable1xxPending {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.reliable1xxPending, key)
+		}
+	}
 	for key, entry := range s.reliable1xxRetransmit {
 		if strings.HasPrefix(key, prefix) {
 			s.reliable1xxAcks[key] = expires
@@ -955,6 +1007,11 @@ func (s *IMSInboundWireServer) pruneWireStateLocked(now time.Time) {
 	for key, expires := range s.reliable1xxAcks {
 		if !expires.IsZero() && now.After(expires) {
 			delete(s.reliable1xxAcks, key)
+		}
+	}
+	for key, expires := range s.reliable1xxPending {
+		if !expires.IsZero() && now.After(expires) {
+			delete(s.reliable1xxPending, key)
 		}
 	}
 }
