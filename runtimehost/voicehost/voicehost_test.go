@@ -792,8 +792,31 @@ func TestParseAndBuildSDP(t *testing.T) {
 	if len(info.Payloads) != 3 || info.Payloads[0] != 0 || info.Payloads[2] != 101 {
 		t.Fatalf("payloads=%+v", info.Payloads)
 	}
+	if info.TelephoneEventPayloads[101] != 8000 {
+		t.Fatalf("telephone-event payloads=%+v", info.TelephoneEventPayloads)
+	}
 	answer := string(BuildSDPAnswer(SDPInfo{ConnectionIP: "192.0.2.2", MediaPort: 6000, RTCPPort: 6001, Payloads: []int{8}, Direction: "recvonly"}))
 	if !strings.Contains(answer, "m=audio 6000 RTP/AVP 8") || !strings.Contains(answer, "a=rtcp:6001 IN IP4 192.0.2.2") || !strings.Contains(answer, "a=recvonly") {
+		t.Fatalf("answer=%q", answer)
+	}
+}
+
+func TestParseAndBuildSDPDynamicTelephoneEventPayload(t *testing.T) {
+	info, err := ParseSDP([]byte("v=0\r\nc=IN IP4 203.0.113.8\r\nm=audio 49170 RTP/AVP 96 110\r\na=rtpmap:96 AMR/8000\r\na=rtpmap:110 telephone-event/16000\r\na=fmtp:110 0-16\r\n"))
+	if err != nil {
+		t.Fatalf("ParseSDP() error = %v", err)
+	}
+	if info.TelephoneEventPayloads[110] != 16000 {
+		t.Fatalf("telephone-event payloads=%+v", info.TelephoneEventPayloads)
+	}
+	answer := string(BuildSDPAnswer(SDPInfo{
+		ConnectionIP:           "192.0.2.2",
+		MediaPort:              6000,
+		Payloads:               []int{96, 110},
+		TelephoneEventPayloads: map[uint8]int{110: 16000},
+		Direction:              "sendrecv",
+	}))
+	if !strings.Contains(answer, "m=audio 6000 RTP/AVP 96 110") || !strings.Contains(answer, "a=rtpmap:110 telephone-event/16000\r\n") || !strings.Contains(answer, "a=fmtp:110 0-16\r\n") {
 		t.Fatalf("answer=%q", answer)
 	}
 }

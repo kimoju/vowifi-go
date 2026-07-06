@@ -184,6 +184,42 @@ func TestSRTPMediaSessionReportsRTCPFeedbackInRelayTransform(t *testing.T) {
 	}
 }
 
+func TestSRTPMediaSessionReportsRTPDTMFInRelayTransform(t *testing.T) {
+	events := make(chan RTPDTMFEvent, 1)
+	cfg := testSRTPMediaConfig()
+	cfg.ClientRTPDTMFPayloads = map[uint8]int{110: 16000}
+	cfg.RTPDTMFHandler = func(event RTPDTMFEvent) {
+		events <- event
+	}
+	session, err := NewSRTPMediaSession(cfg)
+	if err != nil {
+		t.Fatalf("NewSRTPMediaSession() error = %v", err)
+	}
+	packet, err := BuildRTPDTMFPacket(RTPDTMFPacket{PayloadType: 110, Marker: true, SequenceNumber: 44, Timestamp: 3200, SSRC: 0x11111111, Signal: "A", DurationSamples: 1600, ClockRate: 16000})
+	if err != nil {
+		t.Fatalf("BuildRTPDTMFPacket() error = %v", err)
+	}
+	protected, err := session.ProtectClientRTP(packet)
+	if err != nil {
+		t.Fatalf("ProtectClientRTP() error = %v", err)
+	}
+	transformed, err := session.RelayTransforms().ClientToIMSRTP(protected)
+	if err != nil {
+		t.Fatalf("ClientToIMSRTP() error = %v", err)
+	}
+	plain, err := session.UnprotectIMSRTP(transformed)
+	if err != nil {
+		t.Fatalf("UnprotectIMSRTP() error = %v", err)
+	}
+	if !bytes.Equal(plain, packet) {
+		t.Fatalf("RTP plain=%x, want %x", plain, packet)
+	}
+	event := readRTPDTMFEvent(t, events)
+	if event.Direction != RTPDTMFClientToIMS || event.PayloadType != 110 || event.Signal != "A" || event.DurationMS != 100 || !event.Marker {
+		t.Fatalf("event=%+v", event)
+	}
+}
+
 func testSRTPMediaConfig() SRTPMediaConfig {
 	return SRTPMediaConfig{
 		Profile: SRTPProfileAes128CmHmacSha1_80,

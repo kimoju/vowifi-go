@@ -1000,18 +1000,20 @@ func (g *Gateway) HandleClientBye(deviceID string, req *sip.Request, tx sip.Serv
 }
 
 type SDPInfo struct {
-	ConnectionIP string
-	MediaPort    int
-	RTCPIP       string
-	RTCPPort     int
-	Payloads     []int
-	Direction    string
+	ConnectionIP           string
+	MediaPort              int
+	RTCPIP                 string
+	RTCPPort               int
+	Payloads               []int
+	TelephoneEventPayloads map[uint8]int
+	Direction              string
 }
 
 var (
 	sdpConnRE      = regexp.MustCompile(`(?m)^c=IN IP[46] ([^\r\n]+)`)
 	sdpMediaRE     = regexp.MustCompile(`(?m)^m=audio ([0-9]+) [A-Z0-9/]+(.*)$`)
 	sdpRTCPRE      = regexp.MustCompile(`(?m)^a=rtcp:([0-9]+)(?:\s+IN\s+IP[46]\s+([^\r\n]+))?`)
+	sdpRTPMapRE    = regexp.MustCompile(`(?mi)^a=rtpmap:([0-9]+)\s+telephone-event/([0-9]+)(?:/[0-9]+)?\s*$`)
 	sdpDirectionRE = regexp.MustCompile(`(?m)^a=(sendrecv|sendonly|recvonly|inactive)\s*$`)
 )
 
@@ -1049,6 +1051,20 @@ func ParseSDP(body []byte) (SDPInfo, error) {
 		if len(m) >= 3 && strings.TrimSpace(m[2]) != "" {
 			out.RTCPIP = strings.TrimSpace(m[2])
 		}
+	}
+	for _, m := range sdpRTPMapRE.FindAllStringSubmatch(text, -1) {
+		payload, _ := strconv.Atoi(m[1])
+		clockRate, _ := strconv.Atoi(m[2])
+		if payload < 0 || payload > 127 || clockRate <= 0 {
+			continue
+		}
+		if out.TelephoneEventPayloads == nil {
+			out.TelephoneEventPayloads = make(map[uint8]int)
+		}
+		out.TelephoneEventPayloads[uint8(payload)] = clockRate
+	}
+	if out.TelephoneEventPayloads == nil && sdpPayloadsContain(out.Payloads, DefaultRTPDTMFPayloadType) {
+		out.TelephoneEventPayloads = map[uint8]int{DefaultRTPDTMFPayloadType: DefaultRTPDTMFClockRate}
 	}
 	if m := sdpDirectionRE.FindStringSubmatch(text); len(m) == 2 {
 		out.Direction = strings.TrimSpace(m[1])
@@ -1109,18 +1125,37 @@ func BuildSDPAnswer(info SDPInfo) []byte {
 		b.WriteString("a=rtcp:" + strconv.Itoa(info.RTCPPort) + " IN " + rtcpIPVersion + " " + rtcpIP + "\r\n")
 	}
 	b.WriteString("a=" + direction + "\r\n")
+	telephoneEventPayloads := info.TelephoneEventPayloads
+	if telephoneEventPayloads == nil && sdpPayloadsContain(payloads, DefaultRTPDTMFPayloadType) {
+		telephoneEventPayloads = map[uint8]int{DefaultRTPDTMFPayloadType: DefaultRTPDTMFClockRate}
+	}
 	for _, payload := range payloads {
 		switch payload {
 		case 0:
 			b.WriteString("a=rtpmap:0 PCMU/8000\r\n")
 		case 8:
 			b.WriteString("a=rtpmap:8 PCMA/8000\r\n")
-		case 101:
-			b.WriteString("a=rtpmap:101 telephone-event/8000\r\n")
-			b.WriteString("a=fmtp:101 0-16\r\n")
+		}
+		if payload >= 0 && payload <= 127 {
+			if clockRate, ok := telephoneEventPayloads[uint8(payload)]; ok {
+				if clockRate <= 0 {
+					clockRate = DefaultRTPDTMFClockRate
+				}
+				b.WriteString("a=rtpmap:" + strconv.Itoa(payload) + " telephone-event/" + strconv.Itoa(clockRate) + "\r\n")
+				b.WriteString("a=fmtp:" + strconv.Itoa(payload) + " 0-16\r\n")
+			}
 		}
 	}
 	return []byte(b.String())
+}
+
+func sdpPayloadsContain(payloads []int, want int) bool {
+	for _, payload := range payloads {
+		if payload == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) recordDialog(info DialogInfo) {

@@ -88,3 +88,57 @@ func TestBuildDialogDTMFInfoRequest(t *testing.T) {
 		t.Fatalf("headers were not cloned req=%+v err=%v", req2, err)
 	}
 }
+
+func TestBuildAndParseRTPDTMFPacket(t *testing.T) {
+	packet, err := BuildRTPDTMFPacket(RTPDTMFPacket{
+		PayloadType:     110,
+		Marker:          true,
+		SequenceNumber:  77,
+		Timestamp:       0x01020304,
+		SSRC:            0x11223344,
+		Signal:          "#",
+		End:             true,
+		Volume:          6,
+		DurationSamples: 800,
+		ClockRate:       16000,
+	})
+	if err != nil {
+		t.Fatalf("BuildRTPDTMFPacket() error = %v", err)
+	}
+	event, ok, err := ParseRTPDTMFEvent(RTPDTMFClientToIMS, packet, map[uint8]int{110: 16000})
+	if err != nil {
+		t.Fatalf("ParseRTPDTMFEvent() error = %v", err)
+	}
+	if !ok {
+		t.Fatalf("ParseRTPDTMFEvent() ok=false")
+	}
+	if event.Direction != RTPDTMFClientToIMS || event.PayloadType != 110 || event.EventCode != 11 || event.Signal != "#" || !event.End || !event.Marker {
+		t.Fatalf("event=%+v", event)
+	}
+	if event.Volume != 6 || event.DurationSamples != 800 || event.DurationMS != 50 || event.SequenceNumber != 77 || event.Timestamp != 0x01020304 || event.SSRC != 0x11223344 {
+		t.Fatalf("event timing/header=%+v", event)
+	}
+	if _, ok, err := ParseRTPDTMFEvent(RTPDTMFClientToIMS, packet, map[uint8]int{101: 8000}); err != nil || ok {
+		t.Fatalf("ParseRTPDTMFEvent(non dtmf) ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRTPDTMFRejectsInvalidValues(t *testing.T) {
+	if _, err := BuildRTPDTMFPacket(RTPDTMFPacket{PayloadType: 128, Signal: "1"}); !errors.Is(err, ErrInvalidDTMF) {
+		t.Fatalf("BuildRTPDTMFPacket(payload) err=%v, want ErrInvalidDTMF", err)
+	}
+	if _, err := BuildRTPDTMFPacket(RTPDTMFPacket{Signal: "X"}); !errors.Is(err, ErrInvalidDTMF) {
+		t.Fatalf("BuildRTPDTMFPacket(signal) err=%v, want ErrInvalidDTMF", err)
+	}
+	packet, err := BuildRTPDTMFPacket(RTPDTMFPacket{Signal: "1"})
+	if err != nil {
+		t.Fatalf("BuildRTPDTMFPacket() error = %v", err)
+	}
+	if _, _, err := ParseRTPDTMFEvent(RTPDTMFClientToIMS, packet[:15], map[uint8]int{DefaultRTPDTMFPayloadType: DefaultRTPDTMFClockRate}); !errors.Is(err, ErrInvalidDTMF) {
+		t.Fatalf("ParseRTPDTMFEvent(short) err=%v, want ErrInvalidDTMF", err)
+	}
+	packet[12] = 99
+	if _, _, err := ParseRTPDTMFEvent(RTPDTMFClientToIMS, packet, map[uint8]int{DefaultRTPDTMFPayloadType: DefaultRTPDTMFClockRate}); !errors.Is(err, ErrInvalidDTMF) {
+		t.Fatalf("ParseRTPDTMFEvent(code) err=%v, want ErrInvalidDTMF", err)
+	}
+}

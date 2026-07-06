@@ -193,6 +193,10 @@ protocol layers needed by VoHive:
   Reports, PLI/FIR/rapid resynchronization requests, NACK, REMB, transport-wide
   congestion control, SLI, XR, SDES, BYE, application-defined packets,
   clear-relay counters, and SRTP plaintext-stage event callbacks
+- RTP telephone-event DTMF helpers for RFC 4733-style packet construction,
+  SDP dynamic payload discovery, relay-side event inspection, direction-aware
+  callbacks, clear-relay DTMF event/end/error counters, and SRTP plaintext-
+  stage DTMF inspection during media transforms
 - inbound IMS voice agent helpers that bridge IMS-originated INVITEs to a local
   SIP client, parse SDP answers, forward ACK/BYE/CANCEL dialog requests, and
   support RTP relay allocation with IMS-offer/client-answer SDP rewriting,

@@ -356,6 +356,90 @@ func TestRTPRelaySessionReportsRTCPFeedback(t *testing.T) {
 	}
 }
 
+func TestRTPRelaySessionReportsRTPDTMFEvents(t *testing.T) {
+	clientPeer := listenTestUDP(t)
+	defer clientPeer.Close()
+	clientRTCPPeer := listenTestUDP(t)
+	defer clientRTCPPeer.Close()
+	imsPeer := listenTestUDP(t)
+	defer imsPeer.Close()
+	imsRTCPPeer := listenTestUDP(t)
+	defer imsRTCPPeer.Close()
+
+	events := make(chan RTPDTMFEvent, 4)
+	clientAddr := clientPeer.LocalAddr().(*net.UDPAddr)
+	clientRTCPAddr := clientRTCPPeer.LocalAddr().(*net.UDPAddr)
+	imsAddr := imsPeer.LocalAddr().(*net.UDPAddr)
+	imsRTCPAddr := imsRTCPPeer.LocalAddr().(*net.UDPAddr)
+	relay, err := NewRTPRelaySession(context.Background(), RTPRelayConfig{
+		ClientListenIP:    "127.0.0.1",
+		ClientAdvertiseIP: "127.0.0.1",
+		IMSListenIP:       "127.0.0.1",
+		IMSAdvertiseIP:    "127.0.0.1",
+		RTPDTMFHandler: func(event RTPDTMFEvent) {
+			events <- event
+		},
+	}, SDPInfo{
+		ConnectionIP:           "127.0.0.1",
+		MediaPort:              clientAddr.Port,
+		RTCPPort:               clientRTCPAddr.Port,
+		Payloads:               []int{0, 110},
+		TelephoneEventPayloads: map[uint8]int{110: 16000},
+	})
+	if err != nil {
+		t.Fatalf("NewRTPRelaySession() error = %v", err)
+	}
+	defer relay.Close()
+	if err := relay.SetIMSRemote(SDPInfo{
+		ConnectionIP:           "127.0.0.1",
+		MediaPort:              imsAddr.Port,
+		RTCPPort:               imsRTCPAddr.Port,
+		Payloads:               []int{0, 101},
+		TelephoneEventPayloads: map[uint8]int{101: 8000},
+	}); err != nil {
+		t.Fatalf("SetIMSRemote() error = %v", err)
+	}
+
+	clientEndpoint := udpAddrFromSDP(t, relay.ClientEndpoint())
+	imsEndpoint := udpAddrFromSDP(t, relay.IMSEndpoint())
+	clientPacket, err := BuildRTPDTMFPacket(RTPDTMFPacket{PayloadType: 110, Marker: true, SequenceNumber: 10, Timestamp: 160, SSRC: 0x11111111, Signal: "5", DurationSamples: 1600, ClockRate: 16000})
+	if err != nil {
+		t.Fatalf("BuildRTPDTMFPacket(client) error = %v", err)
+	}
+	if _, err := clientPeer.WriteToUDP(clientPacket, clientEndpoint); err != nil {
+		t.Fatalf("client WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, imsPeer); !bytes.Equal(got, clientPacket) {
+		t.Fatalf("IMS got=%x, want %x", got, clientPacket)
+	}
+	clientEvent := readRTPDTMFEvent(t, events)
+	if clientEvent.Direction != RTPDTMFClientToIMS || clientEvent.PayloadType != 110 || clientEvent.Signal != "5" || clientEvent.DurationMS != 100 {
+		t.Fatalf("client event=%+v", clientEvent)
+	}
+
+	imsPacket, err := BuildRTPDTMFPacket(RTPDTMFPacket{PayloadType: 101, SequenceNumber: 11, Timestamp: 320, SSRC: 0x22222222, Signal: "#", End: true, DurationSamples: 800, ClockRate: 8000})
+	if err != nil {
+		t.Fatalf("BuildRTPDTMFPacket(ims) error = %v", err)
+	}
+	if _, err := imsPeer.WriteToUDP(imsPacket, imsEndpoint); err != nil {
+		t.Fatalf("ims WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, clientPeer); !bytes.Equal(got, imsPacket) {
+		t.Fatalf("client got=%x, want %x", got, imsPacket)
+	}
+	imsEvent := readRTPDTMFEvent(t, events)
+	if imsEvent.Direction != RTPDTMFIMSToClient || imsEvent.PayloadType != 101 || imsEvent.Signal != "#" || !imsEvent.End || imsEvent.DurationMS != 100 {
+		t.Fatalf("IMS event=%+v", imsEvent)
+	}
+
+	stats := waitRelayStats(t, relay, func(stats RTPRelayStats) bool {
+		return stats.RTPDTMFEvents == 2
+	})
+	if stats.RTPDTMFEvents != 2 || stats.RTPDTMFEndEvents != 1 || stats.RTPDTMFClientToIMSEvents != 1 || stats.RTPDTMFIMSToClientEvents != 1 || stats.RTPDTMFParseErrors != 0 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
 func listenTestUDP(t *testing.T) *net.UDPConn {
 	t.Helper()
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
@@ -401,6 +485,17 @@ func readRTCPFeedbackEvent(t *testing.T, events <-chan RTCPFeedbackEvent) RTCPFe
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for RTCP feedback event")
 		return RTCPFeedbackEvent{}
+	}
+}
+
+func readRTPDTMFEvent(t *testing.T, events <-chan RTPDTMFEvent) RTPDTMFEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for RTP DTMF event")
+		return RTPDTMFEvent{}
 	}
 }
 
