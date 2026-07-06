@@ -176,6 +176,90 @@ func TestParseSIPRequestAndBuildResponseWire(t *testing.T) {
 	}
 }
 
+func TestBuildSIPResponseWireOrdersReferHeaders(t *testing.T) {
+	req := SIPIncomingRequest{
+		Method: "REFER",
+		URI:    "sip:user@example",
+		Headers: map[string][]string{
+			"Via":     {"SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-a"},
+			"To":      {"<sip:user@example>"},
+			"From":    {"<sip:caller@example>;tag=remote"},
+			"Call-ID": {"refer-order"},
+			"CSeq":    {"7 REFER"},
+		},
+	}
+	wire, err := BuildSIPResponseWire(req, 202, "Accepted", map[string]string{
+		"X-Late":              "tail",
+		"Refer-Sub":           "false",
+		"Request-Disposition": "no-fork",
+		"Referred-By":         "<sip:caller@example>",
+		"Reject-Contact":      "*;audio",
+		"Refer-To":            "<sip:target@example>",
+	}, nil)
+	if err != nil {
+		t.Fatalf("BuildSIPResponseWire() error = %v", err)
+	}
+	assertWireHeaderOrder(t, string(wire),
+		"CSeq: 7 REFER\r\n",
+		"Refer-To: <sip:target@example>\r\n",
+		"Referred-By: <sip:caller@example>\r\n",
+		"Refer-Sub: false\r\n",
+		"Request-Disposition: no-fork\r\n",
+		"Reject-Contact: *;audio\r\n",
+		"X-Late: tail\r\n",
+		"Content-Length: 0\r\n",
+	)
+}
+
+func TestBuildSIPRequestWireOrdersReferHeaders(t *testing.T) {
+	wire, err := buildSIPRequestWire(SIPRequestMessage{
+		Method: "REFER",
+		URI:    "sip:callee@example",
+		Headers: map[string]string{
+			"Via":                 "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-order;rport",
+			"To":                  "<sip:callee@example>;tag=remote",
+			"From":                "<sip:user@example>;tag=local",
+			"Call-ID":             "request-refer-order",
+			"CSeq":                "9 REFER",
+			"Max-Forwards":        "70",
+			"Refer-Sub":           "true",
+			"Request-Disposition": "no-fork",
+			"Referred-By":         "<sip:user@example>",
+			"Reject-Contact":      "*;audio",
+			"Refer-To":            "<sip:target@example>",
+			"X-Late":              "tail",
+		},
+	}, "UDP", nil)
+	if err != nil {
+		t.Fatalf("buildSIPRequestWire() error = %v", err)
+	}
+	assertWireHeaderOrder(t, string(wire),
+		"CSeq: 9 REFER\r\n",
+		"Refer-To: <sip:target@example>\r\n",
+		"Referred-By: <sip:user@example>\r\n",
+		"Refer-Sub: true\r\n",
+		"Request-Disposition: no-fork\r\n",
+		"Reject-Contact: *;audio\r\n",
+		"X-Late: tail\r\n",
+		"Content-Length: 0\r\n",
+	)
+}
+
+func assertWireHeaderOrder(t *testing.T, wire string, headers ...string) {
+	t.Helper()
+	last := -1
+	for _, header := range headers {
+		idx := strings.Index(wire, header)
+		if idx < 0 {
+			t.Fatalf("wire missing header %q in %q", header, wire)
+		}
+		if idx <= last {
+			t.Fatalf("header %q out of order in %q", header, wire)
+		}
+		last = idx
+	}
+}
+
 func TestBuildSIPResponseWireRejectsInvalidStatusCode(t *testing.T) {
 	req := SIPIncomingRequest{
 		Method: "OPTIONS",

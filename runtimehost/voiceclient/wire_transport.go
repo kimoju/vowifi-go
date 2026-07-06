@@ -292,7 +292,8 @@ func writeOrderedHeaders(out *bytes.Buffer, headers map[string]string) {
 		"Expires", "P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
 		"P-Preferred-Service", "Accept-Contact",
 		"P-Access-Network-Info", "Security-Client", "Security-Verify", "Authorization",
-		"Proxy-Authorization", "Session-Expires", "Min-SE", "Event", "Subscription-State",
+		"Proxy-Authorization", "Refer-To", "Referred-By", "Refer-Sub", "Request-Disposition",
+		"Reject-Contact", "Session-Expires", "Min-SE", "Event", "Subscription-State",
 		"Allow-Events", "Content-Type", "Accept",
 	}
 	written := make(map[string]bool, len(order))
@@ -741,10 +742,12 @@ func writeOrderedHeaderValues(out *bytes.Buffer, headers map[string][]string) {
 		"P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
 		"P-Access-Network-Info", "Security-Client", "Security-Verify",
 		"Authorization", "Proxy-Authorization", "WWW-Authenticate",
-		"Proxy-Authenticate", "Session-Expires", "Min-SE", "Event", "Subscription-State",
+		"Proxy-Authenticate", "Refer-To", "Referred-By", "Refer-Sub", "Request-Disposition",
+		"Reject-Contact", "Session-Expires", "Min-SE", "Event", "Subscription-State",
 		"Allow-Events", "Content-Type", "Accept",
 	}
 	written := make(map[string]bool, len(order))
+	var contentLength []string
 	for _, name := range order {
 		for key, values := range headers {
 			if !strings.EqualFold(key, name) {
@@ -763,6 +766,11 @@ func writeOrderedHeaderValues(out *bytes.Buffer, headers map[string][]string) {
 		}
 	}
 	for key, values := range headers {
+		if strings.EqualFold(key, "Content-Length") {
+			contentLength = trimHeaderValues(values)
+			written[strings.ToLower(key)] = true
+			continue
+		}
 		if written[strings.ToLower(key)] {
 			continue
 		}
@@ -775,6 +783,14 @@ func writeOrderedHeaderValues(out *bytes.Buffer, headers map[string][]string) {
 			out.WriteString(strings.TrimSpace(value))
 			out.WriteString("\r\n")
 		}
+	}
+	for _, value := range contentLength {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		out.WriteString("Content-Length: ")
+		out.WriteString(strings.TrimSpace(value))
+		out.WriteString("\r\n")
 	}
 }
 
