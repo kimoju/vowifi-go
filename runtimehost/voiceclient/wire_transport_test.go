@@ -198,12 +198,44 @@ func TestParseSIPMessageRejectsInvalidContentLength(t *testing.T) {
 				return err
 			},
 		},
+		{
+			name: "request_conflicting_lengths",
+			raw: strings.Join([]string{
+				"MESSAGE sip:user@example SIP/2.0",
+				"Call-ID: conflicting-length",
+				"CSeq: 1 MESSAGE",
+				"Content-Length: 5",
+				"l: 3",
+				"",
+				"abcde",
+			}, "\r\n"),
+			parse: func(raw []byte) error {
+				_, err := ParseSIPRequest(raw)
+				return err
+			},
+		},
 	}
 	for _, tc := range tests {
 		err := tc.parse([]byte(tc.raw))
 		if !errors.Is(err, ErrInvalidSIPMessage) {
 			t.Fatalf("%s error=%v, want ErrInvalidSIPMessage", tc.name, err)
 		}
+	}
+}
+
+func TestParseSIPMessageAllowsMatchingContentLength(t *testing.T) {
+	resp, err := ParseSIPResponse([]byte(strings.Join([]string{
+		"SIP/2.0 200 OK",
+		"Content-Length: 5",
+		"l: 5",
+		"",
+		"hello ignored",
+	}, "\r\n")))
+	if err != nil {
+		t.Fatalf("ParseSIPResponse() error = %v", err)
+	}
+	if string(resp.Body) != "hello" {
+		t.Fatalf("body=%q, want hello", resp.Body)
 	}
 }
 
@@ -219,6 +251,14 @@ func TestReadSIPStreamMessageSkipsCRLFKeepalive(t *testing.T) {
 	}
 	if resp.StatusCode != 200 || string(resp.Body) != "ready" {
 		t.Fatalf("response=%+v body=%q raw=%q", resp, resp.Body, raw)
+	}
+}
+
+func TestReadSIPStreamMessageRejectsConflictingContentLength(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("SIP/2.0 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc"))
+	_, err := readSIPStreamMessage(reader)
+	if !errors.Is(err, ErrInvalidSIPMessage) {
+		t.Fatalf("readSIPStreamMessage() error = %v, want ErrInvalidSIPMessage", err)
 	}
 }
 

@@ -629,8 +629,11 @@ func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	n, _ := contentLength(parsed)
-	if n > 0 {
+	n, ok, err := strictContentLength(parsed)
+	if err != nil {
+		return nil, err
+	}
+	if ok && n > 0 {
 		body := make([]byte, n)
 		if _, err := io.ReadFull(r, body); err != nil {
 			return nil, err
@@ -648,21 +651,6 @@ func isSIPResponseWire(raw []byte) bool {
 	return bytes.HasPrefix(bytes.TrimLeft(raw, "\r\n\t "), []byte("SIP/2.0"))
 }
 
-func contentLength(headers map[string][]string) (int, bool) {
-	for key, values := range headers {
-		if !strings.EqualFold(key, "Content-Length") && !strings.EqualFold(key, "l") {
-			continue
-		}
-		for _, value := range values {
-			n, err := strconv.Atoi(strings.TrimSpace(value))
-			if err == nil && n >= 0 {
-				return n, true
-			}
-		}
-	}
-	return 0, false
-}
-
 func sipBodyByContentLength(headers map[string][]string, body []byte) ([]byte, error) {
 	n, ok, err := strictContentLength(headers)
 	if err != nil {
@@ -678,19 +666,28 @@ func sipBodyByContentLength(headers map[string][]string, body []byte) ([]byte, e
 }
 
 func strictContentLength(headers map[string][]string) (int, bool, error) {
+	var length int
+	seen := false
 	for key, values := range headers {
 		if !strings.EqualFold(key, "Content-Length") && !strings.EqualFold(key, "l") {
 			continue
+		}
+		if len(values) == 0 {
+			return 0, false, fmt.Errorf("%w: invalid content length", ErrInvalidSIPMessage)
 		}
 		for _, value := range values {
 			n, err := strconv.Atoi(strings.TrimSpace(value))
 			if err != nil || n < 0 {
 				return 0, false, fmt.Errorf("%w: invalid content length", ErrInvalidSIPMessage)
 			}
-			return n, true, nil
+			if seen && n != length {
+				return 0, false, fmt.Errorf("%w: conflicting content length", ErrInvalidSIPMessage)
+			}
+			length = n
+			seen = true
 		}
 	}
-	return 0, false, nil
+	return length, seen, nil
 }
 
 func sipRetransmitInterval(timeout, configured time.Duration) time.Duration {
