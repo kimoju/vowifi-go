@@ -34,6 +34,24 @@ func TestBuildSMSSubmitTPDURelativeValidityPeriod(t *testing.T) {
 	}
 }
 
+func TestBuildSMSSubmitTPDUReplyPathAndRejectDuplicates(t *testing.T) {
+	tpdu, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", Encoding: "gsm7", ReplyPath: true, RejectDuplicates: true}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU() error = %v", err)
+	}
+	if tpdu[0] != 0x85 {
+		t.Fatalf("first octet=0x%02x want SMS-SUBMIT with TP-RP and TP-RD", tpdu[0])
+	}
+
+	tpdu, err = BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", Encoding: "gsm7", ReplyPath: true, RejectDuplicates: true, RequestStatusReport: true, UDH: concatUDH(2, 1)}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU(UDH) error = %v", err)
+	}
+	if tpdu[0] != 0xe5 {
+		t.Fatalf("first octet=0x%02x want SMS-SUBMIT with TP-RP/TP-UDHI/TP-SRR/TP-RD", tpdu[0])
+	}
+}
+
 func TestBuildSMSSubmitTPDUAbsoluteValidityDeadline(t *testing.T) {
 	deadline := time.Date(2026, 7, 5, 12, 34, 56, 0, time.FixedZone("CST", 8*3600))
 	tpdu, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", Encoding: "gsm7", ValidityDeadline: deadline}, 1)

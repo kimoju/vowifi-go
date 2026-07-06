@@ -35,6 +35,8 @@ type SendOptions struct {
 	DataCodingScheme    byte
 	UseProtocolID       bool
 	UseDataCodingScheme bool
+	ReplyPath           bool
+	RejectDuplicates    bool
 	ConcatRef           int
 	ConcatRefBits       int
 }
@@ -88,6 +90,8 @@ type SMSPart struct {
 	DataCodingScheme    byte
 	UseProtocolID       bool
 	UseDataCodingScheme bool
+	ReplyPath           bool
+	RejectDuplicates    bool
 	ConcatRef           int
 	ConcatRefBits       int
 	RequestStatusReport bool
@@ -473,7 +477,7 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 	}
 	single, concat := smsPartLimitsForUDH(enc, concatUDHLength(normalizeSMSConcatRefBits(opts.ConcatRef, opts.ConcatRefBits)))
 	if messageLen(text, enc) <= single {
-		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme}}, nil
+		return []SMSPart{{PartNo: 1, TotalParts: 1, Text: text, Encoding: enc, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates}}, nil
 	}
 	refBits, err := validateSMSConcatOptions(opts.ConcatRef, opts.ConcatRefBits)
 	if err != nil {
@@ -499,7 +503,7 @@ func segmentSMS(text string, opts SendOptions) ([]SMSPart, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ConcatRef: ref, ConcatRefBits: refBits})
+		out = append(out, SMSPart{PartNo: partNo, TotalParts: total, Text: chunk, Encoding: enc, UDH: udh, ValidityPeriod: opts.ValidityPeriod, ValidityDeadline: opts.ValidityDeadline, ProtocolID: opts.ProtocolID, DataCodingScheme: opts.DataCodingScheme, UseProtocolID: opts.UseProtocolID, UseDataCodingScheme: opts.UseDataCodingScheme, ReplyPath: opts.ReplyPath, RejectDuplicates: opts.RejectDuplicates, ConcatRef: ref, ConcatRefBits: refBits})
 		remaining = rest
 	}
 	for i := range out {

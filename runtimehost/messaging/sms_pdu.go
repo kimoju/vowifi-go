@@ -73,11 +73,17 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 	}
 	udh := append([]byte(nil), part.UDH...)
 	firstOctet := byte(0x01)
+	if part.RejectDuplicates {
+		firstOctet |= 0x04
+	}
 	if part.RequestStatusReport {
 		firstOctet |= 0x20
 	}
 	if len(udh) > 0 {
 		firstOctet |= 0x40
+	}
+	if part.ReplyPath {
+		firstOctet |= 0x80
 	}
 	vpf, vp, err := encodeSMSSubmitValidityPeriod(part.ValidityPeriod, part.ValidityDeadline)
 	if err != nil {
