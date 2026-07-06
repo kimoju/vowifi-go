@@ -68,11 +68,12 @@ type SMSDeliveryReport struct {
 }
 
 type SMSPart struct {
-	PartNo     int
-	TotalParts int
-	Text       string
-	Encoding   string
-	UDH        []byte
+	PartNo              int
+	TotalParts          int
+	Text                string
+	Encoding            string
+	UDH                 []byte
+	RequestStatusReport bool
 }
 
 type SMSSendRequest struct {

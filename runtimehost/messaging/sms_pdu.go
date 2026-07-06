@@ -69,6 +69,9 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 	encoding := normalizeEncoding(part.Text, part.Encoding)
 	udh := append([]byte(nil), part.UDH...)
 	firstOctet := byte(0x01)
+	if part.RequestStatusReport {
+		firstOctet |= 0x20
+	}
 	if len(udh) > 0 {
 		firstOctet |= 0x40
 	}

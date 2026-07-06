@@ -102,6 +102,24 @@ func TestBuildSMSSubmitTPDUGSM7WithUDH(t *testing.T) {
 	}
 }
 
+func TestBuildSMSSubmitTPDURequestsStatusReport(t *testing.T) {
+	tpdu, err := BuildSMSSubmitTPDU("+18005551212", SMSPart{Text: "hello", Encoding: "gsm7", RequestStatusReport: true}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU() error = %v", err)
+	}
+	if tpdu[0] != 0x21 {
+		t.Fatalf("first octet=0x%02x want SMS-SUBMIT with TP-SRR", tpdu[0])
+	}
+
+	tpdu, err = BuildSMSSubmitTPDU("+18005551212", SMSPart{PartNo: 1, TotalParts: 2, Text: "hello", Encoding: "gsm7", UDH: concatUDH(2, 1), RequestStatusReport: true}, 1)
+	if err != nil {
+		t.Fatalf("BuildSMSSubmitTPDU(UDH) error = %v", err)
+	}
+	if tpdu[0] != 0x61 {
+		t.Fatalf("first octet=0x%02x want SMS-SUBMIT with TP-SRR and UDHI", tpdu[0])
+	}
+}
+
 func TestParseSMSRPDUAckAndError(t *testing.T) {
 	ack, err := ParseSMSRPDU(BuildSMSRPAck(0x22))
 	if err != nil {

@@ -49,7 +49,7 @@ func TestIMSSMSTransportSendsSIPMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSMSRPData() error = %v body=%x", err, req.Body)
 	}
-	if rpMR != 2 || len(tpdu) == 0 || tpdu[0] != 0x01 || !strings.HasSuffix(strings.ToUpper(hexString(req.Body)), "E8329BFD06") {
+	if rpMR != 2 || len(tpdu) == 0 || tpdu[0] != 0x21 || !strings.HasSuffix(strings.ToUpper(hexString(req.Body)), "E8329BFD06") {
 		t.Fatalf("RP-DATA rpMR=%d tpdu=%x body=%x", rpMR, tpdu, req.Body)
 	}
 	if req.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.sms" || req.Headers["Accept-Contact"] != "*;+g.3gpp.smsip" {
@@ -57,6 +57,33 @@ func TestIMSSMSTransportSendsSIPMessage(t *testing.T) {
 	}
 	if !strings.Contains(req.Headers["From"], "sip:user@ims.example") || !strings.Contains(req.Headers["To"], "sip:+18005551212@ims.example") {
 		t.Fatalf("dialog headers=%+v", req.Headers)
+	}
+}
+
+func TestIMSSMSTransportCanDisableStatusReports(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
+	sms := IMSSMSTransport{
+		Transport:            transport,
+		DisableStatusReports: true,
+		Profile:              voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration:         voiceclient.RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060", PublicIdentity: "sip:user@ims.example"},
+	}
+
+	if _, err := sms.SendSMSPart(context.Background(), SMSSendRequest{
+		Peer: "+18005551212",
+		Part: SMSPart{PartNo: 1, TotalParts: 1, Text: "hello"},
+	}); err != nil {
+		t.Fatalf("SendSMSPart() error = %v", err)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	_, tpdu, err := ParseSMSRPData(transport.requests[0].Body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPData() error = %v", err)
+	}
+	if len(tpdu) == 0 || tpdu[0] != 0x01 {
+		t.Fatalf("TPDU first octet=0x%02x want 0x01", tpdu[0])
 	}
 }
 

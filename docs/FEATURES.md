@@ -84,9 +84,10 @@ protocol layers needed by VoHive:
   401/407 challenges
 - SMS segmentation, IMS SIP `MESSAGE` transport hooks, inbound SMS, delivery
   report matching, and USSD session transport hooks, including 3xx Contact
-  redirect retries, SMS RP-ERROR/STATUS-REPORT cause mapping, USSD dialog
-  target refresh, and recoverable IMS registration/route failure signals for
-  MESSAGE, USSD INVITE/INFO, and USSD BYE failures
+  redirect retries, TP-SRR delivery-status requests, SMS RP-ERROR/
+  STATUS-REPORT cause mapping, USSD dialog target refresh, and recoverable IMS
+  registration/route failure signals for MESSAGE, USSD INVITE/INFO, and USSD
+  BYE failures
 - outbound voice dialog bridging helpers, SDP parsing/building, IMS INVITE/ACK/
   BYE/CANCEL request construction with MMTel service identification headers,
   route-set application, UDP/TCP SIP request transport, outbound IMS voice

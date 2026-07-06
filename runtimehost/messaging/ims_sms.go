@@ -11,16 +11,17 @@ import (
 )
 
 type IMSSMSTransport struct {
-	Transport       voiceclient.SIPRequestTransport
-	Profile         voiceclient.IMSProfile
-	Registration    voiceclient.RegistrationBinding
-	Domain          string
-	LocalURI        string
-	ContactURI      string
-	RemoteTargetURI string
-	UserAgent       string
-	ContentType     string
-	SMSC            string
+	Transport            voiceclient.SIPRequestTransport
+	Profile              voiceclient.IMSProfile
+	Registration         voiceclient.RegistrationBinding
+	Domain               string
+	LocalURI             string
+	ContactURI           string
+	RemoteTargetURI      string
+	UserAgent            string
+	ContentType          string
+	SMSC                 string
+	DisableStatusReports bool
 }
 
 func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (SMSSendResult, error) {
@@ -113,7 +114,11 @@ func (t IMSSMSTransport) messagePayload(req SMSSendRequest, rpMR byte) (string, 
 	if strings.HasPrefix(strings.ToLower(contentType), "text/plain") {
 		return contentType, []byte(req.Part.Text), nil
 	}
-	tpdu, err := BuildSMSSubmitTPDU(req.Peer, req.Part, rpMR)
+	part := req.Part
+	if !t.DisableStatusReports {
+		part.RequestStatusReport = true
+	}
+	tpdu, err := BuildSMSSubmitTPDU(req.Peer, part, rpMR)
 	if err != nil {
 		return "", nil, err
 	}
