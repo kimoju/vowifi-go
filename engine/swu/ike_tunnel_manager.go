@@ -175,6 +175,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		EAPKeys:            reauth.Keys,
 		InitiatorID:        initiatorID,
 		EAPIdentity:        identity,
+		EAPPseudonym:       reauth.NextPseudonym,
 		EAPReauthIdentity:  reauth.Identity,
 		EAPReauthCounter:   reauth.Counter,
 		EAPReauthCounterOK: reauth.CounterOK,

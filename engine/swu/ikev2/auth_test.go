@@ -156,6 +156,105 @@ func TestRunIKEAuthEAPIdentity(t *testing.T) {
 	}
 }
 
+func TestRunIKEAuthEAPIdentityUsesPseudonymForFullAuthRequest(t *testing.T) {
+	init := fakeInitResult(t)
+	transport := &authFakeTransport{t: t, init: init, keys: init.Keys}
+	res, err := RunIKE_AUTH_EAPIdentity(context.Background(), AuthConfig{
+		Transport:     transport,
+		Init:          init,
+		InitiatorID:   Identity{Type: IDRFC822Addr, Data: []byte("310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org")},
+		EAPIdentity:   "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org",
+		EAPPseudonym:  "pseudo-identity",
+		ChildSPI:      []byte{0xca, 0xfe, 0xba, 0xbe},
+		InitialIV:     bytes.Repeat([]byte{0x23}, init.Keys.Profile.EncryptionBlockSize),
+		EAPIdentityIV: bytes.Repeat([]byte{0x24}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_EAPIdentity() error = %v", err)
+	}
+	if transport.identity != "pseudo-identity" || res.EAPIdentityUsed != "pseudo-identity" {
+		t.Fatalf("identity transport=%q result=%q", transport.identity, res.EAPIdentityUsed)
+	}
+}
+
+func TestIdentityForEAPRequestSelectsRequestedIdentity(t *testing.T) {
+	opts := eapIdentityOptions{
+		PermanentIdentity: " permanent ",
+		Pseudonym:         " pseudonym ",
+		ReauthIdentity:    " reauth ",
+	}
+	tests := []struct {
+		name  string
+		attrs []eapaka.Attribute
+		opts  eapIdentityOptions
+		want  string
+	}{
+		{
+			name: "default permanent",
+			opts: opts,
+			want: "permanent",
+		},
+		{
+			name:  "permanent requested",
+			attrs: []eapaka.Attribute{eapaka.PermanentIDReqAttribute()},
+			opts:  opts,
+			want:  "permanent",
+		},
+		{
+			name:  "full auth requested",
+			attrs: []eapaka.Attribute{eapaka.FullAuthIDReqAttribute()},
+			opts:  opts,
+			want:  "pseudonym",
+		},
+		{
+			name:  "full auth falls back to permanent",
+			attrs: []eapaka.Attribute{eapaka.FullAuthIDReqAttribute()},
+			opts: eapIdentityOptions{
+				PermanentIdentity: "permanent",
+				Pseudonym:         " ",
+				ReauthIdentity:    "reauth",
+			},
+			want: "permanent",
+		},
+		{
+			name:  "any requested",
+			attrs: []eapaka.Attribute{eapaka.AnyIDReqAttribute()},
+			opts:  opts,
+			want:  "reauth",
+		},
+		{
+			name:  "any falls back to pseudonym",
+			attrs: []eapaka.Attribute{eapaka.AnyIDReqAttribute()},
+			opts: eapIdentityOptions{
+				PermanentIdentity: "permanent",
+				Pseudonym:         "pseudonym",
+			},
+			want: "pseudonym",
+		},
+		{
+			name:  "any falls back to permanent",
+			attrs: []eapaka.Attribute{eapaka.AnyIDReqAttribute()},
+			opts: eapIdentityOptions{
+				PermanentIdentity: "permanent",
+			},
+			want: "permanent",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := identityForEAPRequest(eapaka.Packet{
+				Code:       eapaka.CodeRequest,
+				Type:       eapaka.TypeAKA,
+				Subtype:    eapaka.SubtypeIdentity,
+				Attributes: tt.attrs,
+			}, tt.opts)
+			if got != tt.want {
+				t.Fatalf("identityForEAPRequest() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 	init := fakeInitResult(t)
 	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
@@ -293,6 +392,148 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 	}
 	if len(res.EAPKeys.KAut) != eapaka.KeyLengthKAut || res.EAPLast == nil || res.EAPLast.Code != eapaka.CodeSuccess || res.NextMessageID != 5 {
 		t.Fatalf("result=%+v", res)
+	}
+}
+
+func TestRunIKEAuthFullUsesPseudonymForFullAuthChallengeKeys(t *testing.T) {
+	init := fakeInitResult(t)
+	permanent := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	pseudonym := "pseudo-identity"
+	aka := simAKAResult()
+	expectedKeys, err := eapaka.DeriveKeys(pseudonym, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
+	random := bytes.NewReader(bytes.Repeat([]byte{0x45}, 256))
+	exchanges := 0
+	var identityRequestRaw []byte
+	var identityTranscript [][]byte
+	transport := InitTransportFunc(func(ctx context.Context, request []byte) ([]byte, error) {
+		msg, inner, err := UnprotectMessage(request, init.Keys, true)
+		if err != nil {
+			return nil, err
+		}
+		switch exchanges {
+		case 0:
+			if msg.Header.MessageID != 1 || !bytes.Equal(gotTypes(inner), []byte{PayloadIDi, PayloadCP, PayloadSA, PayloadTSi, PayloadTSr}) {
+				t.Fatalf("initial auth header=%+v inner types=%v", msg.Header, gotTypes(inner))
+			}
+			req := eapaka.Packet{
+				Code:       eapaka.CodeRequest,
+				Identifier: 9,
+				Type:       eapaka.TypeAKA,
+				Subtype:    eapaka.SubtypeIdentity,
+				Attributes: []eapaka.Attribute{
+					eapaka.FullAuthIDReqAttribute(),
+					eapaka.VersionListAttribute(eapaka.SupportedVersion),
+				},
+			}
+			rawReq, err := req.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			identityRequestRaw = append([]byte(nil), rawReq...)
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 1, false), init.Keys, false, []Payload{EAPPayload(rawReq)}, bytes.Repeat([]byte{0xa3}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 1:
+			if msg.Header.MessageID != 2 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+				t.Fatalf("identity auth header=%+v inner=%+v", msg.Header, inner)
+			}
+			pkt := parseTestEAP(t, inner[0].Body)
+			if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeIdentity {
+				t.Fatalf("identity response=%+v", pkt)
+			}
+			attr, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeIdentity)
+			if !ok {
+				t.Fatal("missing AT_IDENTITY")
+			}
+			identity, err := attr.IdentityValue()
+			if err != nil {
+				return nil, err
+			}
+			if identity != pseudonym {
+				t.Fatalf("identity response identity=%q, want %q", identity, pseudonym)
+			}
+			selectedAttr, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeSelectedVersion)
+			if !ok {
+				t.Fatal("missing AT_SELECTED_VERSION")
+			}
+			selected, err := selectedAttr.SelectedVersionValue()
+			if err != nil {
+				return nil, err
+			}
+			if selected != eapaka.SupportedVersion {
+				t.Fatalf("selected version=%d", selected)
+			}
+			identityTranscript = [][]byte{append([]byte(nil), identityRequestRaw...), append([]byte(nil), inner[0].Body...)}
+			challenge := signedAKAChallengeWithCheckcode(t, pseudonym, aka, identityTranscript)
+			rawChallenge, err := challenge.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 2, false), init.Keys, false, []Payload{EAPPayload(rawChallenge)}, bytes.Repeat([]byte{0xa4}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 2:
+			if msg.Header.MessageID != 3 || len(inner) != 1 || inner[0].Type != PayloadEAP {
+				t.Fatalf("challenge auth header=%+v inner=%+v", msg.Header, inner)
+			}
+			pkt := parseTestEAP(t, inner[0].Body)
+			if pkt.Code != eapaka.CodeResponse || pkt.Subtype != eapaka.SubtypeChallenge {
+				t.Fatalf("challenge response=%+v", pkt)
+			}
+			raw, err := pkt.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			if err := eapaka.VerifyMAC(expectedKeys.KAut, raw, nil); err != nil {
+				return nil, err
+			}
+			checkcodeAttr, ok := eapaka.FindAttribute(pkt.Attributes, eapaka.AttributeCheckcode)
+			if !ok {
+				t.Fatal("missing AT_CHECKCODE")
+			}
+			if err := eapaka.VerifyCheckcodeAttribute(checkcodeAttr, identityTranscript); err != nil {
+				return nil, err
+			}
+			payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xde, 0xad, 0xbe, 0xef})
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, payloads, bytes.Repeat([]byte{0xa5}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		default:
+			return nil, errors.New("unexpected extra exchange")
+		}
+	})
+
+	res, err := RunIKE_AUTH_Full(context.Background(), FullAuthConfig{
+		Transport:    transport,
+		Init:         init,
+		SIM:          akaProviderStub{result: aka},
+		InitiatorID:  Identity{Type: IDRFC822Addr, Data: []byte(permanent)},
+		EAPIdentity:  permanent,
+		EAPPseudonym: pseudonym,
+		ChildSPI:     localSPI,
+		Random:       random,
+	})
+	if err != nil {
+		t.Fatalf("RunIKE_AUTH_Full() error = %v", err)
+	}
+	if exchanges != 3 {
+		t.Fatalf("exchanges=%d, want 3", exchanges)
+	}
+	if res.Auth.EAPIdentityUsed != pseudonym || len(res.IdentityExchanges) != 0 || len(res.AKAChallenges) != 1 {
+		t.Fatalf("identity used=%q identity exchanges=%d aka=%d", res.Auth.EAPIdentityUsed, len(res.IdentityExchanges), len(res.AKAChallenges))
+	}
+	if !bytes.Equal(res.EAPKeys.KAut, expectedKeys.KAut) || !bytes.Equal(res.EAPKeys.MSK, expectedKeys.MSK) {
+		t.Fatalf("EAP keys were not derived from pseudonym")
+	}
+	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.LocalSPI, localSPI) || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Fatalf("child SA=%+v", res.ChildSA)
 	}
 }
 

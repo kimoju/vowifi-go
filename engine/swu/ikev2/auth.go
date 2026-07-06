@@ -24,20 +24,22 @@ const (
 )
 
 type AuthConfig struct {
-	Transport        InitTransport
-	Init             InitResult
-	Keys             IKEKeys
-	InitiatorID      Identity
-	EAPIdentity      string
-	ChildSA          SecurityAssociation
-	ChildSPI         []byte
-	TSi              TrafficSelectors
-	TSr              TrafficSelectors
-	Configuration    Configuration
-	Random           io.Reader
-	InitialIV        []byte
-	EAPIdentityIV    []byte
-	InitialMessageID uint32
+	Transport         InitTransport
+	Init              InitResult
+	Keys              IKEKeys
+	InitiatorID       Identity
+	EAPIdentity       string
+	EAPPseudonym      string
+	EAPReauthIdentity string
+	ChildSA           SecurityAssociation
+	ChildSPI          []byte
+	TSi               TrafficSelectors
+	TSr               TrafficSelectors
+	Configuration     Configuration
+	Random            io.Reader
+	InitialIV         []byte
+	EAPIdentityIV     []byte
+	InitialMessageID  uint32
 }
 
 type AuthResult struct {
@@ -49,6 +51,7 @@ type AuthResult struct {
 	IdentityResponseInner []Payload
 	EAPRequest            *eapaka.Packet
 	EAPAfterIdentity      *eapaka.Packet
+	EAPIdentityUsed       string
 	IdentityTranscript    [][]byte
 	NextMessageID         uint32
 }
@@ -105,6 +108,7 @@ type FullAuthConfig struct {
 	EAPKeys            eapaka.Keys
 	InitiatorID        Identity
 	EAPIdentity        string
+	EAPPseudonym       string
 	EAPReauthIdentity  string
 	EAPReauthCounter   uint16
 	EAPReauthCounterOK bool
@@ -145,6 +149,7 @@ type FullAuthResult struct {
 type EAPIdentityExchange struct {
 	Request       eapaka.Packet
 	Response      eapaka.Packet
+	Identity      string
 	RequestBytes  []byte
 	ResponseBytes []byte
 	ResponseInner []Payload
@@ -210,10 +215,12 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	if eapReq.Code != eapaka.CodeRequest || eapReq.Subtype != eapaka.SubtypeIdentity {
 		return out, nil
 	}
-	identity := strings.TrimSpace(cfg.EAPIdentity)
-	if identity == "" {
-		identity = strings.TrimSpace(string(cfg.InitiatorID.Data))
-	}
+	permanentIdentity := authPermanentIdentity(cfg.EAPIdentity, cfg.InitiatorID)
+	identity := identityForEAPRequest(eapReq, eapIdentityOptions{
+		PermanentIdentity: permanentIdentity,
+		Pseudonym:         cfg.EAPPseudonym,
+		ReauthIdentity:    cfg.EAPReauthIdentity,
+	})
 	if identity == "" {
 		return AuthResult{}, fmt.Errorf("%w: eap identity is empty", ErrInvalidAuthConfig)
 	}
@@ -244,6 +251,7 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	out.IdentityRequestBytes = append([]byte(nil), identityReqBytes...)
 	out.IdentityResponseBytes = append([]byte(nil), identityRespBytes...)
 	out.IdentityResponseInner = clonePayloads(identityInnerResp)
+	out.EAPIdentityUsed = identity
 	out.IdentityTranscript = cloneByteSlices([][]byte{eapReqRaw, identityPacket})
 	out.NextMessageID = messageID + 2
 	if nextEAP, ok, err := firstEAPPacket(identityInnerResp); err != nil {
@@ -260,20 +268,22 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		return FullAuthResult{}, err
 	}
 	auth, err := RunIKE_AUTH_EAPIdentity(ctx, AuthConfig{
-		Transport:        cfg.Transport,
-		Init:             cfg.Init,
-		Keys:             cfg.Keys,
-		InitiatorID:      cfg.InitiatorID,
-		EAPIdentity:      cfg.EAPIdentity,
-		ChildSA:          cfg.ChildSA,
-		ChildSPI:         localChildSPI,
-		TSi:              cfg.TSi,
-		TSr:              cfg.TSr,
-		Configuration:    cfg.Configuration,
-		Random:           cfg.Random,
-		InitialIV:        cfg.InitialIV,
-		EAPIdentityIV:    cfg.EAPIdentityIV,
-		InitialMessageID: cfg.InitialMessageID,
+		Transport:         cfg.Transport,
+		Init:              cfg.Init,
+		Keys:              cfg.Keys,
+		InitiatorID:       cfg.InitiatorID,
+		EAPIdentity:       cfg.EAPIdentity,
+		EAPPseudonym:      cfg.EAPPseudonym,
+		EAPReauthIdentity: cfg.EAPReauthIdentity,
+		ChildSA:           cfg.ChildSA,
+		ChildSPI:          localChildSPI,
+		TSi:               cfg.TSi,
+		TSr:               cfg.TSr,
+		Configuration:     cfg.Configuration,
+		Random:            cfg.Random,
+		InitialIV:         cfg.InitialIV,
+		EAPIdentityIV:     cfg.EAPIdentityIV,
+		InitialMessageID:  cfg.InitialMessageID,
 	})
 	if err != nil {
 		return FullAuthResult{}, err
@@ -293,10 +303,8 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		return out, nil
 	}
 	next := authNextEAP(auth)
-	identity := strings.TrimSpace(cfg.EAPIdentity)
-	if identity == "" {
-		identity = strings.TrimSpace(string(cfg.InitiatorID.Data))
-	}
+	identity := authPermanentIdentity(cfg.EAPIdentity, cfg.InitiatorID)
+	currentFullAuthIdentity := firstIKEAuthNonEmpty(auth.EAPIdentityUsed, identity)
 	identityTranscript := cloneByteSlices(auth.IdentityTranscript)
 	for i := 0; i < maxFullAuthEAPExchanges; i++ {
 		if next == nil {
@@ -323,6 +331,11 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			if err != nil {
 				return FullAuthResult{}, err
 			}
+			exchangeIdentity := identityForEAPRequest(*next, eapIdentityOptions{
+				PermanentIdentity: identity,
+				Pseudonym:         firstIKEAuthNonEmpty(out.EAPNextPseudonym, cfg.EAPPseudonym),
+				ReauthIdentity:    cfg.EAPReauthIdentity,
+			})
 			exchange, err := runIKEAuthIdentityExchange(ctx, identityExchangeConfig{
 				Transport:  cfg.Transport,
 				Init:       cfg.Init,
@@ -330,12 +343,13 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 				Random:     cfg.Random,
 				Request:    *next,
 				RequestRaw: requestRaw,
-				Identity:   identity,
+				Identity:   exchangeIdentity,
 				MessageID:  out.NextMessageID,
 			})
 			if err != nil {
 				return FullAuthResult{}, err
 			}
+			currentFullAuthIdentity = exchange.Identity
 			out.IdentityExchanges = append(out.IdentityExchanges, exchange)
 			identityTranscript = append(identityTranscript, exchange.Transcript...)
 			out.NextMessageID = exchange.NextMessageID
@@ -350,7 +364,7 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 			next = exchange.EAPNext
 			continue
 		}
-		challengeIdentity := identity
+		challengeIdentity := currentFullAuthIdentity
 		if next.Subtype == eapaka.SubtypeReauthentication && strings.TrimSpace(cfg.EAPReauthIdentity) != "" {
 			challengeIdentity = strings.TrimSpace(cfg.EAPReauthIdentity)
 		}
@@ -709,6 +723,50 @@ type identityExchangeConfig struct {
 	MessageID  uint32
 }
 
+type eapIdentityOptions struct {
+	PermanentIdentity string
+	Pseudonym         string
+	ReauthIdentity    string
+}
+
+func authPermanentIdentity(identity string, initiator Identity) string {
+	out := strings.TrimSpace(identity)
+	if out == "" {
+		out = strings.TrimSpace(string(initiator.Data))
+	}
+	return out
+}
+
+func identityForEAPRequest(request eapaka.Packet, opts eapIdentityOptions) string {
+	permanent := strings.TrimSpace(opts.PermanentIdentity)
+	pseudonym := strings.TrimSpace(opts.Pseudonym)
+	reauth := strings.TrimSpace(opts.ReauthIdentity)
+	switch {
+	case hasEAPIdentityRequestAttribute(request, eapaka.AttributePermanentIDReq):
+		return permanent
+	case hasEAPIdentityRequestAttribute(request, eapaka.AttributeFullAuthIDReq):
+		return firstIKEAuthNonEmpty(pseudonym, permanent)
+	case hasEAPIdentityRequestAttribute(request, eapaka.AttributeAnyIDReq):
+		return firstIKEAuthNonEmpty(reauth, pseudonym, permanent)
+	default:
+		return permanent
+	}
+}
+
+func hasEAPIdentityRequestAttribute(request eapaka.Packet, typ uint8) bool {
+	_, ok := eapaka.FindAttribute(request.Attributes, typ)
+	return ok
+}
+
+func firstIKEAuthNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 func runIKEAuthIdentityExchange(ctx context.Context, cfg identityExchangeConfig) (EAPIdentityExchange, error) {
 	if cfg.Transport == nil {
 		return EAPIdentityExchange{}, fmt.Errorf("%w: transport is nil", ErrInvalidAuthConfig)
@@ -765,6 +823,7 @@ func runIKEAuthIdentityExchange(ctx context.Context, cfg identityExchangeConfig)
 	out := EAPIdentityExchange{
 		Request:       cloneEAPPacket(cfg.Request),
 		Response:      cloneEAPPacket(response),
+		Identity:      identity,
 		RequestBytes:  append([]byte(nil), reqBytes...),
 		ResponseBytes: append([]byte(nil), respBytes...),
 		ResponseInner: clonePayloads(inner),

@@ -125,7 +125,8 @@ protocol layers needed by VoHive:
   hooks when negotiated key material is available
 - EAP-AKA full-auth key derivation, EAP-AKA' CK'/IK' and PRF' key material,
   AT_KDF negotiation, EAP-AKA Identity `AT_VERSION_LIST` /
-  `AT_SELECTED_VERSION` handling, `AT_BIDDING` downgrade protection,
+  `AT_SELECTED_VERSION` handling, IKE_AUTH request-attribute based permanent,
+  pseudonym, and reauthentication identity selection, `AT_BIDDING` downgrade protection,
   AT_MAC verification/generation, AT_RAND/AT_AUTN challenge extraction, SIM AKA
   RES response, AUTS synchronization-failure response, AUTN MAC-failure
   Authentication-Reject response, EAP-AKA Notification ACK, and Client-Error

@@ -184,10 +184,11 @@ func TestIKEPacketTunnelManagerCarriesReauthenticationState(t *testing.T) {
 		Transport:    ikeTunnelNoopTransport{},
 		ESPTransport: &captureESPPacketTransport{},
 		Reauthentication: EAPReauthenticationState{
-			Identity:  "reauth-2",
-			Counter:   2,
-			CounterOK: true,
-			Keys:      initialKeys,
+			Identity:      "reauth-2",
+			NextPseudonym: "pseudo-2",
+			Counter:       2,
+			CounterOK:     true,
+			Keys:          initialKeys,
 		},
 		OnReauthenticationState: func(state EAPReauthenticationState) {
 			gotState = state
@@ -224,8 +225,8 @@ func TestIKEPacketTunnelManagerCarriesReauthenticationState(t *testing.T) {
 	}
 	defer session.Close(context.Background())
 
-	if gotAuth.EAPReauthIdentity != "reauth-2" || gotAuth.EAPReauthCounter != 2 || !gotAuth.EAPReauthCounterOK {
-		t.Fatalf("auth reauth config identity=%q counter=%d ok=%t", gotAuth.EAPReauthIdentity, gotAuth.EAPReauthCounter, gotAuth.EAPReauthCounterOK)
+	if gotAuth.EAPReauthIdentity != "reauth-2" || gotAuth.EAPPseudonym != "pseudo-2" || gotAuth.EAPReauthCounter != 2 || !gotAuth.EAPReauthCounterOK {
+		t.Fatalf("auth reauth config identity=%q pseudonym=%q counter=%d ok=%t", gotAuth.EAPReauthIdentity, gotAuth.EAPPseudonym, gotAuth.EAPReauthCounter, gotAuth.EAPReauthCounterOK)
 	}
 	if !bytes.Equal(gotAuth.EAPKeys.MSK, initialKeys.MSK) {
 		t.Fatalf("auth EAP keys were not carried")
