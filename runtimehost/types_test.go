@@ -163,6 +163,14 @@ func TestStartRegistersRuntimeIMSVoiceAgent(t *testing.T) {
 	if err := canceller.CancelVoiceCall(context.Background(), voicehost.DialogInfo{CallID: "unknown-call"}); err != nil {
 		t.Fatalf("CancelVoiceCall(unknown) error = %v", err)
 	}
+	cancellerWithResult, ok := gw.GetAgent("dev-voice").(voicehost.DialogCancellerWithResult)
+	if !ok {
+		t.Fatalf("gateway agent=%T, want dialog canceller result", gw.GetAgent("dev-voice"))
+	}
+	cancelResult, err := cancellerWithResult.CancelVoiceCallWithResult(context.Background(), voicehost.DialogInfo{CallID: "unknown-call"})
+	if err != nil || cancelResult.StatusCode != 481 {
+		t.Fatalf("CancelVoiceCallWithResult(unknown) result=%+v err=%v, want 481", cancelResult, err)
+	}
 	sender, ok := gw.GetAgent("dev-voice").(voicehost.DialogInfoSender)
 	if !ok {
 		t.Fatalf("gateway agent=%T, want dialog info sender", gw.GetAgent("dev-voice"))

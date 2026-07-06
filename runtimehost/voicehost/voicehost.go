@@ -41,6 +41,10 @@ type DialogCanceller interface {
 	CancelVoiceCall(context.Context, DialogInfo) error
 }
 
+type DialogCancellerWithResult interface {
+	CancelVoiceCallWithResult(context.Context, DialogInfo) (DialogInfoResult, error)
+}
+
 type DialogInfoSender interface {
 	SendDialogInfo(context.Context, DialogInfoRequest) (DialogInfoResult, error)
 }

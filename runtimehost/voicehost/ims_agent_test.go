@@ -1712,6 +1712,70 @@ func TestIMSOutboundAgentCancelVoiceCallIgnoresEstablishedDialog(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentCancelVoiceCallWithResultReturnsIMSResponse(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 503,
+			Reason:     "Service Unavailable",
+			Headers: map[string][]string{
+				"Content-Type": {"message/sipfrag"},
+				"Retry-After":  {"5"},
+				"X-IMS":        {"cancel-failed"},
+			},
+			Body: []byte("SIP/2.0 503 Service Unavailable\r\n"),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{Transport: transport}
+	inviteVia := "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-invite;rport"
+	agent.storeDialog("call-cancel-result", imsDialogState{
+		early: true,
+		invite: voiceclient.SIPRequestMessage{
+			Headers: map[string]string{"Via": inviteVia},
+		},
+		cfg: voiceclient.DialogRequestConfig{
+			Profile:         voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+			LocalURI:        "sip:user@ims.example",
+			ContactURI:      "sip:user@192.0.2.10:5060",
+			RemoteURI:       "sip:+18005551212@ims.example",
+			RemoteTargetURI: "sip:+18005551212@ims.example",
+			CallID:          "call-cancel-result",
+			LocalTag:        "local-tag",
+			CSeq:            1,
+		},
+	})
+
+	result, err := agent.CancelVoiceCallWithResult(context.Background(), DialogInfo{CallID: "call-cancel-result"})
+	if err == nil || !strings.Contains(err.Error(), "IMS CANCEL rejected") {
+		t.Fatalf("CancelVoiceCallWithResult() err=%v, want IMS CANCEL rejection", err)
+	}
+	if result.Accepted || result.StatusCode != 503 || result.Reason != "Service Unavailable" ||
+		result.ContentType != "message/sipfrag" ||
+		string(result.Body) != "SIP/2.0 503 Service Unavailable\r\n" ||
+		result.Headers["X-IMS"] != "cancel-failed" ||
+		result.RetryAfter != 5*time.Second ||
+		!result.RegistrationRecoveryNeeded {
+		t.Fatalf("result=%+v body=%q", result, result.Body)
+	}
+	if _, ok := agent.dialogs["call-cancel-result"]; !ok {
+		t.Fatal("early dialog should remain after rejected IMS CANCEL")
+	}
+	if len(transport.requests) != 1 || transport.requests[0].Method != "CANCEL" ||
+		transport.requests[0].Headers["CSeq"] != "1 CANCEL" ||
+		transport.requests[0].Headers["Via"] != inviteVia {
+		t.Fatalf("CANCEL requests=%+v", transport.requests)
+	}
+	if err := agent.CancelVoiceCall(context.Background(), DialogInfo{CallID: "call-cancel-result"}); err != nil {
+		t.Fatalf("CancelVoiceCall() retry error = %v", err)
+	}
+	if _, ok := agent.dialogs["call-cancel-result"]; ok {
+		t.Fatal("early dialog should close after accepted IMS CANCEL")
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Headers["CSeq"] != "1 CANCEL" {
+		t.Fatalf("CANCEL retry requests=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentKeepsDialogWhenByeFails(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
