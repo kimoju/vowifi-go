@@ -44,8 +44,16 @@ type SRTPMediaConfig struct {
 	ReplayWindowSize      uint
 	RTCPFeedbackHandler   RTCPFeedbackHandler
 	RTPDTMFHandler        RTPDTMFHandler
+	RTPPlaintextHandler   RTPPlaintextHandler
 	ClientRTPDTMFPayloads map[uint8]int
 	IMSRTPDTMFPayloads    map[uint8]int
+}
+
+type RTPPlaintextHandler func(RTPPlaintextEvent)
+
+type RTPPlaintextEvent struct {
+	Direction RTPDTMFDirection
+	Packet    []byte
 }
 
 type SRTPMediaSession struct {
@@ -57,6 +65,7 @@ type SRTPMediaSession struct {
 	imsUnprotect          *srtp.Context
 	rtcpFeedbackHandler   RTCPFeedbackHandler
 	rtpDTMFHandler        RTPDTMFHandler
+	rtpPlaintextHandler   RTPPlaintextHandler
 	clientRTPDTMFPayloads map[uint8]int
 	imsRTPDTMFPayloads    map[uint8]int
 }
@@ -218,6 +227,7 @@ func NewSRTPMediaSession(cfg SRTPMediaConfig) (*SRTPMediaSession, error) {
 		imsUnprotect:          imsUnprotect,
 		rtcpFeedbackHandler:   cfg.RTCPFeedbackHandler,
 		rtpDTMFHandler:        cfg.RTPDTMFHandler,
+		rtpPlaintextHandler:   cfg.RTPPlaintextHandler,
 		clientRTPDTMFPayloads: cloneRTPDTMFPayloadTypes(cfg.ClientRTPDTMFPayloads),
 		imsRTPDTMFPayloads:    cloneRTPDTMFPayloadTypes(cfg.IMSRTPDTMFPayloads),
 	}, nil
@@ -310,6 +320,10 @@ func (s *SRTPMediaSession) RelayTransformsWithRTCPFeedback(handler RTCPFeedbackH
 }
 
 func (s *SRTPMediaSession) RelayTransformsWithMediaEvents(rtcpHandler RTCPFeedbackHandler, dtmfHandler RTPDTMFHandler, clientRTPDTMFPayloads, imsRTPDTMFPayloads map[uint8]int) RTPRelayTransforms {
+	return s.RelayTransformsWithMediaObservers(rtcpHandler, dtmfHandler, s.rtpPlaintextHandler, clientRTPDTMFPayloads, imsRTPDTMFPayloads)
+}
+
+func (s *SRTPMediaSession) RelayTransformsWithMediaObservers(rtcpHandler RTCPFeedbackHandler, dtmfHandler RTPDTMFHandler, rtpHandler RTPPlaintextHandler, clientRTPDTMFPayloads, imsRTPDTMFPayloads map[uint8]int) RTPRelayTransforms {
 	if s == nil {
 		return RTPRelayTransforms{}
 	}
@@ -317,10 +331,10 @@ func (s *SRTPMediaSession) RelayTransformsWithMediaEvents(rtcpHandler RTCPFeedba
 	imsPayloads := cloneRTPDTMFPayloadTypes(imsRTPDTMFPayloads)
 	return RTPRelayTransforms{
 		ClientToIMSRTP: func(packet []byte) ([]byte, error) {
-			return s.clientToIMSRTP(packet, dtmfHandler, clientPayloads, imsPayloads)
+			return s.clientToIMSRTP(packet, dtmfHandler, rtpHandler, clientPayloads, imsPayloads)
 		},
 		IMSToClientRTP: func(packet []byte) ([]byte, error) {
-			return s.imsToClientRTP(packet, dtmfHandler, imsPayloads, clientPayloads)
+			return s.imsToClientRTP(packet, dtmfHandler, rtpHandler, imsPayloads, clientPayloads)
 		},
 		ClientToIMSRTCP: func(packet []byte) ([]byte, error) {
 			return s.clientToIMSRTCP(packet, rtcpHandler)
@@ -347,15 +361,16 @@ func (s *SRTPMediaSession) ClientToIMSRTP(packet []byte) ([]byte, error) {
 	if s == nil {
 		return nil, ErrSRTPMediaConfig
 	}
-	return s.clientToIMSRTP(packet, s.rtpDTMFHandler, s.clientRTPDTMFPayloads, s.imsRTPDTMFPayloads)
+	return s.clientToIMSRTP(packet, s.rtpDTMFHandler, s.rtpPlaintextHandler, s.clientRTPDTMFPayloads, s.imsRTPDTMFPayloads)
 }
 
-func (s *SRTPMediaSession) clientToIMSRTP(packet []byte, handler RTPDTMFHandler, payloads, targetPayloads map[uint8]int) ([]byte, error) {
+func (s *SRTPMediaSession) clientToIMSRTP(packet []byte, dtmfHandler RTPDTMFHandler, rtpHandler RTPPlaintextHandler, payloads, targetPayloads map[uint8]int) ([]byte, error) {
 	plain, err := s.UnprotectClientRTP(packet)
 	if err != nil {
 		return nil, err
 	}
-	plain = rewriteSRTPRTPDTMF(RTPDTMFClientToIMS, plain, payloads, targetPayloads, handler)
+	emitRTPPlaintext(rtpHandler, RTPDTMFClientToIMS, plain)
+	plain = rewriteSRTPRTPDTMF(RTPDTMFClientToIMS, plain, payloads, targetPayloads, dtmfHandler)
 	return s.ProtectIMSRTP(plain)
 }
 
@@ -363,16 +378,27 @@ func (s *SRTPMediaSession) IMSToClientRTP(packet []byte) ([]byte, error) {
 	if s == nil {
 		return nil, ErrSRTPMediaConfig
 	}
-	return s.imsToClientRTP(packet, s.rtpDTMFHandler, s.imsRTPDTMFPayloads, s.clientRTPDTMFPayloads)
+	return s.imsToClientRTP(packet, s.rtpDTMFHandler, s.rtpPlaintextHandler, s.imsRTPDTMFPayloads, s.clientRTPDTMFPayloads)
 }
 
-func (s *SRTPMediaSession) imsToClientRTP(packet []byte, handler RTPDTMFHandler, payloads, targetPayloads map[uint8]int) ([]byte, error) {
+func (s *SRTPMediaSession) imsToClientRTP(packet []byte, dtmfHandler RTPDTMFHandler, rtpHandler RTPPlaintextHandler, payloads, targetPayloads map[uint8]int) ([]byte, error) {
 	plain, err := s.UnprotectIMSRTP(packet)
 	if err != nil {
 		return nil, err
 	}
-	plain = rewriteSRTPRTPDTMF(RTPDTMFIMSToClient, plain, payloads, targetPayloads, handler)
+	emitRTPPlaintext(rtpHandler, RTPDTMFIMSToClient, plain)
+	plain = rewriteSRTPRTPDTMF(RTPDTMFIMSToClient, plain, payloads, targetPayloads, dtmfHandler)
 	return s.ProtectClientRTP(plain)
+}
+
+func emitRTPPlaintext(handler RTPPlaintextHandler, direction RTPDTMFDirection, packet []byte) {
+	if handler == nil {
+		return
+	}
+	handler(RTPPlaintextEvent{
+		Direction: direction,
+		Packet:    append([]byte(nil), packet...),
+	})
 }
 
 func rewriteSRTPRTPDTMF(direction RTPDTMFDirection, packet []byte, sourcePayloads, targetPayloads map[uint8]int, handler RTPDTMFHandler) []byte {

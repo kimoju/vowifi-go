@@ -76,30 +76,32 @@ func NewIKEMOBIKEHandler(cfg IKEMOBIKEConfig) (func(context.Context, MOBIKEReque
 		return nil, fmt.Errorf("%w: next message_id is zero", ErrInvalidIKEControl)
 	}
 	additional := cloneIPs(cfg.AdditionalAddresses)
-	var mu sync.Mutex
-	nextMessageID := cfg.NextMessageID
+	messageIDs, err := newIKEControlMessageIDs(cfg.NextMessageID)
+	if err != nil {
+		return nil, err
+	}
 	return func(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
-		mu.Lock()
-		defer mu.Unlock()
 		payloads, err := mobikeUpdatePayloads(cfg, additional, req)
 		if err != nil {
 			return MOBIKEResult{}, err
 		}
-		res, err := ikev2.RunInformationalExchange(ctx, ikev2.InformationalConfig{
-			Transport: cfg.Transport,
-			Init:      cfg.Init,
-			Keys:      cfg.Keys,
-			MessageID: nextMessageID,
-			Payloads:  payloads,
-			Random:    cfg.Random,
+		err = messageIDs.exchange(func(messageID uint32) error {
+			res, err := ikev2.RunInformationalExchange(ctx, ikev2.InformationalConfig{
+				Transport: cfg.Transport,
+				Init:      cfg.Init,
+				Keys:      cfg.Keys,
+				MessageID: messageID,
+				Payloads:  payloads,
+				Random:    cfg.Random,
+			})
+			if err != nil {
+				return err
+			}
+			return rejectMOBIKEResponse(res.ResponseInner)
 		})
 		if err != nil {
 			return MOBIKEResult{}, err
 		}
-		if err := rejectMOBIKEResponse(res.ResponseInner); err != nil {
-			return MOBIKEResult{}, err
-		}
-		nextMessageID = res.NextMessageID
 		return MOBIKEResult{
 			Rekeyed:          false,
 			OuterLocalIP:     firstPacketNonEmpty(req.NewIP, req.OldIP, cfg.Result.EPDGAddress),
@@ -111,6 +113,32 @@ func NewIKEMOBIKEHandler(cfg IKEMOBIKEConfig) (func(context.Context, MOBIKEReque
 			UpdatedAt:        time.Now(),
 		}, nil
 	}, nil
+}
+
+type ikeControlMessageIDs struct {
+	mu   sync.Mutex
+	next uint32
+}
+
+func newIKEControlMessageIDs(next uint32) (*ikeControlMessageIDs, error) {
+	if next == 0 {
+		return nil, fmt.Errorf("%w: next message_id is zero", ErrInvalidIKEControl)
+	}
+	return &ikeControlMessageIDs{next: next}, nil
+}
+
+func (s *ikeControlMessageIDs) exchange(fn func(uint32) error) error {
+	if s == nil {
+		return fmt.Errorf("%w: message id scheduler is nil", ErrInvalidIKEControl)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.next == 0 {
+		return fmt.Errorf("%w: next message_id is zero", ErrInvalidIKEControl)
+	}
+	messageID := s.next
+	s.next++
+	return fn(messageID)
 }
 
 func cloneIKEPayloads(in []ikev2.Payload) []ikev2.Payload {

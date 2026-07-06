@@ -1527,6 +1527,123 @@ func TestBuildIMSDialogRequestsIncludeSessionRefresher(t *testing.T) {
 	}
 }
 
+func TestParseProvisionalResponseInfoReliableEarlyMedia(t *testing.T) {
+	body := []byte("v=0\r\nm=audio 40000 RTP/AVP 0\r\n")
+	resp := SIPResponse{
+		StatusCode: 183,
+		Reason:     "Session Progress",
+		Headers: map[string][]string{
+			"Require":      {"timer, 100rel"},
+			"RSeq":         {"17"},
+			"CSeq":         {"42 INVITE"},
+			"To":           {`<sip:+18005551212@ims.example;user=phone>;tag=remote-1`},
+			"Contact":      {`<sip:+18005551212@pcscf.example;transport=udp>`},
+			"Content-Type": {"application/sdp; charset=utf-8"},
+		},
+		Body: body,
+	}
+	info, err := ParseProvisionalResponseInfo(resp)
+	if err != nil {
+		t.Fatalf("ParseProvisionalResponseInfo() error = %v", err)
+	}
+	if !info.Reliable || info.RSeq != 17 || info.CSeq != 42 || info.CSeqMethod != "INVITE" || info.RAck != "17 42 INVITE" {
+		t.Fatalf("reliable info=%+v", info)
+	}
+	if !info.EarlyMedia || string(info.SDP) != string(body) || info.RemoteTag != "remote-1" ||
+		info.RemoteTargetURI != "sip:+18005551212@pcscf.example;transport=udp" {
+		t.Fatalf("media/dialog info=%+v", info)
+	}
+	body[0] = 'x'
+	if string(info.SDP) == string(body) {
+		t.Fatalf("SDP was not cloned: %q", info.SDP)
+	}
+}
+
+func TestBuildPrackRequestForProvisionalResponse(t *testing.T) {
+	resp := SIPResponse{
+		StatusCode: 183,
+		Reason:     "Session Progress",
+		Headers: map[string][]string{
+			"Require": {"100rel"},
+			"RSeq":    {"9"},
+			"CSeq":    {"3 INVITE"},
+			"To":      {"<sip:+18005551212@ims.example>;tag=early"},
+			"Contact": {"<sip:+18005551212@pcscf.example>"},
+		},
+	}
+	prack, ok, err := BuildPrackRequestForProvisionalResponse(DialogRequestConfig{
+		Profile:      IMSProfile{IMPU: "sip:user@ims.example"},
+		Registration: RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060"},
+		RemoteURI:    "sip:+18005551212@ims.example",
+		CallID:       "call-prack",
+		LocalTag:     "local",
+		CSeq:         4,
+	}, resp)
+	if err != nil || !ok {
+		t.Fatalf("BuildPrackRequestForProvisionalResponse() ok=%v err=%v", ok, err)
+	}
+	if prack.Method != "PRACK" || prack.URI != "sip:+18005551212@pcscf.example" ||
+		prack.Headers["RAck"] != "9 3 INVITE" || prack.Headers["CSeq"] != "4 PRACK" ||
+		prack.Headers["To"] != "<sip:+18005551212@ims.example>;tag=early" {
+		t.Fatalf("PRACK=%+v", prack)
+	}
+}
+
+func TestBuildPrackRequestForProvisionalResponseSkipsUnreliable(t *testing.T) {
+	resp := SIPResponse{
+		StatusCode: 180,
+		Reason:     "Ringing",
+		Headers:    map[string][]string{"CSeq": {"3 INVITE"}},
+	}
+	prack, ok, err := BuildPrackRequestForProvisionalResponse(DialogRequestConfig{}, resp)
+	if err != nil || ok || prack.Method != "" {
+		t.Fatalf("BuildPrackRequestForProvisionalResponse() msg=%+v ok=%v err=%v", prack, ok, err)
+	}
+	_, err = ParseProvisionalResponseInfo(SIPResponse{
+		StatusCode: 183,
+		Reason:     "Session Progress",
+		Headers: map[string][]string{
+			"Require": {"100rel"},
+			"CSeq":    {"3 INVITE"},
+		},
+	})
+	if !errors.Is(err, ErrInvalidSIPMessage) {
+		t.Fatalf("ParseProvisionalResponseInfo(missing RSeq) err=%v, want ErrInvalidSIPMessage", err)
+	}
+}
+
+func TestAdvanceDialogSessionStateInviteCancelBye(t *testing.T) {
+	state := AdvanceDialogSessionState("", "INVITE", SIPResponse{StatusCode: 100})
+	if state != DialogSessionStateCalling {
+		t.Fatalf("100 INVITE state=%q", state)
+	}
+	state = AdvanceDialogSessionState(state, "INVITE", SIPResponse{StatusCode: 183})
+	if state != DialogSessionStateEarly {
+		t.Fatalf("183 INVITE state=%q", state)
+	}
+	state = AdvanceDialogSessionState(state, "PRACK", SIPResponse{StatusCode: 200})
+	if state != DialogSessionStateEarly {
+		t.Fatalf("200 PRACK state=%q", state)
+	}
+	state = AdvanceDialogSessionState(state, "INVITE", SIPResponse{StatusCode: 200})
+	if state != DialogSessionStateConfirmed {
+		t.Fatalf("200 INVITE state=%q", state)
+	}
+	state = AdvanceDialogSessionState(state, "BYE", SIPResponse{StatusCode: 200})
+	if state != DialogSessionStateTerminated {
+		t.Fatalf("200 BYE state=%q", state)
+	}
+	if rejected := AdvanceDialogSessionState(DialogSessionStateCalling, "INVITE", SIPResponse{StatusCode: 486}); rejected != DialogSessionStateTerminated {
+		t.Fatalf("486 INVITE state=%q", rejected)
+	}
+	if canceling := AdvanceDialogSessionState(DialogSessionStateEarly, "CANCEL", SIPResponse{StatusCode: 200}); canceling != DialogSessionStateTerminating {
+		t.Fatalf("200 CANCEL state=%q", canceling)
+	}
+	if gone := AdvanceDialogSessionState(DialogSessionStateEarly, "UPDATE", SIPResponse{StatusCode: 481}); gone != DialogSessionStateTerminated {
+		t.Fatalf("481 UPDATE state=%q", gone)
+	}
+}
+
 func TestBuildIMSDialogRequestsUseRegistrationDigestAuthSession(t *testing.T) {
 	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-dialog", Algorithm: "MD5", QOP: "auth"}
 	state := newDigestAuthState("Proxy-Authorization", ch, DigestAuthInput{

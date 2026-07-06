@@ -58,6 +58,32 @@ type ReferRequestOptions struct {
 	ReferSub   string
 }
 
+type DialogSessionState string
+
+const (
+	DialogSessionStateIdle        DialogSessionState = "idle"
+	DialogSessionStateCalling     DialogSessionState = "calling"
+	DialogSessionStateEarly       DialogSessionState = "early"
+	DialogSessionStateConfirmed   DialogSessionState = "confirmed"
+	DialogSessionStateTerminating DialogSessionState = "terminating"
+	DialogSessionStateTerminated  DialogSessionState = "terminated"
+)
+
+type ProvisionalResponseInfo struct {
+	StatusCode      int
+	Reason          string
+	Reliable        bool
+	RSeq            int
+	RAck            string
+	CSeq            int
+	CSeqMethod      string
+	EarlyMedia      bool
+	ContentType     string
+	SDP             []byte
+	RemoteTag       string
+	RemoteTargetURI string
+}
+
 func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage, error) {
 	msg, err := buildDialogRequest("INVITE", cfg, sdp)
 	if err != nil {
@@ -144,6 +170,110 @@ func BuildPrackRequestWithBody(cfg DialogRequestConfig, rack, contentType string
 		msg.Headers["Content-Type"] = firstNonEmpty(contentType, "application/sdp")
 	}
 	return msg, nil
+}
+
+func BuildPrackRequestForProvisionalResponse(cfg DialogRequestConfig, resp SIPResponse) (SIPRequestMessage, bool, error) {
+	info, err := ParseProvisionalResponseInfo(resp)
+	if err != nil {
+		return SIPRequestMessage{}, false, err
+	}
+	if !info.Reliable {
+		return SIPRequestMessage{}, false, nil
+	}
+	if cfg.RemoteTag == "" && info.RemoteTag != "" {
+		cfg.RemoteTag = info.RemoteTag
+	}
+	if cfg.RemoteTargetURI == "" && info.RemoteTargetURI != "" {
+		cfg.RemoteTargetURI = info.RemoteTargetURI
+	}
+	msg, err := BuildPrackRequest(cfg, info.RAck)
+	if err != nil {
+		return SIPRequestMessage{}, false, err
+	}
+	return msg, true, nil
+}
+
+func ParseProvisionalResponseInfo(resp SIPResponse) (ProvisionalResponseInfo, error) {
+	info := ProvisionalResponseInfo{
+		StatusCode:      resp.StatusCode,
+		Reason:          strings.TrimSpace(resp.Reason),
+		ContentType:     firstHeader(resp.Headers, "Content-Type"),
+		RemoteTag:       sipHeaderTag(firstHeader(resp.Headers, "To")),
+		RemoteTargetURI: firstProvisionalContactURI(resp.Headers),
+	}
+	if isSIPProvisionalResponse(resp.StatusCode) && sipContentTypeMatches(info.ContentType, "application/sdp") && len(resp.Body) > 0 {
+		info.EarlyMedia = true
+		info.SDP = append([]byte(nil), resp.Body...)
+	}
+	if !isSIPProvisionalResponse(resp.StatusCode) {
+		return info, nil
+	}
+	rseqValue := firstHeader(resp.Headers, "RSeq")
+	if !sipHeaderHasToken(resp.Headers, "Require", "100rel") && strings.TrimSpace(rseqValue) == "" {
+		return info, nil
+	}
+	info.Reliable = true
+	if strings.TrimSpace(rseqValue) == "" {
+		return info, fmt.Errorf("%w: reliable provisional missing RSeq", ErrInvalidSIPMessage)
+	}
+	rseq, err := parsePositiveSIPHeaderInt(rseqValue)
+	if err != nil {
+		return info, fmt.Errorf("%w: invalid RSeq", ErrInvalidSIPMessage)
+	}
+	cseq, method, ok := sipCSeqParts(firstHeader(resp.Headers, "CSeq"))
+	if !ok {
+		return info, fmt.Errorf("%w: invalid CSeq for reliable provisional", ErrInvalidSIPMessage)
+	}
+	info.RSeq = rseq
+	info.CSeq = cseq
+	info.CSeqMethod = method
+	info.RAck = strconv.Itoa(rseq) + " " + strconv.Itoa(cseq) + " " + method
+	return info, nil
+}
+
+func AdvanceDialogSessionState(state DialogSessionState, method string, resp SIPResponse) DialogSessionState {
+	if state == "" {
+		state = DialogSessionStateIdle
+	}
+	if state == DialogSessionStateTerminated {
+		return state
+	}
+	method = strings.ToUpper(strings.TrimSpace(method))
+	switch method {
+	case "INVITE":
+		switch {
+		case isSIPProvisionalResponse(resp.StatusCode):
+			if resp.StatusCode >= 180 {
+				return DialogSessionStateEarly
+			}
+			if state == DialogSessionStateIdle {
+				return DialogSessionStateCalling
+			}
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			return DialogSessionStateConfirmed
+		case resp.StatusCode >= 300 && resp.StatusCode < 700:
+			return DialogSessionStateTerminated
+		}
+	case "CANCEL":
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return DialogSessionStateTerminating
+		}
+		if resp.StatusCode == 481 {
+			return DialogSessionStateTerminated
+		}
+	case "BYE":
+		if isSIPProvisionalResponse(resp.StatusCode) {
+			return DialogSessionStateTerminating
+		}
+		if resp.StatusCode == 481 || (resp.StatusCode >= 200 && resp.StatusCode < 300) {
+			return DialogSessionStateTerminated
+		}
+	case "PRACK", "UPDATE":
+		if resp.StatusCode == 481 {
+			return DialogSessionStateTerminated
+		}
+	}
+	return state
 }
 
 func BuildInfoRequest(cfg DialogRequestConfig, contentType string, body []byte) (SIPRequestMessage, error) {
@@ -409,4 +539,95 @@ func formatReferHeader(value string) string {
 		return "<" + value + ">"
 	}
 	return value
+}
+
+func sipHeaderHasToken(headers map[string][]string, name, token string) bool {
+	token = strings.ToLower(strings.TrimSpace(token))
+	if token == "" {
+		return false
+	}
+	for _, value := range headerListValues(headers, name) {
+		candidate := strings.TrimSpace(value)
+		if semi := strings.IndexByte(candidate, ';'); semi >= 0 {
+			candidate = candidate[:semi]
+		}
+		if strings.EqualFold(strings.TrimSpace(candidate), token) {
+			return true
+		}
+	}
+	return false
+}
+
+func sipContentTypeMatches(value, mediaType string) bool {
+	value = strings.TrimSpace(value)
+	if semi := strings.IndexByte(value, ';'); semi >= 0 {
+		value = value[:semi]
+	}
+	return strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(mediaType))
+}
+
+func parsePositiveSIPHeaderInt(value string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || n <= 0 {
+		return 0, ErrInvalidSIPMessage
+	}
+	return n, nil
+}
+
+func firstProvisionalContactURI(headers map[string][]string) string {
+	contacts := trimHeaderValues(headerListValues(headers, "Contact"))
+	if len(contacts) == 0 {
+		return ""
+	}
+	return extractAddressURI(contacts[0])
+}
+
+func sipHeaderTag(value string) string {
+	for _, part := range splitSIPHeaderParams(value) {
+		key, raw, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(key), "tag") {
+			return strings.TrimSpace(strings.Trim(raw, `"`))
+		}
+	}
+	return ""
+}
+
+func splitSIPHeaderParams(s string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	escaped := false
+	angleDepth := 0
+	for _, r := range s {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\' && inQuote:
+			cur.WriteRune(r)
+			escaped = true
+		case r == '"':
+			cur.WriteRune(r)
+			inQuote = !inQuote
+		case r == '<' && !inQuote:
+			angleDepth++
+			cur.WriteRune(r)
+		case r == '>' && !inQuote:
+			if angleDepth > 0 {
+				angleDepth--
+			}
+			cur.WriteRune(r)
+		case r == ';' && !inQuote && angleDepth == 0:
+			if part := strings.TrimSpace(cur.String()); part != "" {
+				out = append(out, part)
+			}
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if part := strings.TrimSpace(cur.String()); part != "" {
+		out = append(out, part)
+	}
+	return out
 }

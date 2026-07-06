@@ -9,6 +9,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/boa-z/vowifi-go/engine/sim"
 	"github.com/boa-z/vowifi-go/engine/swu"
@@ -259,6 +260,130 @@ func TestParseEntitlementResponseCapturesTS43XMLVariants(t *testing.T) {
 	ws := websheetFromEntitlement("", result)
 	if ws.URL != "https://example.test/e911/xml" || ws.UserData != "xml-token" || ws.Title != "XML emergency address" {
 		t.Fatalf("websheet=%+v", ws)
+	}
+}
+
+func TestParseEntitlementResponseCapturesTS43RoutesAddressAndExpiryJSON(t *testing.T) {
+	body := []byte(`{
+		"status": 1000,
+		"responseId": "route-json",
+		"emergencyServiceRoutes": [
+			{
+				"serviceURN": "urn:service:sos",
+				"p-cscf": ["pcscf1.ims.example", "pcscf2.ims.example"],
+				"esrp-uri": "sip:esrp@example.test",
+				"endpoint": "sips:sos@example.test"
+			},
+			{
+				"service": "fire",
+				"pcscfFqdn": "pcscf-fire.ims.example",
+				"endpoints": ["tel:911"]
+			}
+		],
+		"expires": "2026-07-07T09:30:00Z",
+		"cache-control": "private, max-age=300",
+		"emergencyAddress": {
+			"A1": "WA",
+			"A2": "King",
+			"A3": "Seattle",
+			"A6": "5th Ave",
+			"HNO": "100",
+			"PC": "98101",
+			"countryCode": "US",
+			"FLR": "7",
+			"ROOM": "701"
+		}
+	}`)
+
+	result, err := parseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("parseEntitlementResponse() error = %v", err)
+	}
+	if got, want := result.ExpiresAt, time.Date(2026, 7, 7, 9, 30, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("ExpiresAt=%s, want %s", got, want)
+	}
+	if result.CacheMaxAge != 5*time.Minute {
+		t.Fatalf("CacheMaxAge=%s", result.CacheMaxAge)
+	}
+	if len(result.Routes) != 2 {
+		t.Fatalf("routes=%+v", result.Routes)
+	}
+	first := result.Routes[0]
+	if first.ServiceURN != "urn:service:sos" || !sameStrings(first.PCSCF, []string{"pcscf1.ims.example", "pcscf2.ims.example"}) ||
+		!sameStrings(first.ESRP, []string{"sip:esrp@example.test"}) || !sameStrings(first.Endpoints, []string{"sips:sos@example.test"}) {
+		t.Fatalf("first route=%+v", first)
+	}
+	second := result.Routes[1]
+	if second.ServiceURN != "urn:service:sos.fire" || !sameStrings(second.PCSCF, []string{"pcscf-fire.ims.example"}) ||
+		!sameStrings(second.Endpoints, []string{"tel:911"}) {
+		t.Fatalf("second route=%+v", second)
+	}
+	if !containsString(result.ServiceURNs, "urn:service:sos") || !containsString(result.ServiceURNs, "urn:service:sos.fire") {
+		t.Fatalf("service URNs=%+v", result.ServiceURNs)
+	}
+	if result.EmergencyAddress["state"] != "WA" || result.EmergencyAddress["county"] != "King" ||
+		result.EmergencyAddress["city"] != "Seattle" || result.EmergencyAddress["street"] != "5th Ave" ||
+		result.EmergencyAddress["house_number"] != "100" || result.EmergencyAddress["floor"] != "7" ||
+		result.EmergencyAddress["room"] != "701" {
+		t.Fatalf("emergency address=%+v", result.EmergencyAddress)
+	}
+
+	info, err := ParseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("ParseEntitlementResponse() error = %v", err)
+	}
+	if info.ResponseID != "route-json" || info.Address.HouseNumber != "100" || info.Address.County != "King" ||
+		info.Address.PostalCode != "98101" || len(info.Routes) != 2 {
+		t.Fatalf("public info=%+v", info)
+	}
+	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	if got, want := info.EffectiveExpiresAt(base), time.Date(2026, 7, 7, 9, 30, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("EffectiveExpiresAt=%s, want %s", got, want)
+	}
+	if got, want := info.EffectiveCacheExpiresAt(base), base.Add(5*time.Minute); !got.Equal(want) {
+		t.Fatalf("EffectiveCacheExpiresAt=%s, want %s", got, want)
+	}
+}
+
+func TestParseEntitlementResponseCapturesTS43RoutesAndCacheXML(t *testing.T) {
+	body := []byte(`
+		<ts43:response xmlns:ts43="urn:test">
+			<status-code>1000</status-code>
+			<emergency-service>ambulance</emergency-service>
+			<endpoint>https://example.test/e911/xml-websheet</endpoint>
+			<emergencyRouting>
+				<route serviceUrn="urn:service:sos.police">
+					<p-cscf>
+						<fqdn>pcscf-police.ims.example</fqdn>
+					</p-cscf>
+					<esrp-uri>sip:esrp-police@example.test</esrp-uri>
+					<endpoint>sips:police@example.test</endpoint>
+				</route>
+			</emergencyRouting>
+			<cacheExpires>Tue, 07 Jul 2026 08:15:00 GMT</cacheExpires>
+		</ts43:response>`)
+
+	info, err := ParseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("ParseEntitlementResponse() error = %v", err)
+	}
+	if info.Endpoint != "https://example.test/e911/xml-websheet" {
+		t.Fatalf("websheet endpoint=%q", info.Endpoint)
+	}
+	if got, want := info.CacheExpiresAt, time.Date(2026, 7, 7, 8, 15, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("CacheExpiresAt=%s, want %s", got, want)
+	}
+	if !containsString(info.ServiceURNs, "urn:service:sos.ambulance") || !containsString(info.ServiceURNs, "urn:service:sos.police") {
+		t.Fatalf("service URNs=%+v", info.ServiceURNs)
+	}
+	if len(info.Routes) != 1 {
+		t.Fatalf("routes=%+v", info.Routes)
+	}
+	route := info.Routes[0]
+	if route.ServiceURN != "urn:service:sos.police" || !sameStrings(route.PCSCF, []string{"pcscf-police.ims.example"}) ||
+		!sameStrings(route.ESRP, []string{"sip:esrp-police@example.test"}) ||
+		!sameStrings(route.Endpoints, []string{"sips:police@example.test"}) {
+		t.Fatalf("route=%+v", route)
 	}
 }
 
@@ -1254,6 +1379,27 @@ func headerValue(headers []HeaderPair, name string) string {
 		}
 	}
 	return ""
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func bytesFrom(start byte, n int) []byte {

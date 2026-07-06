@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/boa-z/vowifi-go/engine/sim"
 	"github.com/boa-z/vowifi-go/engine/swu"
@@ -120,6 +121,89 @@ type WebsheetRequest struct {
 	EAPNextPseudonym    string
 	EAPNextReauthID     string
 	EAPReauthentication swu.EAPReauthenticationState
+}
+
+type EmergencyAddress struct {
+	Street            string
+	Unit              string
+	City              string
+	State             string
+	PostalCode        string
+	Country           string
+	Latitude          string
+	Longitude         string
+	Formatted         string
+	HouseNumber       string
+	HouseNumberSuffix string
+	County            string
+	District          string
+	Neighborhood      string
+	Building          string
+	Floor             string
+	Room              string
+	Name              string
+	Fields            map[string]string
+}
+
+type EmergencyPDN struct {
+	Name  string
+	Type  string
+	APN   string
+	Realm string
+}
+
+type EmergencyRoute struct {
+	ServiceURN string
+	PCSCF      []string
+	ESRP       []string
+	Endpoints  []string
+}
+
+type EntitlementInfo struct {
+	Status                   int
+	ResponseID               string
+	WebsheetURL              string
+	Endpoint                 string
+	UserData                 string
+	ContentType              string
+	Title                    string
+	Address                  EmergencyAddress
+	PDN                      EmergencyPDN
+	ServiceURNs              []string
+	Routes                   []EmergencyRoute
+	ExpiresAt                time.Time
+	ExpiresIn                time.Duration
+	CacheExpiresAt           time.Time
+	CacheMaxAge              time.Duration
+	LocationValidationStatus string
+}
+
+func (i EntitlementInfo) EffectiveExpiresAt(base time.Time) time.Time {
+	if !i.ExpiresAt.IsZero() {
+		return i.ExpiresAt
+	}
+	if i.ExpiresIn > 0 && !base.IsZero() {
+		return base.Add(i.ExpiresIn)
+	}
+	return time.Time{}
+}
+
+func (i EntitlementInfo) EffectiveCacheExpiresAt(base time.Time) time.Time {
+	if !i.CacheExpiresAt.IsZero() {
+		return i.CacheExpiresAt
+	}
+	if i.CacheMaxAge > 0 && !base.IsZero() {
+		return base.Add(i.CacheMaxAge)
+	}
+	return time.Time{}
+}
+
+func ParseEntitlementResponse(body []byte) (EntitlementInfo, error) {
+	result, err := parseEntitlementResponse(body)
+	if err != nil {
+		return EntitlementInfo{}, err
+	}
+	return entitlementInfoFromResult(result), nil
 }
 
 func StartEmergencyAddressUpdate(ctx context.Context, req Request) (WebsheetRequest, error) {
@@ -440,6 +524,12 @@ type entitlementResult struct {
 	APN                      string
 	Realm                    string
 	Endpoint                 string
+	ServiceURNs              []string
+	Routes                   []EmergencyRoute
+	ExpiresAt                time.Time
+	ExpiresIn                time.Duration
+	CacheExpiresAt           time.Time
+	CacheMaxAge              time.Duration
 	LocationValidationStatus string
 }
 
@@ -453,6 +543,7 @@ func parseEntitlementResponse(body []byte) (entitlementResult, error) {
 	if err := json.Unmarshal(body, &root); err == nil {
 		var out entitlementResult
 		walkEntitlement(root, &out)
+		collectJSONEmergencyRouting(root, &out)
 		return finalizeEntitlementResult(out), nil
 	} else if xmlResult, xmlErr := parseXMLEntitlementResponse(body); xmlErr == nil {
 		return xmlResult, nil
@@ -469,6 +560,99 @@ func finalizeEntitlementResult(out entitlementResult) entitlementResult {
 	}
 	if out.Title == "" {
 		out.Title = "Emergency address"
+	}
+	return out
+}
+
+func entitlementInfoFromResult(result entitlementResult) EntitlementInfo {
+	return EntitlementInfo{
+		Status:                   result.Status,
+		ResponseID:               responseIDString(result.ResponseID),
+		WebsheetURL:              result.WebsheetURL,
+		Endpoint:                 result.Endpoint,
+		UserData:                 result.UserData,
+		ContentType:              result.ContentType,
+		Title:                    result.Title,
+		Address:                  emergencyAddressFromFields(result.EmergencyAddress),
+		PDN:                      EmergencyPDN{Name: result.PDN, Type: result.PDNType, APN: result.APN, Realm: result.Realm},
+		ServiceURNs:              copyStringSlice(result.ServiceURNs),
+		Routes:                   copyEmergencyRoutes(result.Routes),
+		ExpiresAt:                result.ExpiresAt,
+		ExpiresIn:                result.ExpiresIn,
+		CacheExpiresAt:           result.CacheExpiresAt,
+		CacheMaxAge:              result.CacheMaxAge,
+		LocationValidationStatus: result.LocationValidationStatus,
+	}
+}
+
+func emergencyAddressFromFields(fields map[string]string) EmergencyAddress {
+	copied := copyStringMap(fields)
+	return EmergencyAddress{
+		Street:            copied["street"],
+		Unit:              copied["unit"],
+		City:              copied["city"],
+		State:             copied["state"],
+		PostalCode:        copied["postal_code"],
+		Country:           copied["country"],
+		Latitude:          copied["latitude"],
+		Longitude:         copied["longitude"],
+		Formatted:         copied["formatted"],
+		HouseNumber:       copied["house_number"],
+		HouseNumberSuffix: copied["house_number_suffix"],
+		County:            copied["county"],
+		District:          copied["district"],
+		Neighborhood:      copied["neighborhood"],
+		Building:          copied["building"],
+		Floor:             copied["floor"],
+		Room:              copied["room"],
+		Name:              copied["name"],
+		Fields:            copied,
+	}
+}
+
+func responseIDString(value any) string {
+	switch x := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(x)
+	case json.Number:
+		return x.String()
+	default:
+		return strings.TrimSpace(fmt.Sprint(x))
+	}
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func copyStringSlice(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	return append([]string(nil), in...)
+}
+
+func copyEmergencyRoutes(in []EmergencyRoute) []EmergencyRoute {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]EmergencyRoute, len(in))
+	for i, route := range in {
+		out[i] = EmergencyRoute{
+			ServiceURN: route.ServiceURN,
+			PCSCF:      copyStringSlice(route.PCSCF),
+			ESRP:       copyStringSlice(route.ESRP),
+			Endpoints:  copyStringSlice(route.Endpoints),
+		}
 	}
 	return out
 }
@@ -490,44 +674,52 @@ func parseXMLEntitlementResponse(body []byte) (entitlementResult, error) {
 	}
 	var out entitlementResult
 	walkXMLEntitlement(root, &out, false)
+	collectXMLEmergencyRouting(root, &out)
 	return finalizeEntitlementResult(out), nil
 }
 
 func walkEntitlement(v any, out *entitlementResult) {
-	walkEntitlementValue(v, out, false)
+	walkEntitlementValue(v, out, false, false)
 }
 
-func walkEntitlementValue(v any, out *entitlementResult, inEmergencyAddress bool) {
+func walkEntitlementValue(v any, out *entitlementResult, inEmergencyAddress, inEmergencyRoute bool) {
 	switch x := v.(type) {
 	case []any:
 		for _, item := range x {
-			walkEntitlementValue(item, out, inEmergencyAddress)
+			walkEntitlementValue(item, out, inEmergencyAddress, inEmergencyRoute)
 		}
 	case map[string]any:
 		for key, value := range x {
-			consumeEntitlementField(key, value, out)
-			nextInEmergencyAddress := inEmergencyAddress || isEmergencyAddressKey(normalizeEntitlementKey(key))
+			canonical := normalizeEntitlementKey(key)
+			consumeEntitlementField(key, value, out, inEmergencyRoute)
+			nextInEmergencyAddress := inEmergencyAddress || isEmergencyAddressKey(canonical)
+			nextInEmergencyRoute := inEmergencyRoute || isEmergencyRouteKey(canonical)
 			if nextInEmergencyAddress {
 				collectEmergencyAddressField(key, value, out)
 			}
-			walkEntitlementValue(value, out, nextInEmergencyAddress)
+			walkEntitlementValue(value, out, nextInEmergencyAddress, nextInEmergencyRoute)
 		}
 	}
 }
 
 func walkXMLEntitlement(node entitlementXMLNode, out *entitlementResult, inEmergencyAddress bool) {
+	walkXMLEntitlementValue(node, out, inEmergencyAddress, false)
+}
+
+func walkXMLEntitlementValue(node entitlementXMLNode, out *entitlementResult, inEmergencyAddress, inEmergencyRoute bool) {
 	key := node.XMLName.Local
 	canonical := normalizeEntitlementKey(key)
 	text := strings.TrimSpace(node.Text)
+	nextInEmergencyRoute := inEmergencyRoute || isEmergencyRouteKey(canonical)
 	if text != "" {
-		consumeEntitlementField(key, text, out)
+		consumeEntitlementField(key, text, out, inEmergencyRoute)
 	}
 	nextInEmergencyAddress := inEmergencyAddress || isEmergencyAddressKey(canonical)
 	if nextInEmergencyAddress && text != "" && len(node.Children) == 0 {
 		collectEmergencyAddressField(key, text, out)
 	}
 	for _, attr := range node.Attrs {
-		consumeEntitlementField(attr.Name.Local, attr.Value, out)
+		consumeEntitlementField(attr.Name.Local, attr.Value, out, nextInEmergencyRoute)
 		if isPDNKey(canonical) {
 			consumePDNField(attr.Name.Local, attr.Value, out)
 		}
@@ -536,11 +728,11 @@ func walkXMLEntitlement(node entitlementXMLNode, out *entitlementResult, inEmerg
 		}
 	}
 	for _, child := range node.Children {
-		walkXMLEntitlement(child, out, nextInEmergencyAddress)
+		walkXMLEntitlementValue(child, out, nextInEmergencyAddress, nextInEmergencyRoute)
 	}
 }
 
-func consumeEntitlementField(key string, value any, out *entitlementResult) {
+func consumeEntitlementField(key string, value any, out *entitlementResult, inEmergencyRoute bool) {
 	switch normalizeEntitlementKey(key) {
 	case "status", "statuscode", "entitlementstatus", "resultcode", "responsecode":
 		if n, ok := numberValue(value); ok {
@@ -554,9 +746,13 @@ func consumeEntitlementField(key string, value any, out *entitlementResult) {
 			out.ResponseID = value
 		}
 	case "websheet", "websheeturl", "e911websheet", "e911websheeturl", "addressurl", "addressupdateurl", "emergencyaddressurl", "emergencyaddresswebsheeturl", "emergencyaddressupdateurl", "e911addressurl", "e911addressupdateurl", "locationurl", "locationvalidationurl", "url":
-		setHTTPURL(&out.WebsheetURL, value)
+		if !inEmergencyRoute {
+			setHTTPURL(&out.WebsheetURL, value)
+		}
 	case "endpoint", "addressendpoint", "emergencyaddressendpoint", "e911endpoint", "websheetendpoint", "locationendpoint", "locationvalidationendpoint":
-		setHTTPURL(&out.Endpoint, value)
+		if !inEmergencyRoute {
+			setHTTPURL(&out.Endpoint, value)
+		}
 	case "userdata", "userdatatoken", "token", "entitlementtoken", "authtoken", "authorizationtoken", "accesstoken", "bearertoken":
 		setString(&out.UserData, value)
 	case "contenttype", "mimetype":
@@ -588,10 +784,26 @@ func consumeEntitlementField(key string, value any, out *entitlementResult) {
 		setString(&out.APN, value)
 	case "realm", "networkrealm", "imsrealm", "nairealm", "homerealm":
 		setString(&out.Realm, value)
+	case "serviceurn", "serviceurns", "emergencyserviceurn", "emergencyserviceurns", "sosurn", "sosurns", "sosserviceurn", "sosserviceurns":
+		collectServiceURNs(value, out)
+	case "expires", "expiry", "expiration", "expiresat", "expirationtime", "validuntil", "validto", "notafter":
+		setExpiry(&out.ExpiresAt, &out.ExpiresIn, value)
+	case "expiresin", "expiresseconds", "expiressec", "ttl", "timetolive", "validity", "validityperiod", "validfor":
+		setDuration(&out.ExpiresIn, value)
+	case "cachecontrol":
+		setCacheControlMaxAge(&out.CacheMaxAge, value)
+	case "cacheexpires", "cacheexpiry", "cacheexpiresat", "cacheexpiration", "cacheexpirationtime", "cachevaliduntil":
+		setExpiry(&out.CacheExpiresAt, &out.CacheMaxAge, value)
+	case "cacheexpiresin", "cachemaxage", "cachettl", "cachetimetolive", "maxage":
+		setDuration(&out.CacheMaxAge, value)
 	case "locationvalidationstatus", "validationstatus", "addressvalidationstatus", "e911addressvalidationstatus", "locationstatus":
 		setString(&out.LocationValidationStatus, value)
 	default:
-		if isEmergencyAddressKey(normalizeEntitlementKey(key)) {
+		canonical := normalizeEntitlementKey(key)
+		if isServiceURNKey(canonical) {
+			collectServiceURNs(value, out)
+		}
+		if isEmergencyAddressKey(canonical) {
 			parseEmergencyAddress(value, out)
 		}
 	}
@@ -634,6 +846,190 @@ func setHTTPURL(dst *string, value any) {
 	}
 }
 
+func setExpiry(dstTime *time.Time, dstDuration *time.Duration, value any) {
+	if dstTime == nil || dstDuration == nil {
+		return
+	}
+	if t, d, ok := timeOrDurationValue(value); ok {
+		if !t.IsZero() && dstTime.IsZero() {
+			*dstTime = t
+			return
+		}
+		if d > 0 && *dstDuration == 0 {
+			*dstDuration = d
+		}
+	}
+}
+
+func setDuration(dst *time.Duration, value any) {
+	if dst == nil || *dst != 0 {
+		return
+	}
+	if d, ok := durationValue(value); ok && d > 0 {
+		*dst = d
+	}
+}
+
+func setCacheControlMaxAge(dst *time.Duration, value any) {
+	if dst == nil || *dst != 0 {
+		return
+	}
+	for _, s := range stringsFromAny(value) {
+		for _, part := range strings.Split(s, ",") {
+			item := strings.TrimSpace(part)
+			lower := strings.ToLower(item)
+			if !strings.HasPrefix(lower, "max-age=") {
+				continue
+			}
+			if d, ok := durationValue(strings.TrimSpace(item[len("max-age="):])); ok && d > 0 {
+				*dst = d
+				return
+			}
+		}
+	}
+}
+
+func timeOrDurationValue(value any) (time.Time, time.Duration, bool) {
+	if t, ok := timeValue(value); ok {
+		return t, 0, true
+	}
+	if d, ok := durationValue(value); ok {
+		return time.Time{}, d, true
+	}
+	return time.Time{}, 0, false
+}
+
+func timeValue(value any) (time.Time, bool) {
+	if n, ok := int64Value(value); ok && n >= 946684800 {
+		return time.Unix(n, 0).UTC(), true
+	}
+	s := strings.TrimSpace(stringValue(value))
+	if s == "" {
+		return time.Time{}, false
+	}
+	if n, ok := parseInt64String(s); ok && n >= 946684800 {
+		return time.Unix(n, 0).UTC(), true
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		time.RFC1123Z,
+		time.RFC1123,
+		"2006-01-02T15:04:05-0700",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func durationValue(value any) (time.Duration, bool) {
+	if n, ok := int64Value(value); ok && n > 0 {
+		return time.Duration(n) * time.Second, true
+	}
+	s := strings.TrimSpace(stringValue(value))
+	if s == "" {
+		return 0, false
+	}
+	if n, ok := parseInt64String(s); ok && n > 0 {
+		return time.Duration(n) * time.Second, true
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return d, true
+	}
+	return iso8601DurationValue(s)
+}
+
+func int64Value(v any) (int64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return int64(x), true
+	case int:
+		return int64(x), true
+	case int64:
+		return x, true
+	case json.Number:
+		n, err := x.Int64()
+		return n, err == nil
+	case string:
+		return parseInt64String(x)
+	default:
+		return 0, false
+	}
+}
+
+func parseInt64String(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	for i, r := range s {
+		if i == 0 && (r == '+' || r == '-') {
+			continue
+		}
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	var n int64
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err == nil
+}
+
+func iso8601DurationValue(s string) (time.Duration, bool) {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	if !strings.HasPrefix(s, "P") {
+		return 0, false
+	}
+	var total time.Duration
+	var digits strings.Builder
+	inTime := false
+	for _, r := range s[1:] {
+		switch {
+		case r >= '0' && r <= '9':
+			digits.WriteRune(r)
+			continue
+		case r == 'T':
+			inTime = true
+			continue
+		}
+		n, ok := parseInt64String(digits.String())
+		if !ok {
+			return 0, false
+		}
+		digits.Reset()
+		switch r {
+		case 'D':
+			total += time.Duration(n) * 24 * time.Hour
+		case 'H':
+			if !inTime {
+				return 0, false
+			}
+			total += time.Duration(n) * time.Hour
+		case 'M':
+			if !inTime {
+				return 0, false
+			}
+			total += time.Duration(n) * time.Minute
+		case 'S':
+			if !inTime {
+				return 0, false
+			}
+			total += time.Duration(n) * time.Second
+		default:
+			return 0, false
+		}
+	}
+	if digits.Len() != 0 || total <= 0 {
+		return 0, false
+	}
+	return total, true
+}
+
 func boolValue(v any) (bool, bool) {
 	switch x := v.(type) {
 	case bool:
@@ -673,6 +1069,385 @@ func isPDNKey(canonical string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func isEmergencyRouteKey(canonical string) bool {
+	switch canonical {
+	case "route", "routes", "routing", "emergencyroute", "emergencyroutes", "emergencyrouting", "emergencyserviceroute", "emergencyserviceroutes", "emergencycallrouting", "sosroute", "sosroutes", "sosrouting", "imsrouting", "callrouting":
+		return true
+	default:
+		return false
+	}
+}
+
+func collectJSONEmergencyRouting(v any, out *entitlementResult) {
+	before := len(out.Routes)
+	collectExplicitJSONEmergencyRouting(v, out)
+	if len(out.Routes) != before {
+		return
+	}
+	if m, ok := v.(map[string]any); ok && routeMapHasDirectFields(m) {
+		appendEmergencyRoute(out, emergencyRouteFromJSONMap(m, false))
+	}
+}
+
+func collectExplicitJSONEmergencyRouting(v any, out *entitlementResult) {
+	switch x := v.(type) {
+	case []any:
+		for _, item := range x {
+			collectExplicitJSONEmergencyRouting(item, out)
+		}
+	case map[string]any:
+		for key, item := range x {
+			canonical := normalizeEntitlementKey(key)
+			if isEmergencyRouteKey(canonical) {
+				appendEmergencyRoutesFromJSON(item, out, true)
+				continue
+			}
+			collectExplicitJSONEmergencyRouting(item, out)
+		}
+	}
+}
+
+func appendEmergencyRoutesFromJSON(v any, out *entitlementResult, genericEndpoints bool) {
+	switch x := v.(type) {
+	case []any:
+		for _, item := range x {
+			appendEmergencyRoutesFromJSON(item, out, genericEndpoints)
+		}
+	case map[string]any:
+		appendEmergencyRoute(out, emergencyRouteFromJSONMap(x, genericEndpoints))
+		for key, item := range x {
+			if isEmergencyRouteKey(normalizeEntitlementKey(key)) {
+				appendEmergencyRoutesFromJSON(item, out, true)
+			}
+		}
+	case string:
+		var route EmergencyRoute
+		if urn := normalizeEmergencyServiceURN(x); urn != "" {
+			route.ServiceURN = urn
+		} else if s := strings.TrimSpace(x); s != "" {
+			route.Endpoints = append(route.Endpoints, s)
+		}
+		appendEmergencyRoute(out, route)
+	}
+}
+
+func emergencyRouteFromJSONMap(m map[string]any, genericEndpoints bool) EmergencyRoute {
+	var route EmergencyRoute
+	for key, value := range m {
+		collectEmergencyRouteField(key, value, &route, genericEndpoints)
+	}
+	return normalizeEmergencyRoute(route)
+}
+
+func routeMapHasDirectFields(m map[string]any) bool {
+	for key := range m {
+		canonical := normalizeEntitlementKey(key)
+		if isServiceURNKey(canonical) || isPCSCFKey(canonical) || isESRPKey(canonical) || isSpecificRouteEndpointKey(canonical) {
+			return true
+		}
+	}
+	return false
+}
+
+func collectXMLEmergencyRouting(root entitlementXMLNode, out *entitlementResult) {
+	before := len(out.Routes)
+	collectExplicitXMLEmergencyRouting(root, out)
+	if len(out.Routes) != before {
+		return
+	}
+	appendEmergencyRoute(out, emergencyRouteFromXMLNode(root, false))
+}
+
+func collectExplicitXMLEmergencyRouting(node entitlementXMLNode, out *entitlementResult) {
+	if isEmergencyRouteKey(normalizeEntitlementKey(node.XMLName.Local)) {
+		var hasChildRoute bool
+		for _, child := range node.Children {
+			if isEmergencyRouteKey(normalizeEntitlementKey(child.XMLName.Local)) {
+				hasChildRoute = true
+				collectExplicitXMLEmergencyRouting(child, out)
+			}
+		}
+		if hasChildRoute {
+			return
+		}
+		appendEmergencyRoute(out, emergencyRouteFromXMLNode(node, true))
+		return
+	}
+	for _, child := range node.Children {
+		collectExplicitXMLEmergencyRouting(child, out)
+	}
+}
+
+func emergencyRouteFromXMLNode(node entitlementXMLNode, genericEndpoints bool) EmergencyRoute {
+	var route EmergencyRoute
+	collectXMLRouteFields(node, &route, genericEndpoints)
+	return normalizeEmergencyRoute(route)
+}
+
+func collectXMLRouteFields(node entitlementXMLNode, route *EmergencyRoute, genericEndpoints bool) {
+	canonical := normalizeEntitlementKey(node.XMLName.Local)
+	switch {
+	case isServiceURNKey(canonical):
+		for _, urn := range serviceURNsFromAny(xmlStrings(node)) {
+			if route.ServiceURN == "" {
+				route.ServiceURN = urn
+			}
+		}
+		return
+	case isPCSCFKey(canonical):
+		route.PCSCF = appendUniqueStrings(route.PCSCF, xmlStrings(node)...)
+		return
+	case isESRPKey(canonical):
+		route.ESRP = appendUniqueStrings(route.ESRP, xmlStrings(node)...)
+		return
+	case isSpecificRouteEndpointKey(canonical) || genericEndpoints && isGenericRouteEndpointKey(canonical):
+		route.Endpoints = appendUniqueStrings(route.Endpoints, xmlStrings(node)...)
+		return
+	}
+	for _, attr := range node.Attrs {
+		collectEmergencyRouteField(attr.Name.Local, attr.Value, route, genericEndpoints)
+	}
+	for _, child := range node.Children {
+		collectXMLRouteFields(child, route, genericEndpoints)
+	}
+}
+
+func collectEmergencyRouteField(key string, value any, route *EmergencyRoute, genericEndpoints bool) {
+	if route == nil {
+		return
+	}
+	canonical := normalizeEntitlementKey(key)
+	switch {
+	case isServiceURNKey(canonical):
+		for _, urn := range serviceURNsFromAny(value) {
+			if route.ServiceURN == "" {
+				route.ServiceURN = urn
+			}
+		}
+	case isPCSCFKey(canonical):
+		route.PCSCF = appendUniqueStrings(route.PCSCF, stringsFromAny(value)...)
+	case isESRPKey(canonical):
+		route.ESRP = appendUniqueStrings(route.ESRP, stringsFromAny(value)...)
+	case isSpecificRouteEndpointKey(canonical) || genericEndpoints && isGenericRouteEndpointKey(canonical):
+		route.Endpoints = appendUniqueStrings(route.Endpoints, stringsFromAny(value)...)
+	}
+}
+
+func isServiceURNKey(canonical string) bool {
+	switch canonical {
+	case "serviceurn", "serviceurns", "emergencyserviceurn", "emergencyserviceurns", "sosurn", "sosurns", "sosserviceurn", "sosserviceurns", "service", "servicetype", "emergencyservice", "emergencyservicetype":
+		return true
+	default:
+		return false
+	}
+}
+
+func isPCSCFKey(canonical string) bool {
+	switch canonical {
+	case "pcscf", "pcscfs", "pcscfaddress", "pcscfaddresses", "pcscffqdn", "pcscffqdns", "pcscfserver", "pcscfservers", "pcscflist", "pcscfuri", "pcscfuris", "proxycscf", "pcscfendpoint", "pcscfendpoints":
+		return true
+	default:
+		return false
+	}
+}
+
+func isESRPKey(canonical string) bool {
+	switch canonical {
+	case "esrp", "esrps", "esrpuri", "esrpuris", "esrpurl", "esrpurls", "esrpaddress", "esrpaddresses", "esrpendpoint", "esrpendpoints", "emergencyservicesroutingproxy", "emergencyroutingproxy":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSpecificRouteEndpointKey(canonical string) bool {
+	switch canonical {
+	case "routeendpoint", "routeendpoints", "routingendpoint", "routingendpoints", "emergencyendpoint", "emergencyendpoints", "sipendpoint", "sipendpoints", "sipsendpoint", "sipsendpoints", "callendpoint", "callendpoints", "sosendpoint", "sosendpoints":
+		return true
+	default:
+		return false
+	}
+}
+
+func isGenericRouteEndpointKey(canonical string) bool {
+	switch canonical {
+	case "endpoint", "endpoints", "uri", "uris", "url", "urls", "address", "addresses":
+		return true
+	default:
+		return false
+	}
+}
+
+func collectServiceURNs(value any, out *entitlementResult) {
+	if out == nil {
+		return
+	}
+	out.ServiceURNs = appendUniqueStrings(out.ServiceURNs, serviceURNsFromAny(value)...)
+}
+
+func serviceURNsFromAny(value any) []string {
+	var out []string
+	for _, s := range stringsFromAny(value) {
+		if urn := normalizeEmergencyServiceURN(s); urn != "" {
+			out = appendUniqueStrings(out, urn)
+		}
+	}
+	return out
+}
+
+func normalizeEmergencyServiceURN(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "urn:service:sos") {
+		return lower
+	}
+	switch lower {
+	case "sos", "emergency", "e911", "911":
+		return "urn:service:sos"
+	case "police":
+		return "urn:service:sos.police"
+	case "fire":
+		return "urn:service:sos.fire"
+	case "ambulance", "medical", "ems":
+		return "urn:service:sos.ambulance"
+	case "marine":
+		return "urn:service:sos.marine"
+	case "mountain":
+		return "urn:service:sos.mountain"
+	default:
+		return ""
+	}
+}
+
+func appendEmergencyRoute(out *entitlementResult, route EmergencyRoute) {
+	if out == nil {
+		return
+	}
+	route = normalizeEmergencyRoute(route)
+	if route.ServiceURN == "" && len(route.PCSCF) == 0 && len(route.ESRP) == 0 && len(route.Endpoints) == 0 {
+		return
+	}
+	if route.ServiceURN != "" {
+		out.ServiceURNs = appendUniqueStrings(out.ServiceURNs, route.ServiceURN)
+	}
+	for _, existing := range out.Routes {
+		if emergencyRoutesEqual(existing, route) {
+			return
+		}
+	}
+	out.Routes = append(out.Routes, route)
+}
+
+func normalizeEmergencyRoute(route EmergencyRoute) EmergencyRoute {
+	route.ServiceURN = normalizeEmergencyServiceURN(route.ServiceURN)
+	route.PCSCF = appendUniqueStrings(nil, route.PCSCF...)
+	route.ESRP = appendUniqueStrings(nil, route.ESRP...)
+	route.Endpoints = appendUniqueStrings(nil, route.Endpoints...)
+	return route
+}
+
+func emergencyRoutesEqual(a, b EmergencyRoute) bool {
+	return a.ServiceURN == b.ServiceURN &&
+		strings.Join(a.PCSCF, "\x00") == strings.Join(b.PCSCF, "\x00") &&
+		strings.Join(a.ESRP, "\x00") == strings.Join(b.ESRP, "\x00") &&
+		strings.Join(a.Endpoints, "\x00") == strings.Join(b.Endpoints, "\x00")
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		found := false
+		for _, existing := range dst {
+			if strings.EqualFold(existing, value) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst = append(dst, value)
+		}
+	}
+	return dst
+}
+
+func stringsFromAny(value any) []string {
+	var out []string
+	collectStringsFromAny(value, &out)
+	return appendUniqueStrings(nil, out...)
+}
+
+func collectStringsFromAny(value any, out *[]string) {
+	switch x := value.(type) {
+	case string:
+		*out = append(*out, splitStringList(x)...)
+	case []any:
+		for _, item := range x {
+			collectStringsFromAny(item, out)
+		}
+	case []string:
+		for _, item := range x {
+			collectStringsFromAny(item, out)
+		}
+	case map[string]any:
+		for _, item := range x {
+			collectStringsFromAny(item, out)
+		}
+	case json.Number:
+		*out = append(*out, x.String())
+	case fmt.Stringer:
+		*out = append(*out, x.String())
+	}
+}
+
+func splitStringList(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	if strings.Contains(s, ",") {
+		parts := strings.Split(s, ",")
+		out := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if item := strings.TrimSpace(part); item != "" {
+				out = append(out, item)
+			}
+		}
+		return out
+	}
+	fields := strings.Fields(s)
+	if len(fields) > 1 {
+		return fields
+	}
+	return []string{s}
+}
+
+func xmlStrings(node entitlementXMLNode) []string {
+	var out []string
+	collectXMLStrings(node, &out)
+	return appendUniqueStrings(nil, out...)
+}
+
+func collectXMLStrings(node entitlementXMLNode, out *[]string) {
+	if text := strings.TrimSpace(node.Text); text != "" {
+		*out = append(*out, splitStringList(text)...)
+	}
+	for _, attr := range node.Attrs {
+		if strings.EqualFold(attr.Name.Local, "type") {
+			continue
+		}
+		*out = append(*out, splitStringList(attr.Value)...)
+	}
+	for _, child := range node.Children {
+		collectXMLStrings(child, out)
 	}
 }
 
@@ -742,15 +1517,15 @@ func collectEmergencyAddressField(key string, value any, out *entitlementResult)
 		return
 	}
 	switch canonical {
-	case "street", "street1", "streetaddress", "addressline1", "address1", "line1":
+	case "street", "street1", "streetaddress", "addressline1", "address1", "line1", "road", "rd", "a6":
 		canonical = "street"
 	case "street2", "addressline2", "address2", "line2", "unit", "apartment", "apt", "suite":
 		canonical = "unit"
-	case "city", "locality", "municipality":
+	case "city", "locality", "municipality", "town", "a3":
 		canonical = "city"
-	case "state", "region", "province":
+	case "state", "region", "province", "a1":
 		canonical = "state"
-	case "postalcode", "postcode", "zip", "zipcode":
+	case "postalcode", "postcode", "zip", "zipcode", "pc":
 		canonical = "postal_code"
 	case "country", "countrycode":
 		canonical = "country"
@@ -760,6 +1535,24 @@ func collectEmergencyAddressField(key string, value any, out *entitlementResult)
 		canonical = "longitude"
 	case "formatted", "formattedaddress", "fulladdress", "displayaddress":
 		canonical = "formatted"
+	case "housenumber", "hno":
+		canonical = "house_number"
+	case "housenumbersuffix", "hns":
+		canonical = "house_number_suffix"
+	case "county", "a2":
+		canonical = "county"
+	case "district", "borough", "a4":
+		canonical = "district"
+	case "neighborhood", "neighbourhood", "a5":
+		canonical = "neighborhood"
+	case "building", "bld", "bldg":
+		canonical = "building"
+	case "floor", "flr":
+		canonical = "floor"
+	case "room", "roomnumber":
+		canonical = "room"
+	case "name", "nam":
+		canonical = "name"
 	default:
 		return
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/pion/rtcp"
 )
@@ -263,6 +264,70 @@ func TestSRTPMediaSessionReportsRTPDTMFInRelayTransform(t *testing.T) {
 	}
 }
 
+func TestSRTPMediaSessionReportsPlaintextRTPInRelayTransform(t *testing.T) {
+	events := make(chan RTPPlaintextEvent, 4)
+	session, err := NewSRTPMediaSession(testSRTPMediaConfig())
+	if err != nil {
+		t.Fatalf("NewSRTPMediaSession() error = %v", err)
+	}
+	transforms := session.RelayTransformsWithMediaObservers(nil, nil, func(event RTPPlaintextEvent) {
+		events <- event
+	}, nil, nil)
+
+	clientPlain := testRTPPacket(20, 0x11111111, []byte{0xaa})
+	clientProtected, err := session.ProtectClientRTP(clientPlain)
+	if err != nil {
+		t.Fatalf("ProtectClientRTP() error = %v", err)
+	}
+	clientTransformed, err := transforms.ClientToIMSRTP(clientProtected)
+	if err != nil {
+		t.Fatalf("ClientToIMSRTP() error = %v", err)
+	}
+	clientForwardedPlain, err := session.UnprotectIMSRTP(clientTransformed)
+	if err != nil {
+		t.Fatalf("UnprotectIMSRTP() error = %v", err)
+	}
+	if !bytes.Equal(clientForwardedPlain, clientPlain) {
+		t.Fatalf("client forwarded plain=%x, want %x", clientForwardedPlain, clientPlain)
+	}
+	clientEvent := readRTPPlaintextEvent(t, events)
+	if clientEvent.Direction != RTPDTMFClientToIMS || !bytes.Equal(clientEvent.Packet, clientPlain) {
+		t.Fatalf("client event=%+v packet=%x", clientEvent, clientEvent.Packet)
+	}
+
+	tracker := NewRTPStreamStatsTracker()
+	arrival := time.Unix(100, 0)
+	for i, seq := range []uint16{10, 12} {
+		imsPlain := testRTPPacket(seq, 0x22222222, []byte{byte(seq)})
+		imsProtected, err := session.ProtectIMSRTP(imsPlain)
+		if err != nil {
+			t.Fatalf("ProtectIMSRTP(%d) error = %v", seq, err)
+		}
+		imsTransformed, err := transforms.IMSToClientRTP(imsProtected)
+		if err != nil {
+			t.Fatalf("IMSToClientRTP(%d) error = %v", seq, err)
+		}
+		imsForwardedPlain, err := session.UnprotectClientRTP(imsTransformed)
+		if err != nil {
+			t.Fatalf("UnprotectClientRTP(%d) error = %v", seq, err)
+		}
+		if !bytes.Equal(imsForwardedPlain, imsPlain) {
+			t.Fatalf("IMS forwarded plain=%x, want %x", imsForwardedPlain, imsPlain)
+		}
+		event := readRTPPlaintextEvent(t, events)
+		if event.Direction != RTPDTMFIMSToClient || !bytes.Equal(event.Packet, imsPlain) {
+			t.Fatalf("IMS event=%+v packet=%x want=%x", event, event.Packet, imsPlain)
+		}
+		if _, err := tracker.ObserveRTPPacket(event.Packet, arrival.Add(time.Duration(i)*20*time.Millisecond), 8000); err != nil {
+			t.Fatalf("ObserveRTPPacket(%d) error = %v", seq, err)
+		}
+	}
+	stats := tracker.Stats()
+	if len(stats) != 1 || stats[0].SSRC != 0x22222222 || stats[0].Packets != 2 || stats[0].ExpectedPackets != 3 || stats[0].LostPackets != 1 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
 func testSRTPMediaConfig() SRTPMediaConfig {
 	return SRTPMediaConfig{
 		Profile: SRTPProfileAes128CmHmacSha1_80,
@@ -291,5 +356,16 @@ func testRTCPPacket(ssrc uint32) []byte {
 	return []byte{
 		0x80, 0xc9, 0x00, 0x01,
 		byte(ssrc >> 24), byte(ssrc >> 16), byte(ssrc >> 8), byte(ssrc),
+	}
+}
+
+func readRTPPlaintextEvent(t *testing.T, events <-chan RTPPlaintextEvent) RTPPlaintextEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for RTP plaintext event")
+		return RTPPlaintextEvent{}
 	}
 }

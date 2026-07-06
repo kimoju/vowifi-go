@@ -34,9 +34,10 @@ protocol layers needed by VoHive:
 - carrier presets and JSON carrier overrides, including AT&T TS.43/E911
   configuration for native `310/280` and `310/410` profiles
 - TS.43-style E911 entitlement bootstrap, JSON/XML response parsing for common
-  emergency address, PDN/APN/realm, endpoint, and location validation status
-  variants, token/websheet handling, RAND/AUTN challenge response through the
-  AKA provider, and EAP-AKA/AKA' relay packet response generation with
+  emergency address, PDN/APN/realm, service URN/route, endpoint, expiry/cache,
+  and location validation status variants, public entitlement parsing helpers,
+  token/websheet handling, RAND/AUTN challenge response through the AKA
+  provider, and EAP-AKA/AKA' relay packet response generation with
   Any/FullAuth/Permanent Identity selection, KDF negotiation, Notification ACK,
   and terminal Success/Failure handling, plus Client-Error handling for
   entitlement challenges
@@ -203,8 +204,9 @@ protocol layers needed by VoHive:
 - RTP stream quality helpers for per-SSRC packet/loss/duplicate/out-of-order,
   extended-sequence, and interarrival-jitter tracking, plus RTCP Receiver
   Report block generation from observed RTP streams, relay-side clear-RTP
-  reception snapshots, and generated Receiver Report send paths toward IMS or
-  client media legs
+  reception snapshots, SRTP plaintext observer integration for encrypted relay
+  streams, and generated Receiver Report send paths toward IMS or client media
+  legs
 - RTP telephone-event DTMF helpers for RFC 4733-style packet construction,
   RFC 4733-style packet-train generation with marker/sequence/timestamp/end
   repetition semantics, SDP dynamic payload discovery, relay-side event

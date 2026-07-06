@@ -168,6 +168,39 @@ func TestNewIKEMOBIKEHandlerRejectsUnacceptableAddresses(t *testing.T) {
 	}
 }
 
+func TestNewIKEMOBIKEHandlerAdvancesMessageIDAfterRejectedResponse(t *testing.T) {
+	init := ikeControlInit(t)
+	control := &ikeMOBIKETransport{
+		t:                t,
+		init:             init,
+		keys:             init.Keys,
+		messageIDs:       []uint32{10, 11},
+		responseNotifies: []uint16{ikev2.NotifyUnacceptableAddresses, 0},
+	}
+	handler, err := NewIKEMOBIKEHandler(IKEMOBIKEConfig{
+		Transport:     control,
+		Init:          init,
+		NextMessageID: 10,
+	})
+	if err != nil {
+		t.Fatalf("NewIKEMOBIKEHandler() error = %v", err)
+	}
+	_, err = handler(context.Background(), MOBIKERequest{NewIP: "192.0.2.30"})
+	if !errors.Is(err, ErrMOBIKEUpdateRejected) {
+		t.Fatalf("handler(first) err=%v, want ErrMOBIKEUpdateRejected", err)
+	}
+	res, err := handler(context.Background(), MOBIKERequest{NewIP: "192.0.2.31"})
+	if err != nil {
+		t.Fatalf("handler(second) error = %v", err)
+	}
+	if control.requests != 2 {
+		t.Fatalf("requests=%d, want 2", control.requests)
+	}
+	if res.OuterLocalIP != "192.0.2.31" || !res.IKEEstablished || !res.IPsecEstablished {
+		t.Fatalf("res=%+v", res)
+	}
+}
+
 func TestPacketSessionMOBIKEHandlerUpdatesResult(t *testing.T) {
 	session, err := NewPacketSession(PacketSessionConfig{
 		ChildSA:   packetChildSA(true),
@@ -260,6 +293,7 @@ type ikeMOBIKETransport struct {
 	messageID         uint32
 	messageIDs        []uint32
 	responseNotify    uint16
+	responseNotifies  []uint16
 	requests          int
 	sawUpdate         bool
 	sawNATSource      bool
@@ -270,9 +304,10 @@ type ikeMOBIKETransport struct {
 
 func (tr *ikeMOBIKETransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
 	tr.t.Helper()
+	requestIndex := tr.requests
 	messageID := tr.messageID
-	if len(tr.messageIDs) > tr.requests {
-		messageID = tr.messageIDs[tr.requests]
+	if len(tr.messageIDs) > requestIndex {
+		messageID = tr.messageIDs[requestIndex]
 	}
 	_, inner, err := ikev2.ParseInformationalRequest(request, tr.init, tr.keys, messageID)
 	if err != nil {
@@ -310,8 +345,12 @@ func (tr *ikeMOBIKETransport) ExchangeIKE(ctx context.Context, request []byte) (
 		}
 	}
 	var responseInner []ikev2.Payload
-	if tr.responseNotify != 0 {
-		responseInner = append(responseInner, ikev2.NotifyWithZeroSPI(tr.responseNotify, nil))
+	responseNotify := tr.responseNotify
+	if len(tr.responseNotifies) > requestIndex {
+		responseNotify = tr.responseNotifies[requestIndex]
+	}
+	if responseNotify != 0 {
+		responseInner = append(responseInner, ikev2.NotifyWithZeroSPI(responseNotify, nil))
 	}
 	_, raw, err := ikev2.BuildInformationalResponse(
 		tr.init,

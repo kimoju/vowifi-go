@@ -436,6 +436,24 @@ func (s *RTPRelaySession) IMSToClientRTPStreamStats() []RTPStreamStats {
 	return s.imsToClientRTPStats.Stats()
 }
 
+func (s *RTPRelaySession) RTPPlaintextHandler() RTPPlaintextHandler {
+	if s == nil {
+		return nil
+	}
+	return s.ObserveRTPPlaintext
+}
+
+func (s *RTPRelaySession) ObserveRTPPlaintext(event RTPPlaintextEvent) {
+	if s == nil {
+		return
+	}
+	clockRate := s.clientRTPClockRate
+	if event.Direction == RTPDTMFIMSToClient {
+		clockRate = s.imsRTPClockRate
+	}
+	s.observeRTPStream(event.Direction, event.Packet, time.Now(), clockRate)
+}
+
 func (s *RTPRelaySession) Close() error {
 	if s == nil {
 		return nil
