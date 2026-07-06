@@ -192,7 +192,9 @@ protocol layers needed by VoHive:
 - RTCP feedback inspection for RTP/SRTP relay paths, including Sender/Receiver
   Reports, PLI/FIR/rapid resynchronization requests, NACK, REMB, transport-wide
   congestion control, SLI, XR, SDES, BYE, application-defined packets,
-  clear-relay counters, and SRTP plaintext-stage event callbacks
+  clear-relay counters, generated RTCP packet send paths toward IMS or client
+  media legs, and SRTP plaintext-stage event callbacks plus generated SRTCP
+  protection during media transforms
 - RTP telephone-event DTMF helpers for RFC 4733-style packet construction,
   RFC 4733-style packet-train generation with marker/sequence/timestamp/end
   repetition semantics, SDP dynamic payload discovery, relay-side event

@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pion/rtcp"
 )
 
 var ErrRTPRelayConfig = errors.New("invalid rtp relay config")
@@ -34,12 +36,14 @@ type RTPRelayConfig struct {
 type RTPRelayTransform func([]byte) ([]byte, error)
 
 type RTPRelayTransforms struct {
-	ClientToIMSRTP       RTPRelayTransform
-	IMSToClientRTP       RTPRelayTransform
-	ClientToIMSRTCP      RTPRelayTransform
-	IMSToClientRTCP      RTPRelayTransform
-	GeneratedToIMSRTP    RTPRelayTransform
-	GeneratedToClientRTP RTPRelayTransform
+	ClientToIMSRTP        RTPRelayTransform
+	IMSToClientRTP        RTPRelayTransform
+	ClientToIMSRTCP       RTPRelayTransform
+	IMSToClientRTCP       RTPRelayTransform
+	GeneratedToIMSRTP     RTPRelayTransform
+	GeneratedToClientRTP  RTPRelayTransform
+	GeneratedToIMSRTCP    RTPRelayTransform
+	GeneratedToClientRTCP RTPRelayTransform
 }
 
 type RTPRelayDTMFRequest struct {
@@ -66,6 +70,17 @@ type RTPRelayDTMFResult struct {
 	SSRC           uint32
 	Signal         string
 	DurationMS     int
+}
+
+type RTPRelayRTCPRequest struct {
+	Direction RTCPFeedbackDirection
+	Packets   []rtcp.Packet
+}
+
+type RTPRelayRTCPResult struct {
+	Datagrams int
+	Bytes     int
+	Feedback  RTCPFeedbackSummary
 }
 
 type RTPRelayStats struct {
@@ -514,6 +529,73 @@ func (s *RTPRelaySession) SendRTPDTMF(ctx context.Context, req RTPRelayDTMFReque
 	return result, nil
 }
 
+func (s *RTPRelaySession) SendRTCPToIMS(ctx context.Context, packets ...rtcp.Packet) (RTPRelayRTCPResult, error) {
+	return s.SendRTCP(ctx, RTPRelayRTCPRequest{Direction: RTCPFeedbackClientToIMS, Packets: packets})
+}
+
+func (s *RTPRelaySession) SendRTCPToClient(ctx context.Context, packets ...rtcp.Packet) (RTPRelayRTCPResult, error) {
+	return s.SendRTCP(ctx, RTPRelayRTCPRequest{Direction: RTCPFeedbackIMSToClient, Packets: packets})
+}
+
+func (s *RTPRelaySession) SendRTCP(ctx context.Context, req RTPRelayRTCPRequest) (RTPRelayRTCPResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s == nil {
+		return RTPRelayRTCPResult{}, ErrRTPRelayConfig
+	}
+	direction, err := normalizeRTCPFeedbackDirection(req.Direction)
+	if err != nil {
+		return RTPRelayRTCPResult{}, err
+	}
+	if len(req.Packets) == 0 {
+		return RTPRelayRTCPResult{}, fmt.Errorf("%w: RTCP packet list is empty", ErrRTPRelayConfig)
+	}
+	route, err := s.rtcpSendRoute(direction)
+	if err != nil {
+		return RTPRelayRTCPResult{}, err
+	}
+	if route.target == nil {
+		return RTPRelayRTCPResult{}, fmt.Errorf("%w: %s RTCP target unavailable", ErrRTPRelayConfig, route.label)
+	}
+	if route.conn == nil {
+		return RTPRelayRTCPResult{}, fmt.Errorf("%w: %s RTCP socket unavailable", ErrRTPRelayConfig, route.label)
+	}
+	select {
+	case <-ctx.Done():
+		return RTPRelayRTCPResult{}, ctx.Err()
+	default:
+	}
+	packet, err := rtcp.Marshal(req.Packets)
+	if err != nil {
+		route.drops.Add(1)
+		return RTPRelayRTCPResult{}, err
+	}
+	summary, err := InspectRTCPFeedback(direction, packet, s.rtcpFeedbackHandler)
+	if err != nil {
+		route.drops.Add(1)
+		s.rtcpFeedbackParseErrors.Add(1)
+		return RTPRelayRTCPResult{}, err
+	}
+	s.recordRTCPFeedbackSummary(summary)
+	out := packet
+	if route.transform != nil {
+		transformed, err := route.transform(packet)
+		if err != nil {
+			route.drops.Add(1)
+			return RTPRelayRTCPResult{Feedback: summary}, err
+		}
+		out = transformed
+	}
+	if _, err := route.conn.WriteToUDP(out, route.target); err != nil {
+		route.drops.Add(1)
+		return RTPRelayRTCPResult{Feedback: summary}, err
+	}
+	route.packets.Add(1)
+	route.bytes.Add(uint64(len(out)))
+	return RTPRelayRTCPResult{Datagrams: 1, Bytes: len(out), Feedback: summary}, nil
+}
+
 func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, allow func() bool, packets, bytes, drops *atomic.Uint64, transform RTPRelayTransform, rtcpDirection RTCPFeedbackDirection, dtmfDirection RTPDTMFDirection, dtmfPayloads, dtmfTargetPayloads func() map[uint8]int) {
 	defer s.wg.Done()
 	buf := make([]byte, s.bufferSize)
@@ -642,6 +724,16 @@ type rtpDTMFSendRoute struct {
 	drops     *atomic.Uint64
 }
 
+type rtcpSendRoute struct {
+	label     string
+	conn      *net.UDPConn
+	target    *net.UDPAddr
+	transform RTPRelayTransform
+	packets   *atomic.Uint64
+	bytes     *atomic.Uint64
+	drops     *atomic.Uint64
+}
+
 func (s *RTPRelaySession) rtpDTMFSendRoute(direction RTPDTMFDirection) (rtpDTMFSendRoute, error) {
 	if s == nil {
 		return rtpDTMFSendRoute{}, ErrRTPRelayConfig
@@ -673,6 +765,36 @@ func (s *RTPRelaySession) rtpDTMFSendRoute(direction RTPDTMFDirection) (rtpDTMFS
 		}, nil
 	default:
 		return rtpDTMFSendRoute{}, fmt.Errorf("%w: unsupported RTP DTMF direction %q", ErrInvalidDTMF, direction)
+	}
+}
+
+func (s *RTPRelaySession) rtcpSendRoute(direction RTCPFeedbackDirection) (rtcpSendRoute, error) {
+	if s == nil {
+		return rtcpSendRoute{}, ErrRTPRelayConfig
+	}
+	switch direction {
+	case RTCPFeedbackClientToIMS:
+		return rtcpSendRoute{
+			label:     "IMS",
+			conn:      s.imsRTCPConn,
+			target:    s.currentIMSRTCPTarget(),
+			transform: s.transforms.GeneratedToIMSRTCP,
+			packets:   &s.clientToIMSRTCPPackets,
+			bytes:     &s.clientToIMSRTCPBytes,
+			drops:     &s.clientToIMSRTCPDrops,
+		}, nil
+	case RTCPFeedbackIMSToClient:
+		return rtcpSendRoute{
+			label:     "client",
+			conn:      s.clientRTCPConn,
+			target:    s.currentClientRTCPTarget(),
+			transform: s.transforms.GeneratedToClientRTCP,
+			packets:   &s.imsToClientRTCPPackets,
+			bytes:     &s.imsToClientRTCPBytes,
+			drops:     &s.imsToClientRTCPDrops,
+		}, nil
+	default:
+		return rtcpSendRoute{}, fmt.Errorf("%w: unsupported RTCP feedback direction %q", ErrRTPRelayConfig, direction)
 	}
 }
 
@@ -725,6 +847,17 @@ func (s *RTPRelaySession) buildGeneratedRTPDTMFSequence(direction RTPDTMFDirecti
 	state.nextTimestamp = cfg.Timestamp + uint32(durationSamples)
 	state.ssrc = cfg.SSRC
 	return packets, cfg, nil
+}
+
+func normalizeRTCPFeedbackDirection(direction RTCPFeedbackDirection) (RTCPFeedbackDirection, error) {
+	switch direction {
+	case "", RTCPFeedbackClientToIMS:
+		return RTCPFeedbackClientToIMS, nil
+	case RTCPFeedbackIMSToClient:
+		return RTCPFeedbackIMSToClient, nil
+	default:
+		return "", fmt.Errorf("%w: unsupported RTCP feedback direction %q", ErrRTPRelayConfig, direction)
+	}
 }
 
 func normalizeRTPDTMFDirection(direction RTPDTMFDirection) (RTPDTMFDirection, error) {

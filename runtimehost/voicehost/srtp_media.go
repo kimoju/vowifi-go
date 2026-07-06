@@ -205,6 +205,12 @@ func (s *SRTPMediaSession) RelayTransformsWithMediaEvents(rtcpHandler RTCPFeedba
 		GeneratedToClientRTP: func(packet []byte) ([]byte, error) {
 			return s.ProtectClientRTP(packet)
 		},
+		GeneratedToIMSRTCP: func(packet []byte) ([]byte, error) {
+			return s.ProtectIMSRTCP(packet)
+		},
+		GeneratedToClientRTCP: func(packet []byte) ([]byte, error) {
+			return s.ProtectClientRTCP(packet)
+		},
 	}
 }
 
