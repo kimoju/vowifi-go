@@ -66,6 +66,20 @@ func TestSIPRetryAfterDelayParsesDeltaSeconds(t *testing.T) {
 	}
 }
 
+func TestParseSIPResponseRejectsInvalidStatusCode(t *testing.T) {
+	for _, status := range []string{"99", "700", "0200", "2xx"} {
+		_, err := ParseSIPResponse([]byte(strings.Join([]string{
+			"SIP/2.0 " + status + " Invalid",
+			"Content-Length: 0",
+			"",
+			"",
+		}, "\r\n")))
+		if !errors.Is(err, ErrInvalidSIPMessage) {
+			t.Fatalf("ParseSIPResponse(%s) error=%v, want ErrInvalidSIPMessage", status, err)
+		}
+	}
+}
+
 func TestParseSIPRequestAndBuildResponseWire(t *testing.T) {
 	raw := strings.Join([]string{
 		"INVITE sip:user@example SIP/2.0",
@@ -132,6 +146,26 @@ func TestParseSIPRequestAndBuildResponseWire(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("response wire missing %q in %q", want, text)
+		}
+	}
+}
+
+func TestBuildSIPResponseWireRejectsInvalidStatusCode(t *testing.T) {
+	req := SIPIncomingRequest{
+		Method: "OPTIONS",
+		URI:    "sip:user@example",
+		Headers: map[string][]string{
+			"Via":     {"SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-a"},
+			"To":      {"<sip:user@example>"},
+			"From":    {"<sip:caller@example>;tag=remote"},
+			"Call-ID": {"bad-status-builder"},
+			"CSeq":    {"1 OPTIONS"},
+		},
+	}
+	for _, status := range []int{99, 700} {
+		_, err := BuildSIPResponseWire(req, status, "Invalid", nil, nil)
+		if !errors.Is(err, ErrInvalidSIPMessage) {
+			t.Fatalf("BuildSIPResponseWire(%d) error=%v, want ErrInvalidSIPMessage", status, err)
 		}
 	}
 }

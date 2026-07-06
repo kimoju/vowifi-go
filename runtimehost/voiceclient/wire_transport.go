@@ -364,8 +364,12 @@ func ParseSIPResponse(raw []byte) (RegisterResponse, error) {
 	if len(parts) < 2 || !strings.EqualFold(parts[0], "SIP/2.0") {
 		return RegisterResponse{}, fmt.Errorf("%w: invalid status line", ErrInvalidSIPMessage)
 	}
-	code, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err != nil {
+	statusToken := strings.TrimSpace(parts[1])
+	if !validSIPStatusToken(statusToken) {
+		return RegisterResponse{}, fmt.Errorf("%w: invalid status code", ErrInvalidSIPMessage)
+	}
+	code, _ := strconv.Atoi(statusToken)
+	if !validSIPStatusCode(code) {
 		return RegisterResponse{}, fmt.Errorf("%w: invalid status code", ErrInvalidSIPMessage)
 	}
 	reason := ""
@@ -443,6 +447,22 @@ parse:
 		return 0, false
 	}
 	return time.Duration(seconds) * time.Second, true
+}
+
+func validSIPStatusCode(code int) bool {
+	return code >= 100 && code <= 699
+}
+
+func validSIPStatusToken(token string) bool {
+	if len(token) != 3 {
+		return false
+	}
+	for _, r := range token {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func sipResponseMatchesRequest(resp RegisterResponse, req SIPRequestMessage) bool {
@@ -561,7 +581,7 @@ func ParseSIPRequest(raw []byte) (SIPIncomingRequest, error) {
 }
 
 func BuildSIPResponseWire(req SIPIncomingRequest, statusCode int, reason string, headers map[string]string, body []byte) ([]byte, error) {
-	if statusCode <= 0 {
+	if !validSIPStatusCode(statusCode) {
 		return nil, fmt.Errorf("%w: invalid response status", ErrInvalidSIPMessage)
 	}
 	reason = strings.TrimSpace(reason)
