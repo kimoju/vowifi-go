@@ -1328,6 +1328,10 @@ func normalizeEmergencyServiceURN(s string) string {
 		return "urn:service:sos.physician"
 	case "poison":
 		return "urn:service:sos.poison"
+	case "ecall", "manual-ecall", "ecall-manual":
+		return "urn:service:sos.ecall.manual"
+	case "automatic-ecall", "ecall-automatic":
+		return "urn:service:sos.ecall.automatic"
 	default:
 		return ""
 	}

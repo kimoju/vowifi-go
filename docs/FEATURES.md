@@ -39,6 +39,8 @@ protocol layers needed by VoHive:
 - TS.43-style E911 entitlement bootstrap, JSON/XML response parsing for common
   emergency address, PDN/APN/realm, service URN/route, endpoint, expiry/cache,
   and location validation status variants, public entitlement parsing helpers,
+  emergency service-category URN mapping, IMS emergency SIP Request-URI,
+  `P-Access-Network-Info`, `Geolocation`, and MMTel service header helpers,
   token/websheet handling, RAND/AUTN challenge response through the AKA
   provider, and EAP-AKA/AKA' relay packet response generation with
   Any/FullAuth/Permanent Identity selection, KDF negotiation, Notification ACK,
