@@ -1468,6 +1468,13 @@ func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	if !strings.Contains(subscribe.Headers["Security-Verify"], "spi-c=111") {
 		t.Fatalf("subscribe Security-Verify=%q", subscribe.Headers["Security-Verify"])
 	}
+	defaultSubscribe, err := BuildSubscribeRequest(cfg, "refer", "", "", nil)
+	if err != nil {
+		t.Fatalf("BuildSubscribeRequest(default Expires) error = %v", err)
+	}
+	if defaultSubscribe.Headers["Expires"] != DefaultSubscribeExpires {
+		t.Fatalf("default SUBSCRIBE Expires=%q", defaultSubscribe.Headers["Expires"])
+	}
 	options, err := BuildOptionsRequest(cfg)
 	if err != nil {
 		t.Fatalf("BuildOptionsRequest() error = %v", err)

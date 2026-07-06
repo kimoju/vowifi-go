@@ -10,9 +10,10 @@ import (
 var ErrInvalidDialogConfig = errors.New("invalid IMS dialog config")
 
 const (
-	imsMMTelService        = "urn:urn-7:3gpp-service.ims.icsi.mmtel"
-	imsMMTelContactFeature = `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
-	imsMMTelAcceptContact  = "*;" + imsMMTelContactFeature
+	imsMMTelService         = "urn:urn-7:3gpp-service.ims.icsi.mmtel"
+	imsMMTelContactFeature  = `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
+	imsMMTelAcceptContact   = "*;" + imsMMTelContactFeature
+	DefaultSubscribeExpires = "3600"
 )
 
 type SIPRequestMessage struct {
@@ -222,9 +223,10 @@ func BuildSubscribeRequest(cfg DialogRequestConfig, event, expires, contentType 
 	msg.Headers["Event"] = event
 	msg.Headers["Accept"] = "message/sipfrag"
 	msg.Headers["Allow-Events"] = "refer"
-	if expires = strings.TrimSpace(expires); expires != "" {
-		msg.Headers["Expires"] = expires
+	if expires = strings.TrimSpace(expires); expires == "" {
+		expires = DefaultSubscribeExpires
 	}
+	msg.Headers["Expires"] = expires
 	if len(body) > 0 {
 		msg.Headers["Content-Type"] = firstNonEmpty(contentType, "application/octet-stream")
 	}

@@ -947,6 +947,50 @@ func TestIMSOutboundAgentRetriesDialogSubscribeMinExpires(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentSendsDefaultDialogSubscribeExpires(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact": {"<sip:carrier@198.51.100.1:5060>"},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 202,
+			Reason:     "Accepted",
+			Headers:    map[string][]string{"Expires": {voiceclient.DefaultSubscribeExpires}},
+		},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-subscribe-default-expires",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	result, err := agent.SendDialogSubscribe(context.Background(), DialogSubscribeRequest{
+		CallID: "call-subscribe-default-expires",
+		Event:  "refer",
+	})
+	if err != nil || !result.Accepted || result.Headers["Expires"] != voiceclient.DefaultSubscribeExpires {
+		t.Fatalf("SendDialogSubscribe() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "SUBSCRIBE" || transport.requests[1].Headers["Expires"] != voiceclient.DefaultSubscribeExpires {
+		t.Fatalf("SUBSCRIBE requests=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentFollowsSupplementaryDialogRedirectContacts(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
