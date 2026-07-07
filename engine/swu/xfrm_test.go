@@ -188,6 +188,23 @@ func TestBuildKernelXFRMCommandsDefaultsNATTraversalEncapsulation(t *testing.T) 
 	}
 }
 
+func TestBuildKernelXFRMCommandsSupportsIPv6AddressFamilies(t *testing.T) {
+	commands, err := buildKernelXFRMCommands(KernelXFRMConfig{
+		ChildSA:           xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128),
+		OuterLocalIP:      "2001:db8:1::23",
+		OuterRemoteIP:     "2001:db8:2::7",
+		InnerLocalPrefix:  "2001:db8:10::2/128",
+		InnerRemotePrefix: "2001:db8:20::/64",
+	})
+	if err != nil {
+		t.Fatalf("buildKernelXFRMCommands() error = %v", err)
+	}
+	want := []string{"xfrm", "policy", "add", "src", "2001:db8:10::2/128", "dst", "2001:db8:20::/64", "dir", "out"}
+	if got := commands[2].args[:len(want)]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("out policy prefix args=%v, want %v", got, want)
+	}
+}
+
 func TestKernelXFRMConfigFromIKENegotiation(t *testing.T) {
 	child := xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128)
 	child.Configuration = &ikev2.Configuration{
@@ -293,6 +310,8 @@ func TestBuildKernelXFRMCommandsRejectsInvalidInput(t *testing.T) {
 		{name: "bad inner", cfg: withXFRM(base, func(c *KernelXFRMConfig) { c.InnerLocalPrefix = "bad" })},
 		{name: "bad reqid", cfg: withXFRM(base, func(c *KernelXFRMConfig) { c.ReqID = -1 })},
 		{name: "bad mark", cfg: withXFRM(base, func(c *KernelXFRMConfig) { c.Mark = "bad mark" })},
+		{name: "outer family mismatch", cfg: withXFRM(base, func(c *KernelXFRMConfig) { c.OuterRemoteIP = "2001:db8::7" })},
+		{name: "inner family mismatch", cfg: withXFRM(base, func(c *KernelXFRMConfig) { c.InnerRemotePrefix = "2001:db8:20::/64" })},
 		{name: "bad local spi", cfg: withXFRM(base, func(c *KernelXFRMConfig) { c.ChildSA.LocalSPI = []byte{1, 2} })},
 		{name: "bad encryption", cfg: withXFRM(base, func(c *KernelXFRMConfig) { c.ChildSA.Keys.Profile.EncryptionID = 0xffff })},
 		{name: "bad gcm key shape", cfg: withXFRM(base, func(c *KernelXFRMConfig) { c.ChildSA.Keys.Profile.EncryptionID = ikev2.ENCR_AES_GCM_16 })},

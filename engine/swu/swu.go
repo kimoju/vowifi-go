@@ -56,7 +56,7 @@ type TunnelConfig struct {
 }
 
 func (c TunnelConfig) NormalizedMode() string {
-	mode := strings.TrimSpace(c.Mode)
+	mode := strings.ToLower(strings.TrimSpace(c.Mode))
 	if mode == "" {
 		return DataplaneModeUserspace
 	}
@@ -67,8 +67,12 @@ func (c TunnelConfig) Validate() error {
 	if strings.TrimSpace(c.DeviceID) == "" {
 		return fmt.Errorf("%w: device_id is empty", ErrInvalidTunnelConfig)
 	}
-	if c.NormalizedMode() == DataplaneModeDisabled {
+	switch mode := c.NormalizedMode(); mode {
+	case DataplaneModeDisabled:
 		return nil
+	case DataplaneModeUserspace, DataplaneModeKernel:
+	default:
+		return fmt.Errorf("%w: unsupported dataplane mode %q", ErrInvalidTunnelConfig, mode)
 	}
 	if strings.TrimSpace(c.EPDGAddress) == "" && (strings.TrimSpace(c.MCC) == "" || strings.TrimSpace(c.MNC) == "") {
 		return fmt.Errorf("%w: ePDG address or MCC/MNC is required", ErrInvalidTunnelConfig)

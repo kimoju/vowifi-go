@@ -29,6 +29,33 @@ func TestTunnelConfigValidateAllowsCarrierDerivedEPDG(t *testing.T) {
 	}
 }
 
+func TestTunnelConfigValidateAllowsKernelMode(t *testing.T) {
+	cfg := TunnelConfig{
+		DeviceID:    "dev-1",
+		Mode:        " Kernel ",
+		EPDGAddress: "epdg.example",
+		IMSI:        "310280233641503",
+	}
+	if got := cfg.NormalizedMode(); got != DataplaneModeKernel {
+		t.Fatalf("NormalizedMode()=%q, want %q", got, DataplaneModeKernel)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestTunnelConfigValidateRejectsUnknownDataplaneMode(t *testing.T) {
+	err := (TunnelConfig{
+		DeviceID:    "dev-1",
+		Mode:        "wireguard",
+		EPDGAddress: "epdg.example",
+		IMSI:        "310280233641503",
+	}).Validate()
+	if !errors.Is(err, ErrInvalidTunnelConfig) {
+		t.Fatalf("Validate() err=%v, want ErrInvalidTunnelConfig", err)
+	}
+}
+
 func TestTunnelConfigValidateRejectsMissingIdentity(t *testing.T) {
 	err := (TunnelConfig{
 		DeviceID:    "dev-1",

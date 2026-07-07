@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/bits"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -256,6 +257,9 @@ func normalizeKernelXFRMConfig(cfg KernelXFRMConfig) (kernelXFRMParams, error) {
 	if err != nil {
 		return kernelXFRMParams{}, wrapXFRMError(err)
 	}
+	if err := validateKernelXFRMFamilies(outerLocal, outerRemote, innerLocal, innerRemote); err != nil {
+		return kernelXFRMParams{}, err
+	}
 	if err := validateChildSAForXFRM(cfg.ChildSA); err != nil {
 		return kernelXFRMParams{}, err
 	}
@@ -380,6 +384,48 @@ func validateChildSAForXFRM(child ikev2.ChildSAResult) error {
 		return fmt.Errorf("%w: unsupported ESP encryption %d", ErrInvalidXFRMConfig, child.Keys.Profile.EncryptionID)
 	}
 	return nil
+}
+
+func validateKernelXFRMFamilies(outerLocal, outerRemote, innerLocal, innerRemote string) error {
+	outerLocalIs4, err := xfrmAddressIs4(outerLocal)
+	if err != nil {
+		return wrapXFRMError(err)
+	}
+	outerRemoteIs4, err := xfrmAddressIs4(outerRemote)
+	if err != nil {
+		return wrapXFRMError(err)
+	}
+	if outerLocalIs4 != outerRemoteIs4 {
+		return fmt.Errorf("%w: outer local and remote address families differ", ErrInvalidXFRMConfig)
+	}
+	innerLocalIs4, err := xfrmPrefixIs4(innerLocal)
+	if err != nil {
+		return wrapXFRMError(err)
+	}
+	innerRemoteIs4, err := xfrmPrefixIs4(innerRemote)
+	if err != nil {
+		return wrapXFRMError(err)
+	}
+	if innerLocalIs4 != innerRemoteIs4 {
+		return fmt.Errorf("%w: inner local and remote prefix families differ", ErrInvalidXFRMConfig)
+	}
+	return nil
+}
+
+func xfrmAddressIs4(value string) (bool, error) {
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return false, fmt.Errorf("%w: invalid xfrm address %q", ErrInvalidXFRMConfig, value)
+	}
+	return addr.Is4(), nil
+}
+
+func xfrmPrefixIs4(value string) (bool, error) {
+	prefix, err := netip.ParsePrefix(value)
+	if err != nil {
+		return false, fmt.Errorf("%w: invalid xfrm prefix %q", ErrInvalidXFRMConfig, value)
+	}
+	return prefix.Addr().Is4(), nil
 }
 
 func validateXFRMCBCKeys(profile ikev2.ESPKeyProfile, keys ikev2.ESPKeys, direction string) error {
