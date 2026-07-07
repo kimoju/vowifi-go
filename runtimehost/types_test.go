@@ -2128,11 +2128,15 @@ func TestTriggerMOBIKEDelegatesToTunnel(t *testing.T) {
 		t.Fatalf("events=%d, want ready/pending/complete", len(dispatch.events))
 	}
 	pending, ok := dispatch.events[1].(eventhost.RuntimeStateSnapshot)
-	if !ok || pending.LastReason != "mobike pending 198.51.100.1 -> 198.51.100.2" {
+	if !ok || !strings.Contains(pending.LastReason, "mobike pending") ||
+		strings.Contains(pending.LastReason, "198.51.100.1") ||
+		strings.Contains(pending.LastReason, "198.51.100.2") {
 		t.Fatalf("pending event=%+v ok=%t", dispatch.events[1], ok)
 	}
 	complete, ok := dispatch.events[2].(eventhost.RuntimeStateSnapshot)
-	if !ok || complete.LastReason != wantReason {
+	if !ok || !strings.Contains(complete.LastReason, "mobike rekeyed") ||
+		strings.Contains(complete.LastReason, "198.51.100.1") ||
+		strings.Contains(complete.LastReason, "198.51.100.2") {
 		t.Fatalf("complete event=%+v ok=%t", dispatch.events[2], ok)
 	}
 }
@@ -2166,7 +2170,10 @@ func TestTriggerMOBIKERecordsFailedRuntimeState(t *testing.T) {
 		t.Fatalf("events=%d, want ready/pending/failed", len(dispatch.events))
 	}
 	failed, ok := dispatch.events[2].(eventhost.RuntimeStateSnapshot)
-	if !ok || failed.LastReason != wantReason {
+	if !ok || !strings.Contains(failed.LastReason, "mobike failed") ||
+		!strings.Contains(failed.LastReason, "update timeout") ||
+		strings.Contains(failed.LastReason, "198.51.100.10") ||
+		strings.Contains(failed.LastReason, "198.51.100.20") {
 		t.Fatalf("failed event=%+v ok=%t", dispatch.events[2], ok)
 	}
 }

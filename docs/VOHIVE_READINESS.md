@@ -9,6 +9,9 @@ be treated as usable inside VoHive beyond compile-time compatibility tests.
 The repository currently has local CI, GitHub Actions CI, module-path hygiene
 checks, and a compatibility script that can rewrite an older VoHive consumer in
 a temporary checkout and run a focused test set against this module.
+The VoHive-facing runtime state also has a redacted diagnostic view for logs,
+UI state, and event snapshots so common subscriber identifiers, AKA/digest
+material, IPs, MACs, and local paths are not exposed by default.
 
 That proves an important baseline: VoHive can resolve and compile against this
 module in the covered package set, and the loopback/unit tests exercise many
@@ -116,7 +119,9 @@ Done means:
 - Long-running maintenance tasks have cancellation, timeout, and cleanup
   behavior that VoHive can control.
 - Logs and structured state expose enough detail for user support without
-  leaking identities, nonces, keys, or local machine details.
+  leaking identities, nonces, keys, or local machine details. A redacted
+  runtime diagnostic state is in place; the remaining work is to ensure every
+  VoHive-facing call site uses it consistently.
 
 ## P1: Required Before Broad VoHive Use
 
@@ -201,7 +206,7 @@ These items are needed before any production-readiness claim.
 Done means:
 
 - Nonces, keys, IMS identities, SIM material, APDU payloads, and local paths are
-  redacted from logs and fixtures by default.
+  redacted from logs, runtime diagnostic state, and fixtures by default.
 - XFRM, TUN, route, and command execution boundaries are privilege-minimized and
   rollback-safe.
 - Long-running goroutines, sockets, file descriptors, TUN devices, routes, and

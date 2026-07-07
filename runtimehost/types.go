@@ -1797,6 +1797,15 @@ func (i *Instance) State() State {
 	return i.state
 }
 
+func (i *Instance) DiagnosticState() DiagnosticState {
+	if i == nil {
+		return DiagnosticState{}
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return SafeDiagnosticState(i.state)
+}
+
 func (i *Instance) SetNotifier(fn func(string)) {
 	if i == nil {
 		return
@@ -1902,16 +1911,18 @@ func (i *Instance) Obs() map[string]interface{} {
 	}
 	i.mu.RLock()
 	defer i.mu.RUnlock()
+	state := SafeDiagnosticState(i.state)
 	return map[string]interface{}{
-		"device_id":                    i.state.DeviceID,
-		"phase":                        string(i.state.Phase),
-		"sms_ready":                    i.state.SMSReady,
-		"ims_ready":                    i.state.IMSReady,
-		"ims_recovery_pending":         i.state.IMSRecoveryPending,
-		"ims_recovery_retry_after":     i.state.IMSRecoveryRetryAfter,
-		"ims_recovery_next_attempt_at": i.state.IMSRecoveryNextAttemptAt,
-		"ims_recovery_reason":          i.state.IMSRecoveryReason,
-		"updated":                      i.state.UpdatedAt,
+		"device_id":                    state.DeviceID,
+		"phase":                        string(state.Phase),
+		"sms_ready":                    state.SMSReady,
+		"ims_ready":                    state.IMSReady,
+		"ims_recovery_pending":         state.IMSRecoveryPending,
+		"ims_recovery_retry_after":     state.IMSRecoveryRetryAfter,
+		"ims_recovery_next_attempt_at": state.IMSRecoveryNextAttemptAt,
+		"ims_recovery_reason":          state.IMSRecoveryReason,
+		"updated":                      state.UpdatedAt,
+		"redacted":                     state.Redacted,
 	}
 }
 
@@ -1927,26 +1938,27 @@ func (i *Instance) dispatchRuntimeState(ctx context.Context) {
 }
 
 func runtimeStateSnapshot(state State) eventhost.RuntimeStateSnapshot {
+	diagnostic := SafeDiagnosticState(state)
 	return eventhost.RuntimeStateSnapshot{
-		DevID:                    state.DeviceID,
-		Phase:                    string(state.Phase),
-		DataplaneMode:            state.DataplaneMode,
-		SIMReady:                 state.SIMReady,
-		AccessReady:              state.AccessReady,
-		TunnelReady:              state.TunnelReady,
-		IMSReady:                 state.IMSReady,
-		SMSReady:                 state.SMSReady,
-		RegStatus:                state.RegStatus,
-		RegStatusText:            state.RegStatusText,
-		NetworkMode:              state.NetworkMode,
-		LastErrorClass:           state.LastErrorClass,
-		LastError:                state.LastError,
-		LastReason:               state.LastReason,
-		IMSRecoveryPending:       state.IMSRecoveryPending,
-		IMSRecoveryRetryAfter:    state.IMSRecoveryRetryAfter,
-		IMSRecoveryNextAttemptAt: state.IMSRecoveryNextAttemptAt,
-		IMSRecoveryReason:        state.IMSRecoveryReason,
-		Time:                     state.UpdatedAt,
+		DevID:                    diagnostic.DeviceID,
+		Phase:                    string(diagnostic.Phase),
+		DataplaneMode:            diagnostic.DataplaneMode,
+		SIMReady:                 diagnostic.SIMReady,
+		AccessReady:              diagnostic.AccessReady,
+		TunnelReady:              diagnostic.TunnelReady,
+		IMSReady:                 diagnostic.IMSReady,
+		SMSReady:                 diagnostic.SMSReady,
+		RegStatus:                diagnostic.RegStatus,
+		RegStatusText:            diagnostic.RegStatusText,
+		NetworkMode:              diagnostic.NetworkMode,
+		LastErrorClass:           diagnostic.LastErrorClass,
+		LastError:                diagnostic.LastError,
+		LastReason:               diagnostic.LastReason,
+		IMSRecoveryPending:       diagnostic.IMSRecoveryPending,
+		IMSRecoveryRetryAfter:    diagnostic.IMSRecoveryRetryAfter,
+		IMSRecoveryNextAttemptAt: diagnostic.IMSRecoveryNextAttemptAt,
+		IMSRecoveryReason:        diagnostic.IMSRecoveryReason,
+		Time:                     diagnostic.UpdatedAt,
 	}
 }
 
