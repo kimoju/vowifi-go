@@ -296,6 +296,50 @@ func TestPrepareStartRecordsDeviceIDIMEIFallback(t *testing.T) {
 	}
 }
 
+func TestPrepareStartReadsIMEIFromAccess(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		Profile: Profile{IMSI: "001010123456789"},
+		Access:  imeiAccess{imei: "imei:356938035643809"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.Profile.IMEI != "356938035643809" || prepared.IdentityIMEISource != IMEISourceModem {
+		t.Fatalf("IMEI=%q source=%q, want modem IMEI", prepared.Profile.IMEI, prepared.IdentityIMEISource)
+	}
+	meta, ok := fallbackByField(prepared.Fallbacks, IdentityFieldIMEI)
+	if !ok {
+		t.Fatalf("Fallbacks=%#v, want IMEI fallback metadata", prepared.Fallbacks)
+	}
+	if meta.Field != IdentityFieldIMEI || meta.PrimarySource != IMEISourceProfile ||
+		meta.FallbackSource != IMEISourceModem || !meta.Used || meta.RecoveryClass != simtransport.RecoveryClassNone {
+		t.Fatalf("IMEI fallback metadata=%+v", meta)
+	}
+}
+
+func TestPrepareStartFallsBackToDeviceIDAfterAccessIMEIFailure(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		DeviceID: "quectel-imei-490154203237518-control",
+		Profile:  Profile{IMSI: "001010123456789"},
+		Access:   imeiAccess{err: context.DeadlineExceeded},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.Profile.IMEI != "490154203237518" || prepared.IdentityIMEISource != IMEISourceDeviceID {
+		t.Fatalf("IMEI=%q source=%q, want device fallback", prepared.Profile.IMEI, prepared.IdentityIMEISource)
+	}
+	meta, ok := fallbackByField(prepared.Fallbacks, IdentityFieldIMEI)
+	if !ok {
+		t.Fatalf("Fallbacks=%#v, want IMEI fallback metadata", prepared.Fallbacks)
+	}
+	if meta.Field != IdentityFieldIMEI || meta.PrimarySource != IMEISourceModem ||
+		meta.FallbackSource != IMEISourceDeviceID || !meta.Used || !meta.Recoverable ||
+		meta.RecoveryClass != simtransport.RecoveryClassControlPortHung {
+		t.Fatalf("IMEI fallback metadata=%+v", meta)
+	}
+}
+
 func TestPrepareStartClassifiesISIMReadFallback(t *testing.T) {
 	prepared, err := PrepareStart(PrepareStartInput{
 		Profile: Profile{IMSI: "001010123456789", IMEI: "490154203237518"},
@@ -354,6 +398,20 @@ type partialAccess struct {
 }
 
 func (a partialAccess) GetISIMIdentity() (Identity, error) { return a.id, nil }
+
+type imeiAccess struct {
+	imei string
+	err  error
+}
+
+func (a imeiAccess) GetISIMIdentity() (Identity, error) { return Identity{}, nil }
+
+func (a imeiAccess) GetIMEI() (string, error) {
+	if a.err != nil {
+		return "", a.err
+	}
+	return a.imei, nil
+}
 
 type failingAccess struct {
 	err error

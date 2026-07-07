@@ -103,7 +103,7 @@ func TestIMSUSSDTransportFollowsInviteRedirectContact(t *testing.T) {
 			Reason:     "Moved Temporarily",
 			Headers: map[string][]string{
 				"To":      {"<sip:*100%23@ims.example;user=dialstring>;tag=redirect-tag"},
-				"Contact": {"<sip:ussd-redirect@ims.example>"},
+				"Contact": {"<sip:ussd-expired@ims.example>;expires=0, <sip:ussd-low@ims.example>;q=0.2, <sip:ussd-redirect@ims.example>;q=0.8"},
 			},
 		},
 		{

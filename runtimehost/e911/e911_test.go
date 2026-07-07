@@ -412,6 +412,45 @@ func TestParseEntitlementResponsePreservesWebsheetUserDataAndLocationValidationC
 	}
 }
 
+func TestParseEntitlementResponseNormalizesLocationValidationStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{
+			name: "direct validated alias",
+			body: []byte(`{"status":1000,"validation-status":"APPROVED"}`),
+			want: "validated",
+		},
+		{
+			name: "nested pending alias",
+			body: []byte(`{"status":1000,"location-validation":{"result":"in progress"}}`),
+			want: "pending",
+		},
+		{
+			name: "xml invalid alias",
+			body: []byte(`<response><address-validation><state>not-valid</state></address-validation></response>`),
+			want: "invalid",
+		},
+		{
+			name: "unknown status preserved",
+			body: []byte(`{"status":1000,"location-validation-status":"carrier-review-needed"}`),
+			want: "carrier-review-needed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseEntitlementResponse(tc.body)
+			if err != nil {
+				t.Fatalf("ParseEntitlementResponse() error = %v", err)
+			}
+			if info.LocationValidationStatus != tc.want {
+				t.Fatalf("LocationValidationStatus=%q, want %q", info.LocationValidationStatus, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseEntitlementResponseCapturesRoutePDNAndCacheControlAliases(t *testing.T) {
 	body := []byte(`{
 		"status": 1000,

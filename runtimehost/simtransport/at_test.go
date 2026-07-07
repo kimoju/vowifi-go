@@ -326,6 +326,59 @@ func TestParseAPDUResultIgnoresATCommandEcho(t *testing.T) {
 	}
 }
 
+func TestExtractIMEIFromATResponses(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+		ok   bool
+	}{
+		{
+			name: "plain cgsn",
+			in:   "AT+CGSN\r\n\r\n490154203237518\r\n\r\nOK\r\n",
+			want: "490154203237518",
+			ok:   true,
+		},
+		{
+			name: "quoted cgsn",
+			in:   "\r\n+CGSN: \"356938035643809\"\r\n\r\nOK\r\n",
+			want: "356938035643809",
+			ok:   true,
+		},
+		{
+			name: "no imei",
+			in:   "\r\n+CGSN: \"serial\"\r\n\r\nOK\r\n",
+			ok:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ExtractIMEI(tt.in)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("ExtractIMEI() = %q,%t want %q,%t", got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+func TestAdapterReadIMEIFallsBackAcrossCommonCommands(t *testing.T) {
+	at := &fakeAT{responses: []string{
+		"\r\nERROR\r\n",
+		"\r\n+CGSN: \"356938035643809\"\r\n\r\nOK\r\n",
+	}}
+	imei, err := NewAdapter(at).ReadIMEI()
+	if err != nil {
+		t.Fatalf("ReadIMEI() error = %v", err)
+	}
+	if imei != "356938035643809" {
+		t.Fatalf("ReadIMEI() = %q", imei)
+	}
+	wantCalls := []string{"AT+CGSN", "AT+CGSN=1"}
+	if !reflect.DeepEqual(at.calls, wantCalls) {
+		t.Fatalf("AT calls=%+v want %+v", at.calls, wantCalls)
+	}
+}
+
 func TestParseATErrors(t *testing.T) {
 	tests := []struct {
 		name string

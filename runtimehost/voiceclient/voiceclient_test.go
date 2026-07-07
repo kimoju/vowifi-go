@@ -1275,6 +1275,46 @@ func TestRegisterSessionClassifiesRegisterFailures(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionFailureInfoCapturesDiagnosticHeaders(t *testing.T) {
+	resp := RegisterResponse{
+		StatusCode: 403,
+		Reason:     " Forbidden ",
+		RetryAfter: 13 * time.Second,
+		Headers: map[string][]string{
+			"Retry-After": {"9"},
+			"Warning": {
+				`399 pcscf.example "registration forbidden", 370 pcscf.example "ims barred"`,
+			},
+			"Reason": {`SIP;cause=403;text="Forbidden", Q.850;cause=21;text="call rejected"`},
+		},
+	}
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{resp}}
+	result, err := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-register-failure-info",
+	}.Register(context.Background())
+	if err == nil || !errors.Is(err, ErrRegistrationRejected) {
+		t.Fatalf("Register() result=%+v err=%v, want registration rejection", result, err)
+	}
+	assertRegistrationFailureInfo(t, result.FailureInfo, 403, "Forbidden", 13*time.Second,
+		[]string{
+			`399 pcscf.example "registration forbidden"`,
+			`370 pcscf.example "ims barred"`,
+		},
+		[]string{
+			`SIP;cause=403;text="Forbidden"`,
+			`Q.850;cause=21;text="call rejected"`,
+		},
+	)
+	resp.Headers["Warning"][0] = `399 changed "mutated"`
+	if result.FailureInfo.Warnings[0] != `399 pcscf.example "registration forbidden"` {
+		t.Fatalf("failure info kept header backing slice: warnings=%q", result.FailureInfo.Warnings)
+	}
+}
+
 func TestRegisterSessionFallsBackToSupportedDigestChallenge(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
@@ -1406,6 +1446,36 @@ func TestRegisterSessionDeregisterRetriesDigestChallenge(t *testing.T) {
 		!strings.Contains(second["Security-Verify"], "spi-c=701") {
 		t.Fatalf("second deregister headers=%+v", second)
 	}
+}
+
+func TestRegisterSessionDeregisterFailureInfoCapturesDiagnosticHeaders(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{{
+		StatusCode: 480,
+		Reason:     "Temporarily Unavailable",
+		Headers: map[string][]string{
+			"Retry-After": {"6"},
+			"Warning":     {`399 pcscf.example "deregister temporarily unavailable"`},
+			"Reason":      {`SIP;cause=480;text="Temporarily Unavailable"`},
+		},
+	}}}
+	session := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CallID:       "call-dereg-failure-info",
+	}
+	result, err := session.Deregister(context.Background(), DeregisterRequest{
+		Binding: RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060"},
+		CSeq:    9,
+	})
+	if err == nil || !errors.Is(err, ErrRegistrationRejected) {
+		t.Fatalf("Deregister() result=%+v err=%v, want registration rejection", result, err)
+	}
+	assertRegistrationFailureInfo(t, result.FailureInfo, 480, "Temporarily Unavailable", 6*time.Second,
+		[]string{`399 pcscf.example "deregister temporarily unavailable"`},
+		[]string{`SIP;cause=480;text="Temporarily Unavailable"`},
+	)
 }
 
 func TestRegisterSessionDeregisterHandlesAKASynchronizationFailure(t *testing.T) {
@@ -1997,7 +2067,11 @@ func TestRegisterSessionRefreshReturnsRetryAfter(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{{
 		StatusCode: 503,
 		Reason:     "Service Unavailable",
-		Headers:    map[string][]string{"Retry-After": {"4"}},
+		Headers: map[string][]string{
+			"Retry-After": {"4"},
+			"Warning":     {`399 pcscf.example "refresh throttled"`},
+			"Reason":      {`SIP;cause=503;text="Service Unavailable"`},
+		},
 	}}}
 	session := RegisterSession{
 		Transport:    transport,
@@ -2016,6 +2090,10 @@ func TestRegisterSessionRefreshReturnsRetryAfter(t *testing.T) {
 	if result.StatusCode != 503 || result.RetryAfter != 4*time.Second {
 		t.Fatalf("Refresh() result=%+v, want RetryAfter=4s", result)
 	}
+	assertRegistrationFailureInfo(t, result.FailureInfo, 503, "Service Unavailable", 4*time.Second,
+		[]string{`399 pcscf.example "refresh throttled"`},
+		[]string{`SIP;cause=503;text="Service Unavailable"`},
+	)
 }
 
 func TestSelectDigestChallengePrefersAKAv2(t *testing.T) {
@@ -3448,6 +3526,29 @@ func TestRegisterSessionRejectsFailedSecondRegister(t *testing.T) {
 	}
 	if result.Registered || result.StatusCode != 403 || result.Attempts != 2 {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func assertRegistrationFailureInfo(t *testing.T, info RegistrationFailureInfo, statusCode int, reason string, retryAfter time.Duration, warnings, reasons []string) {
+	t.Helper()
+	if info.StatusCode != statusCode || info.ReasonPhrase != reason || info.RetryAfter != retryAfter {
+		t.Fatalf("failure info=%+v, want status=%d reason=%q retryAfter=%v", info, statusCode, reason, retryAfter)
+	}
+	if len(info.Warnings) != len(warnings) {
+		t.Fatalf("warnings=%q, want %q", info.Warnings, warnings)
+	}
+	for i := range warnings {
+		if info.Warnings[i] != warnings[i] {
+			t.Fatalf("warning[%d]=%q, want %q", i, info.Warnings[i], warnings[i])
+		}
+	}
+	if len(info.Reasons) != len(reasons) {
+		t.Fatalf("reasons=%q, want %q", info.Reasons, reasons)
+	}
+	for i := range reasons {
+		if info.Reasons[i] != reasons[i] {
+			t.Fatalf("reason[%d]=%q, want %q", i, info.Reasons[i], reasons[i])
+		}
 	}
 }
 

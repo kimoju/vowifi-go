@@ -23,6 +23,7 @@ const (
 	IdentityFieldMNC = "mnc"
 
 	IMEISourceProfile     = "profile"
+	IMEISourceModem       = "modem"
 	IMEISourceDeviceID    = "device_id"
 	IMEISourceUnavailable = "unavailable"
 
@@ -119,23 +120,50 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 		profile.MNC = effectiveCfg.MNC
 	}
 	imeiSource := IMEISourceProfile
+	modemIMEIErr := error(nil)
+	if profile.IMEI == "" {
+		if imei, attempted, err := accessIMEI(in.Access); err == nil && imei != "" {
+			profile.IMEI = imei
+			imeiSource = IMEISourceModem
+			fallbacks = append(fallbacks, NewReadFallbackMetadata(
+				IdentityFieldIMEI,
+				IMEISourceProfile,
+				IMEISourceModem,
+				errors.New("profile IMEI is empty"),
+			))
+		} else if attempted {
+			modemIMEIErr = err
+		}
+	}
 	if profile.IMEI == "" {
 		if imei := ExtractIMEI(in.DeviceID); imei != "" {
 			profile.IMEI = imei
 			imeiSource = IMEISourceDeviceID
+			reason := errors.New("profile IMEI is empty")
+			primary := IMEISourceProfile
+			if modemIMEIErr != nil {
+				reason = fmt.Errorf("modem IMEI unavailable: %w", modemIMEIErr)
+				primary = IMEISourceModem
+			}
 			fallbacks = append(fallbacks, NewReadFallbackMetadata(
 				IdentityFieldIMEI,
-				IMEISourceProfile,
+				primary,
 				IMEISourceDeviceID,
-				errors.New("profile IMEI is empty"),
+				reason,
 			))
 		} else {
 			imeiSource = IMEISourceUnavailable
+			reason := errors.New("profile IMEI is empty and device ID fallback is unavailable")
+			primary := IMEISourceProfile
+			if modemIMEIErr != nil {
+				reason = fmt.Errorf("modem IMEI unavailable and device ID fallback is unavailable: %w", modemIMEIErr)
+				primary = IMEISourceModem
+			}
 			fallbacks = append(fallbacks, NewReadFallbackMetadata(
 				IdentityFieldIMEI,
-				IMEISourceProfile,
+				primary,
 				"",
-				errors.New("profile IMEI is empty and device ID fallback is unavailable"),
+				reason,
 			))
 		}
 	}
@@ -193,6 +221,24 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 		}
 	}
 	return prepared, nil
+}
+
+func accessIMEI(access interface{}) (string, bool, error) {
+	if access == nil {
+		return "", false, nil
+	}
+	reader, ok := access.(interface{ GetIMEI() (string, error) })
+	if !ok {
+		return "", false, nil
+	}
+	imei, err := reader.GetIMEI()
+	if err != nil {
+		return "", true, err
+	}
+	if imei = ExtractIMEI(imei); imei != "" {
+		return imei, true, nil
+	}
+	return "", true, errors.New("modem IMEI is empty or invalid")
 }
 
 func ExtractIMEI(value string) string {

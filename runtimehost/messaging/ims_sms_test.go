@@ -220,6 +220,28 @@ func TestIMSSMSTransportFollowsRedirectContact(t *testing.T) {
 	}
 }
 
+func TestIMSMessagingRedirectContactSelectionHonorsQAndExpires(t *testing.T) {
+	resp := voiceclient.SIPResponse{
+		StatusCode: 302,
+		Reason:     "Moved Temporarily",
+		Headers: map[string][]string{
+			"Contact": {
+				"<sip:expired@ims.example>;expires=0, <sip:low@ims.example>;q=0.1",
+				"<tel:+18005551212>;q=1, <sip:backup@ims.example>;q=0.4",
+				"<sips:preferred@ims.example>;q=0.9, <sip:low@ims.example>;q=0.2",
+			},
+		},
+	}
+
+	contacts := messagingRedirectContactURIs(resp.Headers)
+	if got, want := strings.Join(contacts, "|"), "sips:preferred@ims.example|sip:backup@ims.example|sip:low@ims.example"; got != want {
+		t.Fatalf("messagingRedirectContactURIs()=%q want %q", got, want)
+	}
+	if target := firstMessagingRedirectContactURI(resp); target != "sips:preferred@ims.example" {
+		t.Fatalf("firstMessagingRedirectContactURI()=%q", target)
+	}
+}
+
 func TestIMSMessagingResponseHandlingClassifiesRedirectAndAuth(t *testing.T) {
 	redirect := imsMessagingResponseHandlingFor(voiceclient.SIPResponse{
 		StatusCode: 302,

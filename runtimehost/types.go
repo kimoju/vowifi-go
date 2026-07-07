@@ -113,7 +113,10 @@ type CRSMAccess interface {
 	ReadCRSMRecord(fileID uint16, record, length int, pathID string) (simtransport.CRSMResult, error)
 }
 
-const SIMAccessRecoveryOperationISIMIdentity = "isim_identity"
+const (
+	SIMAccessRecoveryOperationISIMIdentity = "isim_identity"
+	SIMAccessRecoveryOperationIMEI         = "imei"
+)
 
 type SIMAccessRecoveryRequest struct {
 	Operation          string
@@ -148,6 +151,51 @@ func (a *modemAccessAdapter) RuntimeModem() Modem {
 		return nil
 	}
 	return a.modem
+}
+
+func (a *modemAccessAdapter) GetIMEI() (string, error) {
+	imei, err := a.getIMEIOnce()
+	if err == nil {
+		return imei, nil
+	}
+	req, ok := newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationIMEI, 1, err)
+	if !ok {
+		return "", err
+	}
+	hook, ok := a.modem.(SIMAccessRecoveryHook)
+	if !ok {
+		return "", err
+	}
+	if recoveryErr := hook.RecoverSIMAccess(req); recoveryErr != nil {
+		return "", errors.Join(err, fmt.Errorf("SIM access recovery: %w", recoveryErr))
+	}
+	imei, retryErr := a.getIMEIOnce()
+	if retryErr == nil {
+		return imei, nil
+	}
+	return "", errors.Join(err, fmt.Errorf("SIM access recovery retry: %w", retryErr))
+}
+
+func (a *modemAccessAdapter) getIMEIOnce() (string, error) {
+	if a == nil || a.modem == nil {
+		return "", errors.New("modem is nil")
+	}
+	if r, ok := a.modem.(interface{ GetIMEI() (string, error) }); ok {
+		imei, err := r.GetIMEI()
+		if err != nil {
+			return "", err
+		}
+		if imei = identity.ExtractIMEI(imei); imei != "" {
+			return imei, nil
+		}
+		return "", errors.New("modem IMEI is empty or invalid")
+	}
+	if at, ok := a.modem.(interface {
+		ExecuteATSilent(cmd string, timeout time.Duration) (string, error)
+	}); ok {
+		return simtransport.NewAdapter(at).ReadIMEI()
+	}
+	return "", errors.New("modem does not expose IMEI")
 }
 
 func (a *modemAccessAdapter) GetISIMIdentity() (identity.Identity, error) {

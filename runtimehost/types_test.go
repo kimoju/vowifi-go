@@ -150,6 +150,27 @@ func (m *runtimeATCRSMModem) ExecuteATSilent(cmd string, timeout time.Duration) 
 	return resp, nil
 }
 
+type runtimeRecoveringIMEIATModem struct {
+	testModem
+	recovered bool
+	calls     []string
+	requests  []SIMAccessRecoveryRequest
+}
+
+func (m *runtimeRecoveringIMEIATModem) ExecuteATSilent(cmd string, timeout time.Duration) (string, error) {
+	m.calls = append(m.calls, cmd)
+	if !m.recovered {
+		return "", context.DeadlineExceeded
+	}
+	return "\r\n490154203237518\r\n\r\nOK\r\n", nil
+}
+
+func (m *runtimeRecoveringIMEIATModem) RecoverSIMAccess(req SIMAccessRecoveryRequest) error {
+	m.requests = append(m.requests, req)
+	m.recovered = true
+	return nil
+}
+
 func TestModemAccessAdapterReadsISIMIdentity(t *testing.T) {
 	direct := identity.Identity{
 		IMPI:   "001010123456789@private.example.test",
@@ -246,6 +267,52 @@ func TestModemAccessAdapterFallsBackToATCRSM(t *testing.T) {
 	}
 	if len(at.calls) < 3 || !strings.HasPrefix(at.calls[0], "AT+CRSM=176,28418") {
 		t.Fatalf("AT calls=%+v", at.calls)
+	}
+}
+
+func TestModemAccessAdapterReadsIMEIFromAT(t *testing.T) {
+	at := &runtimeATCRSMModem{responses: []string{
+		"\r\n+CGSN: \"356938035643809\"\r\n\r\nOK\r\n",
+	}}
+	reader, ok := NewModemAccessAdapter(at).(interface{ GetIMEI() (string, error) })
+	if !ok {
+		t.Fatal("modem access adapter does not expose GetIMEI")
+	}
+	imei, err := reader.GetIMEI()
+	if err != nil {
+		t.Fatalf("GetIMEI() error = %v", err)
+	}
+	if imei != "356938035643809" {
+		t.Fatalf("GetIMEI() = %q", imei)
+	}
+	if len(at.calls) != 1 || at.calls[0] != "AT+CGSN" {
+		t.Fatalf("AT calls=%+v", at.calls)
+	}
+}
+
+func TestModemAccessAdapterRecoversIMEIRead(t *testing.T) {
+	modem := &runtimeRecoveringIMEIATModem{}
+	reader, ok := NewModemAccessAdapter(modem).(interface{ GetIMEI() (string, error) })
+	if !ok {
+		t.Fatal("modem access adapter does not expose GetIMEI")
+	}
+	imei, err := reader.GetIMEI()
+	if err != nil {
+		t.Fatalf("GetIMEI() error = %v", err)
+	}
+	if imei != "490154203237518" {
+		t.Fatalf("GetIMEI() = %q", imei)
+	}
+	if len(modem.requests) != 1 {
+		t.Fatalf("recovery requests=%+v, want one", modem.requests)
+	}
+	req := modem.requests[0]
+	if req.Operation != SIMAccessRecoveryOperationIMEI || req.Attempt != 1 ||
+		req.Class != simtransport.RecoveryClassControlPortHung || req.DestructiveAllowed {
+		t.Fatalf("recovery request=%+v", req)
+	}
+	if len(modem.calls) != 4 || modem.calls[0] != "AT+CGSN" || modem.calls[3] != "AT+CGSN" {
+		t.Fatalf("AT calls=%+v", modem.calls)
 	}
 }
 

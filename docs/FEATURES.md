@@ -39,8 +39,9 @@ protocol layers needed by VoHive:
   definite length support, ISIM identity EF reading with long-form string
   length decoding
   over logical-channel APDUs or CRSM, runtime modem-access fallback from
-  explicit identity readers to APDU/CRSM/AT+CRSM identity reads, SIM/ISIM
-  recovery error classification with opt-in non-destructive retry hooks,
+  explicit identity readers to APDU/CRSM/AT+CRSM identity reads, AT `CGSN`/`GSN`
+  IMEI reads with modem-access recovery retry, SIM/ISIM recovery error
+  classification with opt-in non-destructive retry hooks,
   human-readable APDU/CRSM status-word descriptions for common SIM/USIM/ISIM
   success, warning, procedure, and checking-error responses,
   reusable ISIM identity, USIM EF_IMSI decoding/encoding, and EF_AD MNC-length
@@ -53,7 +54,7 @@ protocol layers needed by VoHive:
   multi-candidate P-CSCF profile overrides for registrar failover
 - TS.43-style E911 entitlement bootstrap, JSON/XML response parsing for common
   emergency address, PDN/APN/realm, service URN/route, endpoint, expiry/cache,
-  and location validation status variants, entitlement cache snapshots with
+  and normalized location validation status variants, entitlement cache snapshots with
   refresh-window and route/service selection helpers, public entitlement parsing helpers,
   emergency service-category URN mapping, IMS emergency SIP Request-URI,
   `P-Access-Network-Info`, `Geolocation`, and MMTel service header helpers,
@@ -79,7 +80,8 @@ protocol layers needed by VoHive:
   transport SAs with null or AES-CBC ESP encryption and selected-parameter
   fallbacks for protocol, mode, SPI, ports, and algorithms, folded/compact SIP header parsing, strict
   Content-Length body and duplicate-length validation, SIP response status-code
-  range validation, deterministic wire ordering for REFER/supplementary-service
+  range validation, REGISTER/refresh/de-registration failure diagnostics for
+  Retry-After/Warning/Reason headers, deterministic wire ordering for REFER/supplementary-service
   headers, wire-level UDP/TCP REGISTER transport, and IMS registration binding
   parsing
 - SIP UDP client transaction retransmission for REGISTER and IMS dialog
@@ -132,7 +134,7 @@ protocol layers needed by VoHive:
   selection for CPIM/3GPP SMS/IMDN payloads, strict UCS2/8-bit user-data
   length validation, optional outbound CPIM wrapping for 3GPP SMS with IMDN
   disposition request headers, and USSD session transport hooks, including 3xx Contact
-  redirect retries, TP-SRR delivery-status requests, SMS RP-ERROR/
+  redirect retries with `q` preference and expired-target filtering, TP-SRR delivery-status requests, SMS RP-ERROR/
   STATUS-REPORT cause mapping, RP-ACK user-data STATUS-REPORT handling,
   RP-ERROR diagnostics/user-data preservation, SMS-DELIVER TP-PID/TP-DCS and
   first-octet metadata preservation, alphanumeric SMS-DELIVER originator address decoding,

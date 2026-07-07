@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -80,7 +81,12 @@ func firstMessagingRedirectContactURI(resp voiceclient.SIPResponse) string {
 }
 
 func messagingRedirectContactURIs(headers map[string][]string) []string {
-	var out []string
+	type redirectContact struct {
+		uri string
+		q   float64
+	}
+
+	var contacts []redirectContact
 	for key, values := range headers {
 		if !strings.EqualFold(key, "Contact") {
 			continue
@@ -88,21 +94,33 @@ func messagingRedirectContactURIs(headers map[string][]string) []string {
 		for _, value := range values {
 			for _, contact := range splitUSSDHeaderValues(value) {
 				uri := sipHeaderURIValue(contact)
-				if !isMessagingRedirectTargetURI(uri) {
+				if !isMessagingRedirectTargetURI(uri) || messagingRedirectContactExpired(contact) {
 					continue
 				}
-				duplicate := false
-				for _, existing := range out {
-					if existing == uri {
-						duplicate = true
+				q := messagingRedirectContactQ(contact)
+				duplicate := -1
+				for i, existing := range contacts {
+					if existing.uri == uri {
+						duplicate = i
 						break
 					}
 				}
-				if !duplicate {
-					out = append(out, uri)
+				if duplicate >= 0 {
+					if q > contacts[duplicate].q {
+						contacts[duplicate].q = q
+					}
+					continue
 				}
+				contacts = append(contacts, redirectContact{uri: uri, q: q})
 			}
 		}
+	}
+	sort.SliceStable(contacts, func(i, j int) bool {
+		return contacts[i].q > contacts[j].q
+	})
+	out := make([]string, 0, len(contacts))
+	for _, contact := range contacts {
+		out = append(out, contact.uri)
 	}
 	return out
 }
@@ -114,4 +132,94 @@ func isMessagingRedirectTargetURI(uri string) bool {
 	}
 	lower := strings.ToLower(uri)
 	return strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:")
+}
+
+func messagingRedirectContactQ(contact string) float64 {
+	value, ok := sipContactHeaderParam(contact, "q")
+	if !ok {
+		return 1
+	}
+	q, err := strconv.ParseFloat(value, 64)
+	if err != nil || q < 0 || q > 1 {
+		return 1
+	}
+	return q
+}
+
+func messagingRedirectContactExpired(contact string) bool {
+	value, ok := sipContactHeaderParam(contact, "expires")
+	if !ok {
+		return false
+	}
+	expires, err := strconv.Atoi(value)
+	return err == nil && expires <= 0
+}
+
+func sipContactHeaderParam(contact, name string) (string, bool) {
+	for _, param := range sipContactHeaderParams(contact) {
+		key, raw, ok := strings.Cut(strings.TrimSpace(param), "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), name) {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(raw), `"`), true
+	}
+	return "", false
+}
+
+func sipContactHeaderParams(contact string) []string {
+	var out []string
+	var cur strings.Builder
+	inQuote := false
+	escaped := false
+	angleDepth := 0
+	collecting := false
+	for _, r := range contact {
+		switch {
+		case escaped:
+			if collecting {
+				cur.WriteRune(r)
+			}
+			escaped = false
+		case r == '\\' && inQuote:
+			if collecting {
+				cur.WriteRune(r)
+			}
+			escaped = true
+		case r == '"':
+			if collecting {
+				cur.WriteRune(r)
+			}
+			inQuote = !inQuote
+		case r == '<' && !inQuote:
+			if collecting {
+				cur.WriteRune(r)
+			}
+			angleDepth++
+		case r == '>' && !inQuote:
+			if collecting {
+				cur.WriteRune(r)
+			}
+			if angleDepth > 0 {
+				angleDepth--
+			}
+		case r == ';' && !inQuote && angleDepth == 0:
+			if collecting {
+				if part := strings.TrimSpace(cur.String()); part != "" {
+					out = append(out, part)
+				}
+				cur.Reset()
+			}
+			collecting = true
+		default:
+			if collecting {
+				cur.WriteRune(r)
+			}
+		}
+	}
+	if collecting {
+		if part := strings.TrimSpace(cur.String()); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }

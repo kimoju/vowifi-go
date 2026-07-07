@@ -210,6 +210,32 @@ func (a *Adapter) ReadCRSMRecord(fileID uint16, record, length int, pathID strin
 	return a.runCRSM(178, int(fileID), record, 4, p3, "", pathID)
 }
 
+// ReadIMEI queries the modem identity through common AT commands.
+func (a *Adapter) ReadIMEI() (string, error) {
+	if a == nil || a.Control == nil {
+		return "", errors.New("nil AT control")
+	}
+	commands := []string{"AT+CGSN", "AT+CGSN=1", "AT+GSN"}
+	var errs []error
+	for _, cmd := range commands {
+		out, err := a.Control.ExecuteATSilent(cmd, a.timeout())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", cmd, err))
+			continue
+		}
+		if err := parseATError(out); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", cmd, err))
+			continue
+		}
+		imei, ok := ExtractIMEI(out)
+		if ok {
+			return imei, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: parse IMEI from %q", cmd, compactAT(out)))
+	}
+	return "", errors.Join(errs...)
+}
+
 func ParseAPDUResult(out string) (APDUResult, error) {
 	if err := parseATError(out); err != nil {
 		return APDUResult{}, err
@@ -315,6 +341,38 @@ func parseATError(out string) error {
 		}
 	}
 	return nil
+}
+
+func ExtractIMEI(out string) (string, bool) {
+	for _, line := range atLines(out) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.EqualFold(line, "OK") || isATCommandEcho(line) {
+			continue
+		}
+		if strings.HasPrefix(strings.ToUpper(line), "+CGSN:") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, line[:strings.IndexByte(line, ':')+1]))
+		}
+		if imei := firstIMEIDigits(line); imei != "" {
+			return imei, true
+		}
+	}
+	return "", false
+}
+
+func firstIMEIDigits(value string) string {
+	digits := make([]byte, 0, 15)
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b >= '0' && b <= '9' {
+			digits = append(digits, b)
+			if len(digits) == 15 {
+				return string(digits)
+			}
+			continue
+		}
+		digits = digits[:0]
+	}
+	return ""
 }
 
 func parseCCHOChannel(out string) (int, bool) {

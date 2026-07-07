@@ -789,7 +789,7 @@ func walkXMLEntitlementValue(node entitlementXMLNode, out *entitlementResult, ct
 func consumeEntitlementField(key string, value any, out *entitlementResult, ctx entitlementWalkContext) {
 	canonical := normalizeEntitlementKey(key)
 	if ctx.inLocationValidation && isLocationValidationStatusKey(canonical) {
-		setScalarString(&out.LocationValidationStatus, value)
+		setLocationValidationStatus(&out.LocationValidationStatus, value)
 		return
 	}
 	if isWebsheetUserDataKey(canonical) {
@@ -864,7 +864,7 @@ func consumeEntitlementField(key string, value any, out *entitlementResult, ctx 
 	case "cacheexpiresin", "cachemaxage", "cachettl", "cachetimetolive", "maxage":
 		setDuration(&out.CacheMaxAge, value)
 	case "locationvalidationstatus", "validationstatus", "addressvalidationstatus", "e911addressvalidationstatus", "locationstatus", "locationvalidationresult", "validationresult", "addressvalidationresult", "civicaddressvalidationstatus", "civiclocationvalidationstatus":
-		setScalarString(&out.LocationValidationStatus, value)
+		setLocationValidationStatus(&out.LocationValidationStatus, value)
 	default:
 		if isServiceURNKey(canonical) {
 			collectServiceURNs(value, out)
@@ -921,6 +921,29 @@ func setScalarString(dst *string, value any) {
 	}
 	if s := strings.TrimSpace(scalarStringValue(value)); s != "" {
 		*dst = s
+	}
+}
+
+func setLocationValidationStatus(dst *string, value any) {
+	if dst == nil || strings.TrimSpace(*dst) != "" {
+		return
+	}
+	if s := strings.TrimSpace(scalarStringValue(value)); s != "" {
+		*dst = normalizeLocationValidationStatus(s)
+	}
+}
+
+func normalizeLocationValidationStatus(s string) string {
+	s = strings.TrimSpace(s)
+	switch normalizeEntitlementKey(s) {
+	case "valid", "validated", "verified", "accepted", "approved", "success", "successful", "pass", "passed", "ok":
+		return "validated"
+	case "pending", "inprogress", "processing", "validating", "validationpending", "pendingvalidation", "pendingreview":
+		return "pending"
+	case "invalid", "notvalid", "validationfailed", "failed", "rejected", "denied":
+		return "invalid"
+	default:
+		return s
 	}
 }
 
@@ -1790,9 +1813,9 @@ func collectLocationValidationField(key string, value any, out *entitlementResul
 	canonical := normalizeEntitlementKey(key)
 	switch {
 	case isLocationValidationKey(canonical):
-		setScalarString(&out.LocationValidationStatus, value)
+		setLocationValidationStatus(&out.LocationValidationStatus, value)
 	case isLocationValidationStatusKey(canonical):
-		setScalarString(&out.LocationValidationStatus, value)
+		setLocationValidationStatus(&out.LocationValidationStatus, value)
 	}
 }
 
