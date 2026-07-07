@@ -108,6 +108,39 @@ func TestSafeDiagnosticIMSRegisterResponseDecisionRedactsReason(t *testing.T) {
 	}
 }
 
+func TestSafeDiagnosticIMSRegistrationRecoveryStateRedactsReasonAndError(t *testing.T) {
+	now := time.Now()
+	localPath := "/" + filepathJoinForDiagnosticTest("home", "boa", "vohive", "ims-recovery.log")
+	state := IMSRegistrationRecoveryState{
+		Attempts:            3,
+		ConsecutiveFailures: 2,
+		LastReason:          "refresh 503 for sip:310280233641503@ims.example from 192.168.31.34 via " + localPath,
+		LastError:           `REGISTER retry failed: Digest nonce="recover-secret", response="0123456789abcdef0123456789abcdef"; pcscf=87.194.9.8`,
+		LastAttemptAt:       now.Add(-2 * time.Second),
+		LastSucceededAt:     now.Add(-time.Minute),
+		NextAttemptAt:       now.Add(5 * time.Second),
+		LastSwitchedTarget:  true,
+	}
+
+	got := SafeDiagnosticIMSRegistrationRecoveryState(state)
+	if !got.Redacted || got.Attempts != 3 || got.ConsecutiveFailures != 2 ||
+		!got.LastAttemptAt.Equal(state.LastAttemptAt) ||
+		!got.LastSucceededAt.Equal(state.LastSucceededAt) ||
+		!got.NextAttemptAt.Equal(state.NextAttemptAt) ||
+		!got.LastSwitchedTarget {
+		t.Fatalf("diagnostic recovery state lost operational fields: %+v", got)
+	}
+	assertNoRuntimeDiagnosticLeak(t, fmt.Sprintf("%+v", got), localPath)
+	for _, want := range []string{"<redacted", ".invalid", "<redacted-local-path>"} {
+		if !strings.Contains(fmt.Sprintf("%+v", got), want) {
+			t.Fatalf("diagnostic recovery state does not contain marker %q: %+v", want, got)
+		}
+	}
+	if state.LastReason == got.LastReason || state.LastError == got.LastError {
+		t.Fatalf("recovery reason/error were not redacted: state=%+v diagnostic=%+v", state, got)
+	}
+}
+
 func TestSafeDiagnosticStringAndErrorRedactFreeFormRuntimeText(t *testing.T) {
 	localPath := "/" + filepathJoinForDiagnosticTest("home", "boa", "vohive", "runtime.log")
 	text := `SWU tunnel establishment failed: read udp 192.168.31.34:44789->87.194.9.8:4500: i/o timeout; ` +

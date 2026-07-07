@@ -54,6 +54,21 @@ type DiagnosticIMSRegisterResponseDecision struct {
 	Redacted        bool
 }
 
+// DiagnosticIMSRegistrationRecoveryState is a redacted view of ongoing IMS
+// registration recovery bookkeeping. It preserves retry counters and timestamps
+// while removing sensitive text from the last reason/error fields.
+type DiagnosticIMSRegistrationRecoveryState struct {
+	Attempts            int
+	ConsecutiveFailures int
+	LastReason          string
+	LastError           string
+	LastAttemptAt       time.Time
+	LastSucceededAt     time.Time
+	NextAttemptAt       time.Time
+	LastSwitchedTarget  bool
+	Redacted            bool
+}
+
 // SafeDiagnosticState returns a diagnostic view of state with sensitive text
 // fields redacted. It does not mutate the input State.
 func SafeDiagnosticState(state State) DiagnosticState {
@@ -79,6 +94,23 @@ func SafeDiagnosticState(state State) DiagnosticState {
 		IMSRecoveryReason:        redactRuntimeDiagnosticString(redactor, state.IMSRecoveryReason),
 		UpdatedAt:                state.UpdatedAt,
 		Redacted:                 true,
+	}
+}
+
+// SafeDiagnosticIMSRegistrationRecoveryState returns a diagnostic view of IMS
+// registration recovery state with sensitive reason/error text redacted.
+func SafeDiagnosticIMSRegistrationRecoveryState(state IMSRegistrationRecoveryState) DiagnosticIMSRegistrationRecoveryState {
+	redactor := tracefixture.NewRedactor()
+	return DiagnosticIMSRegistrationRecoveryState{
+		Attempts:            state.Attempts,
+		ConsecutiveFailures: state.ConsecutiveFailures,
+		LastReason:          redactRuntimeDiagnosticString(redactor, state.LastReason),
+		LastError:           redactRuntimeDiagnosticString(redactor, state.LastError),
+		LastAttemptAt:       state.LastAttemptAt,
+		LastSucceededAt:     state.LastSucceededAt,
+		NextAttemptAt:       state.NextAttemptAt,
+		LastSwitchedTarget:  state.LastSwitchedTarget,
+		Redacted:            true,
 	}
 }
 

@@ -10,9 +10,10 @@ The repository currently has local CI, GitHub Actions CI, module-path hygiene
 checks, and a compatibility script that can rewrite an older VoHive consumer in
 a temporary checkout and run a focused test set against this module.
 The VoHive-facing runtime state also has redacted diagnostic views for logs,
-UI state, event snapshots, IMS REGISTER recovery decisions, and free-form
-runtime error text so common subscriber identifiers, AKA/digest material, IPs,
-MACs, and local paths are not exposed by default.
+UI state, event snapshots, IMS REGISTER recovery decisions, IMS registration
+recovery state, and free-form runtime error text so common subscriber
+identifiers, AKA/digest material, IPs, MACs, and local paths are not exposed by
+default.
 
 That proves an important baseline: VoHive can resolve and compile against this
 module in the covered package set, and the loopback/unit tests exercise many
@@ -223,7 +224,8 @@ Done means:
 - Runtime state exposes registration, tunnel, modem, messaging, E911, and voice
   health snapshots.
 - Recovery decisions include reason codes, retry timing, and next actions; IMS
-  REGISTER response decisions now have a redacted diagnostic shape.
+  REGISTER response decisions and registration recovery state now have redacted
+  diagnostic shapes.
 - VoHive can present concise user-facing failures for modem control, SIM auth,
   ePDG, IMS registration, messaging, E911, and voice media.
 
