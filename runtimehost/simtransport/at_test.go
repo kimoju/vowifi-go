@@ -361,6 +361,46 @@ func TestExtractIMEIFromATResponses(t *testing.T) {
 	}
 }
 
+func TestExtractIMSIFromATResponses(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+		ok   bool
+	}{
+		{
+			name: "plain cimi",
+			in:   "AT+CIMI\r\n\r\n001010123456789\r\n\r\nOK\r\n",
+			want: "001010123456789",
+			ok:   true,
+		},
+		{
+			name: "quoted cimi",
+			in:   "\r\n+CIMI: \"310260123456789\"\r\n\r\nOK\r\n",
+			want: "310260123456789",
+			ok:   true,
+		},
+		{
+			name: "too long",
+			in:   "\r\n+CIMI: \"0010101234567890\"\r\n\r\nOK\r\n",
+			ok:   false,
+		},
+		{
+			name: "no imsi",
+			in:   "\r\n+CIMI: \"subscriber\"\r\n\r\nOK\r\n",
+			ok:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ExtractIMSI(tt.in)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("ExtractIMSI() = %q,%t want %q,%t", got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
 func TestAdapterReadIMEIFallsBackAcrossCommonCommands(t *testing.T) {
 	at := &fakeAT{responses: []string{
 		"\r\nERROR\r\n",
@@ -374,6 +414,23 @@ func TestAdapterReadIMEIFallsBackAcrossCommonCommands(t *testing.T) {
 		t.Fatalf("ReadIMEI() = %q", imei)
 	}
 	wantCalls := []string{"AT+CGSN", "AT+CGSN=1"}
+	if !reflect.DeepEqual(at.calls, wantCalls) {
+		t.Fatalf("AT calls=%+v want %+v", at.calls, wantCalls)
+	}
+}
+
+func TestAdapterReadIMSI(t *testing.T) {
+	at := &fakeAT{responses: []string{
+		"\r\n001010123456789\r\n\r\nOK\r\n",
+	}}
+	imsi, err := NewAdapter(at).ReadIMSI()
+	if err != nil {
+		t.Fatalf("ReadIMSI() error = %v", err)
+	}
+	if imsi != "001010123456789" {
+		t.Fatalf("ReadIMSI() = %q", imsi)
+	}
+	wantCalls := []string{"AT+CIMI"}
 	if !reflect.DeepEqual(at.calls, wantCalls) {
 		t.Fatalf("AT calls=%+v want %+v", at.calls, wantCalls)
 	}

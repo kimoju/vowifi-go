@@ -236,6 +236,25 @@ func (a *Adapter) ReadIMEI() (string, error) {
 	return "", errors.Join(errs...)
 }
 
+// ReadIMSI queries the subscriber identity through the standard AT+CIMI command.
+func (a *Adapter) ReadIMSI() (string, error) {
+	if a == nil || a.Control == nil {
+		return "", errors.New("nil AT control")
+	}
+	out, err := a.Control.ExecuteATSilent("AT+CIMI", a.timeout())
+	if err != nil {
+		return "", err
+	}
+	if err := parseATError(out); err != nil {
+		return "", err
+	}
+	imsi, ok := ExtractIMSI(out)
+	if !ok {
+		return "", fmt.Errorf("parse IMSI from %q", compactAT(out))
+	}
+	return imsi, nil
+}
+
 func ParseAPDUResult(out string) (APDUResult, error) {
 	if err := parseATError(out); err != nil {
 		return APDUResult{}, err
@@ -373,6 +392,52 @@ func firstIMEIDigits(value string) string {
 		digits = digits[:0]
 	}
 	return ""
+}
+
+func ExtractIMSI(out string) (string, bool) {
+	for _, line := range atLines(out) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.EqualFold(line, "OK") || isATCommandEcho(line) {
+			continue
+		}
+		if strings.HasPrefix(strings.ToUpper(line), "+CIMI:") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, line[:strings.IndexByte(line, ':')+1]))
+		}
+		if imsi := firstIMSIRun(line); imsi != "" {
+			return imsi, true
+		}
+	}
+	return "", false
+}
+
+func firstIMSIRun(value string) string {
+	start := -1
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b >= '0' && b <= '9' {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 {
+			if imsi := validIMSIRun(value[start:i]); imsi != "" {
+				return imsi
+			}
+			start = -1
+		}
+	}
+	if start >= 0 {
+		return validIMSIRun(value[start:])
+	}
+	return ""
+}
+
+func validIMSIRun(run string) string {
+	if len(run) < 5 || len(run) > 15 {
+		return ""
+	}
+	return run
 }
 
 func parseCCHOChannel(out string) (int, bool) {

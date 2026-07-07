@@ -397,6 +397,7 @@ func classifyErrorText(text string) RecoveryClass {
 		strings.Contains(s, "control port") ||
 		strings.Contains(s, "parse ccho channel") ||
 		strings.Contains(s, "parse imei") ||
+		strings.Contains(s, "parse imsi") ||
 		strings.Contains(s, "parse crsm result") ||
 		strings.Contains(s, "parse apdu response hex"):
 		return RecoveryClassControlPortHung

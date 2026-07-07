@@ -17,6 +17,7 @@ func TestClassifyRecoveryErrors(t *testing.T) {
 		{name: "deadline", err: context.DeadlineExceeded, want: RecoveryClassControlPortHung},
 		{name: "ccho parse", err: errors.New("open ISIM logical channel: parse CCHO channel from OK"), want: RecoveryClassControlPortHung},
 		{name: "crsm file missing", err: errors.New("CRSM read EF_IMPI: READ BINARY 6F02 failed: SW=6A82"), want: RecoveryClassFileNotFound},
+		{name: "imsi parse", err: errors.New("parse IMSI from OK"), want: RecoveryClassControlPortHung},
 		{name: "bare 6a82", err: errors.New("6A82"), want: RecoveryClassFileNotFound},
 		{name: "apdu busy status", err: errors.New("READ BINARY 6F02 failed: SW=9300"), want: RecoveryClassSIMBusy},
 		{name: "invalidated status", err: errors.New("READ RECORD 6F04 #1 failed: status=6283"), want: RecoveryClassSIMBusy},

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	swusim "github.com/boa-z/vowifi-go/engine/sim"
 )
@@ -22,6 +23,9 @@ const (
 	AKAAUTSLength   = 14
 	AKAAKLength     = 6
 	AKAMACLength    = 8
+
+	defaultAKAAuthTransientRetries = 1
+	defaultAKAAuthRetryDelay       = 200 * time.Millisecond
 )
 
 type AKAResult = swusim.AKAResult
@@ -32,7 +36,11 @@ type AUTSFields struct {
 }
 
 type AKAProvider struct {
-	Transport LogicalChannelTransport
+	Transport               LogicalChannelTransport
+	AuthTransientRetries    int
+	AuthTransientRetryDelay time.Duration
+
+	retrySleep func(time.Duration)
 }
 
 func NewAKAProvider(t LogicalChannelTransport) *AKAProvider {
@@ -83,7 +91,7 @@ func (p *AKAProvider) calculateAKAOnApp(app, fallbackAID, expectedPrefix string,
 	if err != nil {
 		return AKAResult{}, err
 	}
-	resp, err := Transmit(p.Transport, ch, apdu)
+	resp, err := p.transmitUSIMAuth(ch, apdu)
 	if err == nil && resp.Success() {
 		return ParseUSIMAuthResponse(resp.Body, resp.SW1, resp.SW2)
 	}
@@ -92,7 +100,7 @@ func (p *AKAProvider) calculateAKAOnApp(app, fallbackAID, expectedPrefix string,
 	if buildErr != nil {
 		return AKAResult{}, buildErr
 	}
-	resp2, err2 := Transmit(p.Transport, ch, apdu)
+	resp2, err2 := p.transmitUSIMAuth(ch, apdu)
 	if err2 != nil {
 		if err != nil {
 			return AKAResult{}, fmt.Errorf("%s AKA failed: first=%v second=%v", strings.ToUpper(app), err, err2)
@@ -100,6 +108,88 @@ func (p *AKAProvider) calculateAKAOnApp(app, fallbackAID, expectedPrefix string,
 		return AKAResult{}, err2
 	}
 	return ParseUSIMAuthResponse(resp2.Body, resp2.SW1, resp2.SW2)
+}
+
+func (p *AKAProvider) transmitUSIMAuth(channel int, apdu []byte) (Response, error) {
+	retries := p.authTransientRetries()
+	for attempt := 0; ; attempt++ {
+		resp, err := Transmit(p.Transport, channel, apdu)
+		if attempt >= retries || !isTransientUSIMAuthFailure(resp, err) {
+			return resp, err
+		}
+		p.sleepBeforeAuthRetry(attempt)
+	}
+}
+
+func (p *AKAProvider) authTransientRetries() int {
+	if p.AuthTransientRetries < 0 {
+		return 0
+	}
+	if p.AuthTransientRetries > 0 {
+		return p.AuthTransientRetries
+	}
+	return defaultAKAAuthTransientRetries
+}
+
+func (p *AKAProvider) sleepBeforeAuthRetry(attempt int) {
+	delay := p.authTransientRetryDelay(attempt)
+	if delay <= 0 {
+		return
+	}
+	if p.retrySleep != nil {
+		p.retrySleep(delay)
+		return
+	}
+	time.Sleep(delay)
+}
+
+func (p *AKAProvider) authTransientRetryDelay(attempt int) time.Duration {
+	delay := p.AuthTransientRetryDelay
+	if delay < 0 {
+		return 0
+	}
+	if delay == 0 {
+		delay = defaultAKAAuthRetryDelay
+	}
+	for i := 0; i < attempt; i++ {
+		if delay > time.Hour/2 {
+			return time.Hour
+		}
+		delay *= 2
+	}
+	return delay
+}
+
+type apduStatusCarrier interface {
+	Status() uint16
+}
+
+func isTransientUSIMAuthFailure(resp Response, err error) bool {
+	if err != nil {
+		return isTransientUSIMAuthError(err)
+	}
+	return isTransientUSIMAuthStatus(resp.SW1, resp.SW2)
+}
+
+func isTransientUSIMAuthError(err error) bool {
+	var status apduStatusCarrier
+	if errors.As(err, &status) && isTransientUSIMAuthStatus(byte(status.Status()>>8), byte(status.Status())) {
+		return true
+	}
+	s := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(s, "sim busy") ||
+		strings.Contains(s, "apdu busy") ||
+		strings.Contains(s, "temporarily not allowed") ||
+		strings.Contains(s, "resource busy") ||
+		strings.Contains(s, "at cme error: 14")
+}
+
+func isTransientUSIMAuthStatus(sw1, sw2 byte) bool {
+	return sw1 == 0x93 ||
+		(sw1 == 0x62 && sw2 == 0x83) ||
+		(sw1 == 0x64 && sw2 == 0x00) ||
+		sw1 == 0x65 ||
+		(sw1 == 0x6F && sw2 == 0x00)
 }
 
 func BuildUSIMAuthAPDU(rand16, autn16 []byte, includeLe bool) ([]byte, error) {

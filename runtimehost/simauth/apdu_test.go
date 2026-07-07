@@ -4,7 +4,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	swusim "github.com/boa-z/vowifi-go/engine/sim"
 	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
@@ -218,6 +220,106 @@ func TestAPDUStatusErrorsCarryRecoveryStatus(t *testing.T) {
 	}
 	if got := simtransport.ClassifyError(err); got != simtransport.RecoveryClassEmptyEF {
 		t.Fatalf("ClassifyError(AKA StatusError) = %q, want empty EF", got)
+	}
+}
+
+func TestUSIMAuthTransientFailureClassification(t *testing.T) {
+	statuses := []struct {
+		name string
+		sw1  byte
+		sw2  byte
+		want bool
+	}{
+		{name: "sim busy", sw1: 0x93, sw2: 0x00, want: true},
+		{name: "technical problem", sw1: 0x6F, sw2: 0x00, want: true},
+		{name: "memory changed", sw1: 0x65, sw2: 0x81, want: true},
+		{name: "file not found", sw1: 0x6A, sw2: 0x82, want: false},
+		{name: "conditions not satisfied", sw1: 0x69, sw2: 0x85, want: false},
+	}
+	for _, tt := range statuses {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTransientUSIMAuthStatus(tt.sw1, tt.sw2)
+			if got != tt.want {
+				t.Fatalf("isTransientUSIMAuthStatus(%02X%02X) = %t, want %t", tt.sw1, tt.sw2, got, tt.want)
+			}
+		})
+	}
+
+	errorCases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "cme sim busy", err: errors.New("AT CME ERROR: SIM busy"), want: true},
+		{name: "numeric cme sim busy", err: errors.New("AT CME ERROR: 14"), want: true},
+		{name: "deadline", err: errors.New("context deadline exceeded"), want: false},
+	}
+	for _, tt := range errorCases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTransientUSIMAuthError(tt.err)
+			if got != tt.want {
+				t.Fatalf("isTransientUSIMAuthError() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAKAProviderRetriesTransientAuthStatus(t *testing.T) {
+	rand16 := bytesFrom(0x10, 16)
+	autn16 := bytesFrom(0x30, 16)
+	successHex := successfulAKAResponseHex()
+	ft := &fakeTransport{responses: []string{"9300", successHex}}
+	provider := NewAKAProvider(ft)
+	provider.AuthTransientRetryDelay = 5 * time.Millisecond
+	var delays []time.Duration
+	provider.retrySleep = func(delay time.Duration) {
+		delays = append(delays, delay)
+	}
+
+	res, err := provider.CalculateAKA(rand16, autn16)
+	if err != nil {
+		t.Fatalf("CalculateAKA() error = %v", err)
+	}
+	if len(res.RES) != 4 || len(res.CK) != 16 || len(res.IK) != 16 {
+		t.Fatalf("AKA result lengths = RES %d CK %d IK %d", len(res.RES), len(res.CK), len(res.IK))
+	}
+	noLe, err := BuildUSIMAuthAPDU(rand16, autn16, false)
+	if err != nil {
+		t.Fatalf("BuildUSIMAuthAPDU(no Le) error = %v", err)
+	}
+	wantCalls := []string{apduHex(noLe), apduHex(noLe)}
+	if !reflect.DeepEqual(ft.calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", ft.calls, wantCalls)
+	}
+	if !reflect.DeepEqual(delays, []time.Duration{5 * time.Millisecond}) {
+		t.Fatalf("retry delays = %#v, want 5ms", delays)
+	}
+}
+
+func TestAKAProviderDoesNotTransientRetryPermanentAuthStatus(t *testing.T) {
+	rand16 := bytesFrom(0x10, 16)
+	autn16 := bytesFrom(0x30, 16)
+	ft := &fakeTransport{responses: []string{"6A82", "6A82"}}
+	provider := NewAKAProvider(ft)
+	provider.AuthTransientRetryDelay = 5 * time.Millisecond
+	provider.retrySleep = func(delay time.Duration) {
+		t.Fatalf("unexpected transient retry delay %v", delay)
+	}
+
+	if _, err := provider.CalculateAKA(rand16, autn16); err == nil {
+		t.Fatal("CalculateAKA(6A82) err=nil, want status error")
+	}
+	noLe, err := BuildUSIMAuthAPDU(rand16, autn16, false)
+	if err != nil {
+		t.Fatalf("BuildUSIMAuthAPDU(no Le) error = %v", err)
+	}
+	withLe, err := BuildUSIMAuthAPDU(rand16, autn16, true)
+	if err != nil {
+		t.Fatalf("BuildUSIMAuthAPDU(with Le) error = %v", err)
+	}
+	wantCalls := []string{apduHex(noLe), apduHex(withLe)}
+	if !reflect.DeepEqual(ft.calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", ft.calls, wantCalls)
 	}
 }
 
@@ -544,4 +646,16 @@ func bytesFrom(start byte, n int) []byte {
 		out[i] = start + byte(i)
 	}
 	return out
+}
+
+func successfulAKAResponseHex() string {
+	body := append([]byte{0xDB, 0x04, 0x11, 0x22, 0x33, 0x44, 0x10}, bytesFrom(0x01, 16)...)
+	body = append(body, 0x10)
+	body = append(body, bytesFrom(0x21, 16)...)
+	body = append(body, 0x90, 0x00)
+	return strings.ToUpper(hex.EncodeToString(body))
+}
+
+func apduHex(apdu []byte) string {
+	return strings.ToUpper(hex.EncodeToString(apdu))
 }
