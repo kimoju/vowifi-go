@@ -26,11 +26,14 @@ go test ./...
 make ci
 ```
 
-如果同时开发 VoHive 和 vowifi-go，可以在 VoHive 工作区中指向本地检出：
+VoHive 集成时建议在消费者 `go.mod` 中使用 tag 或 pseudo-version：
 
-```go
-replace github.com/boa-z/vowifi-go v1.1.2 => ../vowifi-go
+```sh
+go get github.com/boa-z/vowifi-go@latest
 ```
+
+本地兼容验证请使用 `make compat-vohive`；该命令会复制临时 VoHive
+检出，并只在临时目录内加入本地 replace，不会修改或要求提交本地路径依赖。
 
 ## 文档
 

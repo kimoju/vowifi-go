@@ -124,6 +124,25 @@ verify_vowifi_replace() {
 	printf '\n==> verified VoHive resolves %s through this checkout\n' "$VOWIFI_MODULE"
 }
 
+ensure_vohive_embed_assets() {
+	if [[ ! -f internal/web/fs.go ]]; then
+		return
+	fi
+	if ! grep -q 'go:embed all:dist' internal/web/fs.go; then
+		return
+	fi
+	if find internal/web/dist -type f -print -quit >/dev/null 2>&1; then
+		return
+	fi
+
+	printf '\n==> creating temporary VoHive web embed placeholder\n'
+	mkdir -p internal/web/dist
+	cat >internal/web/dist/index.html <<'EOF'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>VoHive compatibility placeholder</title></head><body></body></html>
+EOF
+}
+
 VOHIVE_DIR="${VOHIVE_DIR:-${1:-}}"
 if [[ -z "$VOHIVE_DIR" ]]; then
 	usage >&2
@@ -182,6 +201,7 @@ fi
 
 cd "$workdir"
 mkdir -p "$tmpdir/go-tmp"
+ensure_vohive_embed_assets
 
 verify_local_module
 

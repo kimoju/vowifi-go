@@ -60,7 +60,7 @@ cleanup() {
 trap cleanup EXIT
 
 consumer="$tmpdir/consumer"
-mkdir -p "$consumer/internal/compat" "$tmpdir/work"
+mkdir -p "$consumer/cmd/vohive" "$consumer/internal/compat" "$tmpdir/work"
 
 cat >"$consumer/go.mod" <<EOF
 module example.invalid/compat-consumer
@@ -100,6 +100,12 @@ func TestCompatRewrite(t *testing.T) {
 		t.Fatalf("unexpected AKA result: RES=%x CK=%x", result.RES, result.CK)
 	}
 }
+EOF
+
+cat >"$consumer/cmd/vohive/main.go" <<EOF
+package main
+
+func main() {}
 EOF
 
 printf 'Using Go: %s\n' "$("$GO_BIN" version)"

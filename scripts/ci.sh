@@ -128,6 +128,7 @@ hygiene_check() {
 	local email_regex legacy_base legacy_module local_path_regex status
 	local email_refs=()
 	local legacy_refs=()
+	local local_replace_refs=()
 	local local_path_refs=()
 
 	status=0
@@ -149,6 +150,13 @@ hygiene_check() {
 	if [[ ${#local_path_refs[@]} -gt 0 ]]; then
 		printf 'possible local home path references found in tracked content:\n' >&2
 		printf '  %s\n' "${local_path_refs[@]}" >&2
+		status=1
+	fi
+
+	mapfile -t local_replace_refs < <(git_grep_tracked_regex 'replace[[:space:]].*=>[[:space:]]*(\.{1,2}/|/|~)')
+	if [[ ${#local_replace_refs[@]} -gt 0 ]]; then
+		printf 'local filesystem replace directives found in tracked content:\n' >&2
+		printf '  %s\n' "${local_replace_refs[@]}" >&2
 		status=1
 	fi
 

@@ -32,12 +32,15 @@ Run the same local CI entry point used by GitHub Actions:
 make ci
 ```
 
-When developing VoHive and vowifi-go side by side, VoHive can point at this
-checkout with a workspace replace:
+When integrating with VoHive, prefer a tagged release or pseudo-version in the
+consumer `go.mod`:
 
-```go
-replace github.com/boa-z/vowifi-go v1.1.2 => ../vowifi-go
+```sh
+go get github.com/boa-z/vowifi-go@latest
 ```
+
+For local compatibility work, use `make compat-vohive`; it creates a temporary
+VoHive copy and adds the local replace only inside that throwaway checkout.
 
 ## Documentation
 

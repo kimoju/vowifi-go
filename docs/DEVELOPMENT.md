@@ -70,13 +70,17 @@ pattern, and added `go build` package list for broader compatibility coverage.
 The current test suite uses loopback networking and mock command boundaries. It
 does not require a modem, root privileges, or a real TUN device in CI.
 
-## VoHive Workspace Usage
+## VoHive Consumer Usage
 
-VoHive can use this repository through its workspace:
+VoHive should consume this module through a normal module version:
 
-```go
-replace github.com/boa-z/vowifi-go v1.1.2 => ../vowifi-go
+```sh
+go get github.com/boa-z/vowifi-go@latest
 ```
+
+Do not commit local filesystem replaces into VoHive or this repository. The
+compatibility check below creates its local replace only in a temporary copy so
+the source checkout stays clean.
 
 ## VoHive Compatibility Check
 
@@ -90,11 +94,10 @@ The script clones or copies the VoHive checkout into a temporary directory,
 first verifies this checkout still declares `github.com/boa-z/vowifi-go` and
 does not use the legacy module path in Go module/source files, rewrites legacy
 `vowifi-go` module references there to `github.com/boa-z/vowifi-go` when
-needed, verifies no legacy module references remain, confirms the temporary
-VoHive module resolves
-`github.com/boa-z/vowifi-go` through a `replace` pointing at this repository,
-then runs the focused VoHive test set. The source VoHive checkout is not
-modified.
+needed, verifies no legacy module references remain, confirms only the
+temporary VoHive module resolves `github.com/boa-z/vowifi-go` through a
+`replace` pointing at this repository, then runs the focused VoHive test set.
+The source VoHive checkout is not modified.
 
 Useful overrides:
 
