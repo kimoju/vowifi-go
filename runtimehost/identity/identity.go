@@ -474,13 +474,9 @@ func ReadISIMIdentity(access interface {
 	if access == nil {
 		return Identity{}, errors.New("nil ISIM access")
 	}
-	aid, _, err := simauth.ResolveAID(access, "isim", simauth.ISIMAIDPrefix, simauth.ISIMAIDPrefix)
+	channel, _, _, err := simauth.OpenLogicalChannelWithAIDFallback(access, "isim", simauth.ISIMAIDPrefix, simauth.ISIMAIDPrefix)
 	if err != nil {
 		return Identity{}, err
-	}
-	channel, err := access.OpenLogicalChannel(aid)
-	if err != nil {
-		return Identity{}, fmt.Errorf("open ISIM logical channel: %w", err)
 	}
 	defer func() { _ = access.CloseLogicalChannel(channel) }()
 

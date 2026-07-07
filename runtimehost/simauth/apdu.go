@@ -24,6 +24,11 @@ type LogicalChannelAIDResolver interface {
 	ResolveLogicalChannelAID(app string, fallbackAID string) (resolvedAID string, source string, err error)
 }
 
+type LogicalChannelAIDCandidate struct {
+	AID    string
+	Source string
+}
+
 type Response struct {
 	Body []byte
 	SW1  byte
@@ -116,25 +121,103 @@ func compactHex(in string) string {
 }
 
 func ResolveAID(t LogicalChannelTransport, app, fallbackAID, expectedPrefix string) (string, string, error) {
-	fallback := strings.ToUpper(strings.TrimSpace(fallbackAID))
-	want := strings.ToUpper(strings.TrimSpace(expectedPrefix))
+	candidates, err := ResolveAIDCandidates(t, app, fallbackAID, expectedPrefix)
+	if err != nil {
+		return "", "", err
+	}
+	if len(candidates) == 0 {
+		return "", "missing", fmt.Errorf("%s AID is empty", strings.TrimSpace(app))
+	}
+	return candidates[0].AID, candidates[0].Source, nil
+}
+
+func ResolveAIDCandidates(t LogicalChannelTransport, app, fallbackAID, expectedPrefix string) ([]LogicalChannelAIDCandidate, error) {
+	fallback := normalizeLogicalChannelAID(fallbackAID)
+	want := normalizeLogicalChannelAID(expectedPrefix)
+	appName := strings.TrimSpace(app)
+	if appName == "" {
+		appName = "application"
+	}
+	var candidates []LogicalChannelAIDCandidate
+	addCandidate := func(aid, source string) error {
+		aid = normalizeLogicalChannelAID(aid)
+		if aid == "" {
+			return fmt.Errorf("%s AID is empty", appName)
+		}
+		if want != "" && !strings.HasPrefix(aid, want) {
+			return fmt.Errorf("%s AID does not match %s: %s", appName, want, aid)
+		}
+		source = strings.TrimSpace(source)
+		if source == "" {
+			source = "resolver"
+		}
+		for _, existing := range candidates {
+			if existing.AID == aid {
+				return nil
+			}
+		}
+		candidates = append(candidates, LogicalChannelAIDCandidate{AID: aid, Source: source})
+		return nil
+	}
 	if resolver, ok := t.(LogicalChannelAIDResolver); ok {
 		aid, source, err := resolver.ResolveLogicalChannelAID(app, fallback)
 		if err == nil {
-			aid = strings.ToUpper(strings.TrimSpace(aid))
-			if strings.HasPrefix(aid, want) && len(aid) > len(want) {
-				if strings.TrimSpace(source) == "" {
-					source = "resolver"
-				}
-				return aid, source, nil
+			if err := addCandidate(aid, source); err != nil {
+				return nil, fmt.Errorf("resolver_invalid: %w", err)
 			}
-			return "", "resolver_invalid", fmt.Errorf("%s AID does not match %s: %s", app, want, aid)
+			if fallback != "" {
+				fallbackSource := "fallback"
+				if want != "" && fallback == want {
+					fallbackSource = "short_fallback"
+				}
+				if err := addCandidate(fallback, fallbackSource); err != nil && len(candidates) == 0 {
+					return nil, err
+				}
+			}
+			return candidates, nil
 		}
 	}
 	if fallback == "" {
-		return "", "missing", fmt.Errorf("%s AID is empty", app)
+		return nil, fmt.Errorf("%s AID is empty", appName)
 	}
-	return fallback, "fallback", nil
+	if err := addCandidate(fallback, "fallback"); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func OpenLogicalChannelWithAIDFallback(t LogicalChannelTransport, app, fallbackAID, expectedPrefix string) (int, string, string, error) {
+	if t == nil {
+		return 0, "", "", errors.New("nil logical channel transport")
+	}
+	candidates, err := ResolveAIDCandidates(t, app, fallbackAID, expectedPrefix)
+	if err != nil {
+		return 0, "", "", err
+	}
+	appLabel := strings.ToUpper(strings.TrimSpace(app))
+	if appLabel == "" {
+		appLabel = "application"
+	}
+	var errs []error
+	for _, candidate := range candidates {
+		channel, err := t.OpenLogicalChannel(candidate.AID)
+		if err == nil {
+			return channel, candidate.AID, candidate.Source, nil
+		}
+		source := strings.TrimSpace(candidate.Source)
+		if source == "" {
+			source = "candidate"
+		}
+		errs = append(errs, fmt.Errorf("%s AID %s: %w", source, candidate.AID, err))
+	}
+	if len(errs) == 0 {
+		return 0, "", "", fmt.Errorf("%s AID is empty", strings.TrimSpace(app))
+	}
+	return 0, "", "", fmt.Errorf("open %s logical channel: %w", appLabel, errors.Join(errs...))
+}
+
+func normalizeLogicalChannelAID(aid string) string {
+	return strings.ToUpper(compactHex(aid))
 }
 
 func SelectFileAPDU(fid uint16) []byte {

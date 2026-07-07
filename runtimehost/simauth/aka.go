@@ -77,13 +77,9 @@ func (p *AKAProvider) CalculateAKAWithPreference(rand16, autn16 []byte, preferen
 }
 
 func (p *AKAProvider) calculateAKAOnApp(app, fallbackAID, expectedPrefix string, rand16, autn16 []byte) (AKAResult, error) {
-	aid, source, err := ResolveAID(p.Transport, app, fallbackAID, expectedPrefix)
+	ch, _, _, err := OpenLogicalChannelWithAIDFallback(p.Transport, app, fallbackAID, expectedPrefix)
 	if err != nil {
 		return AKAResult{}, err
-	}
-	ch, err := p.Transport.OpenLogicalChannel(aid)
-	if err != nil {
-		return AKAResult{}, fmt.Errorf("open %s logical channel (%s): %w", strings.ToUpper(app), source, err)
 	}
 	defer func() { _ = p.Transport.CloseLogicalChannel(ch) }()
 

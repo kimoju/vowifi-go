@@ -11,23 +11,41 @@ import (
 	"testing"
 
 	"github.com/boa-z/vowifi-go/runtimehost/carrier"
+	"github.com/boa-z/vowifi-go/runtimehost/simauth"
 	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
 )
 
 type isimTransportFake struct {
-	aid       string
-	closed    []int
-	calls     []string
-	responses []string
+	aid          string
+	openedAIDs   []string
+	closed       []int
+	calls        []string
+	responses    []string
+	resolvedAID  string
+	resolveErr   error
+	openErrByAID map[string]error
 }
 
 func (f *isimTransportFake) ResolveLogicalChannelAID(app string, fallbackAID string) (string, string, error) {
+	if f.resolveErr != nil {
+		return "", "", f.resolveErr
+	}
+	if strings.TrimSpace(f.resolvedAID) != "" {
+		return f.resolvedAID, "test_card_status", nil
+	}
 	return "A0000000871004FFFFFFFF8903020000", "test_card_status", nil
 }
 
 func (f *isimTransportFake) OpenLogicalChannel(aid string) (int, error) {
+	aid = strings.ToUpper(aid)
 	f.aid = aid
-	return 7, nil
+	f.openedAIDs = append(f.openedAIDs, aid)
+	if f.openErrByAID != nil {
+		if err := f.openErrByAID[aid]; err != nil {
+			return 0, err
+		}
+	}
+	return 6 + len(f.openedAIDs), nil
 }
 
 func (f *isimTransportFake) CloseLogicalChannel(channel int) error {
@@ -80,6 +98,36 @@ func TestReadISIMIdentityReadsIMPIIMPUAndDomain(t *testing.T) {
 	}
 	if !reflect.DeepEqual(ft.calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", ft.calls, wantCalls)
+	}
+}
+
+func TestReadISIMIdentityFallsBackToShortAIDWhenResolvedFullAIDOpenFails(t *testing.T) {
+	fullISIM := simauth.ISIMAIDPrefix + "FFFFFFFF8903020000"
+	ft := &isimTransportFake{
+		resolvedAID: fullISIM,
+		openErrByAID: map[string]error{
+			fullISIM: errors.New("AT CME ERROR: operation not allowed"),
+		},
+		responses: []string{
+			"9000",
+			hexResponse(isimTLVString("310280233621715@private.att.net")),
+			"6A82",
+			"6A82",
+		},
+	}
+
+	id, err := ReadISIMIdentity(ft)
+	if err != nil {
+		t.Fatalf("ReadISIMIdentity(short AID fallback) error = %v", err)
+	}
+	if id.IMPI != "310280233621715@private.att.net" {
+		t.Fatalf("IMPI = %q, want ISIM value", id.IMPI)
+	}
+	if !reflect.DeepEqual(ft.openedAIDs, []string{fullISIM, simauth.ISIMAIDPrefix}) {
+		t.Fatalf("opened AIDs = %#v, want full then short", ft.openedAIDs)
+	}
+	if !reflect.DeepEqual(ft.closed, []int{8}) {
+		t.Fatalf("closed channels = %#v, want short channel 8", ft.closed)
 	}
 }
 

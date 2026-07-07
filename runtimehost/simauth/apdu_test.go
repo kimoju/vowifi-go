@@ -13,13 +13,28 @@ import (
 )
 
 type fakeTransport struct {
-	calls     []string
-	responses []string
-	err       error
+	calls        []string
+	openedAIDs   []string
+	closed       []int
+	responses    []string
+	err          error
+	openErrByAID map[string]error
 }
 
-func (f *fakeTransport) OpenLogicalChannel(aid string) (int, error) { return 1, nil }
-func (f *fakeTransport) CloseLogicalChannel(channel int) error      { return nil }
+func (f *fakeTransport) OpenLogicalChannel(aid string) (int, error) {
+	aid = strings.ToUpper(aid)
+	f.openedAIDs = append(f.openedAIDs, aid)
+	if f.openErrByAID != nil {
+		if err := f.openErrByAID[aid]; err != nil {
+			return 0, err
+		}
+	}
+	return len(f.openedAIDs), nil
+}
+func (f *fakeTransport) CloseLogicalChannel(channel int) error {
+	f.closed = append(f.closed, channel)
+	return nil
+}
 func (f *fakeTransport) TransmitAPDU(channel int, hexAPDU string) (string, error) {
 	f.calls = append(f.calls, hexAPDU)
 	if f.err != nil {
@@ -31,6 +46,20 @@ func (f *fakeTransport) TransmitAPDU(channel int, hexAPDU string) (string, error
 	resp := f.responses[0]
 	f.responses = f.responses[1:]
 	return resp, nil
+}
+
+type aidResolverTransport struct {
+	*fakeTransport
+	resolvedAID string
+	source      string
+	err         error
+}
+
+func (f *aidResolverTransport) ResolveLogicalChannelAID(app string, fallbackAID string) (string, string, error) {
+	if f.err != nil {
+		return "", "", f.err
+	}
+	return f.resolvedAID, f.source, nil
 }
 
 func TestParseAPDUResponseHex(t *testing.T) {
@@ -57,6 +86,64 @@ func TestParseAPDUResponseHex(t *testing.T) {
 				t.Fatalf("ParseAPDUResponseHex(%q) = %+v nil error, want error", tt, got)
 			}
 		})
+	}
+}
+
+func TestResolveAIDCandidatesPrefersResolvedFullAIDThenShortFallback(t *testing.T) {
+	fullISIM := ISIMAIDPrefix + "FFFFFFFF8903020000"
+	ft := &aidResolverTransport{
+		fakeTransport: &fakeTransport{},
+		resolvedAID:   strings.ToLower(fullISIM),
+		source:        "card_status",
+	}
+
+	candidates, err := ResolveAIDCandidates(ft, "isim", ISIMAIDPrefix, ISIMAIDPrefix)
+	if err != nil {
+		t.Fatalf("ResolveAIDCandidates() error = %v", err)
+	}
+	want := []LogicalChannelAIDCandidate{
+		{AID: fullISIM, Source: "card_status"},
+		{AID: ISIMAIDPrefix, Source: "short_fallback"},
+	}
+	if !reflect.DeepEqual(candidates, want) {
+		t.Fatalf("candidates = %#v, want %#v", candidates, want)
+	}
+
+	aid, source, err := ResolveAID(ft, "isim", ISIMAIDPrefix, ISIMAIDPrefix)
+	if err != nil {
+		t.Fatalf("ResolveAID() error = %v", err)
+	}
+	if aid != fullISIM || source != "card_status" {
+		t.Fatalf("ResolveAID() = %s/%s, want full card_status", aid, source)
+	}
+}
+
+func TestResolveAIDCandidatesAcceptsResolvedShortAID(t *testing.T) {
+	ft := &aidResolverTransport{
+		fakeTransport: &fakeTransport{},
+		resolvedAID:   ISIMAIDPrefix,
+		source:        "card_status",
+	}
+
+	candidates, err := ResolveAIDCandidates(ft, "isim", ISIMAIDPrefix, ISIMAIDPrefix)
+	if err != nil {
+		t.Fatalf("ResolveAIDCandidates(short) error = %v", err)
+	}
+	want := []LogicalChannelAIDCandidate{{AID: ISIMAIDPrefix, Source: "card_status"}}
+	if !reflect.DeepEqual(candidates, want) {
+		t.Fatalf("short candidates = %#v, want %#v", candidates, want)
+	}
+}
+
+func TestResolveAIDCandidatesRejectsWrongApplicationAID(t *testing.T) {
+	ft := &aidResolverTransport{
+		fakeTransport: &fakeTransport{},
+		resolvedAID:   USIMAIDPrefix + "FFFFFFFF8903020000",
+		source:        "card_status",
+	}
+
+	if got, err := ResolveAIDCandidates(ft, "isim", ISIMAIDPrefix, ISIMAIDPrefix); err == nil {
+		t.Fatalf("ResolveAIDCandidates(wrong app) = %#v nil error, want error", got)
 	}
 }
 
@@ -320,6 +407,44 @@ func TestAKAProviderDoesNotTransientRetryPermanentAuthStatus(t *testing.T) {
 	wantCalls := []string{apduHex(noLe), apduHex(withLe)}
 	if !reflect.DeepEqual(ft.calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", ft.calls, wantCalls)
+	}
+}
+
+func TestAKAProviderFallsBackToShortAIDWhenResolvedFullAIDOpenFails(t *testing.T) {
+	rand16 := bytesFrom(0x10, 16)
+	autn16 := bytesFrom(0x30, 16)
+	fullUSIM := USIMAIDPrefix + "FFFFFFFF8903020000"
+	ft := &aidResolverTransport{
+		fakeTransport: &fakeTransport{
+			responses: []string{successfulAKAResponseHex()},
+			openErrByAID: map[string]error{
+				fullUSIM: errors.New("AT CME ERROR: operation not allowed"),
+			},
+		},
+		resolvedAID: fullUSIM,
+		source:      "card_status",
+	}
+	provider := NewAKAProvider(ft)
+
+	res, err := provider.CalculateAKA(rand16, autn16)
+	if err != nil {
+		t.Fatalf("CalculateAKA(full AID open fallback) error = %v", err)
+	}
+	if len(res.RES) != 4 || len(res.CK) != 16 || len(res.IK) != 16 {
+		t.Fatalf("AKA result lengths = RES %d CK %d IK %d", len(res.RES), len(res.CK), len(res.IK))
+	}
+	if !reflect.DeepEqual(ft.openedAIDs, []string{fullUSIM, USIMAIDPrefix}) {
+		t.Fatalf("opened AIDs = %#v, want full then short", ft.openedAIDs)
+	}
+	if !reflect.DeepEqual(ft.closed, []int{2}) {
+		t.Fatalf("closed channels = %#v, want short channel closed", ft.closed)
+	}
+	noLe, err := BuildUSIMAuthAPDU(rand16, autn16, false)
+	if err != nil {
+		t.Fatalf("BuildUSIMAuthAPDU(no Le) error = %v", err)
+	}
+	if !reflect.DeepEqual(ft.calls, []string{apduHex(noLe)}) {
+		t.Fatalf("calls = %#v, want one AKA command on short AID channel", ft.calls)
 	}
 }
 
