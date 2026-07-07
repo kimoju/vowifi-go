@@ -42,17 +42,20 @@ type EntitlementCache struct {
 
 // EntitlementSnapshot is the runtime-facing view of cached entitlement state.
 type EntitlementSnapshot struct {
-	Cached          bool
-	RefreshRequired bool
-	RefreshReason   string
-	StoredAt        time.Time
-	ExpiresAt       time.Time
-	CacheExpiresAt  time.Time
-	RefreshAt       time.Time
-	Token           string
-	Info            EntitlementInfo
-	ServiceURNs     []string
-	Routes          []EmergencyRoute
+	Cached                bool
+	RefreshRequired       bool
+	RefreshReason         string
+	StoredAt              time.Time
+	ExpiresAt             time.Time
+	CacheExpiresAt        time.Time
+	RefreshAt             time.Time
+	RetryAfter            time.Time
+	StaleIfErrorExpiresAt time.Time
+	StaleIfErrorAvailable bool
+	Token                 string
+	Info                  EntitlementInfo
+	ServiceURNs           []string
+	Routes                []EmergencyRoute
 }
 
 // NewEntitlementCache returns a zero-state cache with the supplied policy.
@@ -179,6 +182,12 @@ func (s EntitlementSnapshot) Usable() bool {
 	}
 }
 
+// CanUseStaleOnError reports whether expired cached entitlement data may still
+// be used as a fallback when a refresh attempt fails.
+func (s EntitlementSnapshot) CanUseStaleOnError() bool {
+	return s.StaleIfErrorAvailable
+}
+
 // AvailableServiceURNs returns a defensive copy of the snapshot service URNs.
 func (s EntitlementSnapshot) AvailableServiceURNs() []string {
 	return copyStringSlice(s.ServiceURNs)
@@ -239,18 +248,24 @@ func entitlementSnapshot(info EntitlementInfo, storedAt, now time.Time, cached b
 		}
 	}
 	refreshRequired, reason := entitlementRefreshState(info, now, cached, expiresAt, cacheExpiresAt, refreshAt)
+	retryAfter := info.EffectiveRetryAfter(storedAt)
+	staleIfErrorExpiresAt := entitlementStaleIfErrorExpiresAt(info, expiresAt, cacheExpiresAt)
+	staleIfErrorAvailable := entitlementStaleIfErrorAvailable(info, now, cached, expiresAt, cacheExpiresAt, staleIfErrorExpiresAt)
 	return EntitlementSnapshot{
-		Cached:          cached,
-		RefreshRequired: refreshRequired,
-		RefreshReason:   reason,
-		StoredAt:        storedAt,
-		ExpiresAt:       expiresAt,
-		CacheExpiresAt:  cacheExpiresAt,
-		RefreshAt:       refreshAt,
-		Token:           strings.TrimSpace(info.UserData),
-		Info:            info,
-		ServiceURNs:     serviceURNs,
-		Routes:          routes,
+		Cached:                cached,
+		RefreshRequired:       refreshRequired,
+		RefreshReason:         reason,
+		StoredAt:              storedAt,
+		ExpiresAt:             expiresAt,
+		CacheExpiresAt:        cacheExpiresAt,
+		RefreshAt:             refreshAt,
+		RetryAfter:            retryAfter,
+		StaleIfErrorExpiresAt: staleIfErrorExpiresAt,
+		StaleIfErrorAvailable: staleIfErrorAvailable,
+		Token:                 strings.TrimSpace(info.UserData),
+		Info:                  info,
+		ServiceURNs:           serviceURNs,
+		Routes:                routes,
 	}
 }
 
@@ -303,6 +318,28 @@ func entitlementInfoServiceURNs(info EntitlementInfo) []string {
 		out = append(out, DefaultEmergencyServiceURN)
 	}
 	return out
+}
+
+func entitlementStaleIfErrorExpiresAt(info EntitlementInfo, expiresAt, cacheExpiresAt time.Time) time.Time {
+	if info.StaleIfError <= 0 {
+		return time.Time{}
+	}
+	staleBase := earliestNonZeroTime(expiresAt, cacheExpiresAt)
+	if staleBase.IsZero() {
+		return time.Time{}
+	}
+	return staleBase.Add(info.StaleIfError)
+}
+
+func entitlementStaleIfErrorAvailable(info EntitlementInfo, now time.Time, cached bool, expiresAt, cacheExpiresAt, staleExpiresAt time.Time) bool {
+	if !cached || staleExpiresAt.IsZero() || !now.Before(staleExpiresAt) {
+		return false
+	}
+	if !entitlementInfoCacheableStatus(info) || !entitlementInfoHasData(info) {
+		return false
+	}
+	freshUntil := earliestNonZeroTime(expiresAt, cacheExpiresAt)
+	return !freshUntil.IsZero() && !now.Before(freshUntil)
 }
 
 func normalizeEmergencyRoutes(routes []EmergencyRoute) []EmergencyRoute {

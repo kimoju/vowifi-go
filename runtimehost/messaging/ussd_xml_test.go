@@ -164,3 +164,74 @@ func TestDecodeIMSUSSDDocumentFromMultipart(t *testing.T) {
 		t.Fatalf("ok=%v payload=%+v", ok, payload)
 	}
 }
+
+func TestDecodeIMSUSSDDocumentHonorsMultipartRelatedStartContentID(t *testing.T) {
+	firstXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "ignored", Operation: IMSUSSDOperationNotify})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML(first) error = %v", err)
+	}
+	selectedXML, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "selected", Operation: IMSUSSDOperationResponse})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML(selected) error = %v", err)
+	}
+	body := buildUSSDMultipartTestBody("ussd-start", []ussdMultipartTestPart{
+		{contentType: IMSUSSDContentType, contentID: "<first@ims.test>", body: firstXML},
+		{contentType: IMSUSSDContentType, contentID: "<selected@ims.test>", body: selectedXML},
+	})
+
+	payload, ok, err := DecodeIMSUSSDDocument(`multipart/related; boundary="ussd-start"; start="<selected@ims.test>"`, body)
+	if err != nil {
+		t.Fatalf("DecodeIMSUSSDDocument() error = %v", err)
+	}
+	if !ok || payload.Text != "selected" || payload.Operation != IMSUSSDOperationResponse {
+		t.Fatalf("ok=%v payload=%+v, want selected response", ok, payload)
+	}
+}
+
+func TestDecodeIMSUSSDDocumentFallsBackWhenMultipartStartIsNotUSSD(t *testing.T) {
+	xmlBody, err := BuildIMSUSSDXML(IMSUSSDPayload{Text: "fallback", Operation: IMSUSSDOperationNotify})
+	if err != nil {
+		t.Fatalf("BuildIMSUSSDXML() error = %v", err)
+	}
+	body := buildUSSDMultipartTestBody("ussd-start-sdp", []ussdMultipartTestPart{
+		{contentType: "application/sdp", contentID: "<root@ims.test>", body: []byte("v=0\r\ns=-\r\n")},
+		{contentType: IMSUSSDContentType, contentID: "<ussd@ims.test>", body: xmlBody},
+	})
+
+	payload, ok, err := DecodeIMSUSSDDocument(`multipart/related; boundary="ussd-start-sdp"; start="<root@ims.test>"`, body)
+	if err != nil {
+		t.Fatalf("DecodeIMSUSSDDocument() error = %v", err)
+	}
+	if !ok || payload.Text != "fallback" || payload.Operation != IMSUSSDOperationNotify {
+		t.Fatalf("ok=%v payload=%+v, want fallback notify", ok, payload)
+	}
+}
+
+type ussdMultipartTestPart struct {
+	contentType string
+	contentID   string
+	body        []byte
+}
+
+func buildUSSDMultipartTestBody(boundary string, parts []ussdMultipartTestPart) []byte {
+	var out strings.Builder
+	for _, part := range parts {
+		out.WriteString("--")
+		out.WriteString(boundary)
+		out.WriteString("\r\nContent-Type: ")
+		out.WriteString(part.contentType)
+		out.WriteString("\r\n")
+		if part.contentID != "" {
+			out.WriteString("Content-ID: ")
+			out.WriteString(part.contentID)
+			out.WriteString("\r\n")
+		}
+		out.WriteString("\r\n")
+		out.Write(part.body)
+		out.WriteString("\r\n")
+	}
+	out.WriteString("--")
+	out.WriteString(boundary)
+	out.WriteString("--\r\n")
+	return []byte(out.String())
+}

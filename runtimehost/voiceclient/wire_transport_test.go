@@ -222,6 +222,57 @@ func TestSIPTransactionFailureForClassifiesTimeoutsAndRetryAfter(t *testing.T) {
 	}
 }
 
+func TestSIPTransactionTimerPolicyDefaults(t *testing.T) {
+	invite := DefaultSIPTransactionTimerPolicy(" invite ")
+	if !invite.Invite || invite.Method != "INVITE" ||
+		invite.T1 != 500*time.Millisecond || invite.T2 != 4*time.Second || invite.T4 != 5*time.Second ||
+		invite.TimerA != 500*time.Millisecond || invite.TimerB != 32*time.Second ||
+		invite.TimerE != 0 || invite.TimerF != 0 || invite.TimerK != 0 {
+		t.Fatalf("INVITE policy=%+v", invite)
+	}
+
+	message := DefaultSIPTransactionTimerPolicy("MESSAGE")
+	if message.Invite || message.Method != "MESSAGE" ||
+		message.TimerA != 0 || message.TimerB != 0 ||
+		message.TimerE != 500*time.Millisecond || message.TimerF != 32*time.Second || message.TimerK != 5*time.Second {
+		t.Fatalf("MESSAGE policy=%+v", message)
+	}
+}
+
+func TestSIPTransactionRetryScheduleForInviteAndNonInvite(t *testing.T) {
+	cfg := SIPTransactionTimerConfig{
+		T1: 100 * time.Millisecond,
+		T2: 400 * time.Millisecond,
+		T4: 900 * time.Millisecond,
+	}
+	invite := SIPTransactionRetryScheduleFor("INVITE", cfg)
+	if !invite.Invite || invite.Timeout != 6400*time.Millisecond || invite.CleanupWait != 0 {
+		t.Fatalf("INVITE schedule=%+v", invite)
+	}
+	if len(invite.Intervals) < 5 ||
+		invite.Intervals[0] != 100*time.Millisecond ||
+		invite.Intervals[1] != 200*time.Millisecond ||
+		invite.Intervals[2] != 400*time.Millisecond ||
+		invite.Intervals[len(invite.Intervals)-1] != 400*time.Millisecond {
+		t.Fatalf("INVITE intervals=%v", invite.Intervals)
+	}
+	var inviteElapsed time.Duration
+	for _, interval := range invite.Intervals {
+		inviteElapsed += interval
+		if inviteElapsed >= invite.Timeout {
+			t.Fatalf("INVITE interval %v reaches timeout %v", invite.Intervals, invite.Timeout)
+		}
+	}
+
+	message := SIPTransactionRetryScheduleFor("MESSAGE", cfg)
+	if message.Invite || message.Timeout != 6400*time.Millisecond || message.CleanupWait != 900*time.Millisecond {
+		t.Fatalf("MESSAGE schedule=%+v", message)
+	}
+	if len(message.Intervals) != len(invite.Intervals) || message.Intervals[0] != invite.Intervals[0] {
+		t.Fatalf("MESSAGE intervals=%v INVITE intervals=%v", message.Intervals, invite.Intervals)
+	}
+}
+
 func TestSIPFinalResponseDrainDurationSkipsInvite(t *testing.T) {
 	if got := sipFinalResponseDrainDuration("INVITE", time.Second); got != 0 {
 		t.Fatalf("sipFinalResponseDrainDuration(INVITE)=%v, want 0", got)

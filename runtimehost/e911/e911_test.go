@@ -493,6 +493,49 @@ func TestParseEntitlementResponseCapturesRoutePDNAndCacheControlAliases(t *testi
 	}
 }
 
+func TestParseEntitlementResponseCapturesRetryAfterAndStaleIfError(t *testing.T) {
+	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	body := []byte(`{
+		"status": 6004,
+		"response-id": "retry-json",
+		"retry-after": "120",
+		"cache-control": "private, max-age=60, stale-if-error=300"
+	}`)
+
+	info, err := ParseEntitlementResponse(body)
+	if err != nil {
+		t.Fatalf("ParseEntitlementResponse() error = %v", err)
+	}
+	if info.ResponseID != "retry-json" || info.Status != 6004 {
+		t.Fatalf("basics=%+v", info)
+	}
+	if info.RetryAfterIn != 2*time.Minute {
+		t.Fatalf("RetryAfterIn=%s, want 2m", info.RetryAfterIn)
+	}
+	if got, want := info.EffectiveRetryAfter(base), base.Add(2*time.Minute); !got.Equal(want) {
+		t.Fatalf("EffectiveRetryAfter=%s, want %s", got, want)
+	}
+	if info.CacheMaxAge != time.Minute || info.StaleIfError != 5*time.Minute {
+		t.Fatalf("CacheMaxAge=%s StaleIfError=%s", info.CacheMaxAge, info.StaleIfError)
+	}
+
+	xmlInfo, err := ParseEntitlementResponse([]byte(`
+		<response>
+			<status>6004</status>
+			<retry-after>Tue, 07 Jul 2026 09:05:00 GMT</retry-after>
+			<stale-if-error>PT10M</stale-if-error>
+		</response>`))
+	if err != nil {
+		t.Fatalf("ParseEntitlementResponse(XML) error = %v", err)
+	}
+	if got, want := xmlInfo.RetryAfter, base.Add(5*time.Minute); !got.Equal(want) {
+		t.Fatalf("XML RetryAfter=%s, want %s", got, want)
+	}
+	if xmlInfo.StaleIfError != 10*time.Minute {
+		t.Fatalf("XML StaleIfError=%s, want 10m", xmlInfo.StaleIfError)
+	}
+}
+
 func TestParseEntitlementResponseNormalizesRegisteredEmergencyServiceAliases(t *testing.T) {
 	body := []byte(`{
 		"status": 1000,

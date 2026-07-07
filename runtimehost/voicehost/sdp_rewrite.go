@@ -114,7 +114,7 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 	}
 	text := strings.ReplaceAll(string(body), "\r\n", "\n")
 	lines := strings.Split(text, "\n")
-	audioDisabled := sdpAudioPortDisabled(lines)
+	audioDisabled := sdpAudioPortDisabled(lines) || sdpAudioConnectionDisabled(lines)
 	ipVersion := "IP4"
 	if ip := net.ParseIP(endpoint.ConnectionIP); ip != nil && ip.To4() == nil {
 		ipVersion = "IP6"
@@ -146,7 +146,7 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 		case strings.HasPrefix(line, "m=audio "):
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
-				if fields[1] != "0" {
+				if !audioDisabled && fields[1] != "0" {
 					fields[1] = strconv.Itoa(endpoint.MediaPort)
 				}
 				line = strings.Join(fields, " ")
@@ -561,6 +561,68 @@ func parseSDPAudioDirection(body []byte, connectionIP string, mediaPort int) str
 		return "inactive"
 	}
 	return "sendrecv"
+}
+
+func parseSDPAudioConnectionIP(body []byte) string {
+	return effectiveSDPAudioConnectionIP(sdpSecurityLines(body))
+}
+
+func sdpAudioConnectionDisabled(lines []string) bool {
+	ip := net.ParseIP(strings.TrimSpace(effectiveSDPAudioConnectionIP(lines)))
+	return ip != nil && ip.IsUnspecified()
+}
+
+func effectiveSDPAudioConnectionIP(lines []string) string {
+	beforeFirstMedia := true
+	inFirstAudio := false
+	sawAudio := false
+	sessionIP := ""
+	audioIP := ""
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(lower, "m=") {
+			if sawAudio && inFirstAudio {
+				break
+			}
+			beforeFirstMedia = false
+			inFirstAudio = false
+			fields := strings.Fields(line)
+			if !sawAudio && len(fields) > 0 && strings.EqualFold(fields[0], "m=audio") {
+				inFirstAudio = true
+				sawAudio = true
+			}
+			continue
+		}
+		ip, ok := parseSDPConnectionLine(line)
+		if !ok {
+			continue
+		}
+		if beforeFirstMedia {
+			sessionIP = ip
+			continue
+		}
+		if inFirstAudio {
+			audioIP = ip
+		}
+	}
+	if audioIP != "" {
+		return audioIP
+	}
+	return sessionIP
+}
+
+func parseSDPConnectionLine(line string) (string, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 || !strings.EqualFold(fields[0], "c=IN") {
+		return "", false
+	}
+	if !strings.EqualFold(fields[1], "IP4") && !strings.EqualFold(fields[1], "IP6") {
+		return "", false
+	}
+	return strings.TrimSpace(fields[2]), true
 }
 
 func parseSDPDirectionLine(line string) (string, bool) {

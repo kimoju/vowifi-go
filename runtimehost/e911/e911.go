@@ -190,6 +190,9 @@ type EntitlementInfo struct {
 	ExpiresIn                time.Duration
 	CacheExpiresAt           time.Time
 	CacheMaxAge              time.Duration
+	RetryAfter               time.Time
+	RetryAfterIn             time.Duration
+	StaleIfError             time.Duration
 	LocationValidationStatus string
 }
 
@@ -209,6 +212,16 @@ func (i EntitlementInfo) EffectiveCacheExpiresAt(base time.Time) time.Time {
 	}
 	if i.CacheMaxAge > 0 && !base.IsZero() {
 		return base.Add(i.CacheMaxAge)
+	}
+	return time.Time{}
+}
+
+func (i EntitlementInfo) EffectiveRetryAfter(base time.Time) time.Time {
+	if !i.RetryAfter.IsZero() {
+		return i.RetryAfter
+	}
+	if i.RetryAfterIn > 0 && !base.IsZero() {
+		return base.Add(i.RetryAfterIn)
 	}
 	return time.Time{}
 }
@@ -548,6 +561,9 @@ type entitlementResult struct {
 	ExpiresIn                time.Duration
 	CacheExpiresAt           time.Time
 	CacheMaxAge              time.Duration
+	RetryAfter               time.Time
+	RetryAfterIn             time.Duration
+	StaleIfError             time.Duration
 	LocationValidationStatus string
 }
 
@@ -599,6 +615,9 @@ func entitlementInfoFromResult(result entitlementResult) EntitlementInfo {
 		ExpiresIn:                result.ExpiresIn,
 		CacheExpiresAt:           result.CacheExpiresAt,
 		CacheMaxAge:              result.CacheMaxAge,
+		RetryAfter:               result.RetryAfter,
+		RetryAfterIn:             result.RetryAfterIn,
+		StaleIfError:             result.StaleIfError,
 		LocationValidationStatus: result.LocationValidationStatus,
 	}
 }
@@ -858,11 +877,15 @@ func consumeEntitlementField(key string, value any, out *entitlementResult, ctx 
 	case "expiresin", "expiresseconds", "expiressec", "ttl", "timetolive", "validity", "validityperiod", "validfor":
 		setDuration(&out.ExpiresIn, value)
 	case "cachecontrol":
-		setCacheControlMaxAge(&out.CacheMaxAge, value)
+		setCacheControlDirectives(&out.CacheMaxAge, &out.StaleIfError, value)
 	case "cacheexpires", "cacheexpiry", "cacheexpiresat", "cacheexpiration", "cacheexpirationtime", "cachevaliduntil":
 		setExpiry(&out.CacheExpiresAt, &out.CacheMaxAge, value)
 	case "cacheexpiresin", "cachemaxage", "cachettl", "cachetimetolive", "maxage":
 		setDuration(&out.CacheMaxAge, value)
+	case "retryafter", "retryafterseconds", "retryin", "retryafterin", "nextretry", "retryat":
+		setRetryAfter(&out.RetryAfter, &out.RetryAfterIn, value)
+	case "staleiferror", "staleonerror", "staleiferrorseconds":
+		setDuration(&out.StaleIfError, value)
 	case "locationvalidationstatus", "validationstatus", "addressvalidationstatus", "e911addressvalidationstatus", "locationstatus", "locationvalidationresult", "validationresult", "addressvalidationresult", "civicaddressvalidationstatus", "civiclocationvalidationstatus":
 		setLocationValidationStatus(&out.LocationValidationStatus, value)
 	default:
@@ -980,21 +1003,39 @@ func setDuration(dst *time.Duration, value any) {
 	}
 }
 
-func setCacheControlMaxAge(dst *time.Duration, value any) {
-	if dst == nil || *dst != 0 {
+func setRetryAfter(dstTime *time.Time, dstDuration *time.Duration, value any) {
+	if dstTime == nil || dstDuration == nil {
 		return
 	}
-	if d, ok := cacheControlMaxAgeValue(value); ok && d > 0 {
-		*dst = d
+	if t, d, ok := timeOrDurationValue(value); ok {
+		if !t.IsZero() && dstTime.IsZero() {
+			*dstTime = t
+			return
+		}
+		if d > 0 && *dstDuration == 0 {
+			*dstDuration = d
+		}
 	}
 }
 
-func cacheControlMaxAgeValue(value any) (time.Duration, bool) {
+func setCacheControlDirectives(maxAge *time.Duration, staleIfError *time.Duration, value any) {
+	if maxAge != nil && *maxAge == 0 {
+		if d, ok := cacheControlDirectiveDurationValue(value, "maxage", "smaxage", "cachemaxage", "ttl"); ok && d > 0 {
+			*maxAge = d
+		}
+	}
+	if staleIfError != nil && *staleIfError == 0 {
+		if d, ok := cacheControlDirectiveDurationValue(value, "staleiferror", "staleonerror"); ok && d > 0 {
+			*staleIfError = d
+		}
+	}
+}
+
+func cacheControlDirectiveDurationValue(value any, keys ...string) (time.Duration, bool) {
 	switch x := value.(type) {
 	case map[string]any:
 		for key, item := range x {
-			switch normalizeEntitlementKey(key) {
-			case "maxage", "smaxage", "cachemaxage", "ttl":
+			if matchesNormalizedKey(normalizeEntitlementKey(key), keys...) {
 				if d, ok := durationValue(item); ok && d > 0 {
 					return d, true
 				}
@@ -1002,26 +1043,26 @@ func cacheControlMaxAgeValue(value any) (time.Duration, bool) {
 		}
 	case []any:
 		for _, item := range x {
-			if d, ok := cacheControlMaxAgeValue(item); ok {
+			if d, ok := cacheControlDirectiveDurationValue(item, keys...); ok {
 				return d, true
 			}
 		}
 	case []string:
 		for _, item := range x {
-			if d, ok := cacheControlMaxAgeValue(item); ok {
+			if d, ok := cacheControlDirectiveDurationValue(item, keys...); ok {
 				return d, true
 			}
 		}
 	}
 	for _, s := range stringsFromAny(value) {
-		if d, ok := cacheControlMaxAgeString(s); ok {
+		if d, ok := cacheControlDirectiveDurationString(s, keys...); ok {
 			return d, true
 		}
 	}
 	return 0, false
 }
 
-func cacheControlMaxAgeString(s string) (time.Duration, bool) {
+func cacheControlDirectiveDurationString(s string, keys ...string) (time.Duration, bool) {
 	for _, part := range strings.FieldsFunc(s, func(r rune) bool {
 		return r == ',' || r == ';'
 	}) {
@@ -1036,8 +1077,7 @@ func cacheControlMaxAgeString(s string) (time.Duration, bool) {
 		if !ok {
 			continue
 		}
-		switch normalizeEntitlementKey(key) {
-		case "maxage", "smaxage", "cachemaxage":
+		if matchesNormalizedKey(normalizeEntitlementKey(key), keys...) {
 			value = strings.Trim(strings.TrimSpace(value), `"'`)
 			if d, ok := durationValue(value); ok && d > 0 {
 				return d, true
@@ -1045,6 +1085,15 @@ func cacheControlMaxAgeString(s string) (time.Duration, bool) {
 		}
 	}
 	return 0, false
+}
+
+func matchesNormalizedKey(key string, values ...string) bool {
+	for _, value := range values {
+		if key == normalizeEntitlementKey(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func timeOrDurationValue(value any) (time.Time, time.Duration, bool) {

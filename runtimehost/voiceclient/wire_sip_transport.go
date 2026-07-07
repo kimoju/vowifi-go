@@ -115,8 +115,8 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 		return readFinalSIPResponse(ctx, reader, attempt, onProvisional)
 	}
 	buf := make([]byte, 65535)
-	interval := sipRetransmitInterval(timeout, t.RetransmitInterval)
-	maxInterval := sipMaxRetransmitInterval(timeout, t.MaxRetransmitInterval)
+	interval := sipRetransmitInterval(attempt.Method, timeout, t.RetransmitInterval)
+	maxInterval := sipMaxRetransmitInterval(attempt.Method, timeout, t.MaxRetransmitInterval)
 	deadline := time.Now().Add(timeout)
 	retransmits := 0
 	gotResponse := false

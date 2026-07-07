@@ -1082,7 +1082,6 @@ type SDPInfo struct {
 }
 
 var (
-	sdpConnRE   = regexp.MustCompile(`(?m)^c=IN IP[46] ([^\r\n]+)`)
 	sdpMediaRE  = regexp.MustCompile(`(?m)^m=audio ([0-9]+) [A-Z0-9/]+(.*)$`)
 	sdpRTCPRE   = regexp.MustCompile(`(?m)^a=rtcp:([0-9]+)(?:\s+IN\s+IP[46]\s+([^\r\n]+))?`)
 	sdpRTPMapRE = regexp.MustCompile(`(?mi)^a=rtpmap:([0-9]+)\s+telephone-event/([0-9]+)(?:/[0-9]+)?\s*$`)
@@ -1091,8 +1090,8 @@ var (
 func ParseSDP(body []byte) (SDPInfo, error) {
 	text := string(body)
 	var out SDPInfo
-	if m := sdpConnRE.FindStringSubmatch(text); len(m) == 2 {
-		out.ConnectionIP = strings.TrimSpace(m[1])
+	if ip := parseSDPAudioConnectionIP(body); ip != "" {
+		out.ConnectionIP = ip
 	}
 	if out.ConnectionIP == "" {
 		out.ConnectionIP = "127.0.0.1"

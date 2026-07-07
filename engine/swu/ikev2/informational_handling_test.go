@@ -60,6 +60,56 @@ func TestHandleInformationalContentTreatsEmptyAsLiveness(t *testing.T) {
 	}
 }
 
+func TestPlanInformationalResponseEchoesCookie2(t *testing.T) {
+	cookiePayload, err := Cookie2Notify([]byte("cookie-2"))
+	if err != nil {
+		t.Fatalf("Cookie2Notify() error = %v", err)
+	}
+	handling, err := HandleInformationalPayloads([]Payload{
+		UpdateSAAddressesNotify(),
+		cookiePayload,
+	})
+	if err != nil {
+		t.Fatalf("HandleInformationalPayloads() error = %v", err)
+	}
+	plan, err := PlanInformationalResponse(handling)
+	if err != nil {
+		t.Fatalf("PlanInformationalResponse() error = %v", err)
+	}
+	if !plan.EchoCookie2 || len(plan.Payloads) != 1 {
+		t.Fatalf("plan=%+v", plan)
+	}
+	handling.Cookie2[0] = 'x'
+	notify, err := ParseNotify(plan.Payloads[0].Body)
+	if err != nil {
+		t.Fatalf("ParseNotify(response cookie) error = %v", err)
+	}
+	if notify.NotifyType != NotifyCookie2 || !bytes.Equal(notify.NotificationData, []byte("cookie-2")) {
+		t.Fatalf("notify=%+v", notify)
+	}
+}
+
+func TestPlanInformationalResponseLeavesUpdateSAAddressesEmptyWithoutCookie2(t *testing.T) {
+	handling, err := HandleInformationalPayloads([]Payload{UpdateSAAddressesNotify()})
+	if err != nil {
+		t.Fatalf("HandleInformationalPayloads() error = %v", err)
+	}
+	plan, err := PlanInformationalResponse(handling)
+	if err != nil {
+		t.Fatalf("PlanInformationalResponse() error = %v", err)
+	}
+	if plan.EchoCookie2 || len(plan.Payloads) != 0 {
+		t.Fatalf("plan=%+v", plan)
+	}
+}
+
+func TestPlanInformationalResponseRejectsMalformedCookie2(t *testing.T) {
+	_, err := PlanInformationalResponse(InformationalHandling{Cookie2: []byte("short")})
+	if !errors.Is(err, ErrInvalidInformational) || !errors.Is(err, ErrInvalidNotify) {
+		t.Fatalf("PlanInformationalResponse(malformed cookie) err=%v, want ErrInvalidInformational and ErrInvalidNotify", err)
+	}
+}
+
 func TestHandleInformationalContentPreservesNotifyError(t *testing.T) {
 	payload, err := NotifyPayload(Notify{NotifyType: NotifyUnexpectedNATDetected})
 	if err != nil {

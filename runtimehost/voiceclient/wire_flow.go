@@ -347,8 +347,8 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 
 func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, timeout time.Duration, wire []byte, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	buf := make([]byte, 65535)
-	interval := sipRetransmitInterval(timeout, f.RetransmitInterval)
-	maxInterval := sipMaxRetransmitInterval(timeout, f.MaxRetransmitInterval)
+	interval := sipRetransmitInterval(msg.Method, timeout, f.RetransmitInterval)
+	maxInterval := sipMaxRetransmitInterval(msg.Method, timeout, f.MaxRetransmitInterval)
 	deadline := time.Now().Add(timeout)
 	retransmits := 0
 	gotResponse := false

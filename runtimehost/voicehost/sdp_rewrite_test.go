@@ -73,6 +73,26 @@ func TestRewriteSDPMediaEndpointPreservesDisabledAudioPort(t *testing.T) {
 	}
 }
 
+func TestRewriteSDPMediaEndpointPreservesConnectionAddressHold(t *testing.T) {
+	raw := []byte("v=0\r\n" +
+		"o=user 0 0 IN IP4 192.0.2.10\r\n" +
+		"s=-\r\n" +
+		"c=IN IP4 203.0.113.10\r\n" +
+		"t=0 0\r\n" +
+		"m=audio 4002 RTP/AVP 0\r\n" +
+		"c=IN IP4 0.0.0.0\r\n" +
+		"a=rtcp:4003 IN IP4 192.0.2.10\r\n")
+	got := string(RewriteSDPMediaEndpoint(raw, SDPInfo{ConnectionIP: "198.51.100.20", MediaPort: 49170, RTCPPort: 49171}))
+	for _, want := range []string{"c=IN IP4 0.0.0.0", "m=audio 4002 RTP/AVP 0", "a=rtcp:4003 IN IP4 192.0.2.10"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rewritten held SDP missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "49170") || strings.Contains(got, "49171") || strings.Contains(got, "198.51.100.20") {
+		t.Fatalf("rewritten held SDP leaked relay endpoint:\n%s", got)
+	}
+}
+
 func TestParseSDPMediaDescriptionCapturesRTCPMuxAndCodecs(t *testing.T) {
 	raw := []byte("v=0\r\n" +
 		"o=user 0 0 IN IP4 203.0.113.8\r\n" +
@@ -400,6 +420,32 @@ func TestParseSDPAudioDirectionUsesSessionFallback(t *testing.T) {
 	}
 	if info.Direction != "sendonly" {
 		t.Fatalf("direction=%q, want sendonly", info.Direction)
+	}
+}
+
+func TestParseSDPUsesAudioConnectionOverride(t *testing.T) {
+	info, err := ParseSDP([]byte("v=0\r\n" +
+		"c=IN IP4 0.0.0.0\r\n" +
+		"m=audio 49170 RTP/AVP 0\r\n" +
+		"c=IN IP4 198.51.100.44\r\n"))
+	if err != nil {
+		t.Fatalf("ParseSDP() error = %v", err)
+	}
+	if info.ConnectionIP != "198.51.100.44" || info.Direction != "sendrecv" {
+		t.Fatalf("info=%+v, want audio connection override with sendrecv", info)
+	}
+}
+
+func TestParseSDPConnectionAddressHoldIsInactive(t *testing.T) {
+	info, err := ParseSDP([]byte("v=0\r\n" +
+		"c=IN IP4 203.0.113.8\r\n" +
+		"m=audio 49170 RTP/AVP 0\r\n" +
+		"c=IN IP4 0.0.0.0\r\n"))
+	if err != nil {
+		t.Fatalf("ParseSDP() error = %v", err)
+	}
+	if info.ConnectionIP != "0.0.0.0" || info.MediaPort != 49170 || info.Direction != "inactive" {
+		t.Fatalf("info=%+v, want media-level connection hold", info)
 	}
 }
 

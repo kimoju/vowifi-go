@@ -190,6 +190,54 @@ func TestEntitlementCacheUsableViewsRejectExpiredOrFailedEntitlement(t *testing.
 	}
 }
 
+func TestEntitlementCacheSurfacesRetryAfterAndStaleIfError(t *testing.T) {
+	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	cache := NewEntitlementCache(EntitlementCachePolicy{})
+	fresh := cache.Store(EntitlementInfo{
+		Status:       1000,
+		UserData:     "token-1",
+		ExpiresIn:    time.Minute,
+		RetryAfterIn: 30 * time.Second,
+		StaleIfError: 5 * time.Minute,
+	}, base)
+	if got, want := fresh.RetryAfter, base.Add(30*time.Second); !got.Equal(want) {
+		t.Fatalf("RetryAfter=%s, want %s", got, want)
+	}
+	if got, want := fresh.StaleIfErrorExpiresAt, base.Add(6*time.Minute); !got.Equal(want) {
+		t.Fatalf("StaleIfErrorExpiresAt=%s, want %s", got, want)
+	}
+	if fresh.CanUseStaleOnError() {
+		t.Fatalf("fresh snapshot should not need stale-if-error: %+v", fresh)
+	}
+
+	stale := cache.Snapshot(base.Add(90 * time.Second))
+	if stale.Usable() {
+		t.Fatalf("expired snapshot should not be normally usable: %+v", stale)
+	}
+	if !stale.CanUseStaleOnError() || !stale.StaleIfErrorAvailable {
+		t.Fatalf("stale-if-error unavailable inside window: %+v", stale)
+	}
+	if routes := stale.UsableRoutes(""); len(routes) != 0 {
+		t.Fatalf("normal usable routes should remain unavailable after expiry: %+v", routes)
+	}
+
+	expired := cache.Snapshot(base.Add(6 * time.Minute))
+	if expired.CanUseStaleOnError() {
+		t.Fatalf("stale-if-error should close at boundary: %+v", expired)
+	}
+
+	retry := cache.Store(EntitlementInfo{
+		Status:       6004,
+		RetryAfterIn: 2 * time.Minute,
+	}, base)
+	if got, want := retry.RetryAfter, base.Add(2*time.Minute); !got.Equal(want) {
+		t.Fatalf("failed RetryAfter=%s, want %s", got, want)
+	}
+	if retry.CanUseStaleOnError() {
+		t.Fatalf("failed entitlement without data should not be stale-if-error usable: %+v", retry)
+	}
+}
+
 func TestEntitlementCacheUsesPolicyDefaultsAndServiceFallback(t *testing.T) {
 	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
 	cache := NewEntitlementCache(EntitlementCachePolicy{

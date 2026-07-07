@@ -154,8 +154,8 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 		return RegisterResponse{}, err
 	}
 	buf := make([]byte, 65535)
-	interval := sipRetransmitInterval(timeout, t.RetransmitInterval)
-	maxInterval := sipMaxRetransmitInterval(timeout, t.MaxRetransmitInterval)
+	interval := sipRetransmitInterval(attempt.Method, timeout, t.RetransmitInterval)
+	maxInterval := sipMaxRetransmitInterval(attempt.Method, timeout, t.MaxRetransmitInterval)
 	deadline := time.Now().Add(timeout)
 	retransmits := 0
 	gotResponse := false
@@ -1128,24 +1128,26 @@ func strictContentLength(headers map[string][]string) (int, bool, error) {
 	return length, seen, nil
 }
 
-func sipRetransmitInterval(timeout, configured time.Duration) time.Duration {
+func sipRetransmitInterval(method string, timeout, configured time.Duration) time.Duration {
 	if configured > 0 {
 		return configured
 	}
-	if timeout > 0 && timeout < 500*time.Millisecond {
+	interval := DefaultSIPTransactionTimerPolicy(method).T1
+	if timeout > 0 && timeout < interval {
 		return timeout
 	}
-	return 500 * time.Millisecond
+	return interval
 }
 
-func sipMaxRetransmitInterval(timeout, configured time.Duration) time.Duration {
+func sipMaxRetransmitInterval(method string, timeout, configured time.Duration) time.Duration {
 	if configured > 0 {
 		return configured
 	}
-	if timeout > 0 && timeout < 4*time.Second {
+	interval := DefaultSIPTransactionTimerPolicy(method).T2
+	if timeout > 0 && timeout < interval {
 		return timeout
 	}
-	return 4 * time.Second
+	return interval
 }
 
 func nextSIPReadDeadline(deadline time.Time, interval time.Duration) time.Time {

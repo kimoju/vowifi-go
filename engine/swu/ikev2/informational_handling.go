@@ -21,6 +21,11 @@ type InformationalHandling struct {
 	Deletes               []Delete
 }
 
+type InformationalResponsePlan struct {
+	Payloads    []Payload
+	EchoCookie2 bool
+}
+
 func HandleInformationalPayloads(payloads []Payload) (InformationalHandling, error) {
 	content, err := ParseInformationalContent(payloads)
 	if err != nil {
@@ -53,6 +58,22 @@ func HandleInformationalContent(content InformationalContent) (InformationalHand
 		}
 	}
 	return handling, nil
+}
+
+func PlanInformationalResponse(handling InformationalHandling) (InformationalResponsePlan, error) {
+	var payloads []Payload
+	echoCookie2 := len(handling.Cookie2) > 0
+	if echoCookie2 {
+		payload, err := Cookie2Notify(handling.Cookie2)
+		if err != nil {
+			return InformationalResponsePlan{}, fmt.Errorf("%w: %w", ErrInvalidInformational, err)
+		}
+		payloads = append(payloads, payload)
+	}
+	return InformationalResponsePlan{
+		Payloads:    clonePayloads(payloads),
+		EchoCookie2: echoCookie2,
+	}, nil
 }
 
 func handleInformationalNotify(handling *InformationalHandling, notify Notify) error {

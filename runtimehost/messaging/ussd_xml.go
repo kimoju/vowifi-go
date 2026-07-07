@@ -268,24 +268,19 @@ func DecodeIMSUSSDDocument(contentType string, body []byte) (IMSUSSDPayload, boo
 		if boundary == "" {
 			return IMSUSSDPayload{}, false, errors.New("USSD multipart boundary is empty")
 		}
-		reader := multipart.NewReader(bytes.NewReader(body), boundary)
-		for {
-			part, err := reader.NextPart()
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if err != nil {
-				return IMSUSSDPayload{}, false, err
-			}
-			partBody, err := io.ReadAll(part)
-			if err != nil {
-				return IMSUSSDPayload{}, false, err
-			}
-			if normalizeUSSDContentType(part.Header.Get("Content-Type")) != IMSUSSDContentType {
-				continue
-			}
-			payload, err := ParseIMSUSSDXML(partBody)
+		parts, err := readIMSUSSDMultipartParts(body, boundary)
+		if err != nil {
+			return IMSUSSDPayload{}, false, err
+		}
+		if part, ok := imsUSSDMultipartStartPart(parts, imsUSSDMultipartStartContentID(params["start"])); ok {
+			payload, err := ParseIMSUSSDXML(part.Body)
 			return payload, true, err
+		}
+		for _, part := range parts {
+			if normalizeUSSDContentType(part.ContentType) == IMSUSSDContentType {
+				payload, err := ParseIMSUSSDXML(part.Body)
+				return payload, true, err
+			}
 		}
 		return IMSUSSDPayload{}, false, nil
 	default:
@@ -295,6 +290,59 @@ func DecodeIMSUSSDDocument(contentType string, body []byte) (IMSUSSDPayload, boo
 		}
 		return IMSUSSDPayload{}, false, nil
 	}
+}
+
+type imsUSSDMultipartPart struct {
+	ContentType string
+	ContentID   string
+	Body        []byte
+}
+
+func readIMSUSSDMultipartParts(body []byte, boundary string) ([]imsUSSDMultipartPart, error) {
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	var parts []imsUSSDMultipartPart
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		partBody, err := io.ReadAll(part)
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, imsUSSDMultipartPart{
+			ContentType: part.Header.Get("Content-Type"),
+			ContentID:   part.Header.Get("Content-ID"),
+			Body:        partBody,
+		})
+	}
+	return parts, nil
+}
+
+func imsUSSDMultipartStartContentID(value string) string {
+	value = strings.Trim(strings.TrimSpace(value), `"`)
+	value = strings.Trim(strings.TrimSpace(value), "<>")
+	return strings.ToLower(value)
+}
+
+func imsUSSDMultipartStartPart(parts []imsUSSDMultipartPart, startContentID string) (imsUSSDMultipartPart, bool) {
+	startContentID = imsUSSDMultipartStartContentID(startContentID)
+	if startContentID == "" {
+		return imsUSSDMultipartPart{}, false
+	}
+	for _, part := range parts {
+		if imsUSSDMultipartStartContentID(part.ContentID) != startContentID {
+			continue
+		}
+		if normalizeUSSDContentType(part.ContentType) != IMSUSSDContentType {
+			return imsUSSDMultipartPart{}, false
+		}
+		return part, true
+	}
+	return imsUSSDMultipartPart{}, false
 }
 
 func ussdResultFromPayload(sessionID string, payload IMSUSSDPayload, status int) USSDResult {
