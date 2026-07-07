@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
+	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
 
 func TestSafeDiagnosticStateRedactsSensitiveRuntimeText(t *testing.T) {
@@ -138,6 +139,60 @@ func TestSafeDiagnosticIMSRegistrationRecoveryStateRedactsReasonAndError(t *test
 	}
 	if state.LastReason == got.LastReason || state.LastError == got.LastError {
 		t.Fatalf("recovery reason/error were not redacted: state=%+v diagnostic=%+v", state, got)
+	}
+}
+
+func TestSafeDiagnosticIMSRegistrationResultOmitsSensitiveProfileAndBinding(t *testing.T) {
+	now := time.Now()
+	localPath := "/" + filepathJoinForDiagnosticTest("home", "boa", "vohive", "ims-result.log")
+	result := IMSRegistrationResult{
+		Registered:    true,
+		StatusCode:    200,
+		Reason:        "registered sip:310280233641503@ims.example from 192.168.31.34 using " + localPath,
+		Server:        "sip:310280233641503@ims.example via 87.194.9.8",
+		RegisteredAt:  now.Add(-time.Minute),
+		ExpiresAt:     now.Add(time.Hour),
+		RefreshDelay:  30 * time.Minute,
+		NextRefreshAt: now.Add(30 * time.Minute),
+		Profile: voiceclient.IMSProfile{
+			IMPI:              "310280233641503@ims.example",
+			IMPU:              "sip:310280233641503@ims.example",
+			Domain:            "ims.example",
+			LocalIP:           "192.168.31.34",
+			AccessNetworkInfo: `IEEE-802.11;i-wlan-node-id="00:11:22:33:44:55"`,
+		},
+		Binding: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:310280233641503@192.168.31.34:5060",
+			PublicIdentity: "sip:310280233641503@ims.example",
+			AuthHeader:     `Authorization: Digest nonce="recover-secret", response="0123456789abcdef0123456789abcdef"`,
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+		RecoveryState: IMSRegistrationRecoveryState{
+			Attempts:   1,
+			LastReason: "refresh sip:310280233641503@ims.example",
+			LastError:  `Digest nonce="recover-secret" from 87.194.9.8`,
+		},
+	}
+
+	got := SafeDiagnosticIMSRegistrationResult(result)
+	if !got.Redacted || !got.Registered || got.StatusCode != 200 ||
+		!got.RegisteredAt.Equal(result.RegisteredAt) ||
+		!got.ExpiresAt.Equal(result.ExpiresAt) ||
+		got.RefreshDelay != result.RefreshDelay ||
+		!got.NextRefreshAt.Equal(result.NextRefreshAt) ||
+		got.RecoveryState.Attempts != 1 || !got.RecoveryState.Redacted {
+		t.Fatalf("diagnostic registration result lost operational fields: %+v", got)
+	}
+	assertNoRuntimeDiagnosticLeak(t, fmt.Sprintf("%+v", got), localPath, "00:11:22:33:44:55")
+	for _, leak := range []string{"ContactURI", "PublicIdentity", "AuthHeader", "ServiceRoutes", "IMPI", "IMPU"} {
+		if strings.Contains(fmt.Sprintf("%+v", got), leak) {
+			t.Fatalf("diagnostic registration result exposed raw field name %q: %+v", leak, got)
+		}
+	}
+	for _, want := range []string{"<redacted", ".invalid", "<redacted-local-path>"} {
+		if !strings.Contains(fmt.Sprintf("%+v", got), want) {
+			t.Fatalf("diagnostic registration result does not contain marker %q: %+v", want, got)
+		}
 	}
 }
 

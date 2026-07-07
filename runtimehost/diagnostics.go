@@ -69,6 +69,25 @@ type DiagnosticIMSRegistrationRecoveryState struct {
 	Redacted            bool
 }
 
+// DiagnosticIMSRegistrationResult is a redacted view of an IMS registration
+// result for support surfaces. It deliberately omits Profile and Binding, which
+// can contain IMS identities, Contact URIs, security material, and route state.
+type DiagnosticIMSRegistrationResult struct {
+	Registered          bool
+	StatusCode          int
+	Reason              string
+	Server              string
+	RegisteredAt        time.Time
+	ExpiresAt           time.Time
+	RefreshDelay        time.Duration
+	NextRefreshAt       time.Time
+	RecoveryState       DiagnosticIMSRegistrationRecoveryState
+	VoiceTransportReady bool
+	SMSTransportReady   bool
+	USSDTransportReady  bool
+	Redacted            bool
+}
+
 // SafeDiagnosticState returns a diagnostic view of state with sensitive text
 // fields redacted. It does not mutate the input State.
 func SafeDiagnosticState(state State) DiagnosticState {
@@ -94,6 +113,27 @@ func SafeDiagnosticState(state State) DiagnosticState {
 		IMSRecoveryReason:        redactRuntimeDiagnosticString(redactor, state.IMSRecoveryReason),
 		UpdatedAt:                state.UpdatedAt,
 		Redacted:                 true,
+	}
+}
+
+// SafeDiagnosticIMSRegistrationResult returns a diagnostic summary of IMS
+// registration without exposing raw IMS profile, binding, or SIP route data.
+func SafeDiagnosticIMSRegistrationResult(result IMSRegistrationResult) DiagnosticIMSRegistrationResult {
+	redactor := tracefixture.NewRedactor()
+	return DiagnosticIMSRegistrationResult{
+		Registered:          result.Registered,
+		StatusCode:          result.StatusCode,
+		Reason:              redactRuntimeDiagnosticString(redactor, result.Reason),
+		Server:              redactRuntimeDiagnosticString(redactor, result.Server),
+		RegisteredAt:        result.RegisteredAt,
+		ExpiresAt:           result.ExpiresAt,
+		RefreshDelay:        result.RefreshDelay,
+		NextRefreshAt:       result.NextRefreshAt,
+		RecoveryState:       SafeDiagnosticIMSRegistrationRecoveryState(result.RecoveryState),
+		VoiceTransportReady: result.VoiceTransport != nil,
+		SMSTransportReady:   result.SMSTransport != nil,
+		USSDTransportReady:  result.USSDTransport != nil,
+		Redacted:            true,
 	}
 }
 
