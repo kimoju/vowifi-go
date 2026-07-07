@@ -209,7 +209,7 @@ func RedactTranscript(transcript Transcript) (Transcript, error) {
 			Label:     redactor.RedactString(event.Label),
 			Direction: event.Direction,
 			Transport: event.Transport,
-			Wire:      redactor.RedactString(event.Wire),
+			Wire:      redactor.RedactSIPString(event.Wire),
 		}
 	}
 	if err := ValidateTranscript(out); err != nil {
@@ -267,15 +267,19 @@ func (v *redactionValidator) scanString(path, value string) {
 	}
 	v.scanSensitiveHeaders(path, value)
 	v.scanAuthAndAKAParams(path, value)
+	v.scanPAccessNetworkInfo(path, value)
 	v.scanSIPURIUserIdentifiers(path, value)
 	if labelledSubscriberIDRE.MatchString(value) || longDigitRE.MatchString(value) {
 		v.add(path, "subscriber identifier")
 	}
-	if telURIRE.MatchString(value) || e164RE.MatchString(value) {
+	if labelledMSISDNValueRE.MatchString(value) || telURIRE.MatchString(value) || e164RE.MatchString(value) {
 		v.add(path, "msisdn")
 	}
 	if longHexRE.MatchString(value) {
 		v.add(path, "auth/aka material")
+	}
+	if macAddressRE.MatchString(value) {
+		v.add(path, "mac address")
 	}
 	v.scanIPv4(path, value)
 	v.scanIPv6(path, value)
@@ -307,12 +311,23 @@ func (v *redactionValidator) scanAuthAndAKAParams(path, value string) {
 	}
 }
 
+func (v *redactionValidator) scanPAccessNetworkInfo(path, value string) {
+	for _, line := range pAccessNetworkInfoLineRE.FindAllString(value, -1) {
+		for _, match := range pAccessNetworkInfoParamRE.FindAllStringSubmatch(line, -1) {
+			if len(match) != 4 || isRedactedLiteral(match[3]) {
+				continue
+			}
+			v.add(path, "access network info")
+		}
+	}
+}
+
 func (v *redactionValidator) scanSIPURIUserIdentifiers(path, value string) {
 	for _, match := range sipURIRE.FindAllStringSubmatch(value, -1) {
-		if len(match) != 3 {
+		if len(match) != 4 {
 			continue
 		}
-		if kind, ok := sensitiveSIPURIUserKind(match[1]); ok {
+		if kind, ok := sensitiveSIPURIUserKind(match[2]); ok {
 			v.add(path, kind)
 		}
 	}

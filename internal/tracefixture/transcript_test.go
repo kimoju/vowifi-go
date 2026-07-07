@@ -3,6 +3,7 @@ package tracefixture
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -85,6 +86,12 @@ func TestParseTranscriptJSONRejectsSensitiveFixture(t *testing.T) {
 			wantKind: "msisdn",
 		},
 		{
+			name:     "labelled msisdn",
+			wire:     "X-MSISDN: 15550101234",
+			secret:   "15550101234",
+			wantKind: "msisdn",
+		},
+		{
 			name:     "msisdn sip uri user",
 			wire:     "P-Preferred-Identity: <sip:15550101234@ims.example.invalid;user=phone>",
 			secret:   "15550101234",
@@ -107,6 +114,24 @@ func TestParseTranscriptJSONRejectsSensitiveFixture(t *testing.T) {
 			wire:     "X-AKA: rand=00112233445566778899AABBCCDDEEFF",
 			secret:   "00112233445566778899AABBCCDDEEFF",
 			wantKind: "aka",
+		},
+		{
+			name:     "aka nonce",
+			wire:     "X-Debug-AKA: nonce=plainAKA",
+			secret:   "plainAKA",
+			wantKind: "auth",
+		},
+		{
+			name:     "pani cell id",
+			wire:     "P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=310260ABCDEFFF",
+			secret:   "310260ABCDEFFF",
+			wantKind: "access network",
+		},
+		{
+			name:     "mac address",
+			wire:     "X-BSSID: 00:11:22:33:44:55",
+			secret:   "00:11:22:33:44:55",
+			wantKind: "mac",
 		},
 		{
 			name:     "ip",
@@ -241,6 +266,127 @@ func TestParseAndRedactTranscriptJSONSanitizesSensitiveFixture(t *testing.T) {
 	}
 }
 
+func TestParseAndRedactTranscriptJSONSanitizesE911VoiceSIPWithBody(t *testing.T) {
+	outboundBody := strings.Join([]string{
+		"v=0",
+		"o=- 123456 1 IN IP4 192.0.2.44",
+		"s=VoLTE emergency",
+		"c=IN IP4 192.0.2.44",
+		"m=audio 49170 RTP/AVP 0 8 96",
+		"a=rtcp:49171 IN IP4 192.0.2.44",
+		"",
+	}, "\r\n")
+	inboundBody := strings.Join([]string{
+		"v=0",
+		"o=- 654321 1 IN IP6 2001:db8::20",
+		"s=VoLTE progress",
+		"c=IN IP6 2001:db8::20",
+		"m=audio 50000 RTP/AVP 0 8 96",
+		"",
+	}, "\r\n")
+	raw := marshalTranscript(t, Transcript{
+		Schema: TranscriptSchemaVersion,
+		Name:   "e911-voice-001010123456789",
+		Events: []TranscriptEvent{
+			{
+				Label:     "invite-001010123456789",
+				Direction: "outbound",
+				Transport: "udp",
+				Wire: sipWireWithBody([]string{
+					"INVITE urn:service:sos SIP/2.0",
+					"Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bKfixture",
+					"From: <sip:+15550101234@ims.example.invalid;user=phone>;tag=fixture",
+					"To: <urn:service:sos>",
+					"Call-ID: emergency-call",
+					"CSeq: 1 INVITE",
+					`Contact: <sip:001010123456789@[2001:db8::10]:5060;transport=udp>;+sip.instance="<urn:gsma:imei:49015420-323751-8>"`,
+					`P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=310260ABCDEFFF;ue-ip=2001:db8::10;ssid="Home WiFi"`,
+					"Geolocation: <cid:pidf-001010123456789>",
+					"Content-Type: application/sdp",
+				}, outboundBody),
+			},
+			{
+				Label:     "progress-001010123456789",
+				Direction: "inbound",
+				Transport: "udp",
+				Wire: sipWireWithBody([]string{
+					"SIP/2.0 183 Session Progress",
+					"Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bKfixture",
+					"From: <sip:+15550101234@ims.example.invalid;user=phone>;tag=fixture",
+					"To: <urn:service:sos>;tag=fixture2",
+					"Call-ID: emergency-call",
+					"CSeq: 1 INVITE",
+					"Contact: <sip:psap@example.net>",
+					"Content-Type: application/sdp",
+				}, inboundBody),
+			},
+		},
+	})
+
+	if _, err := ParseTranscriptJSON(raw); !errors.Is(err, ErrSensitiveFixture) {
+		t.Fatalf("ParseTranscriptJSON error = %v, want ErrSensitiveFixture", err)
+	}
+	transcript, err := ParseAndRedactTranscriptJSON(raw)
+	if err != nil {
+		t.Fatalf("ParseAndRedactTranscriptJSON returned error: %v", err)
+	}
+	replay, err := NewReplay(transcript)
+	if err != nil {
+		t.Fatalf("NewReplay returned error: %v", err)
+	}
+	invite, err := replay.NextOutbound()
+	if err != nil {
+		t.Fatalf("NextOutbound returned error: %v", err)
+	}
+	inviteMsg, err := invite.SIPMessage()
+	if err != nil {
+		t.Fatalf("redacted INVITE did not parse: %v\n%s", err, string(invite.Wire))
+	}
+	if inviteMsg.Method != "INVITE" || inviteMsg.Header("Content-Length") != strconv.Itoa(len(inviteMsg.Body)) {
+		t.Fatalf("unexpected redacted INVITE parse result: method=%q content-length=%q body=%d", inviteMsg.Method, inviteMsg.Header("Content-Length"), len(inviteMsg.Body))
+	}
+	progress, err := replay.NextInbound()
+	if err != nil {
+		t.Fatalf("NextInbound returned error: %v", err)
+	}
+	progressMsg, err := progress.SIPMessage()
+	if err != nil {
+		t.Fatalf("redacted progress response did not parse: %v\n%s", err, string(progress.Wire))
+	}
+	if progressMsg.StatusCode != 183 || progressMsg.Header("Content-Length") != strconv.Itoa(len(progressMsg.Body)) {
+		t.Fatalf("unexpected redacted progress parse result: status=%d content-length=%q body=%d", progressMsg.StatusCode, progressMsg.Header("Content-Length"), len(progressMsg.Body))
+	}
+
+	joined := transcript.Name + "\n" + transcript.Events[0].Label + "\n" + transcript.Events[0].Wire + "\n" + transcript.Events[1].Label + "\n" + transcript.Events[1].Wire
+	for _, sensitive := range []string{
+		"001010123456789",
+		"+15550101234",
+		"49015420-323751-8",
+		"310260ABCDEFFF",
+		"192.0.2.10",
+		"192.0.2.44",
+		"2001:db8::10",
+		"2001:db8::20",
+		"Home WiFi",
+	} {
+		if strings.Contains(joined, sensitive) {
+			t.Fatalf("redacted E911 voice transcript still contains %q:\n%s", sensitive, joined)
+		}
+	}
+	for _, want := range []string{
+		"INVITE urn:service:sos SIP/2.0",
+		"Contact: <sip:<redacted-sip-user-2>@[<redacted-ipv6-1>]:5060;transport=udp>",
+		"utran-cell-id-3gpp=<redacted-pani-1>",
+		`ssid="<redacted-pani-2>"`,
+		"c=IN IP4 <redacted-ipv4-2>",
+		"c=IN IP6 <redacted-ipv6-2>",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("redacted E911 voice transcript missing %q:\n%s", want, joined)
+		}
+	}
+}
+
 func TestParseTranscriptJSONRejectsInvalidShape(t *testing.T) {
 	tests := []struct {
 		name string
@@ -281,4 +427,10 @@ func marshalTranscript(t *testing.T, transcript Transcript) []byte {
 		t.Fatalf("marshal transcript: %v", err)
 	}
 	return raw
+}
+
+func sipWireWithBody(headers []string, body string) string {
+	lines := append([]string(nil), headers...)
+	lines = append(lines, "Content-Length: "+strconv.Itoa(len(body)), "", body)
+	return strings.Join(lines, "\r\n")
 }

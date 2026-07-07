@@ -344,6 +344,73 @@ func TestPrepareStartUsesCarrierPrivateIdentityRealmOverride(t *testing.T) {
 	}
 }
 
+func TestPrepareStartExposesCarrierPolicyMetadata(t *testing.T) {
+	carrier.ClearCarrierOverrides()
+	t.Cleanup(carrier.ClearCarrierOverrides)
+
+	path := t.TempDir() + "/carriers.json"
+	if err := os.WriteFile(path, []byte(`{
+		"001017": {
+			"mcc": "001",
+			"mnc": "017",
+			"preset_id": "identity-policy",
+			"e911": {
+				"enabled": true,
+				"provider": " TS43 ",
+				"websheet": "https://example.test/identity-e911"
+			},
+			"network": {
+				"ims_realm": " ims.identity.example. ",
+				"private_identity_realm": " private.identity.example. ",
+				"pcscf_fqdns": ["pcscf-a.identity.example.", "pcscf-b.identity.example"],
+				"epdg_fqdn": " epdg.identity.example. ",
+				"p_access_network_info": " IEEE-802.11;i-wlan-node-id=\"node;17\" ",
+				"p_visited_network_id": " visited.identity.example ",
+				"service_urns": ["fire", "URN:SERVICE:SOS.POLICE"]
+			}
+		}
+	}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := carrier.LoadCarrierOverrides(path); err != nil {
+		t.Fatalf("LoadCarrierOverrides() error = %v", err)
+	}
+
+	prepared, err := PrepareStart(PrepareStartInput{
+		Profile: Profile{IMSI: "001017123456789"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	policy := prepared.CarrierPolicy
+	if policy.PresetID != "identity-policy" || policy.MCC != "001" || policy.MNC != "017" {
+		t.Fatalf("CarrierPolicy=%+v, want identity-policy for 001/017", policy)
+	}
+	if !policy.E911.Enabled || policy.E911.Provider != "ts43" ||
+		policy.E911.Websheet != "https://example.test/identity-e911" {
+		t.Fatalf("CarrierPolicy.E911=%+v, want normalized E911 metadata", policy.E911)
+	}
+	if policy.IMS.IMSPrivateIdentity != "001017123456789@private.identity.example" ||
+		policy.IMS.IMSPublicIdentity != "sip:001017123456789@ims.identity.example" ||
+		policy.IMS.AccessNetworkInfo != `IEEE-802.11;i-wlan-node-id="node;17"` ||
+		policy.IMS.VisitedNetworkID != "visited.identity.example" {
+		t.Fatalf("CarrierPolicy.IMS=%+v, want normalized carrier metadata", policy.IMS)
+	}
+	if !reflect.DeepEqual(policy.IMS.PCSCFFQDNs, []string{"pcscf-a.identity.example", "pcscf-b.identity.example"}) ||
+		!reflect.DeepEqual(prepared.PCSCFFQDNs, policy.IMS.PCSCFFQDNs) {
+		t.Fatalf("P-CSCF prepared=%+v policy=%+v", prepared.PCSCFFQDNs, policy.IMS.PCSCFFQDNs)
+	}
+	if got := policy.IMS.EmergencyServiceURNs; !reflect.DeepEqual(got, []string{"urn:service:sos.fire", "urn:service:sos.police"}) {
+		t.Fatalf("EmergencyServiceURNs=%+v", got)
+	}
+	if prepared.EPDGAddr != "epdg.identity.example" ||
+		prepared.IMSIdentity.IMPI != policy.IMS.IMSPrivateIdentity ||
+		prepared.IMSIdentity.IMPU != policy.IMS.IMSPublicIdentity ||
+		prepared.IMSIdentity.Domain != policy.IMS.IMSRealm {
+		t.Fatalf("prepared session=%+v policy=%+v, want policy-backed IMS metadata", prepared, policy)
+	}
+}
+
 func TestPrepareStartPrefersDomainMatchedSIPIMPU(t *testing.T) {
 	prepared, err := PrepareStart(PrepareStartInput{
 		Profile: Profile{IMSI: "001010123456789"},

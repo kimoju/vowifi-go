@@ -410,15 +410,15 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 
 func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, timeout time.Duration, wire []byte, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	buf := make([]byte, 65535)
-	interval := sipRetransmitInterval(msg.Method, timeout, f.RetransmitInterval)
-	maxInterval := sipMaxRetransmitInterval(msg.Method, timeout, f.MaxRetransmitInterval)
+	timerConfig := sipFlowTransactionTimerConfig(msg.Method, timeout, f.RetransmitInterval, f.MaxRetransmitInterval)
+	interval := timerConfig.T1
 	deadline := time.Now().Add(timeout)
 	retransmits := 0
-	gotResponse := false
+	state := InitialSIPClientTransactionState(msg.Method)
 	retransmitExhausted := false
 	for {
 		readInterval := interval
-		if gotResponse || retransmitExhausted {
+		if retransmitExhausted || !sipClientTransactionRetransmitTimerActive(msg.Method, state) {
 			readInterval = time.Until(deadline)
 		}
 		if err := conn.SetReadDeadline(nextSIPReadDeadline(deadline, readInterval)); err != nil {
@@ -430,20 +430,30 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 				return SIPResponse{}, ctx.Err()
 			}
 			if !isSIPTimeout(err) || !time.Now().Before(deadline) {
-				if gotResponse && isSIPTimeout(err) {
+				if state == SIPClientTransactionStateProceeding && isSIPTimeout(err) {
 					return SIPResponse{}, sipFinalResponseTimeoutError{Method: msg.Method, Err: err}
 				}
 				return SIPResponse{}, err
 			}
-			if !gotResponse && !retransmitExhausted && shouldSIPRetransmit(retransmits, f.MaxRetransmits) {
+			step := AdvanceSIPClientTransaction(SIPClientTransactionInput{
+				Method:                   msg.Method,
+				State:                    state,
+				Event:                    SIPClientTransactionEventRetransmitTimer,
+				LastRetransmitInterval:   interval,
+				TimerConfig:              timerConfig,
+				MaxRetransmits:           f.MaxRetransmits,
+				CompletedRetransmissions: retransmits,
+			})
+			state = step.NextState
+			if !retransmitExhausted && step.RetransmitRequest {
 				if _, writeErr := conn.Write(wire); writeErr != nil {
 					return SIPResponse{}, writeErr
 				}
 				retransmits++
-				interval = nextSIPRetransmitInterval(interval, maxInterval)
+				interval = step.NextRetransmitInterval
 				continue
 			}
-			if !gotResponse {
+			if !sipClientTransactionRetransmitTimerActive(msg.Method, state) || !shouldSIPRetransmit(retransmits, f.MaxRetransmits) {
 				retransmitExhausted = true
 				continue
 			}
@@ -459,16 +469,23 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 		if !sipResponseMatchesRequest(resp, msg) {
 			continue
 		}
-		if !isSIPProvisionalResponse(resp.StatusCode) {
+		step := AdvanceSIPClientTransaction(SIPClientTransactionInput{
+			Method:      msg.Method,
+			State:       state,
+			Event:       SIPClientTransactionEventResponse,
+			Response:    resp,
+			TimerConfig: timerConfig,
+		})
+		state = step.NextState
+		if step.Final && step.DeliverResponse {
 			drainSIPUDPFinalResponses(ctx, conn, msg, sipFinalResponseDrainDuration(msg.Method, f.FinalResponseDrain))
 			return resp, nil
 		}
-		if onProvisional != nil && shouldReportSIPProvisionalResponse(msg.Method) {
+		if step.Provisional && step.DeliverResponse && onProvisional != nil && shouldReportSIPProvisionalResponse(msg.Method) {
 			if err := onProvisional(ctx, msg, resp); err != nil {
 				return SIPResponse{}, err
 			}
 		}
-		gotResponse = true
 	}
 }
 
@@ -498,6 +515,13 @@ func readFinalSIPFlowResponse(ctx context.Context, reader *bufio.Reader, msg SIP
 			}
 		}
 		gotResponse = true
+	}
+}
+
+func sipFlowTransactionTimerConfig(method string, timeout, retransmitInterval, maxRetransmitInterval time.Duration) SIPTransactionTimerConfig {
+	return SIPTransactionTimerConfig{
+		T1: sipRetransmitInterval(method, timeout, retransmitInterval),
+		T2: sipMaxRetransmitInterval(method, timeout, maxRetransmitInterval),
 	}
 }
 

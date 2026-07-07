@@ -212,6 +212,81 @@ func TestWireIMSRegistrarPassesPreparedAKAAppPreference(t *testing.T) {
 	}
 }
 
+func TestWireIMSRegistrarRefreshesISIMIdentityAfterForbidden(t *testing.T) {
+	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{
+		{StatusCode: 403, Reason: "Forbidden"},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	access := &wireIMSRegistrarAccess{id: identity.Identity{
+		IMPI:   "fresh-impi@private.example",
+		IMPU:   []string{"sip:fresh-user@ims.example"},
+		Domain: "ims.example",
+	}}
+	res, err := WireIMSRegistrar{
+		Transport:   transport,
+		ContactHost: "192.0.2.10",
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-refresh-identity",
+		TraceID:  "trace-refresh-identity",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Prepared: &identity.PreparedSession{
+			IMSIdentity: identity.IMSIdentityResolution{
+				IMPI:   "stale-impi@private.example",
+				IMPU:   "sip:stale-user@ims.example",
+				Domain: "ims.example",
+			},
+		},
+		Access: access,
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if !res.Registered || res.Profile.IMPI != "fresh-impi@private.example" || res.Profile.IMPU != "sip:fresh-user@ims.example" {
+		t.Fatalf("result=%+v", res)
+	}
+	if access.calls != 1 || len(transport.requests) != 2 {
+		t.Fatalf("access calls=%d register requests=%d", access.calls, len(transport.requests))
+	}
+	if !strings.Contains(transport.requests[0].Headers["To"], "sip:stale-user@ims.example") ||
+		!strings.Contains(transport.requests[1].Headers["To"], "sip:fresh-user@ims.example") {
+		t.Fatalf("registration To headers first=%q second=%q", transport.requests[0].Headers["To"], transport.requests[1].Headers["To"])
+	}
+}
+
+func TestWireIMSRegistrarDoesNotRetryForbiddenWhenISIMIdentityUnchanged(t *testing.T) {
+	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{
+		{StatusCode: 403, Reason: "Forbidden"},
+		{StatusCode: 200, Reason: "unexpected"},
+	}}
+	access := &wireIMSRegistrarAccess{id: identity.Identity{
+		IMPI:   "impi@private.example",
+		IMPU:   []string{"sip:user@ims.example"},
+		Domain: "ims.example",
+	}}
+	res, err := WireIMSRegistrar{
+		Transport:   transport,
+		ContactHost: "192.0.2.10",
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-refresh-identity-unchanged",
+		TraceID:  "trace-refresh-identity-unchanged",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Prepared: &identity.PreparedSession{
+			IMSIdentity: identity.IMSIdentityResolution{
+				IMPI:   "impi@private.example",
+				IMPU:   "sip:user@ims.example",
+				Domain: "ims.example",
+			},
+		},
+		Access: access,
+	})
+	if !errors.Is(err, voiceclient.ErrRegistrationRejected) {
+		t.Fatalf("RegisterIMS() err=%v, want ErrRegistrationRejected", err)
+	}
+	if res.StatusCode != 403 || access.calls != 1 || len(transport.requests) != 1 {
+		t.Fatalf("result=%+v access calls=%d requests=%d", res, access.calls, len(transport.requests))
+	}
+}
+
 func TestWireIMSRegistrarReportsRegistrationRefreshSchedule(t *testing.T) {
 	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{{
 		StatusCode: 200,
@@ -1758,6 +1833,21 @@ func (s *wireIMSRegistrarSIM) CalculateAKAWithPreference(rand16, autn16 []byte, 
 }
 
 func (s *wireIMSRegistrarSIM) Close() error { return nil }
+
+type wireIMSRegistrarAccess struct {
+	id    identity.Identity
+	err   error
+	calls int
+}
+
+func (a *wireIMSRegistrarAccess) GetISIMIdentity() (identity.Identity, error) {
+	a.calls++
+	return a.id, a.err
+}
+
+func (a *wireIMSRegistrarAccess) RuntimeModem() Modem {
+	return nil
+}
 
 func waitWire(t *testing.T, ch <-chan string) string {
 	t.Helper()

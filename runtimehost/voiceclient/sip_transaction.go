@@ -470,6 +470,14 @@ func completeSIPClientTransaction(step SIPClientTransactionStep, reliable bool, 
 	return step
 }
 
+func sipClientTransactionRetransmitTimerActive(method string, state SIPClientTransactionState) bool {
+	if sipTransactionKindForMethod(method) == sipTransactionInvite {
+		return normalizeSIPClientTransactionState(state, method) == SIPClientTransactionStateCalling
+	}
+	state = normalizeSIPClientTransactionState(state, method)
+	return state == SIPClientTransactionStateTrying || state == SIPClientTransactionStateProceeding
+}
+
 func normalizeSIPClientTransactionState(state SIPClientTransactionState, method string) SIPClientTransactionState {
 	switch state {
 	case SIPClientTransactionStateCalling:

@@ -62,6 +62,7 @@ type IKEPacketTunnelManagerConfig struct {
 	EAPIdentity              string
 	Reauthentication         EAPReauthenticationState
 	OnReauthenticationState  func(EAPReauthenticationState)
+	ReauthenticationLifetime time.Duration
 	InitiatorID              ikev2.Identity
 	IKETransportFactory      IKETransportFactory
 	ESPTransportFactory      IKEESPTransportFactory
@@ -130,6 +131,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	if err != nil {
 		return nil, err
 	}
+	operatorRealm := eapOperatorRealm(identity)
 	initiatorID := m.Config.InitiatorID
 	if initiatorID.Type == 0 {
 		initiatorID = ikev2.Identity{Type: ikev2.IDRFC822Addr, Data: []byte(identity)}
@@ -167,10 +169,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	if authRunner == nil {
 		authRunner = ikev2.RunIKE_AUTH_Full
 	}
-	reauth := m.Config.Reauthentication.clone()
-	if !reauth.Usable() {
-		reauth = EAPReauthenticationState{}
-	}
+	reauth := m.Config.Reauthentication.authStateAt(reauthenticationNow(cfg.StartedAt), operatorRealm)
 	auth, err := authRunner(ctx, ikev2.FullAuthConfig{
 		Transport:          transport,
 		Init:               init,
@@ -197,7 +196,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		return nil, fmt.Errorf("%w: IKE_AUTH completed without CHILD_SA", ErrTunnelNotReady)
 	}
 	child := *auth.ChildSA
-	m.updateReauthenticationState(auth)
+	m.updateReauthenticationState(auth, operatorRealm)
 	result := tunnelResultFromIKE(cfg, epdg, init, child, mode)
 	closeHandler, mobikeHandler, rekeyHandler, dpdHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
 	if mode == DataplaneModeKernel {
@@ -301,43 +300,34 @@ func closeIKEBestEffort(ctx context.Context, closeHandler func(context.Context) 
 	return closeHandler(ctx)
 }
 
-func (m *IKEPacketTunnelManager) updateReauthenticationState(auth ikev2.FullAuthResult) {
+func (m *IKEPacketTunnelManager) updateReauthenticationState(auth ikev2.FullAuthResult, operatorRealm string) {
 	if m == nil || len(auth.EAPKeys.KAut) == 0 || len(auth.EAPKeys.KEncr) == 0 {
 		return
 	}
-	current := m.Config.Reauthentication.clone()
-	next := current
-	if strings.TrimSpace(auth.EAPNextReauthID) != "" {
-		next.Identity = strings.TrimSpace(auth.EAPNextReauthID)
-	}
-	if strings.TrimSpace(auth.EAPNextPseudonym) != "" {
-		next.NextPseudonym = strings.TrimSpace(auth.EAPNextPseudonym)
-	}
-	if strings.TrimSpace(next.Identity) == "" {
+	next, ok := m.Config.Reauthentication.ApplyUpdate(EAPReauthenticationUpdate{
+		NextReauthID:    auth.EAPNextReauthID,
+		NextPseudonym:   auth.EAPNextPseudonym,
+		Keys:            auth.EAPKeys,
+		Reauthenticated: auth.EAPReauthenticated,
+		CounterTooSmall: auth.EAPReauthCounterTooSmall,
+		Counter:         auth.EAPReauthCounter,
+		ExpiresAt:       m.reauthenticationExpiresAt(),
+		OperatorRealm:   operatorRealm,
+	})
+	if !ok {
 		return
 	}
-	next.Keys = cloneEAPAKAKeys(auth.EAPKeys)
-	next.Reauthenticated = auth.EAPReauthenticated
-	next.CounterTooSmall = auth.EAPReauthCounterTooSmall
-	switch {
-	case auth.EAPReauthenticated:
-		next.Counter = auth.EAPReauthCounter
-		next.CounterOK = true
-		next.LastAcceptedCounter = auth.EAPReauthCounter
-	case auth.EAPReauthCounterTooSmall:
-		next.CounterOK = current.CounterOK
-		next.LastRejectedCounter = auth.EAPReauthCounter
-	default:
-		next.Counter = 0
-		next.CounterOK = true
-		next.LastAcceptedCounter = 0
-		next.LastRejectedCounter = 0
-	}
-	next = next.clone()
 	m.Config.Reauthentication = next
 	if m.Config.OnReauthenticationState != nil {
 		m.Config.OnReauthenticationState(next.clone())
 	}
+}
+
+func (m *IKEPacketTunnelManager) reauthenticationExpiresAt() time.Time {
+	if m == nil || m.Config.ReauthenticationLifetime <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(m.Config.ReauthenticationLifetime)
 }
 
 func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string) (IKETransportConfig, ESPTransportConfig) {
@@ -695,6 +685,22 @@ func eapIdentityForTunnel(cfg TunnelConfig, override string) (string, error) {
 		prefix = "0"
 	}
 	return fmt.Sprintf("%s%s@nai.epc.mnc%s.mcc%s.3gppnetwork.org", prefix, raw, leftPadTunnel(mnc, 3), mcc), nil
+}
+
+func eapOperatorRealm(identity string) string {
+	identity = normalizeTunnelIdentity(identity)
+	at := strings.LastIndexByte(identity, '@')
+	if at < 0 || at == len(identity)-1 {
+		return ""
+	}
+	return normalizeEAPOperatorRealm(identity[at+1:])
+}
+
+func reauthenticationNow(startedAt time.Time) time.Time {
+	if !startedAt.IsZero() {
+		return startedAt
+	}
+	return time.Now()
 }
 
 func normalizeTunnelIdentity(identity string) string {

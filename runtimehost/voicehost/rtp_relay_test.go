@@ -1006,6 +1006,97 @@ func TestRTPRelaySessionReportsQualitySnapshot(t *testing.T) {
 	}
 }
 
+func TestRTPRelaySessionEmitsQualityEventsOnStatusChange(t *testing.T) {
+	base := time.Date(2026, 7, 7, 10, 30, 0, 0, time.UTC)
+	var events []RTPRelayQualityEvent
+	relay := &RTPRelaySession{
+		clientRTPClockRate: 8000,
+		rtpQualityConfig: RTPRelayQualityConfig{
+			EmitInitial: true,
+			ClientToIMS: RTPStreamDiagnosisConfig{
+				ClockRate:            8000,
+				MinExpectedPackets:   2,
+				LossWarningFraction:  1,
+				LossCriticalFraction: 200,
+			},
+		},
+		rtpQualityHandler: func(event RTPRelayQualityEvent) {
+			events = append(events, event)
+		},
+	}
+
+	relay.observeRTPStream(RTPDTMFClientToIMS, buildRTPStatsPacket(0x11111111, 10, 1000), base, 8000)
+	if len(events) != 0 {
+		t.Fatalf("startup quality events=%+v, want none before diagnosis is known", events)
+	}
+
+	relay.observeRTPStream(RTPDTMFClientToIMS, buildRTPStatsPacket(0x11111111, 11, 1160), base.Add(20*time.Millisecond), 8000)
+	if len(events) != 1 ||
+		events[0].Direction != RTCPFeedbackClientToIMS ||
+		events[0].Status != RTPStreamDiagnosisStatusOK ||
+		events[0].PreviousStatus != RTPStreamDiagnosisStatusUnknown ||
+		len(events[0].Reasons) != 0 ||
+		len(events[0].Diagnoses) != 1 {
+		t.Fatalf("initial quality event=%+v", events)
+	}
+
+	relay.observeRTPStream(RTPDTMFClientToIMS, buildRTPStatsPacket(0x11111111, 12, 1320), base.Add(40*time.Millisecond), 8000)
+	if len(events) != 1 {
+		t.Fatalf("duplicate OK quality events=%+v", events)
+	}
+
+	relay.observeRTPStream(RTPDTMFClientToIMS, buildRTPStatsPacket(0x11111111, 14, 1640), base.Add(80*time.Millisecond), 8000)
+	if len(events) != 2 {
+		t.Fatalf("quality events after loss=%+v, want status change event", events)
+	}
+	event := events[1]
+	if event.Status != RTPStreamDiagnosisStatusWarning ||
+		event.PreviousStatus != RTPStreamDiagnosisStatusOK ||
+		len(event.Reasons) != 1 ||
+		event.Reasons[0] != RTPStreamDiagnosisReasonPacketLoss ||
+		event.Quality.RTPLostPackets != 1 ||
+		event.Quality.RTPExpectedPackets != 5 {
+		t.Fatalf("loss quality event=%+v", event)
+	}
+}
+
+func TestRTPRelaySessionRTCPQualityEventDoesNotDeadlock(t *testing.T) {
+	base := time.Date(2026, 7, 7, 10, 31, 0, 0, time.UTC)
+	relay := &RTPRelaySession{
+		clientRTPClockRate: 8000,
+		rtpQualityHandler:  func(RTPRelayQualityEvent) {},
+		rtpQualityConfig: RTPRelayQualityConfig{
+			ClientToIMS: RTPStreamDiagnosisConfig{
+				ClockRate:          8000,
+				MinExpectedPackets: 1,
+			},
+		},
+	}
+	relay.observeRTPStream(RTPDTMFClientToIMS, buildRTPStatsPacket(0x11111111, 10, 1000), base, 8000)
+
+	done := make(chan struct{})
+	go func() {
+		relay.recordRTCPReportQuality(RTCPFeedbackEvent{
+			Direction: RTCPFeedbackClientToIMS,
+			SSRC:      0x61616161,
+			Reports: []RTCPReceptionReport{{
+				SSRC:               0x11111111,
+				FractionLost:       32,
+				TotalLost:          1,
+				LastSequenceNumber: 10,
+				Jitter:             4,
+			}},
+		}, base.Add(20*time.Millisecond))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("recordRTCPReportQuality deadlocked while emitting RTP quality event")
+	}
+}
+
 func TestRTPRelaySessionEstimatesRTTFromSenderAndReceiverReports(t *testing.T) {
 	clientPeer := listenTestUDP(t)
 	defer clientPeer.Close()

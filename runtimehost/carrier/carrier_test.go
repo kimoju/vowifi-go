@@ -199,6 +199,38 @@ func TestLoadCarrierOverridesNormalizesPCSCFCandidates(t *testing.T) {
 	}
 }
 
+func TestLoadCarrierOverridesIndexesNamedPresetByPLMN(t *testing.T) {
+	ClearCarrierOverrides()
+	t.Cleanup(ClearCarrierOverrides)
+
+	path := filepath.Join(t.TempDir(), "carriers.json")
+	if err := os.WriteFile(path, []byte(`{
+		"001013": {
+			"mcc": "001",
+			"mnc": "013",
+			"preset_id": "lab-wifi",
+			"network": {
+				"ims_realm": " ims.named.example. ",
+				"pcscf_fqdn": " pcscf.named.example. "
+			}
+		}
+	}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := LoadCarrierOverrides(path)
+	if err != nil {
+		t.Fatalf("LoadCarrierOverrides() error = %v", err)
+	}
+	if res.Missing || res.Count != 1 {
+		t.Fatalf("LoadResult=%+v, want one loaded override", res)
+	}
+	cfg := ResolveEffectiveCarrierConfig(EffectiveCarrierConfigInput{MCC: "001", MNC: "013"})
+	if cfg.PresetID != "lab-wifi" || cfg.Network.IMSRealm != "ims.named.example" ||
+		cfg.Network.PCSCFFQDN != "pcscf.named.example" {
+		t.Fatalf("ResolveEffectiveCarrierConfig(named preset)=%+v, want PLMN lookup to find override", cfg)
+	}
+}
+
 func TestLoadCarrierOverridesAcceptsNetworkAliases(t *testing.T) {
 	ClearCarrierOverrides()
 	t.Cleanup(ClearCarrierOverrides)
@@ -319,6 +351,64 @@ func TestLoadCarrierOverridesNormalizesAccessProfileMetadata(t *testing.T) {
 	if profile.AccessNetworkInfo != `IEEE-802.11;i-wlan-node-id="node;2"` ||
 		profile.VisitedNetworkID != "visited.profile.example" {
 		t.Fatalf("ANI/visited=%q/%q, want normalized policy metadata", profile.AccessNetworkInfo, profile.VisitedNetworkID)
+	}
+}
+
+func TestCarrierPolicyForSubscriberSurfacesIMSAndE911Metadata(t *testing.T) {
+	ClearCarrierOverrides()
+	t.Cleanup(ClearCarrierOverrides)
+
+	path := filepath.Join(t.TempDir(), "carriers.json")
+	if err := os.WriteFile(path, []byte(`{
+		"001016": {
+			"mcc": "001",
+			"mnc": "016",
+			"preset_id": "matrix-lab",
+			"e911": {
+				"enabled": true,
+				"provider": " Lab-TS43 ",
+				"websheet": "https://example.test/lab-e911",
+				"entitlement_endpoint": "https://example.test/lab-entitlement"
+			},
+			"network": {
+				"ims_realm": " ims.policy.example. ",
+				"private_identity_realm": " private.policy.example. ",
+				"pcscf_fqdns": ["pcscf-a.policy.example.", "pcscf-b.policy.example"],
+				"pani": " IEEE-802.11;i-wlan-node-id=\"node;16\" ",
+				"visited_network": " visited.policy.example ",
+				"service_urns": ["police", "URN:SERVICE:SOS.AMBULANCE"]
+			}
+		}
+	}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadCarrierOverrides(path); err != nil {
+		t.Fatalf("LoadCarrierOverrides() error = %v", err)
+	}
+
+	policy := CarrierPolicyForSubscriber(CarrierPolicyInput{IMSI: "001016123456789"})
+	if policy.MCC != "001" || policy.MNC != "016" || policy.PresetID != "matrix-lab" {
+		t.Fatalf("CarrierPolicy PLMN/Preset=%+v, want named 001/016 policy", policy)
+	}
+	if !policy.E911.Enabled || policy.E911.Provider != "lab-ts43" ||
+		policy.E911.Websheet != "https://example.test/lab-e911" ||
+		policy.E911.EntitlementEndpoint != "https://example.test/lab-entitlement" {
+		t.Fatalf("CarrierPolicy E911=%+v, want normalized E911 metadata", policy.E911)
+	}
+	if policy.IMS.IMSPrivateIdentity != "001016123456789@private.policy.example" ||
+		policy.IMS.IMSPublicIdentity != "sip:001016123456789@ims.policy.example" ||
+		policy.IMS.AccessNetworkInfo != `IEEE-802.11;i-wlan-node-id="node;16"` ||
+		policy.IMS.VisitedNetworkID != "visited.policy.example" {
+		t.Fatalf("CarrierPolicy IMS=%+v, want normalized IMS metadata", policy.IMS)
+	}
+	if !reflect.DeepEqual(policy.IMS.PCSCFFQDNs, []string{"pcscf-a.policy.example", "pcscf-b.policy.example"}) {
+		t.Fatalf("CarrierPolicy PCSCF=%+v", policy.IMS.PCSCFFQDNs)
+	}
+	wantURNs := []string{"urn:service:sos.police", "urn:service:sos.ambulance"}
+	if !reflect.DeepEqual(policy.IMS.EmergencyServiceURNs, wantURNs) ||
+		!reflect.DeepEqual(policy.Network.EmergencyServiceURNs, wantURNs) {
+		t.Fatalf("CarrierPolicy service URNs IMS=%+v Network=%+v, want %+v",
+			policy.IMS.EmergencyServiceURNs, policy.Network.EmergencyServiceURNs, wantURNs)
 	}
 }
 

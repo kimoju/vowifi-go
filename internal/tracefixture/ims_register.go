@@ -39,6 +39,7 @@ type IMSRegisterReplaySummary struct {
 	FinalStatusCode    int
 	FinalReason        string
 	StatusCodes        []int
+	AccessNetworkInfo  []string
 	AssociatedURIs     []string
 	Contacts           []string
 	ServiceRoutes      []string
@@ -61,6 +62,8 @@ type IMSRegisterReplayTransaction struct {
 	HasProxyAuthorization bool
 	HasWWWAuthenticate    bool
 	HasProxyAuthenticate  bool
+	HasContact            bool
+	HasPAccessNetworkInfo bool
 	HasSecurityServer     bool
 	HasSecurityVerify     bool
 }
@@ -170,11 +173,14 @@ func ClassifyIMSRegisterReplayEvents(name string, events []ReplayEvent, bounds I
 			HasProxyAuthorization: headerPresent(reqMsg, "Proxy-Authorization"),
 			HasWWWAuthenticate:    headerPresent(respMsg, "WWW-Authenticate"),
 			HasProxyAuthenticate:  headerPresent(respMsg, "Proxy-Authenticate"),
+			HasContact:            headerPresent(reqMsg, "Contact"),
+			HasPAccessNetworkInfo: headerPresent(reqMsg, "P-Access-Network-Info"),
 			HasSecurityServer:     headerPresent(respMsg, "Security-Server"),
 			HasSecurityVerify:     headerPresent(reqMsg, "Security-Verify"),
 		}
 		summary.Transactions = append(summary.Transactions, tx)
 		summary.StatusCodes = append(summary.StatusCodes, tx.StatusCode)
+		summary.AccessNetworkInfo = appendHeaderValues(summary.AccessNetworkInfo, reqMsg, "P-Access-Network-Info")
 		summary.FinalStatusCode = tx.StatusCode
 		summary.FinalReason = tx.Reason
 		summary.Challenged = summary.Challenged || tx.Challenge

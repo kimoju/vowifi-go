@@ -144,33 +144,38 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 	if expires <= 0 {
 		expires = 3600
 	}
-	registerSession := voiceclient.RegisterSession{
-		Transport:             transport,
-		AKAProvider:           cfg.SIM,
-		AKAAppPreference:      imsAKAAppPreferenceFromConfig(cfg),
-		Profile:               profile,
-		RegistrarURI:          registrarURI,
-		ContactURI:            contactURI,
-		CallID:                firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
-		CNonce:                firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
-		Expires:               expires,
-		SecurityPlanInstaller: r.SecurityPlanInstaller,
-		SecurityLocalAddr:     firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, r.LocalAddr),
-		SecurityRemoteAddr:    r.ServerAddr,
-	}
+	registerSession := r.registerSession(cfg, profile, registrarURI, contactURI, transport, expires)
 	result, err := registerSession.Register(ctx)
 	if err != nil {
-		if defaultFlow != nil {
-			_ = defaultFlow.Close()
+		refreshedCfg, refreshedProfile, refreshedRegistrarURI, refreshedContactURI, refreshed, refreshErr := r.refreshIdentityAfterForbidden(ctx, cfg, profile, result, err)
+		if refreshErr != nil {
+			err = errors.Join(err, refreshErr)
+		} else if refreshed {
+			cfg = refreshedCfg
+			profile = refreshedProfile
+			registrarURI = refreshedRegistrarURI
+			contactURI = refreshedContactURI
+			if r.Transport == nil {
+				transport = nil
+				if r.TransportFactory != nil {
+					transport = r.TransportFactory(cfg, profile, registrarURI, contactURI)
+				}
+				if transport == nil {
+					if defaultFlow == nil {
+						defaultFlow = r.defaultSIPFlow(cfg)
+					}
+					transport = defaultFlow
+				}
+			}
+			registerSession = r.registerSession(cfg, profile, registrarURI, contactURI, transport, expires)
+			result, err = registerSession.Register(ctx)
 		}
-		return IMSRegistrationResult{
-			Registered: result.Registered,
-			StatusCode: result.StatusCode,
-			Reason:     result.Reason,
-			Server:     result.Binding.PublicIdentity,
-			Profile:    profile,
-			Binding:    result.Binding,
-		}, err
+		if err != nil {
+			if defaultFlow != nil {
+				_ = defaultFlow.Close()
+			}
+			return imsRegisterFailureResult(result, profile, err), err
+		}
 	}
 	registeredAt := time.Now()
 	expiresAt, refreshDelay, nextRefreshAt := imsRegistrationSchedule(r, result.Binding, registerSession, registeredAt, result.Registered)
@@ -236,6 +241,120 @@ func (r WireIMSRegistrar) defaultSIPFlow(cfg IMSRegistrationConfig) *voiceclient
 		MaxRetransmitInterval: r.MaxRetransmitInterval,
 		MaxRetransmits:        r.MaxRetransmits,
 	}
+}
+
+func (r WireIMSRegistrar) registerSession(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, registrarURI, contactURI string, transport voiceclient.SIPRegisterTransport, expires int) voiceclient.RegisterSession {
+	return voiceclient.RegisterSession{
+		Transport:             transport,
+		AKAProvider:           cfg.SIM,
+		AKAAppPreference:      imsAKAAppPreferenceFromConfig(cfg),
+		Profile:               profile,
+		RegistrarURI:          registrarURI,
+		ContactURI:            contactURI,
+		CallID:                firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
+		CNonce:                firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
+		Expires:               expires,
+		SecurityPlanInstaller: r.SecurityPlanInstaller,
+		SecurityLocalAddr:     firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, r.LocalAddr),
+		SecurityRemoteAddr:    r.ServerAddr,
+	}
+}
+
+func imsRegisterFailureResult(result voiceclient.RegisterResult, profile voiceclient.IMSProfile, err error) IMSRegistrationResult {
+	reason := result.Reason
+	if reason == "" && err != nil {
+		reason = err.Error()
+	}
+	return IMSRegistrationResult{
+		Registered: result.Registered,
+		StatusCode: result.StatusCode,
+		Reason:     reason,
+		Server:     firstRuntimeNonEmpty(result.Binding.PublicIdentity, profile.Domain),
+		Profile:    profile,
+		Binding:    result.Binding,
+	}
+}
+
+func (r WireIMSRegistrar) refreshIdentityAfterForbidden(ctx context.Context, cfg IMSRegistrationConfig, current voiceclient.IMSProfile, result voiceclient.RegisterResult, cause error) (IMSRegistrationConfig, voiceclient.IMSProfile, string, string, bool, error) {
+	_ = ctx
+	_ = cause
+	if !ClassifyIMSRegisterResponse(result.StatusCode, result.RetryAfter).RefreshIdentity {
+		return cfg, current, "", "", false, nil
+	}
+	if cfg.Access == nil {
+		return cfg, current, "", "", false, nil
+	}
+	id, err := cfg.Access.GetISIMIdentity()
+	if err != nil {
+		return cfg, current, "", "", false, fmt.Errorf("refresh IMS identity after 403: %w", err)
+	}
+	impu := refreshedISIMPublicIdentity(id, cfg.Profile)
+	if strings.TrimSpace(id.IMPI) == "" || impu == "" || strings.TrimSpace(id.Domain) == "" {
+		return cfg, current, "", "", false, errors.New("refresh IMS identity after 403: incomplete ISIM identity")
+	}
+	if strings.TrimSpace(id.IMPI) == strings.TrimSpace(current.IMPI) &&
+		impu == strings.TrimSpace(current.IMPU) &&
+		strings.TrimSpace(id.Domain) == strings.TrimSpace(current.Domain) {
+		return cfg, current, "", "", false, nil
+	}
+	prepared := clonePreparedSession(cfg.Prepared)
+	prepared.Profile = cfg.Profile
+	if cfg.Prepared != nil {
+		prepared.Profile = cfg.Prepared.Profile
+	}
+	prepared.IMSIdentity = identity.IMSIdentityResolution{
+		RequestedSource:  identity.IMSIdentitySourceISIM,
+		ActualSource:     identity.IMSIdentitySourceISIM,
+		AKAAppPreference: identity.AKAAppPreferenceISIMStrict,
+		Applied:          true,
+		IMPI:             strings.TrimSpace(id.IMPI),
+		IMPU:             impu,
+		Domain:           strings.TrimSpace(id.Domain),
+	}
+	nextCfg := cfg
+	nextCfg.Prepared = &prepared
+	nextProfile, err := r.profileFromConfig(nextCfg)
+	if err != nil {
+		return cfg, current, "", "", false, err
+	}
+	registrarURI := firstRuntimeNonEmpty(r.RegistrarURI, registrarURIForProfile(nextProfile))
+	contactURI := firstRuntimeNonEmpty(r.ContactURI, r.contactURIForProfile(nextProfile))
+	if registrarURI == "" || contactURI == "" {
+		return cfg, current, "", "", false, errors.New("refresh IMS identity after 403: registrar URI or contact URI is empty")
+	}
+	return nextCfg, nextProfile, registrarURI, contactURI, true, nil
+}
+
+func clonePreparedSession(in *identity.PreparedSession) identity.PreparedSession {
+	if in == nil {
+		return identity.PreparedSession{}
+	}
+	out := *in
+	out.PCSCFFQDNs = append([]string(nil), in.PCSCFFQDNs...)
+	out.Fallbacks = append([]identity.FallbackMetadata(nil), in.Fallbacks...)
+	return out
+}
+
+func refreshedISIMPublicIdentity(id identity.Identity, profile identity.Profile) string {
+	domain := strings.ToLower(strings.TrimSpace(id.Domain))
+	imsi := strings.TrimSpace(profile.IMSI)
+	for _, impu := range id.IMPU {
+		impu = strings.TrimSpace(impu)
+		if impu == "" {
+			continue
+		}
+		lower := strings.ToLower(impu)
+		if imsi != "" && strings.Contains(impu, imsi) {
+			return impu
+		}
+		if domain != "" && strings.Contains(lower, "@"+domain) {
+			return impu
+		}
+	}
+	if len(id.IMPU) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(id.IMPU[0])
 }
 
 func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclient.SIPServerResolver {

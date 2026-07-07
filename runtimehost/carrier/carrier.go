@@ -160,6 +160,21 @@ type IMSAccessProfile struct {
 	VisitedNetworkID     string
 }
 
+type CarrierPolicyInput struct {
+	IMSI string
+	MCC  string
+	MNC  string
+}
+
+type CarrierPolicy struct {
+	MCC      string
+	MNC      string
+	PresetID string
+	E911     E911Config
+	Network  NetworkConfig
+	IMS      IMSAccessProfile
+}
+
 const (
 	IMSIdentityDomainRoleIMSRealm             = "ims_realm"
 	IMSIdentityDomainRolePrivateIdentityRealm = "private_identity_realm"
@@ -277,25 +292,22 @@ func LoadCarrierOverrides(path string) (LoadResult, error) {
 		}
 	}
 	next := make(map[string]EffectiveCarrierConfig, len(decoded))
+	count := 0
 	for key, cfg := range decoded {
 		cfg = normalizeConfig(cfg)
 		if cfg.MCC == "" || cfg.MNC == "" {
 			cfg.MCC, cfg.MNC = splitPresetKey(key)
 			cfg = normalizeConfig(cfg)
 		}
-		if cfg.PresetID != "" {
-			key = cfg.PresetID
-		}
-		key = strings.TrimSpace(key)
-		if key != "" {
-			next[key] = cfg
+		if storeCarrierOverride(next, key, cfg) {
+			count++
 		}
 	}
 	overridesMu.Lock()
 	overrides = next
 	overridesMu.Unlock()
 	result.Missing = false
-	result.Count = len(next)
+	result.Count = count
 	return result, nil
 }
 
@@ -368,8 +380,33 @@ func IMSAccessProfileForSubscriber(in IMSAccessProfileInput) IMSAccessProfile {
 		MCC:  in.MCC,
 		MNC:  in.MNC,
 	})
-	profile := NormalizeSubscriberProfile(SubscriberProfileInput{
+	return imsAccessProfileForConfig(in.IMSI, cfg)
+}
+
+func CarrierPolicyForSubscriber(in CarrierPolicyInput) CarrierPolicy {
+	cfg := ResolveEffectiveCarrierConfig(EffectiveCarrierConfigInput{
 		IMSI: in.IMSI,
+		MCC:  in.MCC,
+		MNC:  in.MNC,
+	})
+	return CarrierPolicyForConfig(in.IMSI, cfg)
+}
+
+func CarrierPolicyForConfig(imsi string, cfg EffectiveCarrierConfig) CarrierPolicy {
+	cfg = normalizeConfig(cfg)
+	return CarrierPolicy{
+		MCC:      cfg.MCC,
+		MNC:      cfg.MNC,
+		PresetID: cfg.PresetID,
+		E911:     cfg.E911,
+		Network:  cfg.Network,
+		IMS:      imsAccessProfileForConfig(imsi, cfg),
+	}
+}
+
+func imsAccessProfileForConfig(imsi string, cfg EffectiveCarrierConfig) IMSAccessProfile {
+	profile := NormalizeSubscriberProfile(SubscriberProfileInput{
+		IMSI: imsi,
 		MCC:  cfg.MCC,
 		MNC:  cfg.MNC,
 	})
@@ -636,6 +673,34 @@ func stringsFromNetworkJSON(raw json.RawMessage, strict bool) ([]string, error) 
 		return nil, nil
 	}
 	return nil, errors.New("network P-CSCF candidates must be a string or string array")
+}
+
+func storeCarrierOverride(overrides map[string]EffectiveCarrierConfig, rawKey string, cfg EffectiveCarrierConfig) bool {
+	keys := carrierOverrideKeys(rawKey, cfg)
+	for _, key := range keys {
+		overrides[key] = cfg
+	}
+	return len(keys) > 0
+}
+
+func carrierOverrideKeys(rawKey string, cfg EffectiveCarrierConfig) []string {
+	var keys []string
+	add := func(key string) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return
+		}
+		for _, existing := range keys {
+			if existing == key {
+				return
+			}
+		}
+		keys = append(keys, key)
+	}
+	add(presetKey(cfg.MCC, cfg.MNC))
+	add(cfg.PresetID)
+	add(rawKey)
+	return keys
 }
 
 func splitNetworkStringList(value string) []string {

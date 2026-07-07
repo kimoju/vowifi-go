@@ -177,6 +177,27 @@ func TestAdvanceSIPClientTransactionNormalizesInitialState(t *testing.T) {
 	}
 }
 
+func TestSIPClientTransactionRetransmitTimerActive(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		state  SIPClientTransactionState
+		want   bool
+	}{
+		{name: "invite calling", method: "INVITE", state: SIPClientTransactionStateCalling, want: true},
+		{name: "invite proceeding", method: "INVITE", state: SIPClientTransactionStateProceeding},
+		{name: "invite completed", method: "INVITE", state: SIPClientTransactionStateCompleted},
+		{name: "message trying", method: "MESSAGE", state: SIPClientTransactionStateTrying, want: true},
+		{name: "message proceeding", method: "MESSAGE", state: SIPClientTransactionStateProceeding, want: true},
+		{name: "message completed", method: "MESSAGE", state: SIPClientTransactionStateCompleted},
+	}
+	for _, tc := range tests {
+		if got := sipClientTransactionRetransmitTimerActive(tc.method, tc.state); got != tc.want {
+			t.Fatalf("%s active=%t, want %t", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestAdvanceSIPClientTransactionNonInviteFlow(t *testing.T) {
 	cfg := SIPTransactionTimerConfig{
 		T1: 100 * time.Millisecond,
@@ -228,6 +249,20 @@ func TestAdvanceSIPClientTransactionNonInviteFlow(t *testing.T) {
 		t.Fatalf("non-INVITE final step=%+v", final)
 	}
 
+	duplicateFinal := AdvanceSIPClientTransaction(SIPClientTransactionInput{
+		Method:      "MESSAGE",
+		State:       SIPClientTransactionStateCompleted,
+		Event:       SIPClientTransactionEventResponse,
+		Response:    SIPResponse{StatusCode: 202, Reason: "Accepted"},
+		TimerConfig: cfg,
+	})
+	if duplicateFinal.NextState != SIPClientTransactionStateCompleted ||
+		duplicateFinal.Action != SIPClientTransactionActionWait ||
+		duplicateFinal.DeliverResponse ||
+		duplicateFinal.Terminated {
+		t.Fatalf("non-INVITE duplicate final step=%+v", duplicateFinal)
+	}
+
 	reliableFinal := AdvanceSIPClientTransaction(SIPClientTransactionInput{
 		Method:            "MESSAGE",
 		State:             SIPClientTransactionStateProceeding,
@@ -253,6 +288,26 @@ func TestAdvanceSIPClientTransactionNonInviteFlow(t *testing.T) {
 		cleanup.TimerName != "K" ||
 		!cleanup.Terminated {
 		t.Fatalf("non-INVITE cleanup step=%+v", cleanup)
+	}
+}
+
+func TestAdvanceSIPClientTransactionInviteReliableFailureCleanup(t *testing.T) {
+	cfg := SIPTransactionTimerConfig{T1: 100 * time.Millisecond}
+	failure := AdvanceSIPClientTransaction(SIPClientTransactionInput{
+		Method:            "INVITE",
+		State:             SIPClientTransactionStateProceeding,
+		Event:             SIPClientTransactionEventResponse,
+		Response:          SIPResponse{StatusCode: 486, Reason: "Busy Here"},
+		ReliableTransport: true,
+		TimerConfig:       cfg,
+	})
+	if failure.NextState != SIPClientTransactionStateTerminated ||
+		failure.Action != SIPClientTransactionActionDeliverFinal ||
+		!failure.DeliverResponse ||
+		!failure.SendAck ||
+		!failure.Terminated ||
+		failure.CleanupAfter != 0 {
+		t.Fatalf("reliable INVITE failure step=%+v", failure)
 	}
 }
 

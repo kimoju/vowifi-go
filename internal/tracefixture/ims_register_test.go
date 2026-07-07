@@ -48,15 +48,38 @@ func TestClassifyIMSRegisterReplaySummarizesRedactedChallengeFlow(t *testing.T) 
 	if first.RequestIndex != 0 || first.ResponseIndex != 1 || first.CSeq != 1 || first.StatusCode != 401 || !first.Challenge {
 		t.Fatalf("unexpected first transaction: %+v", first)
 	}
-	if first.RequestLabel != "initial-register" || first.ResponseLabel != "register-challenge" || !first.HasWWWAuthenticate || !first.HasSecurityServer {
+	if first.RequestLabel != "initial-register" || first.ResponseLabel != "register-challenge" || !first.HasContact || !first.HasWWWAuthenticate || !first.HasSecurityServer {
 		t.Fatalf("unexpected challenge transaction metadata: %+v", first)
 	}
 	second := summary.Transactions[1]
 	if second.RequestIndex != 2 || second.ResponseIndex != 3 || second.CSeq != 2 || second.StatusCode != 200 {
 		t.Fatalf("unexpected second transaction: %+v", second)
 	}
-	if !second.HasAuthorization || !second.HasSecurityVerify || second.Challenge {
+	if !second.HasContact || !second.HasAuthorization || !second.HasSecurityVerify || second.Challenge {
 		t.Fatalf("unexpected authenticated transaction metadata: %+v", second)
+	}
+}
+
+func TestClassifyIMSRegisterReplayCapturesRequestAccessNetworkInfo(t *testing.T) {
+	pani := "P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=<redacted-pani-1>;ue-ip=<redacted-ipv6-1>"
+	transcript := registerReplayTranscript(t, []TranscriptEvent{
+		registerRequestEvent("initial-register", 1, pani),
+		registerStatusEvent("register-ok", 1, 200, "OK", nil),
+	})
+
+	summary, err := ClassifyIMSRegisterReplay(transcript)
+	if err != nil {
+		t.Fatalf("ClassifyIMSRegisterReplay returned error: %v", err)
+	}
+	if !reflect.DeepEqual(summary.AccessNetworkInfo, []string{"3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=<redacted-pani-1>;ue-ip=<redacted-ipv6-1>"}) {
+		t.Fatalf("AccessNetworkInfo = %#v", summary.AccessNetworkInfo)
+	}
+	if len(summary.Transactions) != 1 {
+		t.Fatalf("transaction count = %d, want 1", len(summary.Transactions))
+	}
+	tx := summary.Transactions[0]
+	if !tx.HasContact || !tx.HasPAccessNetworkInfo || tx.StatusCode != 200 {
+		t.Fatalf("unexpected transaction access-network metadata: %+v", tx)
 	}
 }
 

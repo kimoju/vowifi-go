@@ -82,6 +82,7 @@ type EffectiveCarrier struct {
 type PreparedSession struct {
 	Profile            Profile
 	EffectiveCarrier   EffectiveCarrier
+	CarrierPolicy      carrier.CarrierPolicy
 	EPDGAddr           string
 	PCSCFFQDNs         []string
 	EPDGSource         string
@@ -126,6 +127,7 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 		MCC:  profile.MCC,
 		MNC:  profile.MNC,
 	})
+	policy := carrier.CarrierPolicyForConfig(profile.IMSI, effectiveCfg)
 	if effectiveCfg.MCC != "" {
 		profile.MCC = effectiveCfg.MCC
 	}
@@ -187,8 +189,9 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 			MNC:      effectiveCfg.MNC,
 			PresetID: effectiveCfg.PresetID,
 		},
-		EPDGAddr:           defaultEPDGWithNetwork(effectiveCfg.Network),
-		PCSCFFQDNs:         carrier.PCSCFCandidates(effectiveCfg.Network),
+		CarrierPolicy:      policy,
+		EPDGAddr:           strings.TrimSpace(policy.IMS.EPDGFQDN),
+		PCSCFFQDNs:         append([]string(nil), policy.IMS.PCSCFFQDNs...),
 		EPDGSource:         "derived",
 		IdentityIMSISource: IMSISourceProfile,
 		IdentityIMEISource: imeiSource,
@@ -197,9 +200,9 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 			ActualSource:     IMSIdentitySourceProfile,
 			AKAAppPreference: AKAAppPreferenceUSIM,
 			Applied:          true,
-			IMPI:             profileIMPIWithNetwork(profile, effectiveCfg.Network),
-			IMPU:             profileIMPUWithNetwork(profile, effectiveCfg.Network),
-			Domain:           profileDomainWithNetwork(effectiveCfg.Network),
+			IMPI:             strings.TrimSpace(policy.IMS.IMSPrivateIdentity),
+			IMPU:             strings.TrimSpace(policy.IMS.IMSPublicIdentity),
+			Domain:           strings.TrimSpace(policy.IMS.IMSRealm),
 		},
 		Fallbacks: fallbacks,
 	}
