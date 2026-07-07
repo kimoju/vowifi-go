@@ -130,20 +130,31 @@ type SIMAccessRecoveryHook interface {
 	RecoverSIMAccess(req SIMAccessRecoveryRequest) error
 }
 
+type SIMAccessRecoveryOptions struct {
+	AllowVendorSpecific bool
+	DryRun              bool
+	Delay               simtransport.ATRecoveryDelayFunc
+}
+
 type ModemAccess interface {
 	GetISIMIdentity() (identity.Identity, error)
 	RuntimeModem() Modem
 }
 
 type modemAccessAdapter struct {
-	modem Modem
+	modem    Modem
+	recovery SIMAccessRecoveryOptions
 }
 
 func NewModemAccessAdapter(m Modem) ModemAccess {
+	return NewModemAccessAdapterWithRecovery(m, SIMAccessRecoveryOptions{})
+}
+
+func NewModemAccessAdapterWithRecovery(m Modem, recovery SIMAccessRecoveryOptions) ModemAccess {
 	if m == nil {
 		return nil
 	}
-	return &modemAccessAdapter{modem: m}
+	return &modemAccessAdapter{modem: m, recovery: recovery}
 }
 
 func (a *modemAccessAdapter) RuntimeModem() Modem {
@@ -162,11 +173,11 @@ func (a *modemAccessAdapter) GetIMEI() (string, error) {
 	if !ok {
 		return "", err
 	}
-	hook, ok := a.modem.(SIMAccessRecoveryHook)
-	if !ok {
+	recovered, recoveryErr := a.recoverSIMAccess(req)
+	if !recovered {
 		return "", err
 	}
-	if recoveryErr := hook.RecoverSIMAccess(req); recoveryErr != nil {
+	if recoveryErr != nil {
 		return "", errors.Join(err, fmt.Errorf("SIM access recovery: %w", recoveryErr))
 	}
 	imei, retryErr := a.getIMEIOnce()
@@ -210,11 +221,11 @@ func (a *modemAccessAdapter) GetISIMIdentity() (identity.Identity, error) {
 	if !ok {
 		return identity.Identity{}, err
 	}
-	hook, ok := a.modem.(SIMAccessRecoveryHook)
-	if !ok {
+	recovered, recoveryErr := a.recoverSIMAccess(req)
+	if !recovered {
 		return identity.Identity{}, err
 	}
-	if recoveryErr := hook.RecoverSIMAccess(req); recoveryErr != nil {
+	if recoveryErr != nil {
 		return identity.Identity{}, errors.Join(err, fmt.Errorf("SIM access recovery: %w", recoveryErr))
 	}
 	id, retryErr := a.getISIMIdentityOnce()
@@ -261,6 +272,38 @@ func (a *modemAccessAdapter) getISIMIdentityOnce() (identity.Identity, error) {
 		return identity.Identity{}, errors.Join(errs...)
 	}
 	return identity.Identity{}, errors.New("modem does not expose ISIM identity")
+}
+
+func (a *modemAccessAdapter) recoverSIMAccess(req SIMAccessRecoveryRequest) (bool, error) {
+	if a == nil || a.modem == nil {
+		return false, nil
+	}
+	if hook, ok := a.modem.(SIMAccessRecoveryHook); ok {
+		return true, hook.RecoverSIMAccess(req)
+	}
+	at, ok := a.modem.(interface {
+		ExecuteATSilent(cmd string, timeout time.Duration) (string, error)
+	})
+	if !ok {
+		return false, nil
+	}
+	steps := simtransport.PlanATControlRecovery(req.Class, defaultATRecoveryPlanAttempt(req.Attempt))
+	if len(steps) == 0 {
+		return false, nil
+	}
+	opts := simtransport.ATRecoveryOptions{
+		AllowVendorSpecific: req.DestructiveAllowed || a.recovery.AllowVendorSpecific,
+		DryRun:              a.recovery.DryRun,
+		Delay:               a.recovery.Delay,
+	}
+	return true, simtransport.ExecuteATControlRecovery(context.Background(), at, steps, opts)
+}
+
+func defaultATRecoveryPlanAttempt(attempt int) int {
+	if attempt <= 0 {
+		return 0
+	}
+	return attempt - 1
 }
 
 func newSIMAccessRecoveryRequest(operation string, attempt int, err error) (SIMAccessRecoveryRequest, bool) {

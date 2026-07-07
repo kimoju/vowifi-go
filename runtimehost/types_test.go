@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -171,6 +172,42 @@ func (m *runtimeRecoveringIMEIATModem) RecoverSIMAccess(req SIMAccessRecoveryReq
 	return nil
 }
 
+type runtimeDefaultRecoveringATModem struct {
+	testModem
+	recovered bool
+	calls     []string
+}
+
+func (m *runtimeDefaultRecoveringATModem) ExecuteATSilent(cmd string, timeout time.Duration) (string, error) {
+	m.calls = append(m.calls, cmd)
+	switch cmd {
+	case "AT+CFUN=0":
+		return "\r\nOK\r\n", nil
+	case "AT+CFUN=1":
+		m.recovered = true
+		return "\r\nOK\r\n", nil
+	case "AT+CGSN", "AT+CGSN=1", "AT+GSN":
+		if m.recovered {
+			return "\r\n490154203237518\r\n\r\nOK\r\n", nil
+		}
+		return "", context.DeadlineExceeded
+	default:
+		return "", context.DeadlineExceeded
+	}
+}
+
+type runtimeDefaultRecoveringIdentityATModem struct {
+	runtimeDefaultRecoveringATModem
+	id identity.Identity
+}
+
+func (m *runtimeDefaultRecoveringIdentityATModem) GetISIMIdentity() (identity.Identity, error) {
+	if !m.recovered {
+		return identity.Identity{}, context.DeadlineExceeded
+	}
+	return m.id, nil
+}
+
 func TestModemAccessAdapterReadsISIMIdentity(t *testing.T) {
 	direct := identity.Identity{
 		IMPI:   "001010123456789@private.example.test",
@@ -270,6 +307,29 @@ func TestModemAccessAdapterFallsBackToATCRSM(t *testing.T) {
 	}
 }
 
+func TestModemAccessAdapterRunsDefaultATRecoveryForISIMIdentity(t *testing.T) {
+	want := identity.Identity{
+		IMPI:   "001010123456789@private.example.test",
+		Domain: "ims.example.test",
+		IMPU:   []string{"sip:001010123456789@ims.example.test"},
+	}
+	modem := &runtimeDefaultRecoveringIdentityATModem{id: want}
+	access := NewModemAccessAdapterWithRecovery(modem, SIMAccessRecoveryOptions{
+		Delay: func(context.Context, time.Duration) error { return nil },
+	})
+	got, err := access.GetISIMIdentity()
+	if err != nil {
+		t.Fatalf("GetISIMIdentity() error = %v", err)
+	}
+	if got.IMPI != want.IMPI || got.Domain != want.Domain || len(got.IMPU) != 1 {
+		t.Fatalf("identity = %+v, want %+v", got, want)
+	}
+	wantCalls := []string{"AT+CFUN=0", "AT+CFUN=1"}
+	if !reflect.DeepEqual(modem.calls, wantCalls) {
+		t.Fatalf("AT recovery calls=%+v want %+v", modem.calls, wantCalls)
+	}
+}
+
 func TestModemAccessAdapterReadsIMEIFromAT(t *testing.T) {
 	at := &runtimeATCRSMModem{responses: []string{
 		"\r\n+CGSN: \"356938035643809\"\r\n\r\nOK\r\n",
@@ -313,6 +373,28 @@ func TestModemAccessAdapterRecoversIMEIRead(t *testing.T) {
 	}
 	if len(modem.calls) != 4 || modem.calls[0] != "AT+CGSN" || modem.calls[3] != "AT+CGSN" {
 		t.Fatalf("AT calls=%+v", modem.calls)
+	}
+}
+
+func TestModemAccessAdapterRunsDefaultATRecoveryForIMEIRead(t *testing.T) {
+	modem := &runtimeDefaultRecoveringATModem{}
+	access := NewModemAccessAdapterWithRecovery(modem, SIMAccessRecoveryOptions{
+		Delay: func(context.Context, time.Duration) error { return nil },
+	})
+	reader, ok := access.(interface{ GetIMEI() (string, error) })
+	if !ok {
+		t.Fatal("modem access adapter does not expose GetIMEI")
+	}
+	imei, err := reader.GetIMEI()
+	if err != nil {
+		t.Fatalf("GetIMEI() error = %v", err)
+	}
+	if imei != "490154203237518" {
+		t.Fatalf("GetIMEI() = %q", imei)
+	}
+	wantCalls := []string{"AT+CGSN", "AT+CGSN=1", "AT+GSN", "AT+CFUN=0", "AT+CFUN=1", "AT+CGSN"}
+	if !reflect.DeepEqual(modem.calls, wantCalls) {
+		t.Fatalf("AT calls=%+v want %+v", modem.calls, wantCalls)
 	}
 }
 

@@ -41,7 +41,8 @@ protocol layers needed by VoHive:
   over logical-channel APDUs or CRSM, runtime modem-access fallback from
   explicit identity readers to APDU/CRSM/AT+CRSM identity reads, AT `CGSN`/`GSN`
   IMEI reads with modem-access recovery retry, SIM/ISIM recovery error
-  classification with opt-in non-destructive retry hooks,
+  classification with opt-in hooks and default non-destructive AT control
+  recovery plans,
   human-readable APDU/CRSM status-word descriptions for common SIM/USIM/ISIM
   success, warning, procedure, and checking-error responses,
   reusable ISIM identity, USIM EF_IMSI decoding/encoding, and EF_AD MNC-length
