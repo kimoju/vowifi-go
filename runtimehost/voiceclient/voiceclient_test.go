@@ -3242,6 +3242,72 @@ func TestBuildPrackRequestForProvisionalResponse(t *testing.T) {
 	}
 }
 
+func TestBuildPrackPlanForProvisionalResponseIncludesDialogUpdatesAndAnswer(t *testing.T) {
+	remoteOffer := []byte("v=0\r\nm=audio 40000 RTP/AVP 0\r\n")
+	sdpAnswer := []byte("v=0\r\nm=audio 50000 RTP/AVP 0\r\n")
+	wantOffer := string(remoteOffer)
+	wantAnswer := string(sdpAnswer)
+	resp := SIPResponse{
+		StatusCode: 183,
+		Reason:     "Session Progress",
+		Headers: map[string][]string{
+			"Require":      {"100rel"},
+			"RSeq":         {"23"},
+			"CSeq":         {"8 INVITE"},
+			"To":           {"<sip:+18005551212@ims.example>;tag=remote-plan"},
+			"Contact":      {"<sip:+18005551212@pcscf.example;transport=udp>"},
+			"Record-Route": {"<sip:edge1.example;lr>, <sip:edge2.example;lr>"},
+			"Content-Type": {"application/sdp; charset=utf-8"},
+		},
+		Body: remoteOffer,
+	}
+	plan, ok, err := BuildPrackPlanForProvisionalResponse(DialogRequestConfig{
+		Profile: IMSProfile{IMPU: "sip:user@example"},
+		Registration: RegistrationBinding{
+			ContactURI:    "sip:user@192.0.2.10:5060",
+			ServiceRoutes: []string{"<sip:service-route.example;lr>"},
+		},
+		RemoteURI: "sip:+18005551212@ims.example",
+		CallID:    "call-prack-plan",
+		LocalTag:  "local-plan",
+		CSeq:      10,
+	}, resp, sdpAnswer)
+	if err != nil || !ok {
+		t.Fatalf("BuildPrackPlanForProvisionalResponse() ok=%v err=%v", ok, err)
+	}
+	if !plan.Info.Reliable || plan.Info.RAck != "23 8 INVITE" || !plan.Info.EarlyMedia ||
+		plan.Info.ContentType != "application/sdp; charset=utf-8" ||
+		plan.Info.RemoteTag != "remote-plan" ||
+		plan.Info.ContactURI != "sip:+18005551212@pcscf.example;transport=udp" ||
+		plan.Info.RemoteTargetURI != plan.Info.ContactURI {
+		t.Fatalf("provisional info=%+v", plan.Info)
+	}
+	if len(plan.Info.RouteSet) != 2 || plan.Info.RouteSet[0] != "<sip:edge2.example;lr>" ||
+		plan.Info.RouteSet[1] != "<sip:edge1.example;lr>" {
+		t.Fatalf("route set=%+v", plan.Info.RouteSet)
+	}
+	if plan.Dialog.RemoteTag != "remote-plan" ||
+		plan.Dialog.RemoteTargetURI != "sip:+18005551212@pcscf.example;transport=udp" ||
+		len(plan.Dialog.RouteSet) != 2 {
+		t.Fatalf("dialog config=%+v", plan.Dialog)
+	}
+	if plan.Request.Method != "PRACK" ||
+		plan.Request.URI != "sip:+18005551212@pcscf.example;transport=udp" ||
+		plan.Request.Headers["RAck"] != "23 8 INVITE" ||
+		plan.Request.Headers["CSeq"] != "10 PRACK" ||
+		plan.Request.Headers["To"] != "<sip:+18005551212@ims.example>;tag=remote-plan" ||
+		plan.Request.Headers["Route"] != "<sip:edge2.example;lr>, <sip:edge1.example;lr>" ||
+		plan.Request.Headers["Content-Type"] != "application/sdp" ||
+		string(plan.Request.Body) != wantAnswer {
+		t.Fatalf("PRACK plan request=%+v body=%q", plan.Request, plan.Request.Body)
+	}
+	remoteOffer[0] = 'x'
+	sdpAnswer[0] = 'x'
+	if string(plan.Info.SDP) != wantOffer || string(plan.Request.Body) != wantAnswer {
+		t.Fatalf("plan kept mutable SDP backing slices: offer=%q answer=%q", plan.Info.SDP, plan.Request.Body)
+	}
+}
+
 func TestBuildPrackRequestForProvisionalResponseSkipsUnreliable(t *testing.T) {
 	resp := SIPResponse{
 		StatusCode: 180,
@@ -3251,6 +3317,22 @@ func TestBuildPrackRequestForProvisionalResponseSkipsUnreliable(t *testing.T) {
 	prack, ok, err := BuildPrackRequestForProvisionalResponse(DialogRequestConfig{}, resp)
 	if err != nil || ok || prack.Method != "" {
 		t.Fatalf("BuildPrackRequestForProvisionalResponse() msg=%+v ok=%v err=%v", prack, ok, err)
+	}
+	plan, ok, err := BuildPrackPlanForProvisionalResponse(DialogRequestConfig{}, resp, []byte("v=0\r\n"))
+	if err != nil || ok || plan.Request.Method != "" || plan.Info.Reliable {
+		t.Fatalf("BuildPrackPlanForProvisionalResponse() plan=%+v ok=%v err=%v", plan, ok, err)
+	}
+	_, _, err = BuildPrackPlanForProvisionalResponse(DialogRequestConfig{}, SIPResponse{
+		StatusCode: 183,
+		Reason:     "Session Progress",
+		Headers: map[string][]string{
+			"Require": {"100rel"},
+			"RSeq":    {"bad"},
+			"CSeq":    {"3 INVITE"},
+		},
+	}, nil)
+	if !errors.Is(err, ErrInvalidSIPMessage) {
+		t.Fatalf("BuildPrackPlanForProvisionalResponse(invalid RSeq) err=%v, want ErrInvalidSIPMessage", err)
 	}
 	_, err = ParseProvisionalResponseInfo(SIPResponse{
 		StatusCode: 183,

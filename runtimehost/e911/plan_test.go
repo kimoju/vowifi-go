@@ -375,6 +375,123 @@ func TestPlanEmergencySIPRetryRefreshesLocationOnBadLocation(t *testing.T) {
 	}
 }
 
+func TestPrepareEmergencyRevalidationInputsRefreshesLocationOnBadLocation(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 3, 0, 0, time.UTC)
+	current := EmergencyPlan{
+		Emergency:  true,
+		ServiceURN: "urn:service:sos.fire",
+		RequestURI: "urn:service:sos.fire",
+		RouteSet:   []string{"<sip:pcscf-fire.example;lr>"},
+		Headers: map[string]string{
+			"Geolocation": "<cid:location-inline>;inserted-by=endpoint",
+		},
+	}
+	inputs := PrepareEmergencyRevalidationInputs(current, voiceclient.SIPResponse{
+		StatusCode: 424,
+		Reason:     "Bad Location Information",
+		Headers: map[string][]string{
+			"Retry-After": {"3"},
+			"Warning":     {`399 ims.example "PIDF-LO rejected"`},
+		},
+	}, now)
+
+	if !inputs.Emergency ||
+		!inputs.Required ||
+		!inputs.Retry ||
+		!inputs.EntitlementRefreshNeeded ||
+		!inputs.LocationRefreshNeeded ||
+		!inputs.RebuildEmergencyPlan ||
+		!inputs.RebuildPIDFLO ||
+		inputs.RouteRefreshNeeded ||
+		inputs.AlternativeService ||
+		inputs.RetryPlan.Action != EmergencySIPRetryActionRefreshLocation ||
+		inputs.NextServiceURN != "urn:service:sos.fire" ||
+		inputs.NextRequestURI != "urn:service:sos.fire" ||
+		inputs.RetryAfter != 3*time.Second ||
+		!inputs.NextAttemptAt.Equal(now.Add(3*time.Second)) {
+		t.Fatalf("bad-location revalidation inputs=%+v", inputs)
+	}
+	if !sameStrings(inputs.NextRouteSet, []string{"<sip:pcscf-fire.example;lr>"}) {
+		t.Fatalf("NextRouteSet=%+v", inputs.NextRouteSet)
+	}
+	if inputs.NextHeaders["Geolocation"] != current.Headers["Geolocation"] {
+		t.Fatalf("NextHeaders=%+v", inputs.NextHeaders)
+	}
+}
+
+func TestPrepareEmergencyRevalidationInputsUsesAlternativeServiceMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 4, 0, 0, time.UTC)
+	current := EmergencyPlan{
+		Emergency:  true,
+		ServiceURN: DefaultEmergencyServiceURN,
+		RequestURI: DefaultEmergencyServiceURN,
+		RouteSet:   []string{"<sip:pcscf-old.example;lr>"},
+	}
+	inputs := PrepareEmergencyRevalidationInputs(current, voiceclient.SIPResponse{
+		StatusCode: 380,
+		Reason:     "Alternative Service",
+		Headers: map[string][]string{
+			"Contact": {`<urn:service:sos.ambulance>, <sip:ecscf-alt.example;lr>`},
+		},
+	}, now)
+
+	if !inputs.Emergency ||
+		!inputs.Required ||
+		!inputs.Retry ||
+		!inputs.RouteRefreshNeeded ||
+		!inputs.AlternativeService ||
+		inputs.EntitlementRefreshNeeded ||
+		inputs.LocationRefreshNeeded ||
+		inputs.RebuildPIDFLO ||
+		inputs.RetryPlan.Action != EmergencySIPRetryActionAlternativeService ||
+		inputs.AlternativeServiceURN != "urn:service:sos.ambulance" ||
+		inputs.AlternativeContactURI != "sip:ecscf-alt.example;lr" ||
+		inputs.NextServiceURN != "urn:service:sos.ambulance" ||
+		inputs.NextRequestURI != "urn:service:sos.ambulance" {
+		t.Fatalf("alternative revalidation inputs=%+v", inputs)
+	}
+	if !sameStrings(inputs.AlternativeServiceURNs, []string{"urn:service:sos.ambulance"}) {
+		t.Fatalf("AlternativeServiceURNs=%+v", inputs.AlternativeServiceURNs)
+	}
+	if !sameStrings(inputs.ContactURIs, []string{"urn:service:sos.ambulance", "sip:ecscf-alt.example;lr"}) {
+		t.Fatalf("ContactURIs=%+v", inputs.ContactURIs)
+	}
+	if !sameStrings(inputs.NextRouteSet, []string{"<sip:ecscf-alt.example;lr>"}) {
+		t.Fatalf("NextRouteSet=%+v", inputs.NextRouteSet)
+	}
+}
+
+func TestPrepareEmergencyRevalidationInputsNoRefreshForNonEmergency(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 5, 0, 0, time.UTC)
+	current, err := PlanEmergencyCall("411", EntitlementSnapshot{}, EmergencySIPHeaderConfig{}, now)
+	if err != nil {
+		t.Fatalf("PlanEmergencyCall(non-emergency) error = %v", err)
+	}
+	inputs := PrepareEmergencyRevalidationInputs(current, voiceclient.SIPResponse{
+		StatusCode: 424,
+		Reason:     "Bad Location Information",
+		Headers: map[string][]string{
+			"Warning": {`399 ims.example "PIDF-LO rejected"`},
+		},
+	}, now)
+
+	if inputs.Emergency ||
+		inputs.Required ||
+		inputs.Retry ||
+		inputs.EntitlementRefreshNeeded ||
+		inputs.LocationRefreshNeeded ||
+		inputs.RouteRefreshNeeded ||
+		inputs.RebuildEmergencyPlan ||
+		inputs.RebuildPIDFLO ||
+		inputs.AlternativeService ||
+		inputs.NextServiceURN != "" ||
+		inputs.NextRequestURI != "" ||
+		len(inputs.NextRouteSet) != 0 ||
+		len(inputs.NextHeaders) != 0 {
+		t.Fatalf("non-emergency revalidation inputs=%+v", inputs)
+	}
+}
+
 func TestPlanEmergencySIPRetryLeavesNonRetryableFailureTerminal(t *testing.T) {
 	retry := PlanEmergencySIPRetry(EmergencyPlan{
 		ServiceURN: DefaultEmergencyServiceURN,

@@ -89,7 +89,17 @@ type ProvisionalResponseInfo struct {
 	SDP             []byte
 	RemoteTag       string
 	RemoteTargetURI string
+	ContactURI      string
+	RouteSet        []string
 	DialogReasons   []DialogReason
+}
+
+// ProvisionalResponsePrackPlan captures the dialog updates and outbound PRACK
+// request required by a reliable provisional response.
+type ProvisionalResponsePrackPlan struct {
+	Info    ProvisionalResponseInfo
+	Dialog  DialogRequestConfig
+	Request SIPRequestMessage
 }
 
 type DialogSessionTimerInfo struct {
@@ -281,12 +291,21 @@ func BuildPrackRequestWithBody(cfg DialogRequestConfig, rack, contentType string
 }
 
 func BuildPrackRequestForProvisionalResponse(cfg DialogRequestConfig, resp SIPResponse) (SIPRequestMessage, bool, error) {
+	plan, ok, err := BuildPrackPlanForProvisionalResponse(cfg, resp, nil)
+	return plan.Request, ok, err
+}
+
+// BuildPrackPlanForProvisionalResponse turns a reliable provisional response
+// into the next PRACK request and dialog config. If sdpAnswer is provided, it is
+// sent as an application/sdp PRACK body.
+func BuildPrackPlanForProvisionalResponse(cfg DialogRequestConfig, resp SIPResponse, sdpAnswer []byte) (ProvisionalResponsePrackPlan, bool, error) {
 	info, err := ParseProvisionalResponseInfo(resp)
+	plan := ProvisionalResponsePrackPlan{Info: info}
 	if err != nil {
-		return SIPRequestMessage{}, false, err
+		return plan, false, err
 	}
 	if !info.Reliable {
-		return SIPRequestMessage{}, false, nil
+		return plan, false, nil
 	}
 	if cfg.RemoteTag == "" && info.RemoteTag != "" {
 		cfg.RemoteTag = info.RemoteTag
@@ -294,20 +313,28 @@ func BuildPrackRequestForProvisionalResponse(cfg DialogRequestConfig, resp SIPRe
 	if cfg.RemoteTargetURI == "" && info.RemoteTargetURI != "" {
 		cfg.RemoteTargetURI = info.RemoteTargetURI
 	}
-	msg, err := BuildPrackRequest(cfg, info.RAck)
-	if err != nil {
-		return SIPRequestMessage{}, false, err
+	if len(trimHeaderValues(cfg.RouteSet)) == 0 && len(info.RouteSet) > 0 {
+		cfg.RouteSet = append([]string(nil), info.RouteSet...)
 	}
-	return msg, true, nil
+	plan.Dialog = cfg
+	msg, err := BuildPrackRequestWithBody(cfg, info.RAck, "application/sdp", sdpAnswer)
+	if err != nil {
+		return plan, false, err
+	}
+	plan.Request = msg
+	return plan, true, nil
 }
 
 func ParseProvisionalResponseInfo(resp SIPResponse) (ProvisionalResponseInfo, error) {
+	contactURI := firstContactURI(resp.Headers)
 	info := ProvisionalResponseInfo{
 		StatusCode:      resp.StatusCode,
 		Reason:          strings.TrimSpace(resp.Reason),
 		ContentType:     firstHeader(resp.Headers, "Content-Type"),
 		RemoteTag:       sipHeaderTag(firstHeader(resp.Headers, "To")),
-		RemoteTargetURI: firstContactURI(resp.Headers),
+		RemoteTargetURI: contactURI,
+		ContactURI:      contactURI,
+		RouteSet:        dialogRouteSetFromResponse(resp.Headers),
 		DialogReasons:   ParseDialogReasonHeaders(resp.Headers),
 	}
 	if isSIPProvisionalResponse(resp.StatusCode) && sipContentTypeMatches(info.ContentType, "application/sdp") && len(resp.Body) > 0 {
@@ -1094,6 +1121,14 @@ func routeHeader(routes []string) string {
 		return ""
 	}
 	return strings.Join(clean, ", ")
+}
+
+func dialogRouteSetFromResponse(headers map[string][]string) []string {
+	routes := trimHeaderValues(headerListValues(headers, "Record-Route"))
+	for i, j := 0, len(routes)-1; i < j; i, j = i+1, j-1 {
+		routes[i], routes[j] = routes[j], routes[i]
+	}
+	return routes
 }
 
 func firstNonEmptySlice(items ...[]string) []string {

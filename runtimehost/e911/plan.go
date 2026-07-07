@@ -178,6 +178,34 @@ type EmergencySIPRetryPlan struct {
 	Reason                     string
 }
 
+// EmergencyRevalidationInputs captures the refresh and routing inputs that a
+// runtime should prepare before retrying an emergency request after a SIP
+// failure.
+type EmergencyRevalidationInputs struct {
+	Emergency                bool
+	Required                 bool
+	Retry                    bool
+	Failure                  EmergencySIPFailure
+	RetryPlan                EmergencySIPRetryPlan
+	EntitlementRefreshNeeded bool
+	LocationRefreshNeeded    bool
+	RouteRefreshNeeded       bool
+	RebuildEmergencyPlan     bool
+	RebuildPIDFLO            bool
+	AlternativeService       bool
+	AlternativeServiceURN    string
+	AlternativeServiceURNs   []string
+	AlternativeContactURI    string
+	ContactURIs              []string
+	NextServiceURN           string
+	NextRequestURI           string
+	NextRouteSet             []string
+	NextHeaders              map[string]string
+	RetryAfter               time.Duration
+	NextAttemptAt            time.Time
+	Reason                   string
+}
+
 func ClassifyEmergencyNumber(value string) EmergencyNumberClassification {
 	input := strings.TrimSpace(value)
 	candidate := emergencyDialStringCandidate(input)
@@ -346,6 +374,45 @@ func PlanEmergencySIPRetry(current EmergencyPlan, resp voiceclient.SIPResponse, 
 	return plan
 }
 
+// PrepareEmergencyRevalidationInputs classifies a SIP response and returns the
+// emergency-only refresh, PIDF-LO rebuild, and alternate routing inputs needed
+// before a retry.
+func PrepareEmergencyRevalidationInputs(current EmergencyPlan, resp voiceclient.SIPResponse, now time.Time) EmergencyRevalidationInputs {
+	failure := ClassifyEmergencySIPFailure(resp)
+	out := EmergencyRevalidationInputs{
+		Emergency:              emergencyPlanTargetsEmergency(current),
+		Failure:                cloneEmergencySIPFailure(failure),
+		AlternativeServiceURNs: copyStringSlice(failure.AlternativeServiceURNs),
+		ContactURIs:            copyStringSlice(failure.ContactURIs),
+		RetryAfter:             failure.RetryAfter,
+		Reason:                 strings.TrimSpace(failure.Reason),
+	}
+	if !out.Emergency || !failure.Retryable {
+		return out
+	}
+
+	retry := PlanEmergencySIPRetry(current, resp, now)
+	out.RetryPlan = cloneEmergencySIPRetryPlan(retry)
+	out.Retry = retry.Retry
+	out.EntitlementRefreshNeeded = retry.EntitlementRefreshNeeded
+	out.LocationRefreshNeeded = retry.LocationRefreshNeeded
+	out.RouteRefreshNeeded = retry.RouteRefreshNeeded
+	out.RebuildEmergencyPlan = retry.RebuildEmergencyPlan
+	out.RebuildPIDFLO = retry.RebuildPIDFLO
+	out.AlternativeService = retry.AlternativeService
+	out.AlternativeServiceURN = strings.TrimSpace(retry.AlternativeServiceURN)
+	out.AlternativeContactURI = strings.TrimSpace(retry.AlternativeContactURI)
+	out.NextServiceURN = strings.TrimSpace(retry.NextServiceURN)
+	out.NextRequestURI = strings.TrimSpace(retry.NextRequestURI)
+	out.NextRouteSet = copyStringSlice(retry.NextRouteSet)
+	out.NextHeaders = copyStringMap(retry.NextHeaders)
+	out.RetryAfter = retry.RetryAfter
+	out.NextAttemptAt = retry.NextAttemptAt
+	out.Reason = strings.TrimSpace(retry.Reason)
+	out.Required = emergencyRevalidationRequired(retry)
+	return out
+}
+
 func (p *EmergencySIPRetryPlan) applyAlternativeEmergencyService(failure EmergencySIPFailure) {
 	p.Action = EmergencySIPRetryActionAlternativeService
 	p.AlternativeService = true
@@ -413,6 +480,32 @@ func emergencyRetryRouteFromContact(contact string) string {
 		return contact
 	}
 	return "<" + contact + ">"
+}
+
+func emergencyRevalidationRequired(retry EmergencySIPRetryPlan) bool {
+	return retry.Retry && (retry.EntitlementRefreshNeeded ||
+		retry.LocationRefreshNeeded ||
+		retry.RouteRefreshNeeded ||
+		retry.RebuildEmergencyPlan ||
+		retry.RebuildPIDFLO ||
+		retry.AlternativeService)
+}
+
+func emergencyPlanTargetsEmergency(plan EmergencyPlan) bool {
+	if plan.Emergency || plan.Number.Emergency || plan.Service.Emergency {
+		return true
+	}
+	for _, value := range []string{
+		plan.DialString,
+		plan.ServiceURN,
+		plan.RequestURI,
+		plan.Call.RequestURI,
+	} {
+		if ClassifyEmergencyNumber(value).Emergency || ClassifyEmergencyService(value).Emergency {
+			return true
+		}
+	}
+	return false
 }
 
 func emergencyPlanTarget(cfg EmergencyPlanConfig) (EmergencyNumberClassification, EmergencyServiceClassification, string, EmergencyServiceCategory, bool) {
@@ -734,4 +827,17 @@ func cloneEmergencySIPRequestInfo(info EmergencySIPRequestInfo) EmergencySIPRequ
 	info.RouteSet = copyStringSlice(info.RouteSet)
 	info.PIDFLOBody = append([]byte(nil), info.PIDFLOBody...)
 	return info
+}
+
+func cloneEmergencySIPFailure(failure EmergencySIPFailure) EmergencySIPFailure {
+	failure.AlternativeServiceURNs = copyStringSlice(failure.AlternativeServiceURNs)
+	failure.ContactURIs = copyStringSlice(failure.ContactURIs)
+	return failure
+}
+
+func cloneEmergencySIPRetryPlan(plan EmergencySIPRetryPlan) EmergencySIPRetryPlan {
+	plan.Failure = cloneEmergencySIPFailure(plan.Failure)
+	plan.NextRouteSet = copyStringSlice(plan.NextRouteSet)
+	plan.NextHeaders = copyStringMap(plan.NextHeaders)
+	return plan
 }

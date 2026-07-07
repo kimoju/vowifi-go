@@ -72,33 +72,36 @@ type IMSMessagingRetryInput struct {
 // pointers or transient transport state, so callers can JSON-encode and replay
 // the decision from a local queue.
 type IMSMessagingRetryPlan struct {
-	Operation                  IMSMessagingRetryOperation `json:"operation"`
-	Method                     string                     `json:"method,omitempty"`
-	StatusCode                 int                        `json:"status_code,omitempty"`
-	Class                      IMSMessagingRetryClass     `json:"class"`
-	Action                     IMSMessagingRetryAction    `json:"action"`
-	Retry                      bool                       `json:"retry"`
-	Terminal                   bool                       `json:"terminal"`
-	Durable                    bool                       `json:"durable"`
-	Attempt                    int                        `json:"attempt"`
-	NextAttempt                int                        `json:"next_attempt,omitempty"`
-	MaxAttempts                int                        `json:"max_attempts"`
-	Delay                      time.Duration              `json:"delay,omitempty"`
-	RetryAfter                 time.Duration              `json:"retry_after,omitempty"`
-	RetryAfterPresent          bool                       `json:"retry_after_present,omitempty"`
-	NextAttemptAt              time.Time                  `json:"next_attempt_at,omitempty"`
-	RetryKey                   string                     `json:"retry_key,omitempty"`
-	IdempotencyKey             string                     `json:"idempotency_key,omitempty"`
-	SessionKey                 string                     `json:"session_key,omitempty"`
-	TargetURI                  string                     `json:"target_uri,omitempty"`
-	TargetFailover             bool                       `json:"target_failover,omitempty"`
-	RegistrationRecoveryNeeded bool                       `json:"registration_recovery_needed,omitempty"`
-	AuthenticationRefresh      bool                       `json:"authentication_refresh,omitempty"`
-	TransportFailure           bool                       `json:"transport_failure,omitempty"`
-	TimedOut                   bool                       `json:"timed_out,omitempty"`
-	FinalResponseTimeout       bool                       `json:"final_response_timeout,omitempty"`
-	DuplicateRisk              bool                       `json:"duplicate_risk,omitempty"`
-	Reason                     string                     `json:"reason,omitempty"`
+	Operation                         IMSMessagingRetryOperation `json:"operation"`
+	Method                            string                     `json:"method,omitempty"`
+	StatusCode                        int                        `json:"status_code,omitempty"`
+	Class                             IMSMessagingRetryClass     `json:"class"`
+	Action                            IMSMessagingRetryAction    `json:"action"`
+	Retry                             bool                       `json:"retry"`
+	Terminal                          bool                       `json:"terminal"`
+	Durable                           bool                       `json:"durable"`
+	Attempt                           int                        `json:"attempt"`
+	NextAttempt                       int                        `json:"next_attempt,omitempty"`
+	MaxAttempts                       int                        `json:"max_attempts"`
+	Delay                             time.Duration              `json:"delay,omitempty"`
+	RetryAfter                        time.Duration              `json:"retry_after,omitempty"`
+	RetryAfterPresent                 bool                       `json:"retry_after_present,omitempty"`
+	NextAttemptAt                     time.Time                  `json:"next_attempt_at,omitempty"`
+	RetryKey                          string                     `json:"retry_key,omitempty"`
+	IdempotencyKey                    string                     `json:"idempotency_key,omitempty"`
+	SessionKey                        string                     `json:"session_key,omitempty"`
+	TargetURI                         string                     `json:"target_uri,omitempty"`
+	TargetFailover                    bool                       `json:"target_failover,omitempty"`
+	RegistrationRecoveryNeeded        bool                       `json:"registration_recovery_needed,omitempty"`
+	AuthenticationRefresh             bool                       `json:"authentication_refresh,omitempty"`
+	AuthenticationChallengeHeader     string                     `json:"authentication_challenge_header,omitempty"`
+	AuthenticationChallenge           string                     `json:"authentication_challenge,omitempty"`
+	AuthenticationAuthorizationHeader string                     `json:"authentication_authorization_header,omitempty"`
+	TransportFailure                  bool                       `json:"transport_failure,omitempty"`
+	TimedOut                          bool                       `json:"timed_out,omitempty"`
+	FinalResponseTimeout              bool                       `json:"final_response_timeout,omitempty"`
+	DuplicateRisk                     bool                       `json:"duplicate_risk,omitempty"`
+	Reason                            string                     `json:"reason,omitempty"`
 }
 
 type IMSMessagingRetryQueueState string
@@ -379,6 +382,9 @@ func PlanIMSMessagingRetry(input IMSMessagingRetryInput) IMSMessagingRetryPlan {
 		plan.TargetFailover = recovery.TargetFailover
 		plan.RegistrationRecoveryNeeded = recovery.RegistrationRecoveryNeeded
 		plan.AuthenticationRefresh = recovery.AuthenticationRefresh
+		plan.AuthenticationChallengeHeader = recovery.AuthenticationChallengeHeader
+		plan.AuthenticationChallenge = recovery.AuthenticationChallenge
+		plan.AuthenticationAuthorizationHeader = recovery.AuthenticationAuthorizationHeader
 		plan.TimedOut = recovery.StatusCode == 408
 		plan.Class = classifyIMSMessagingRetryResponse(recovery)
 		plan.Reason = firstNonEmpty(recovery.FailureText, imsMessagingRetryErrorText(input.Err))

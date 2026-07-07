@@ -710,6 +710,45 @@ func TestClassifyUSIMAuthResponse(t *testing.T) {
 	}
 }
 
+func TestClassifyUSIMAuthExchange(t *testing.T) {
+	successBody := append([]byte{0xDB, 0x04, 0x11, 0x22, 0x33, 0x44, 0x10}, bytesFrom(0x01, 16)...)
+	successBody = append(successBody, 0x10)
+	successBody = append(successBody, bytesFrom(0x21, 16)...)
+
+	info, err := ClassifyUSIMAuthExchange(Response{Body: successBody, SW1: 0x90, SW2: 0x00}, nil)
+	if err != nil {
+		t.Fatalf("ClassifyUSIMAuthExchange(success) error = %v", err)
+	}
+	if info.Class != AKAAuthResponseClassSuccess || len(info.Result.RES) != 4 ||
+		len(info.Result.CK) != AKACKLength || len(info.Result.IK) != AKAIKLength {
+		t.Fatalf("success exchange info=%+v, want RES/CK/IK success", info)
+	}
+
+	auts := bytesFrom(0xA0, AKAAUTSLength)
+	syncBody := append([]byte{0xDC, AKAAUTSLength}, auts...)
+	info, err = ClassifyUSIMAuthExchange(Response{Body: syncBody, SW1: 0x90, SW2: 0x00}, nil)
+	if !errors.Is(err, swusim.ErrSyncFailure) {
+		t.Fatalf("ClassifyUSIMAuthExchange(sync) err=%v, want ErrSyncFailure", err)
+	}
+	if info.Class != AKAAuthResponseClassSyncFailure ||
+		hex.EncodeToString(info.Result.AUTS) != hex.EncodeToString(auts) ||
+		len(info.AUTS.SQNMSXorAK) != AKAAKLength ||
+		len(info.AUTS.MACS) != AKAMACLength {
+		t.Fatalf("sync exchange info=%+v, want AUTS sync failure", info)
+	}
+
+	info, err = ClassifyUSIMAuthExchange(Response{Body: []byte{0xDB, 0x02, 0x11, 0x22}, SW1: 0x90, SW2: 0x00}, nil)
+	if err == nil || info.Class != AKAAuthResponseClassMalformed {
+		t.Fatalf("malformed exchange info=%+v err=%v, want malformed error", info, err)
+	}
+
+	transportErr := errors.New("modem transport failed")
+	info, err = ClassifyUSIMAuthExchange(Response{}, transportErr)
+	if !errors.Is(err, transportErr) || info.Class != AKAAuthResponseClassTransportFailure || info.StatusString() != "0000" {
+		t.Fatalf("transport exchange info=%+v err=%v, want transport failure", info, err)
+	}
+}
+
 func TestAKAProviderExposesSyncFailureAUTS(t *testing.T) {
 	rand16 := bytesFrom(0x10, 16)
 	autn16 := bytesFrom(0x30, 16)

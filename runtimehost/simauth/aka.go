@@ -33,12 +33,13 @@ type AKAResult = swusim.AKAResult
 type AKAAuthResponseClass string
 
 const (
-	AKAAuthResponseClassUnknown     AKAAuthResponseClass = ""
-	AKAAuthResponseClassSuccess     AKAAuthResponseClass = "success"
-	AKAAuthResponseClassSyncFailure AKAAuthResponseClass = "sync_failure"
-	AKAAuthResponseClassMACFailure  AKAAuthResponseClass = "mac_failure"
-	AKAAuthResponseClassAPDUStatus  AKAAuthResponseClass = "apdu_status"
-	AKAAuthResponseClassMalformed   AKAAuthResponseClass = "malformed"
+	AKAAuthResponseClassUnknown          AKAAuthResponseClass = ""
+	AKAAuthResponseClassSuccess          AKAAuthResponseClass = "success"
+	AKAAuthResponseClassSyncFailure      AKAAuthResponseClass = "sync_failure"
+	AKAAuthResponseClassMACFailure       AKAAuthResponseClass = "mac_failure"
+	AKAAuthResponseClassAPDUStatus       AKAAuthResponseClass = "apdu_status"
+	AKAAuthResponseClassMalformed        AKAAuthResponseClass = "malformed"
+	AKAAuthResponseClassTransportFailure AKAAuthResponseClass = "transport_failure"
 )
 
 type AKAAuthResponseInfo struct {
@@ -290,6 +291,18 @@ func ClassifyUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAAuthResponseInfo, 
 		info.Class = AKAAuthResponseClassMACFailure
 	}
 	return info, err
+}
+
+// ClassifyUSIMAuthExchange classifies the result of a USIM AUTHENTICATE APDU
+// exchange while keeping transport failures separate from card payload errors.
+func ClassifyUSIMAuthExchange(resp Response, transportErr error) (AKAAuthResponseInfo, error) {
+	if transportErr != nil {
+		return AKAAuthResponseInfo{
+			Class:  AKAAuthResponseClassTransportFailure,
+			Status: resp.Status(),
+		}, transportErr
+	}
+	return ClassifyUSIMAuthResponse(resp.Body, resp.SW1, resp.SW2)
 }
 
 func ParseAUTS(auts14 []byte) (AUTSFields, error) {

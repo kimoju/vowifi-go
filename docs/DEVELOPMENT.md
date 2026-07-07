@@ -18,6 +18,7 @@ Useful focused targets are:
 
 - `make go-version`
 - `make module-path`
+- `make hygiene-check`
 - `make privacy-check`
 - `make fmt-check`
 - `make tidy-check`
@@ -32,8 +33,9 @@ Useful focused targets are:
 
 The default `make ci` path stays lightweight: it checks the Go version required
 by `go.mod`, verifies the canonical module path and Go import roots, downloads
-modules, scans tracked content for personal emails, local home paths, and
-legacy module references, verifies formatting and module tidiness, runs
+modules, scans tracked content for forbidden hygiene strings, personal emails,
+local home paths, and legacy module references, verifies formatting and
+module tidiness, runs
 `go vet`, compiles packages/tests with a zero-test smoke pass, runs the local
 VoHive compatibility self-test, then runs the unit suite. Race and coverage
 runs are opt-in:

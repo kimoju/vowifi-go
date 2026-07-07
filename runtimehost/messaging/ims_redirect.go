@@ -26,17 +26,20 @@ type imsMessagingResponseHandling struct {
 // IMSMessagingSIPRecoveryDecision describes the messaging-layer recovery action
 // for a SIP response to SMS MESSAGE or USSD dialog requests.
 type IMSMessagingSIPRecoveryDecision struct {
-	Method                     string
-	StatusCode                 int
-	RetryAfter                 time.Duration
-	RetryAfterPresent          bool
-	Recoverable                bool
-	TargetFailover             bool
-	RegistrationRecoveryNeeded bool
-	AuthenticationRefresh      bool
-	RedirectURI                string
-	Candidates                 []IMSMessagingRecoveryCandidate
-	FailureText                string
+	Method                            string
+	StatusCode                        int
+	RetryAfter                        time.Duration
+	RetryAfterPresent                 bool
+	Recoverable                       bool
+	TargetFailover                    bool
+	RegistrationRecoveryNeeded        bool
+	AuthenticationRefresh             bool
+	AuthenticationChallengeHeader     string
+	AuthenticationChallenge           string
+	AuthenticationAuthorizationHeader string
+	RedirectURI                       string
+	Candidates                        []IMSMessagingRecoveryCandidate
+	FailureText                       string
 }
 
 type IMSMessagingRecoveryCandidateKind string
@@ -82,6 +85,11 @@ func ClassifyIMSMessagingSIPResponseRecovery(method string, resp voiceclient.SIP
 		AuthenticationRefresh:      plan.AuthenticationRefresh,
 		RedirectURI:                redirectURI,
 		Candidates:                 candidates,
+	}
+	decision.AuthenticationChallengeHeader, decision.AuthenticationAuthorizationHeader = imsMessagingAuthHeaders(resp.StatusCode)
+	if decision.AuthenticationChallengeHeader != "" {
+		decision.AuthenticationRefresh = true
+		decision.AuthenticationChallenge = firstHeaderValue(resp.Headers, decision.AuthenticationChallengeHeader)
 	}
 	if redirectURI != "" || firstIMSMessagingRecoveryTarget(candidates) != "" {
 		decision.Recoverable = true

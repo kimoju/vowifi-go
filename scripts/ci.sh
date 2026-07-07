@@ -53,7 +53,7 @@ module_path_check() {
 	local module_files=()
 	local legacy_refs=()
 
-	expected="${CI_MODULE_PATH:-github.com/boa-z/vowifi-go}"
+	expected="github.com/boa-z/vowifi-go"
 	legacy_base="${CI_LEGACY_MODULE_BASE:-github.com/iniwex5}"
 	legacy_module="${CI_LEGACY_MODULE:-${legacy_base%/}/vowifi-go}"
 
@@ -79,23 +79,52 @@ module_path_check() {
 	printf '\n==> verified Go module/source references do not use %s\n' "$legacy_module"
 }
 
-grep_repo_fixed() {
-	grep -RInIF \
-		--exclude-dir=.git \
-		--exclude='go.sum' \
-		--exclude='go.work.sum' \
-		"$@" . 2>/dev/null || true
+git_grep_tracked_fixed() {
+	local pattern="$1"
+	git grep -nIF -- "$pattern" -- . 2>/dev/null || true
 }
 
-grep_repo_regex() {
-	grep -RInIE \
-		--exclude-dir=.git \
-		--exclude='go.sum' \
-		--exclude='go.work.sum' \
-		"$@" . 2>/dev/null || true
+git_grep_tracked_regex() {
+	local pattern="$1"
+	git grep -nIE -- "$pattern" -- . 2>/dev/null || true
 }
 
-privacy_check() {
+forbidden_tracked_content_patterns() {
+	local mail_domain legacy_owner repo_name
+	mail_domain="$(printf '%s.%s' outlook com)"
+	legacy_owner="iniwex5"
+	repo_name="vowifi-go"
+
+	printf '%s%s%s\n' boa-z @ "$mail_domain"
+	printf '%s\n' "$mail_domain"
+	printf '/%s/%s\n' home boa
+	printf 'github.com/%s/%s\n' "$legacy_owner" "$repo_name"
+	printf '%s/%s\n' "$legacy_owner" "$repo_name"
+}
+
+forbidden_tracked_content_check() {
+	local pattern status
+	local refs=()
+
+	status=0
+	while IFS= read -r pattern; do
+		mapfile -t refs < <(git_grep_tracked_fixed "$pattern")
+		if [[ ${#refs[@]} -gt 0 ]]; then
+			if [[ "$status" == "0" ]]; then
+				printf 'forbidden strings found in tracked content:\n' >&2
+			fi
+			printf '  %s\n' "${refs[@]}" >&2
+			status=1
+		fi
+	done < <(forbidden_tracked_content_patterns)
+
+	if [[ "$status" == "0" ]]; then
+		printf '\n==> tracked content contains none of the forbidden repo hygiene strings\n'
+	fi
+	return "$status"
+}
+
+hygiene_check() {
 	local email_regex legacy_base legacy_module local_path_regex status
 	local email_refs=()
 	local legacy_refs=()
@@ -107,29 +136,31 @@ privacy_check() {
 	email_regex="${CI_PRIVACY_EMAIL_RE:-[[:alnum:]_.%+-]+[@]([[:alnum:]-]+[.])?(gmail|googlemail|hotmail|outlook|live|msn|icloud|me|mac|yahoo|ymail|rocketmail|proton|protonmail|pm|aol|qq|163|126|yeah|foxmail)[.][[:alpha:].]{2,}}"
 	local_path_regex='/(home|Users)/[[:alnum:]_.-]+|[[:alpha:]]:[\\]+Users[\\]+[[:alnum:]_.-]+'
 
-	mapfile -t legacy_refs < <(grep_repo_fixed -- "$legacy_module")
+	forbidden_tracked_content_check || status=1
+
+	mapfile -t legacy_refs < <(git_grep_tracked_fixed "$legacy_module")
 	if [[ ${#legacy_refs[@]} -gt 0 ]]; then
-		printf 'legacy vowifi-go module references found in repository files:\n' >&2
+		printf 'legacy vowifi-go module references found in tracked content:\n' >&2
 		printf '  %s\n' "${legacy_refs[@]}" >&2
 		status=1
 	fi
 
-	mapfile -t local_path_refs < <(grep_repo_regex -- "$local_path_regex")
+	mapfile -t local_path_refs < <(git_grep_tracked_regex "$local_path_regex")
 	if [[ ${#local_path_refs[@]} -gt 0 ]]; then
-		printf 'possible local home path references found in repository files:\n' >&2
+		printf 'possible local home path references found in tracked content:\n' >&2
 		printf '  %s\n' "${local_path_refs[@]}" >&2
 		status=1
 	fi
 
-	mapfile -t email_refs < <(grep_repo_regex -- "$email_regex")
+	mapfile -t email_refs < <(git_grep_tracked_regex "$email_regex")
 	if [[ ${#email_refs[@]} -gt 0 ]]; then
-		printf 'possible personal email references found in repository files:\n' >&2
+		printf 'possible personal email references found in tracked content:\n' >&2
 		printf '  %s\n' "${email_refs[@]}" >&2
 		status=1
 	fi
 
 	if [[ "$status" == "0" ]]; then
-		printf '\n==> privacy scan found no personal emails, local home paths, or legacy vowifi-go module references\n'
+		printf '\n==> hygiene scan found no forbidden strings, personal emails, local home paths, or legacy vowifi-go module references in tracked content\n'
 	fi
 	return "$status"
 }
@@ -264,16 +295,15 @@ coverage() {
 
 usage() {
 	cat <<'USAGE'
-Usage: scripts/ci.sh [all|version|module-path|privacy|download|fmt|tidy|vet|smoke|compat-selftest|test|race|coverage ...]
+Usage: scripts/ci.sh [all|version|module-path|hygiene|privacy|download|fmt|tidy|vet|smoke|compat-selftest|test|race|coverage ...]
 
 Environment:
   GO_BIN               path to go binary when it is not on PATH
   GOFMT_BIN            path to gofmt binary
   GOWORK               Go workspace mode, default: off for hermetic CI
-  CI_MODULE_PATH       expected module path, default: github.com/boa-z/vowifi-go
   CI_LEGACY_MODULE     legacy module path rejected in Go files
   CI_LEGACY_MODULE_BASE legacy owner/base used to build the default legacy path
-  CI_PRIVACY_EMAIL_RE  personal email regex for privacy checks
+  CI_PRIVACY_EMAIL_RE  personal email regex for hygiene checks
   CI_SMOKE_PACKAGES    package pattern(s) for smoke tests, default: ./...
   CI_SMOKE_RUN         go test -run pattern for smoke tests, default: ^$
   SKIP_RACE=1          skip race tests
@@ -282,14 +312,14 @@ Environment:
   CI_COVERAGE_FILE     coverage profile path; default: temporary file
   CI_COVERAGE_MODE     Go coverage mode, default: atomic
 
-Default all runs version/module-path/privacy/download/fmt/tidy/vet/smoke/
+Default all runs version/module-path/hygiene/download/fmt/tidy/vet/smoke/
 compat-selftest/test. Race and coverage are opt-in so the main local and
 GitHub CI path stays lightweight.
 USAGE
 }
 
 if [[ $# -eq 0 || "${1:-}" == "all" ]]; then
-	tasks=(version module-path privacy download fmt tidy vet smoke compat-selftest test)
+	tasks=(version module-path hygiene download fmt tidy vet smoke compat-selftest test)
 else
 	tasks=("$@")
 fi
@@ -302,7 +332,7 @@ for task in "${tasks[@]}"; do
 	case "$task" in
 		version | go-version) version_check ;;
 		module-path | module_path) module_path_check ;;
-		privacy | privacy-check) privacy_check ;;
+		hygiene | hygiene-check | privacy | privacy-check) hygiene_check ;;
 		download) download ;;
 		fmt | fmt-check) fmt_check ;;
 		tidy | tidy-check) tidy_check ;;

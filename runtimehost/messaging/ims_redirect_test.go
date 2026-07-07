@@ -146,6 +146,54 @@ func TestIMSMessagingRecoveryCandidatesSortRedirectContacts(t *testing.T) {
 	}
 }
 
+func TestClassifyIMSMessagingSIPResponseRecoveryIncludesAuthChallenge(t *testing.T) {
+	tests := []struct {
+		name            string
+		statusCode      int
+		headers         map[string][]string
+		wantChallenge   string
+		wantAuthHeader  string
+		wantAuthzHeader string
+	}{
+		{
+			name:       "www authenticate",
+			statusCode: 401,
+			headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="n1", algorithm=AKAv1-MD5`},
+			},
+			wantChallenge:   `Digest realm="ims.example", nonce="n1", algorithm=AKAv1-MD5`,
+			wantAuthHeader:  "WWW-Authenticate",
+			wantAuthzHeader: "Authorization",
+		},
+		{
+			name:       "proxy authenticate",
+			statusCode: 407,
+			headers: map[string][]string{
+				"Proxy-Authenticate": {`Digest realm="ims.example", nonce="p1", algorithm=AKAv2-MD5`},
+			},
+			wantChallenge:   `Digest realm="ims.example", nonce="p1", algorithm=AKAv2-MD5`,
+			wantAuthHeader:  "Proxy-Authenticate",
+			wantAuthzHeader: "Proxy-Authorization",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ClassifyIMSMessagingSIPResponseRecovery("MESSAGE", voiceclient.SIPResponse{
+				StatusCode: tc.statusCode,
+				Reason:     "authentication required",
+				Headers:    tc.headers,
+			})
+			if !got.AuthenticationRefresh ||
+				got.AuthenticationChallengeHeader != tc.wantAuthHeader ||
+				got.AuthenticationAuthorizationHeader != tc.wantAuthzHeader ||
+				got.AuthenticationChallenge != tc.wantChallenge {
+				t.Fatalf("ClassifyIMSMessagingSIPResponseRecovery()=%+v", got)
+			}
+		})
+	}
+}
+
 func TestIMSMessagingRecoveryCandidatesParseAlternativeService(t *testing.T) {
 	resp := voiceclient.SIPResponse{
 		StatusCode: 380,

@@ -7,14 +7,15 @@ CI := ./scripts/ci.sh
 VOHIVE_COMPAT := ./scripts/compat-vohive.sh
 VOHIVE_COMPAT_SELFTEST := ./scripts/compat-vohive-selftest.sh
 
-.PHONY: help ci go-version module-path privacy-check download fmt-check tidy-check vet smoke test race coverage compat-vohive compat-vohive-selftest
+.PHONY: help ci go-version module-path hygiene-check privacy-check download fmt-check tidy-check vet smoke test race coverage compat-vohive compat-vohive-selftest
 
 help:
 > @printf 'Targets:\n'
 > @printf '  make ci          run the default local CI suite used by GitHub Actions\n'
 > @printf '  make go-version  check current Go against the go.mod version pin\n'
 > @printf '  make module-path check canonical module path and Go import roots\n'
-> @printf '  make privacy-check check for personal emails, local paths, and legacy module refs\n'
+> @printf '  make hygiene-check check tracked content for repo hygiene leaks\n'
+> @printf '  make privacy-check alias for hygiene-check\n'
 > @printf '  make download    download Go module dependencies\n'
 > @printf '  make fmt-check   check gofmt formatting\n'
 > @printf '  make tidy-check  check go.mod/go.sum tidiness\n'
@@ -35,6 +36,9 @@ go-version:
 
 module-path:
 > GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) module-path
+
+hygiene-check:
+> GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) hygiene
 
 privacy-check:
 > GO_BIN="$(GO)" GOFMT_BIN="$(GOFMT)" $(CI) privacy

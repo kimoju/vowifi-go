@@ -1006,6 +1006,107 @@ func TestRTPRelaySessionReportsQualitySnapshot(t *testing.T) {
 	}
 }
 
+func TestRTPRelayRTCPReportDiagnosisActions(t *testing.T) {
+	cfg := RTPStreamDiagnosisConfig{
+		ClockRate:            8000,
+		LossWarningFraction:  32,
+		LossCriticalFraction: 128,
+		JitterWarning:        40 * time.Millisecond,
+		JitterCritical:       100 * time.Millisecond,
+		RoundTripWarning:     300 * time.Millisecond,
+		RoundTripCritical:    800 * time.Millisecond,
+	}
+	base := RTPRelayRTCPReportQuality{
+		Direction:    RTCPFeedbackClientToIMS,
+		ReporterSSRC: 0x61616161,
+		MediaSSRC:    0x11111111,
+		TotalLost:    7,
+	}
+	tests := []struct {
+		name        string
+		report      RTPRelayRTCPReportQuality
+		wantStatus  RTPStreamDiagnosisStatus
+		wantReasons []RTPStreamDiagnosisReason
+		wantAction  RTPRelayQualityAction
+	}{
+		{
+			name:       "ok",
+			report:     base,
+			wantStatus: RTPStreamDiagnosisStatusOK,
+			wantAction: RTPRelayQualityActionNone,
+		},
+		{
+			name:        "jitter warning",
+			report:      reportWithRTCPQuality(base, 0, 400, 0),
+			wantStatus:  RTPStreamDiagnosisStatusWarning,
+			wantReasons: []RTPStreamDiagnosisReason{RTPStreamDiagnosisReasonJitter},
+			wantAction:  RTPRelayQualityActionIncreaseJitterBuffer,
+		},
+		{
+			name:        "loss warning",
+			report:      reportWithRTCPQuality(base, 40, 0, 0),
+			wantStatus:  RTPStreamDiagnosisStatusWarning,
+			wantReasons: []RTPStreamDiagnosisReason{RTPStreamDiagnosisReasonPacketLoss},
+			wantAction:  RTPRelayQualityActionReduceBitrate,
+		},
+		{
+			name:        "RTT warning",
+			report:      reportWithRTCPQuality(base, 0, 0, 350*time.Millisecond),
+			wantStatus:  RTPStreamDiagnosisStatusWarning,
+			wantReasons: []RTPStreamDiagnosisReason{RTPStreamDiagnosisReasonRoundTripTime},
+			wantAction:  RTPRelayQualityActionMonitor,
+		},
+		{
+			name:        "critical media path",
+			report:      reportWithRTCPQuality(base, 160, 960, 900*time.Millisecond),
+			wantStatus:  RTPStreamDiagnosisStatusCritical,
+			wantReasons: []RTPStreamDiagnosisReason{RTPStreamDiagnosisReasonPacketLoss, RTPStreamDiagnosisReasonJitter, RTPStreamDiagnosisReasonRoundTripTime},
+			wantAction:  RTPRelayQualityActionRecoverMediaPath,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diagnosis := tt.report.Diagnose(cfg)
+			if diagnosis.Direction != base.Direction || diagnosis.ReporterSSRC != base.ReporterSSRC || diagnosis.MediaSSRC != base.MediaSSRC {
+				t.Fatalf("diagnosis identity=%+v", diagnosis)
+			}
+			if diagnosis.Status != tt.wantStatus || diagnosis.Action != tt.wantAction {
+				t.Fatalf("diagnosis status/action=%q/%q, want %q/%q: %+v", diagnosis.Status, diagnosis.Action, tt.wantStatus, tt.wantAction, diagnosis)
+			}
+			if !rtpDiagnosisReasonsEqual(diagnosis.Reasons, tt.wantReasons) {
+				t.Fatalf("diagnosis reasons=%+v, want %+v", diagnosis.Reasons, tt.wantReasons)
+			}
+		})
+	}
+
+	diagnoses := RTPRelayDirectionQuality{RTCPReports: []RTPRelayRTCPReportQuality{tests[len(tests)-1].report}}.DiagnoseRTCPReports(cfg)
+	if len(diagnoses) != 1 || diagnoses[0].Action != RTPRelayQualityActionRecoverMediaPath ||
+		diagnoses[0].Loss.TotalLost != 7 || diagnoses[0].Jitter.Duration != 120*time.Millisecond ||
+		diagnoses[0].RoundTripTime.RoundTripTime != 900*time.Millisecond {
+		t.Fatalf("quality diagnoses=%+v", diagnoses)
+	}
+}
+
+func TestRTPRelayRTCPReportQualitySummaryIncludesRoundTripTime(t *testing.T) {
+	status, reasons := summarizeRTPRelayRTCPReportQuality([]RTPRelayRTCPReportQuality{{
+		Direction:     RTCPFeedbackClientToIMS,
+		ReporterSSRC:  0x61616161,
+		MediaSSRC:     0x11111111,
+		RoundTripTime: 900 * time.Millisecond,
+	}}, RTPStreamDiagnosisConfig{
+		RoundTripWarning:  300 * time.Millisecond,
+		RoundTripCritical: 800 * time.Millisecond,
+	}, RTPStreamDiagnosisStatusUnknown, nil)
+
+	if status != RTPStreamDiagnosisStatusCritical {
+		t.Fatalf("summary status=%q, want critical", status)
+	}
+	if !rtpDiagnosisReasonsEqual(reasons, []RTPStreamDiagnosisReason{RTPStreamDiagnosisReasonRoundTripTime}) {
+		t.Fatalf("summary reasons=%+v, want round-trip time", reasons)
+	}
+}
+
 func TestRTPRelaySessionEmitsQualityEventsOnStatusChange(t *testing.T) {
 	base := time.Date(2026, 7, 7, 10, 30, 0, 0, time.UTC)
 	var events []RTPRelayQualityEvent
@@ -1150,6 +1251,25 @@ func TestRTPRelaySessionEmitsQualityEventsFromRTCPReceiverReports(t *testing.T) 
 		event.Quality.RTCPReports[0].Jitter != 800 {
 		t.Fatalf("critical RTCP quality event=%+v", event)
 	}
+}
+
+func reportWithRTCPQuality(report RTPRelayRTCPReportQuality, fractionLost uint8, jitter uint32, roundTripTime time.Duration) RTPRelayRTCPReportQuality {
+	report.FractionLost = fractionLost
+	report.Jitter = jitter
+	report.RoundTripTime = roundTripTime
+	return report
+}
+
+func rtpDiagnosisReasonsEqual(got, want []RTPStreamDiagnosisReason) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestRTPRelaySessionRTCPQualityEventDoesNotDeadlock(t *testing.T) {

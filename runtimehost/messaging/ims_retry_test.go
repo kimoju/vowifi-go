@@ -91,6 +91,40 @@ func TestPlanIMSMessagingRetryClassifies4xxAndRetryAfter(t *testing.T) {
 	}
 }
 
+func TestPlanIMSMessagingRetryCarriesAuthChallenge(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
+	plan := PlanIMSMessagingRetry(IMSMessagingRetryInput{
+		Operation: IMSMessagingRetryOperationSMSSubmit,
+		Method:    "MESSAGE",
+		Response: voiceclient.SIPResponse{
+			StatusCode: 407,
+			Reason:     "Proxy Authentication Required",
+			Headers: map[string][]string{
+				"Proxy-Authenticate": {`Digest realm="ims.example", nonce="p1", algorithm=AKAv2-MD5`},
+				"Retry-After":        {"2"},
+			},
+		},
+		Attempt:        1,
+		Now:            now,
+		IdempotencyKey: "sms-submit:auth:part-1",
+	})
+
+	if plan.Class != IMSMessagingRetryClassAuthentication ||
+		!plan.Retry ||
+		plan.Terminal ||
+		plan.Action != IMSMessagingRetryActionRefreshAuthentication ||
+		!plan.AuthenticationRefresh ||
+		plan.AuthenticationChallengeHeader != "Proxy-Authenticate" ||
+		plan.AuthenticationAuthorizationHeader != "Proxy-Authorization" ||
+		plan.AuthenticationChallenge != `Digest realm="ims.example", nonce="p1", algorithm=AKAv2-MD5` ||
+		!plan.RetryAfterPresent ||
+		plan.Delay != 2*time.Second ||
+		!plan.NextAttemptAt.Equal(now.Add(2*time.Second)) ||
+		!plan.Durable {
+		t.Fatalf("auth retry plan=%+v", plan)
+	}
+}
+
 func TestPlanIMSMessagingRetryClassifies5xxWithRetryAfter(t *testing.T) {
 	now := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
 	plan := PlanIMSMessagingRetry(IMSMessagingRetryInput{

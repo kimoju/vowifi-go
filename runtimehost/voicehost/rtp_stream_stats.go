@@ -45,6 +45,7 @@ const (
 	RTPStreamDiagnosisReasonPacketLoss    RTPStreamDiagnosisReason = "packet_loss"
 	RTPStreamDiagnosisReasonJitter        RTPStreamDiagnosisReason = "jitter"
 	RTPStreamDiagnosisReasonRTCPKeepalive RTPStreamDiagnosisReason = "rtcp_keepalive"
+	RTPStreamDiagnosisReasonRoundTripTime RTPStreamDiagnosisReason = "round_trip_time"
 )
 
 const (
@@ -53,11 +54,14 @@ const (
 	defaultRTPDiagnosisLossCritical       = 26
 	defaultRTPDiagnosisJitterWarning      = 30 * time.Millisecond
 	defaultRTPDiagnosisJitterCritical     = 100 * time.Millisecond
+	defaultRTPDiagnosisRoundTripWarning   = 300 * time.Millisecond
+	defaultRTPDiagnosisRoundTripCritical  = 800 * time.Millisecond
 )
 
 // RTPStreamDiagnosisConfig tunes the conservative thresholds used to classify a
-// received RTP stream. RTCP keepalive classification is enabled only when
-// RTCPKeepaliveInterval is positive or RequireRTCP is true.
+// received RTP stream and remote RTCP reception reports. RTCP keepalive
+// classification is enabled only when RTCPKeepaliveInterval is positive or
+// RequireRTCP is true.
 type RTPStreamDiagnosisConfig struct {
 	ClockRate             int
 	MinExpectedPackets    uint64
@@ -65,6 +69,8 @@ type RTPStreamDiagnosisConfig struct {
 	LossCriticalFraction  uint8
 	JitterWarning         time.Duration
 	JitterCritical        time.Duration
+	RoundTripWarning      time.Duration
+	RoundTripCritical     time.Duration
 	RTCPKeepaliveInterval time.Duration
 	RTCPKeepaliveGrace    time.Duration
 	RequireRTCP           bool
@@ -343,6 +349,15 @@ func normalizeRTPStreamDiagnosisConfig(cfg RTPStreamDiagnosisConfig) RTPStreamDi
 	}
 	if cfg.JitterCritical < cfg.JitterWarning {
 		cfg.JitterCritical = cfg.JitterWarning
+	}
+	if cfg.RoundTripWarning <= 0 {
+		cfg.RoundTripWarning = defaultRTPDiagnosisRoundTripWarning
+	}
+	if cfg.RoundTripCritical <= 0 {
+		cfg.RoundTripCritical = defaultRTPDiagnosisRoundTripCritical
+	}
+	if cfg.RoundTripCritical < cfg.RoundTripWarning {
+		cfg.RoundTripCritical = cfg.RoundTripWarning
 	}
 	if cfg.RTCPKeepaliveInterval > 0 && cfg.RTCPKeepaliveGrace <= 0 {
 		cfg.RTCPKeepaliveGrace = cfg.RTCPKeepaliveInterval
