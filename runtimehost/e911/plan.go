@@ -21,6 +21,15 @@ const (
 	EmergencyLocationRevalidationReasonPending = "pending-location-validation"
 )
 
+const (
+	EmergencySIPRetryActionNone                = "none"
+	EmergencySIPRetryActionRetrySameRequest    = "retry-same-request"
+	EmergencySIPRetryActionAlternativeService  = "alternative-service"
+	EmergencySIPRetryActionRefreshLocation     = "refresh-location"
+	EmergencySIPRetryActionRecoverRegistration = "recover-registration"
+	EmergencySIPRetryActionRefreshRoute        = "refresh-route"
+)
+
 type EmergencyNumberClassification struct {
 	Input           string
 	DialString      string
@@ -147,6 +156,28 @@ type EmergencyBodyPlan struct {
 	PIDFLOBody        []byte
 }
 
+type EmergencySIPRetryPlan struct {
+	Failure                    EmergencySIPFailure
+	Action                     string
+	Retry                      bool
+	RetryAfter                 time.Duration
+	NextAttemptAt              time.Time
+	RegistrationRecoveryNeeded bool
+	RouteRefreshNeeded         bool
+	EntitlementRefreshNeeded   bool
+	LocationRefreshNeeded      bool
+	RebuildEmergencyPlan       bool
+	RebuildPIDFLO              bool
+	AlternativeService         bool
+	AlternativeServiceURN      string
+	AlternativeContactURI      string
+	NextServiceURN             string
+	NextRequestURI             string
+	NextRouteSet               []string
+	NextHeaders                map[string]string
+	Reason                     string
+}
+
 func ClassifyEmergencyNumber(value string) EmergencyNumberClassification {
 	input := strings.TrimSpace(value)
 	candidate := emergencyDialStringCandidate(input)
@@ -248,6 +279,140 @@ func PlanEmergencyCallWithCache(number string, cache *EntitlementCache, cfg Emer
 		SIPHeaderConfig: cfg,
 		Now:             now,
 	})
+}
+
+func PlanEmergencySIPRetry(current EmergencyPlan, resp voiceclient.SIPResponse, now time.Time) EmergencySIPRetryPlan {
+	failure := ClassifyEmergencySIPFailure(resp)
+	plan := EmergencySIPRetryPlan{
+		Failure:                    failure,
+		Action:                     EmergencySIPRetryActionNone,
+		RetryAfter:                 failure.RetryAfter,
+		RegistrationRecoveryNeeded: failure.RegistrationRecoveryNeeded,
+		RouteRefreshNeeded:         failure.RouteRefreshNeeded,
+		EntitlementRefreshNeeded:   failure.EntitlementRefreshNeeded,
+		LocationRefreshNeeded:      failure.LocationRefreshNeeded,
+		NextServiceURN:             strings.TrimSpace(current.ServiceURN),
+		NextRequestURI:             strings.TrimSpace(current.RequestURI),
+		NextRouteSet:               copyStringSlice(current.RouteSet),
+		NextHeaders:                copyStringMap(current.Headers),
+		Reason:                     strings.TrimSpace(failure.Reason),
+	}
+	if plan.NextRequestURI == "" {
+		plan.NextRequestURI = strings.TrimSpace(current.Call.RequestURI)
+	}
+	if len(plan.NextRouteSet) == 0 {
+		plan.NextRouteSet = copyStringSlice(current.Call.RouteSet)
+	}
+	if len(plan.NextHeaders) == 0 {
+		plan.NextHeaders = copyStringMap(current.Call.Headers)
+	}
+	if !failure.Retryable {
+		if plan.Reason == "" {
+			plan.Reason = "emergency SIP failure is not retryable"
+		}
+		return plan
+	}
+	plan.Retry = true
+	if failure.RetryAfter > 0 && !now.IsZero() {
+		plan.NextAttemptAt = now.Add(failure.RetryAfter)
+	}
+	switch {
+	case failure.AlternativeService:
+		plan.applyAlternativeEmergencyService(failure)
+	case failure.LocationRefreshNeeded || failure.EntitlementRefreshNeeded:
+		plan.Action = EmergencySIPRetryActionRefreshLocation
+		plan.RebuildEmergencyPlan = true
+		plan.RebuildPIDFLO = true
+		if plan.Reason == "" {
+			plan.Reason = "emergency location refresh required"
+		}
+	case failure.RegistrationRecoveryNeeded:
+		plan.Action = EmergencySIPRetryActionRecoverRegistration
+		if plan.Reason == "" {
+			plan.Reason = "emergency registration recovery required"
+		}
+	case failure.RouteRefreshNeeded:
+		plan.Action = EmergencySIPRetryActionRefreshRoute
+		plan.RebuildEmergencyPlan = true
+		if plan.Reason == "" {
+			plan.Reason = "emergency route refresh required"
+		}
+	default:
+		plan.Action = EmergencySIPRetryActionRetrySameRequest
+		if plan.Reason == "" {
+			plan.Reason = "emergency request retry required"
+		}
+	}
+	return plan
+}
+
+func (p *EmergencySIPRetryPlan) applyAlternativeEmergencyService(failure EmergencySIPFailure) {
+	p.Action = EmergencySIPRetryActionAlternativeService
+	p.AlternativeService = true
+	p.RouteRefreshNeeded = true
+	if serviceURN := firstEmergencyRetryAlternativeServiceURN(failure); serviceURN != "" {
+		p.AlternativeServiceURN = serviceURN
+		p.NextServiceURN = serviceURN
+		p.NextRequestURI = EmergencyRequestURI(serviceURN)
+	}
+	if contactURI := firstEmergencyRetryAlternativeContactURI(failure.ContactURIs); contactURI != "" {
+		p.AlternativeContactURI = contactURI
+		if p.AlternativeServiceURN == "" {
+			p.NextRequestURI = contactURI
+		}
+	}
+	if routeSet := emergencyRetryRouteSetFromContacts(failure.ContactURIs); len(routeSet) > 0 {
+		p.NextRouteSet = routeSet
+	}
+	if p.Reason == "" {
+		p.Reason = "alternative emergency service available"
+	}
+}
+
+func firstEmergencyRetryAlternativeServiceURN(failure EmergencySIPFailure) string {
+	if len(failure.AlternativeServiceURNs) > 0 {
+		return strings.TrimSpace(failure.AlternativeServiceURNs[0])
+	}
+	for _, contact := range failure.ContactURIs {
+		if urn := NormalizeEmergencyServiceURN(contact); urn != "" {
+			return urn
+		}
+	}
+	return ""
+}
+
+func firstEmergencyRetryAlternativeContactURI(contacts []string) string {
+	for _, contact := range contacts {
+		contact = strings.TrimSpace(contact)
+		lower := strings.ToLower(contact)
+		if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") {
+			return contact
+		}
+	}
+	return ""
+}
+
+func emergencyRetryRouteSetFromContacts(contacts []string) []string {
+	var out []string
+	for _, contact := range contacts {
+		route := emergencyRetryRouteFromContact(contact)
+		if route != "" {
+			out = appendUniqueStrings(out, route)
+		}
+	}
+	return out
+}
+
+func emergencyRetryRouteFromContact(contact string) string {
+	contact = strings.TrimSpace(contact)
+	lower := strings.ToLower(contact)
+	if !strings.HasPrefix(lower, "sip:") && !strings.HasPrefix(lower, "sips:") {
+		return ""
+	}
+	if strings.HasPrefix(contact, "<") && strings.HasSuffix(contact, ">") {
+		return contact
+	}
+	return "<" + contact + ">"
 }
 
 func emergencyPlanTarget(cfg EmergencyPlanConfig) (EmergencyNumberClassification, EmergencyServiceClassification, string, EmergencyServiceCategory, bool) {

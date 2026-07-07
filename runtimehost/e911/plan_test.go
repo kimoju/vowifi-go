@@ -295,3 +295,102 @@ func TestBuildEmergencyPlanFlagsExpiredEntitlementLocationForRevalidation(t *tes
 		t.Fatalf("RetryAfterDelay=%s, want 1m", revalidation.RetryAfterDelay)
 	}
 }
+
+func TestPlanEmergencySIPRetryUsesAlternativeServiceAndContactRoute(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
+	current := EmergencyPlan{
+		ServiceURN: DefaultEmergencyServiceURN,
+		RequestURI: DefaultEmergencyServiceURN,
+		RouteSet:   []string{"<sip:pcscf-old.example;lr>"},
+		Headers: map[string]string{
+			"Geolocation": "<geo:47.6205,-122.3493>;inserted-by=endpoint",
+		},
+	}
+	retry := PlanEmergencySIPRetry(current, voiceclient.SIPResponse{
+		StatusCode: 380,
+		Reason:     "Alternative Service",
+		Headers: map[string][]string{
+			"Retry-After": {"7"},
+			"Contact":     {`<urn:service:sos.ambulance>, <sip:ecscf-alt.example;lr>`},
+		},
+	}, now)
+
+	if !retry.Retry ||
+		retry.Action != EmergencySIPRetryActionAlternativeService ||
+		!retry.AlternativeService ||
+		!retry.RouteRefreshNeeded ||
+		retry.AlternativeServiceURN != "urn:service:sos.ambulance" ||
+		retry.AlternativeContactURI != "sip:ecscf-alt.example;lr" ||
+		retry.NextServiceURN != "urn:service:sos.ambulance" ||
+		retry.NextRequestURI != "urn:service:sos.ambulance" ||
+		retry.RetryAfter != 7*time.Second ||
+		!retry.NextAttemptAt.Equal(now.Add(7*time.Second)) {
+		t.Fatalf("alternative retry=%+v", retry)
+	}
+	if !sameStrings(retry.NextRouteSet, []string{"<sip:ecscf-alt.example;lr>"}) {
+		t.Fatalf("NextRouteSet=%+v", retry.NextRouteSet)
+	}
+	if retry.NextHeaders["Geolocation"] != current.Headers["Geolocation"] {
+		t.Fatalf("NextHeaders=%+v", retry.NextHeaders)
+	}
+}
+
+func TestPlanEmergencySIPRetryRefreshesLocationOnBadLocation(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 1, 0, 0, time.UTC)
+	current := EmergencyPlan{
+		ServiceURN: "urn:service:sos.fire",
+		RequestURI: "urn:service:sos.fire",
+		RouteSet:   []string{"<sip:pcscf-fire.example;lr>"},
+		Headers: map[string]string{
+			"Geolocation": "<cid:location-inline>;inserted-by=endpoint",
+		},
+		Call: EmergencyCallPlan{
+			RequestURI: "urn:service:sos.fire",
+			RouteSet:   []string{"<sip:pcscf-fire.example;lr>"},
+		},
+	}
+	retry := PlanEmergencySIPRetry(current, voiceclient.SIPResponse{
+		StatusCode: 424,
+		Reason:     "Bad Location Information",
+		Headers: map[string][]string{
+			"Retry-After": {"3"},
+			"Warning":     {`399 ims.example "PIDF-LO rejected"`},
+		},
+	}, now)
+
+	if !retry.Retry ||
+		retry.Action != EmergencySIPRetryActionRefreshLocation ||
+		!retry.LocationRefreshNeeded ||
+		!retry.EntitlementRefreshNeeded ||
+		!retry.RebuildEmergencyPlan ||
+		!retry.RebuildPIDFLO ||
+		retry.NextServiceURN != "urn:service:sos.fire" ||
+		retry.NextRequestURI != "urn:service:sos.fire" ||
+		retry.RetryAfter != 3*time.Second ||
+		!retry.NextAttemptAt.Equal(now.Add(3*time.Second)) {
+		t.Fatalf("location retry=%+v", retry)
+	}
+	if !sameStrings(retry.NextRouteSet, []string{"<sip:pcscf-fire.example;lr>"}) {
+		t.Fatalf("NextRouteSet=%+v", retry.NextRouteSet)
+	}
+}
+
+func TestPlanEmergencySIPRetryLeavesNonRetryableFailureTerminal(t *testing.T) {
+	retry := PlanEmergencySIPRetry(EmergencyPlan{
+		ServiceURN: DefaultEmergencyServiceURN,
+		RequestURI: DefaultEmergencyServiceURN,
+	}, voiceclient.SIPResponse{
+		StatusCode: 403,
+		Reason:     "Forbidden",
+	}, time.Date(2026, 7, 7, 10, 2, 0, 0, time.UTC))
+
+	if retry.Retry ||
+		retry.Action != EmergencySIPRetryActionNone ||
+		retry.NextRequestURI != DefaultEmergencyServiceURN ||
+		retry.NextAttemptAt != (time.Time{}) ||
+		retry.RegistrationRecoveryNeeded ||
+		retry.LocationRefreshNeeded ||
+		retry.RouteRefreshNeeded {
+		t.Fatalf("non-retryable retry plan=%+v", retry)
+	}
+}
