@@ -323,14 +323,18 @@ func TestSIPTransactionTimerPolicyDefaults(t *testing.T) {
 	if !invite.Invite || invite.Method != "INVITE" ||
 		invite.T1 != 500*time.Millisecond || invite.T2 != 4*time.Second || invite.T4 != 5*time.Second ||
 		invite.TimerA != 500*time.Millisecond || invite.TimerB != 32*time.Second ||
-		invite.TimerE != 0 || invite.TimerF != 0 || invite.TimerK != 0 {
+		invite.TimerD != 32*time.Second || invite.TimerG != 500*time.Millisecond ||
+		invite.TimerH != 32*time.Second || invite.TimerI != 5*time.Second ||
+		invite.TimerE != 0 || invite.TimerF != 0 || invite.TimerJ != 0 || invite.TimerK != 0 {
 		t.Fatalf("INVITE policy=%+v", invite)
 	}
 
 	message := DefaultSIPTransactionTimerPolicy("MESSAGE")
 	if message.Invite || message.Method != "MESSAGE" ||
 		message.TimerA != 0 || message.TimerB != 0 ||
-		message.TimerE != 500*time.Millisecond || message.TimerF != 32*time.Second || message.TimerK != 5*time.Second {
+		message.TimerD != 0 || message.TimerG != 0 || message.TimerH != 0 || message.TimerI != 0 ||
+		message.TimerE != 500*time.Millisecond || message.TimerF != 32*time.Second ||
+		message.TimerJ != 32*time.Second || message.TimerK != 5*time.Second {
 		t.Fatalf("MESSAGE policy=%+v", message)
 	}
 }

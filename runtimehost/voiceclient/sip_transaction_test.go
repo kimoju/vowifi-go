@@ -285,3 +285,293 @@ func TestAdvanceSIPClientTransactionNonInviteTimeoutAndRetransmitLimit(t *testin
 		t.Fatalf("non-INVITE timeout step=%+v", timeout)
 	}
 }
+
+func TestAdvanceSIPServerTransactionInviteFlow(t *testing.T) {
+	cfg := SIPTransactionTimerConfig{
+		T1: 100 * time.Millisecond,
+		T2: 400 * time.Millisecond,
+		T4: 900 * time.Millisecond,
+	}
+	request := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "invite",
+		Event:       SIPServerTransactionEventRequest,
+		TimerConfig: cfg,
+	})
+	if request.Method != "INVITE" ||
+		!request.Invite ||
+		request.State != SIPServerTransactionStateProceeding ||
+		request.NextState != SIPServerTransactionStateProceeding ||
+		request.Action != SIPServerTransactionActionPassRequest ||
+		!request.PassRequest {
+		t.Fatalf("INVITE request step=%+v", request)
+	}
+
+	provisional := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "INVITE",
+		State:       SIPServerTransactionStateProceeding,
+		Event:       SIPServerTransactionEventResponse,
+		Response:    SIPResponse{StatusCode: 183, Reason: "Session Progress"},
+		TimerConfig: cfg,
+	})
+	if provisional.NextState != SIPServerTransactionStateProceeding ||
+		provisional.Action != SIPServerTransactionActionSendResponse ||
+		!provisional.SendResponse ||
+		!provisional.Provisional ||
+		provisional.Final {
+		t.Fatalf("INVITE provisional response step=%+v", provisional)
+	}
+
+	failure := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "INVITE",
+		State:       SIPServerTransactionStateProceeding,
+		Event:       SIPServerTransactionEventResponse,
+		Response:    SIPResponse{StatusCode: 486, Reason: "Busy Here"},
+		TimerConfig: cfg,
+	})
+	if failure.NextState != SIPServerTransactionStateCompleted ||
+		failure.Action != SIPServerTransactionActionSendResponse ||
+		!failure.SendResponse ||
+		!failure.Failure ||
+		failure.TimerName != "G" ||
+		failure.NextRetransmitInterval != 100*time.Millisecond ||
+		failure.TimeoutAfter != 6400*time.Millisecond ||
+		failure.Terminated {
+		t.Fatalf("INVITE failure response step=%+v", failure)
+	}
+
+	retransmitTimer := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:                 "INVITE",
+		State:                  SIPServerTransactionStateCompleted,
+		Event:                  SIPServerTransactionEventRetransmitTimer,
+		Response:               SIPResponse{StatusCode: 486, Reason: "Busy Here"},
+		LastRetransmitInterval: 200 * time.Millisecond,
+		TimerConfig:            cfg,
+	})
+	if retransmitTimer.NextState != SIPServerTransactionStateCompleted ||
+		retransmitTimer.Action != SIPServerTransactionActionRetransmitResponse ||
+		!retransmitTimer.RetransmitResponse ||
+		retransmitTimer.TimerName != "G" ||
+		retransmitTimer.NextRetransmitInterval != 400*time.Millisecond {
+		t.Fatalf("INVITE retransmit timer step=%+v", retransmitTimer)
+	}
+
+	requestRetransmit := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:                "INVITE",
+		State:                 SIPServerTransactionStateCompleted,
+		Event:                 SIPServerTransactionEventRequest,
+		RequestRetransmission: true,
+		Response:              SIPResponse{StatusCode: 486, Reason: "Busy Here"},
+		TimerConfig:           cfg,
+	})
+	if requestRetransmit.Action != SIPServerTransactionActionRetransmitResponse ||
+		!requestRetransmit.RetransmitResponse ||
+		requestRetransmit.StatusCode != 486 {
+		t.Fatalf("INVITE request retransmission step=%+v", requestRetransmit)
+	}
+
+	ack := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "INVITE",
+		State:       SIPServerTransactionStateCompleted,
+		Event:       SIPServerTransactionEventACK,
+		TimerConfig: cfg,
+	})
+	if ack.NextState != SIPServerTransactionStateConfirmed ||
+		ack.Action != SIPServerTransactionActionDeliverACK ||
+		!ack.DeliverACK ||
+		ack.TimerName != "I" ||
+		ack.CleanupAfter != 900*time.Millisecond ||
+		ack.Terminated {
+		t.Fatalf("INVITE ACK step=%+v", ack)
+	}
+
+	cleanup := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "INVITE",
+		State:       SIPServerTransactionStateConfirmed,
+		Event:       SIPServerTransactionEventCleanupTimer,
+		TimerConfig: cfg,
+	})
+	if cleanup.NextState != SIPServerTransactionStateTerminated ||
+		cleanup.Action != SIPServerTransactionActionTerminate ||
+		cleanup.TimerName != "I" ||
+		!cleanup.Terminated {
+		t.Fatalf("INVITE server cleanup step=%+v", cleanup)
+	}
+}
+
+func TestAdvanceSIPServerTransactionInviteSuccessAndTimeout(t *testing.T) {
+	cfg := SIPTransactionTimerConfig{T1: 100 * time.Millisecond, T4: 900 * time.Millisecond}
+	success := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "INVITE",
+		State:       SIPServerTransactionStateProceeding,
+		Event:       SIPServerTransactionEventResponse,
+		Response:    SIPResponse{StatusCode: 200, Reason: "OK"},
+		TimerConfig: cfg,
+	})
+	if success.NextState != SIPServerTransactionStateTerminated ||
+		success.Action != SIPServerTransactionActionSendResponse ||
+		!success.SendResponse ||
+		!success.Success ||
+		!success.Terminated {
+		t.Fatalf("INVITE 2xx server step=%+v", success)
+	}
+
+	reliableFailure := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:            "INVITE",
+		State:             SIPServerTransactionStateProceeding,
+		Event:             SIPServerTransactionEventResponse,
+		Response:          SIPResponse{StatusCode: 488, Reason: "Not Acceptable Here"},
+		ReliableTransport: true,
+		TimerConfig:       cfg,
+	})
+	if reliableFailure.NextState != SIPServerTransactionStateCompleted ||
+		reliableFailure.NextRetransmitInterval != 0 ||
+		reliableFailure.TimeoutAfter != 6400*time.Millisecond ||
+		reliableFailure.Terminated {
+		t.Fatalf("reliable INVITE failure server step=%+v", reliableFailure)
+	}
+
+	reliableACK := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:            "INVITE",
+		State:             SIPServerTransactionStateCompleted,
+		Event:             SIPServerTransactionEventACK,
+		ReliableTransport: true,
+		TimerConfig:       cfg,
+	})
+	if reliableACK.NextState != SIPServerTransactionStateTerminated ||
+		!reliableACK.DeliverACK ||
+		!reliableACK.Terminated ||
+		reliableACK.CleanupAfter != 0 {
+		t.Fatalf("reliable INVITE ACK step=%+v", reliableACK)
+	}
+
+	timeout := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "INVITE",
+		State:       SIPServerTransactionStateCompleted,
+		Event:       SIPServerTransactionEventTimeoutTimer,
+		TimerConfig: cfg,
+	})
+	if timeout.NextState != SIPServerTransactionStateTerminated ||
+		timeout.Action != SIPServerTransactionActionTimeout ||
+		timeout.TimerName != "H" ||
+		!timeout.TimedOut ||
+		!timeout.Terminated {
+		t.Fatalf("INVITE server timeout step=%+v", timeout)
+	}
+}
+
+func TestAdvanceSIPServerTransactionNonInviteFlow(t *testing.T) {
+	cfg := SIPTransactionTimerConfig{
+		T1: 100 * time.Millisecond,
+		T2: 400 * time.Millisecond,
+		T4: 900 * time.Millisecond,
+	}
+	request := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "MESSAGE",
+		Event:       SIPServerTransactionEventRequest,
+		TimerConfig: cfg,
+	})
+	if request.Invite ||
+		request.State != SIPServerTransactionStateTrying ||
+		request.NextState != SIPServerTransactionStateTrying ||
+		request.Action != SIPServerTransactionActionPassRequest ||
+		!request.PassRequest {
+		t.Fatalf("non-INVITE request step=%+v", request)
+	}
+
+	provisional := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "MESSAGE",
+		State:       SIPServerTransactionStateTrying,
+		Event:       SIPServerTransactionEventResponse,
+		Response:    SIPResponse{StatusCode: 100, Reason: "Trying"},
+		TimerConfig: cfg,
+	})
+	if provisional.NextState != SIPServerTransactionStateProceeding ||
+		provisional.Action != SIPServerTransactionActionSendResponse ||
+		!provisional.SendResponse ||
+		!provisional.Provisional {
+		t.Fatalf("non-INVITE provisional server step=%+v", provisional)
+	}
+
+	final := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "MESSAGE",
+		State:       SIPServerTransactionStateProceeding,
+		Event:       SIPServerTransactionEventResponse,
+		Response:    SIPResponse{StatusCode: 202, Reason: "Accepted"},
+		TimerConfig: cfg,
+	})
+	if final.NextState != SIPServerTransactionStateCompleted ||
+		final.Action != SIPServerTransactionActionSendResponse ||
+		!final.SendResponse ||
+		!final.Success ||
+		final.TimerName != "J" ||
+		final.CleanupAfter != 6400*time.Millisecond ||
+		final.Terminated {
+		t.Fatalf("non-INVITE final server step=%+v", final)
+	}
+
+	requestRetransmit := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:                "MESSAGE",
+		State:                 SIPServerTransactionStateCompleted,
+		Event:                 SIPServerTransactionEventRequest,
+		RequestRetransmission: true,
+		Response:              SIPResponse{StatusCode: 202, Reason: "Accepted"},
+		TimerConfig:           cfg,
+	})
+	if requestRetransmit.Action != SIPServerTransactionActionRetransmitResponse ||
+		!requestRetransmit.RetransmitResponse ||
+		requestRetransmit.StatusCode != 202 {
+		t.Fatalf("non-INVITE request retransmission step=%+v", requestRetransmit)
+	}
+
+	cleanup := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:      "MESSAGE",
+		State:       SIPServerTransactionStateCompleted,
+		Event:       SIPServerTransactionEventCleanupTimer,
+		TimerConfig: cfg,
+	})
+	if cleanup.NextState != SIPServerTransactionStateTerminated ||
+		cleanup.Action != SIPServerTransactionActionTerminate ||
+		cleanup.TimerName != "J" ||
+		!cleanup.Terminated {
+		t.Fatalf("non-INVITE server cleanup step=%+v", cleanup)
+	}
+}
+
+func TestAdvanceSIPServerTransactionNonInviteReliableAndStateNormalization(t *testing.T) {
+	cfg := SIPTransactionTimerConfig{T1: 100 * time.Millisecond, T4: 900 * time.Millisecond}
+	reliableFinal := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method:            "UPDATE",
+		State:             SIPServerTransactionStateProceeding,
+		Event:             SIPServerTransactionEventResponse,
+		Response:          SIPResponse{StatusCode: 500, Reason: "Server Internal Error"},
+		ReliableTransport: true,
+		TimerConfig:       cfg,
+	})
+	if reliableFinal.NextState != SIPServerTransactionStateTerminated ||
+		!reliableFinal.SendResponse ||
+		!reliableFinal.Failure ||
+		!reliableFinal.Terminated ||
+		reliableFinal.CleanupAfter != 0 {
+		t.Fatalf("reliable non-INVITE final server step=%+v", reliableFinal)
+	}
+
+	normalizedInvite := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method: "INVITE",
+		State:  SIPServerTransactionStateTrying,
+		Event:  SIPServerTransactionEventRequest,
+	})
+	if normalizedInvite.State != SIPServerTransactionStateProceeding ||
+		normalizedInvite.NextState != SIPServerTransactionStateProceeding {
+		t.Fatalf("normalized server INVITE step=%+v", normalizedInvite)
+	}
+
+	normalizedMessage := AdvanceSIPServerTransaction(SIPServerTransactionInput{
+		Method: "MESSAGE",
+		State:  SIPServerTransactionStateConfirmed,
+		Event:  SIPServerTransactionEventRequest,
+	})
+	if normalizedMessage.State != SIPServerTransactionStateTrying ||
+		normalizedMessage.NextState != SIPServerTransactionStateTrying {
+		t.Fatalf("normalized server MESSAGE step=%+v", normalizedMessage)
+	}
+}
