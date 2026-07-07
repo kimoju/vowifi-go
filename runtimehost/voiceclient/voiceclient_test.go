@@ -899,6 +899,44 @@ func TestRegisterSessionInstallsSecurityPlanBeforeAuthenticatedRegister(t *testi
 	}
 }
 
+func TestRegisterSessionActivatesSecurityAssociationBeforeAuthenticatedRegister(t *testing.T) {
+	transport := &securityAwareRegisterTransport{fakeRegisterTransport: fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce", algorithm=MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}}
+	result, err := RegisterSession{
+		Transport:             transport,
+		Profile:               IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:          "sip:ims.example",
+		ContactURI:            "sip:user@192.0.2.10:5060",
+		CNonce:                "cnonce",
+		SecurityPlanInstaller: &fakeSecurityPlanInstaller{},
+		SecurityLocalAddr:     "192.0.2.20:45000",
+		SecurityRemoteAddr:    "198.51.100.10:5060",
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", result, len(transport.requests))
+	}
+	if len(transport.securityRequests) != 1 || len(transport.requestsAtSecurity) != 1 || transport.requestsAtSecurity[0] != 1 {
+		t.Fatalf("securityRequests=%+v requestsAtSecurity=%+v", transport.securityRequests, transport.requestsAtSecurity)
+	}
+	req := transport.securityRequests[0]
+	if req.LocalEndpoint.Address != "192.0.2.20" || req.LocalEndpoint.Port != 5062 ||
+		req.RemoteEndpoint.Address != "198.51.100.10" || req.RemoteEndpoint.Port != 5063 {
+		t.Fatalf("security endpoints local=%+v remote=%+v", req.LocalEndpoint, req.RemoteEndpoint)
+	}
+}
+
 func TestRegisterSessionSecurityVerifyExactEchoesRawSecurityServer(t *testing.T) {
 	selectedRaw := `IPSEC-3GPP;Q="0.7";PORT-S="5063";SPI-S="222";PORT-C="5062";SPI-C="111";EALG="NULL";ALG="HMAC-SHA-1-96";note="v,1;quoted";PROT=ESP;MODE=TRANSPORT`
 	fallbackRaw := `ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065;q=0.1`
@@ -4012,6 +4050,19 @@ func (f *fakeRegisterTransport) RoundTripRegister(ctx context.Context, msg Regis
 	resp := f.responses[0]
 	f.responses = f.responses[1:]
 	return resp, nil
+}
+
+type securityAwareRegisterTransport struct {
+	fakeRegisterTransport
+	securityRequests   []IMSSecurityAssociationInstallRequest
+	requestsAtSecurity []int
+	err                error
+}
+
+func (t *securityAwareRegisterTransport) UseSecurityAssociation(ctx context.Context, req IMSSecurityAssociationInstallRequest) error {
+	t.securityRequests = append(t.securityRequests, cloneIMSSecurityAssociationInstallRequest(req))
+	t.requestsAtSecurity = append(t.requestsAtSecurity, len(t.requests))
+	return t.err
 }
 
 type fakeSecurityPlanInstaller struct {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -715,6 +716,129 @@ func TestWireSIPFlowRegisterFollowsRedirectContactTarget(t *testing.T) {
 	}
 }
 
+func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *testing.T) {
+	initial, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(initial) error = %v", err)
+	}
+	defer initial.Close()
+	protected, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(protected) error = %v", err)
+	}
+	defer protected.Close()
+	protectedLocalPort := reserveTestUDPPort(t)
+	protectedRemotePort := protected.LocalAddr().(*net.UDPAddr).Port
+
+	firstSeen := make(chan string, 1)
+	firstErr := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = initial.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := initial.ReadFrom(buf)
+		if err != nil {
+			firstErr <- "read error: " + err.Error()
+			return
+		}
+		wire := string(append([]byte(nil), buf[:n]...))
+		firstSeen <- wire
+		req, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			firstErr <- "parse request error: " + err.Error()
+			return
+		}
+		challenge, err := BuildSIPResponseWire(req, 401, "Unauthorized", map[string]string{
+			"WWW-Authenticate": `Digest realm="ims.example", nonce="nonce", algorithm=MD5, qop="auth"`,
+			"Security-Server": "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=" +
+				strconv.Itoa(protectedLocalPort) + ";port-s=" + strconv.Itoa(protectedRemotePort),
+		}, nil)
+		if err != nil {
+			firstErr <- "build challenge error: " + err.Error()
+			return
+		}
+		if _, err := initial.WriteTo(challenge, addr); err != nil {
+			firstErr <- "write challenge error: " + err.Error()
+			return
+		}
+		firstErr <- ""
+	}()
+
+	type protectedSeenRequest struct {
+		wire       string
+		sourcePort int
+	}
+	protectedSeen := make(chan protectedSeenRequest, 1)
+	protectedErr := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = protected.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := protected.ReadFrom(buf)
+		if err != nil {
+			protectedErr <- "read error: " + err.Error()
+			return
+		}
+		sourcePort := 0
+		if udpAddr, ok := addr.(*net.UDPAddr); ok {
+			sourcePort = udpAddr.Port
+		}
+		protectedSeen <- protectedSeenRequest{
+			wire:       string(append([]byte(nil), buf[:n]...)),
+			sourcePort: sourcePort,
+		}
+		req, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			protectedErr <- "parse request error: " + err.Error()
+			return
+		}
+		ok, err := BuildSIPResponseWire(req, 200, "OK", nil, nil)
+		if err != nil {
+			protectedErr <- "build ok error: " + err.Error()
+			return
+		}
+		if _, err := protected.WriteTo(ok, addr); err != nil {
+			protectedErr <- "write ok error: " + err.Error()
+			return
+		}
+		protectedErr <- ""
+	}()
+
+	flow := &WireSIPFlow{Network: "udp", ServerAddr: initial.LocalAddr().String(), Timeout: time.Second}
+	defer flow.Close()
+	result, err := RegisterSession{
+		Transport:             flow,
+		Profile:               IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:          "sip:ims.example",
+		ContactURI:            "sip:user@127.0.0.1:5060",
+		CallID:                "flow-security-register",
+		CNonce:                "cnonce",
+		SecurityPlanInstaller: &fakeSecurityPlanInstaller{},
+		SecurityLocalAddr:     "127.0.0.1",
+		SecurityRemoteAddr:    initial.LocalAddr().String(),
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || result.Attempts != 2 {
+		t.Fatalf("result=%+v", result)
+	}
+	if msg := <-firstErr; msg != "" {
+		t.Fatal(msg)
+	}
+	if msg := <-protectedErr; msg != "" {
+		t.Fatal(msg)
+	}
+	if wire := <-firstSeen; !strings.Contains(wire, "CSeq: 1 REGISTER") || strings.Contains(wire, "Authorization:") {
+		t.Fatalf("first REGISTER wire=%q", wire)
+	}
+	protectedReq := <-protectedSeen
+	if protectedReq.sourcePort != protectedLocalPort ||
+		!strings.Contains(protectedReq.wire, "CSeq: 2 REGISTER") ||
+		!strings.Contains(protectedReq.wire, "Authorization: Digest") ||
+		!strings.Contains(protectedReq.wire, "Security-Verify: ipsec-3gpp") {
+		t.Fatalf("protected REGISTER sourcePort=%d wire=%q", protectedReq.sourcePort, protectedReq.wire)
+	}
+}
+
 func TestWireSIPFlowDialogFollowsRedirectContactTarget(t *testing.T) {
 	first, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -1304,4 +1428,17 @@ func TestWireSIPFlowResetToNextTargetPreservesCandidates(t *testing.T) {
 	if resolverCalls != 1 {
 		t.Fatalf("resolver calls=%d, want 1", resolverCalls)
 	}
+}
+
+func reserveTestUDPPort(t *testing.T) int {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(reserve) error = %v", err)
+	}
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close(reserve) error = %v", err)
+	}
+	return port
 }

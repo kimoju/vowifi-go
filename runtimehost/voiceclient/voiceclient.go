@@ -123,6 +123,10 @@ type SecurityPlanRequestInstaller interface {
 	InstallSecurityPlanRequest(context.Context, IMSSecurityAssociationInstallRequest) error
 }
 
+type SecurityAssociationTransport interface {
+	UseSecurityAssociation(context.Context, IMSSecurityAssociationInstallRequest) error
+}
+
 type akaPreferenceProvider interface {
 	CalculateAKAWithPreference(rand16, autn16 []byte, preference string) (sim.AKAResult, error)
 }
@@ -749,7 +753,13 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if err != nil {
 		return registerFailureResult(resp, attempts, ch, ""), err
 	}
-	if err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClients, akaKeys); err != nil {
+	securityReq, securityOK, err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClients, akaKeys)
+	if err != nil {
+		result := registerFailureResult(resp, attempts, ch, authz)
+		result.AuthHeaderName = authzHeader
+		return result, err
+	}
+	if err := s.useChallengeSecurityAssociation(ctx, securityReq, securityOK); err != nil {
 		result := registerFailureResult(resp, attempts, ch, authz)
 		result.AuthHeaderName = authzHeader
 		return result, err
@@ -817,7 +827,13 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		currentAuthInput = nextAuthInput
 		nextChallengeHeaders := resp2.Headers
 		securityHeaders = nextChallengeHeaders
-		if err := s.installChallengeSecurityPlan(ctx, nextChallengeHeaders, securityClients, nextAKAKeys); err != nil {
+		securityReq, securityOK, err := s.installChallengeSecurityPlan(ctx, nextChallengeHeaders, securityClients, nextAKAKeys)
+		if err != nil {
+			result := registerFailureResult(resp2, attempts, ch, authz)
+			result.AuthHeaderName = authzHeader
+			return result, err
+		}
+		if err := s.useChallengeSecurityAssociation(ctx, securityReq, securityOK); err != nil {
 			result := registerFailureResult(resp2, attempts, ch, authz)
 			result.AuthHeaderName = authzHeader
 			return result, err
@@ -1208,19 +1224,30 @@ func (s RegisterSession) securityClientAgreements() []SecurityAgreement {
 	return []SecurityAgreement{DefaultSecurityClientAgreement(s.SecurityRandom)}
 }
 
-func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, clients []SecurityAgreement, akaKeys IMSSecurityAKAKeys) error {
-	if s.SecurityPlanInstaller == nil {
-		return nil
-	}
+func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, clients []SecurityAgreement, akaKeys IMSSecurityAKAKeys) (IMSSecurityAssociationInstallRequest, bool, error) {
 	agreement, plan, ok := securityPlanFromChallenge(headers, clients)
+	if !ok {
+		return IMSSecurityAssociationInstallRequest{}, false, nil
+	}
+	req := buildIMSSecurityAssociationInstallRequest(plan, agreement, akaKeys, s.SecurityLocalAddr, s.SecurityRemoteAddr, s.ContactURI, s.RegistrarURI)
+	if s.SecurityPlanInstaller == nil {
+		return req, false, nil
+	}
+	if requestInstaller, ok := s.SecurityPlanInstaller.(SecurityPlanRequestInstaller); ok {
+		return req, true, requestInstaller.InstallSecurityPlanRequest(ctx, req)
+	}
+	return req, true, s.SecurityPlanInstaller.InstallSecurityPlan(ctx, plan)
+}
+
+func (s RegisterSession) useChallengeSecurityAssociation(ctx context.Context, req IMSSecurityAssociationInstallRequest, ok bool) error {
 	if !ok {
 		return nil
 	}
-	if requestInstaller, ok := s.SecurityPlanInstaller.(SecurityPlanRequestInstaller); ok {
-		req := buildIMSSecurityAssociationInstallRequest(plan, agreement, akaKeys, s.SecurityLocalAddr, s.SecurityRemoteAddr, s.ContactURI, s.RegistrarURI)
-		return requestInstaller.InstallSecurityPlanRequest(ctx, req)
+	transport, ok := s.Transport.(SecurityAssociationTransport)
+	if !ok {
+		return nil
 	}
-	return s.SecurityPlanInstaller.InstallSecurityPlan(ctx, plan)
+	return transport.UseSecurityAssociation(ctx, req)
 }
 
 func nextDigestAuthorization(state DigestAuthState, method, uri, fallbackName, fallbackHeader string) (string, string, DigestAuthState, error) {

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/boa-z/vowifi-go/runtimehost/carrier"
 	"github.com/boa-z/vowifi-go/runtimehost/identity"
 	"github.com/boa-z/vowifi-go/runtimehost/messaging"
 	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
@@ -967,12 +968,15 @@ func (r WireIMSRegistrar) profileFromConfig(cfg IMSRegistrationConfig) (voicecli
 	if impu == "" {
 		return voiceclient.IMSProfile{}, errors.New("IMS public identity is empty")
 	}
+	accessNetworkInfo, visitedNetworkID := imsRegistrationNetworkHeaders(cfg)
 	return voiceclient.IMSProfile{
-		IMPI:      impi,
-		IMPU:      impu,
-		Domain:    domain,
-		LocalIP:   firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP),
-		UserAgent: firstRuntimeNonEmpty(r.UserAgent, "vowifi-go"),
+		IMPI:              impi,
+		IMPU:              impu,
+		Domain:            domain,
+		LocalIP:           firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP),
+		UserAgent:         firstRuntimeNonEmpty(r.UserAgent, "vowifi-go"),
+		AccessNetworkInfo: accessNetworkInfo,
+		VisitedNetworkID:  visitedNetworkID,
 	}, nil
 }
 
@@ -981,6 +985,20 @@ func imsAKAAppPreferenceFromConfig(cfg IMSRegistrationConfig) string {
 		return ""
 	}
 	return strings.TrimSpace(cfg.Prepared.IMSIdentity.AKAAppPreference)
+}
+
+func imsRegistrationNetworkHeaders(cfg IMSRegistrationConfig) (string, string) {
+	imsi := strings.TrimSpace(cfg.Profile.IMSI)
+	if imsi == "" && cfg.Prepared != nil {
+		imsi = strings.TrimSpace(cfg.Prepared.Profile.IMSI)
+	}
+	mcc, mnc := cfgMCCMNC(cfg)
+	profile := carrier.IMSAccessProfileForSubscriber(carrier.IMSAccessProfileInput{
+		IMSI: imsi,
+		MCC:  mcc,
+		MNC:  mnc,
+	})
+	return strings.TrimSpace(profile.AccessNetworkInfo), strings.TrimSpace(profile.VisitedNetworkID)
 }
 
 func (r WireIMSRegistrar) contactURIForProfile(profile voiceclient.IMSProfile) string {

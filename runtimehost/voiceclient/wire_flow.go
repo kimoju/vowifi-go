@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,7 @@ type WireSIPFlow struct {
 var _ SIPRegisterTransport = (*WireSIPFlow)(nil)
 var _ SIPRequestTransport = (*WireSIPFlow)(nil)
 var _ SIPInviteTransport = (*WireSIPFlow)(nil)
+var _ SecurityAssociationTransport = (*WireSIPFlow)(nil)
 
 func (f *WireSIPFlow) RoundTripRegister(ctx context.Context, msg RegisterMessage) (RegisterResponse, error) {
 	return f.roundTrip(ctx, SIPRequestMessage{
@@ -226,6 +228,65 @@ func (f *WireSIPFlow) ResetToNextTarget() (bool, error) {
 	old := f.targetIndex
 	switched := f.advanceTargetLocked() && f.targetIndex != old
 	return switched, err
+}
+
+func (f *WireSIPFlow) UseSecurityAssociation(ctx context.Context, req IMSSecurityAssociationInstallRequest) error {
+	if f == nil {
+		return errors.New("nil SIP flow")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return ErrSIPFlowClosed
+	}
+	localAddr, err := sipSecurityAssociationAddr(f.LocalAddr, req.LocalEndpoint, true)
+	if err != nil {
+		return err
+	}
+	currentTarget := firstNonEmpty(f.target, f.ServerAddr)
+	remoteEndpoint := req.RemoteEndpoint
+	if host, _, ok := splitIMSSecurityEndpointAddr(currentTarget); ok && strings.TrimSpace(host) != "" {
+		remoteEndpoint.Address = host
+	}
+	remoteAddr, err := sipSecurityAssociationAddr(currentTarget, remoteEndpoint, false)
+	if err != nil {
+		return err
+	}
+	if localAddr != "" {
+		f.LocalAddr = localAddr
+	}
+	if remoteAddr != "" {
+		f.ServerAddr = remoteAddr
+		f.targets = []string{remoteAddr}
+		f.targetIndex = 0
+	}
+	return f.closeConnLocked()
+}
+
+func sipSecurityAssociationAddr(current string, endpoint IMSSecurityAssociationEndpoint, allowWildcardHost bool) (string, error) {
+	host := strings.TrimSpace(endpoint.Address)
+	port := endpoint.Port
+	if strings.TrimSpace(current) != "" {
+		currentHost, currentPort, ok := splitIMSSecurityEndpointAddr(current)
+		if ok {
+			if host == "" {
+				host = strings.TrimSpace(currentHost)
+			}
+			if port <= 0 {
+				port = parseSecurityPort(currentPort)
+			}
+		}
+	}
+	if port <= 0 {
+		return "", nil
+	}
+	if port > 65535 {
+		return "", errors.New("security association endpoint port out of range")
+	}
+	if host == "" && !allowWildcardHost {
+		return "", nil
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler, retryStatus func(int) bool) (SIPResponse, error) {

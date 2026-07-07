@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/boa-z/vowifi-go/engine/sim"
 	"github.com/boa-z/vowifi-go/engine/swu"
+	"github.com/boa-z/vowifi-go/runtimehost/carrier"
 	"github.com/boa-z/vowifi-go/runtimehost/identity"
 	"github.com/boa-z/vowifi-go/runtimehost/messaging"
 	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
@@ -111,6 +114,57 @@ func TestWireIMSRegistrarUsesPreparedIdentity(t *testing.T) {
 	}
 	if req.Headers["User-Agent"] != "VoHive" || !strings.Contains(req.Headers["To"], "sip:user@ims.example") {
 		t.Fatalf("headers=%+v", req.Headers)
+	}
+}
+
+func TestWireIMSRegistrarUsesPreparedCarrierAccessHeaders(t *testing.T) {
+	carrier.ClearCarrierOverrides()
+	t.Cleanup(carrier.ClearCarrierOverrides)
+	path := filepath.Join(t.TempDir(), "carriers.json")
+	if err := os.WriteFile(path, []byte(`{
+		"001010": {
+			"mcc": "001",
+			"mnc": "010",
+			"network": {
+				"pani": " IEEE-802.11;i-wlan-node-id=\"node;1\" ",
+				"visited_network": " visited.example.test "
+			}
+		}
+	}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := carrier.LoadCarrierOverrides(path); err != nil {
+		t.Fatalf("LoadCarrierOverrides() error = %v", err)
+	}
+	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+	}}}
+	res, err := WireIMSRegistrar{
+		Transport:   transport,
+		ContactHost: "192.0.2.10",
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-carrier-headers",
+		TraceID:  "trace-carrier-headers",
+		Prepared: &identity.PreparedSession{
+			Profile:          identity.Profile{IMSI: "001010123456789"},
+			EffectiveCarrier: identity.EffectiveCarrier{MCC: "001", MNC: "010"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if !res.Registered || res.Profile.AccessNetworkInfo != `IEEE-802.11;i-wlan-node-id="node;1"` ||
+		res.Profile.VisitedNetworkID != "visited.example.test" {
+		t.Fatalf("result profile=%+v", res.Profile)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("requests=%d", len(transport.requests))
+	}
+	req := transport.requests[0]
+	if req.Headers["P-Access-Network-Info"] != `IEEE-802.11;i-wlan-node-id="node;1"` ||
+		req.Headers["P-Visited-Network-ID"] != `"visited.example.test"` {
+		t.Fatalf("registration access headers=%+v", req.Headers)
 	}
 }
 
