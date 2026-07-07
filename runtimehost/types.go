@@ -994,6 +994,52 @@ func (i *Instance) SendDialogDTMF(ctx context.Context, req voicehost.DialogDTMFR
 	return voicehost.DialogDTMFResult(result), err
 }
 
+func (i *Instance) SendDialogAutoDTMF(ctx context.Context, req voicehost.DialogDTMFRequest) (voicehost.DialogAutoDTMFResult, error) {
+	if _, err := voicehost.BuildDTMFRelayBody(req.Signal, req.DurationMS); err != nil {
+		return voicehost.DialogAutoDTMFResult{Accepted: false, StatusCode: 400, Reason: err.Error()}, err
+	}
+	if agent := i.dialogRTPDTMFSender(); agent != nil {
+		rtpResult, rtpErr := agent.SendDialogRTPDTMF(ctx, runtimeDialogRTPDTMFRequest(req))
+		if rtpErr == nil || !errors.Is(rtpErr, voicehost.ErrRTPRelayConfig) {
+			return runtimeDialogAutoDTMFResultFromRTP(rtpResult), rtpErr
+		}
+	}
+	infoResult, err := i.SendDialogDTMF(ctx, req)
+	return runtimeDialogAutoDTMFResultFromINFO(infoResult), err
+}
+
+func runtimeDialogRTPDTMFRequest(req voicehost.DialogDTMFRequest) voicehost.DialogRTPDTMFRequest {
+	return voicehost.DialogRTPDTMFRequest{
+		DeviceID:   strings.TrimSpace(req.DeviceID),
+		CallID:     strings.TrimSpace(req.CallID),
+		Direction:  voicehost.RTPDTMFClientToIMS,
+		Signal:     req.Signal,
+		DurationMS: req.DurationMS,
+	}
+}
+
+func runtimeDialogAutoDTMFResultFromRTP(result voicehost.DialogRTPDTMFResult) voicehost.DialogAutoDTMFResult {
+	return voicehost.DialogAutoDTMFResult{
+		Accepted:   result.Accepted,
+		StatusCode: result.StatusCode,
+		Reason:     result.Reason,
+		Route:      voicehost.DialogDTMFRouteRTP,
+		RTP:        result,
+	}
+}
+
+func runtimeDialogAutoDTMFResultFromINFO(result voicehost.DialogDTMFResult) voicehost.DialogAutoDTMFResult {
+	return voicehost.DialogAutoDTMFResult{
+		Accepted:                   result.Accepted,
+		StatusCode:                 result.StatusCode,
+		Reason:                     result.Reason,
+		Route:                      voicehost.DialogDTMFRouteInfo,
+		RegistrationRecoveryNeeded: result.RegistrationRecoveryNeeded,
+		RetryAfter:                 result.RetryAfter,
+		INFO:                       result,
+	}
+}
+
 func (i *Instance) SendDialogUpdate(ctx context.Context, req voicehost.DialogUpdateRequest) (voicehost.DialogUpdateResult, error) {
 	agent := i.dialogUpdater()
 	if agent == nil {
@@ -1473,6 +1519,20 @@ func (i *Instance) dialogDTMFSender() voicehost.DialogDTMFSender {
 	}
 	i.mu.RLock()
 	agent, _ := i.voice.(voicehost.DialogDTMFSender)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return agent
+}
+
+func (i *Instance) dialogRTPDTMFSender() voicehost.DialogRTPDTMFSender {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	agent, _ := i.voice.(voicehost.DialogRTPDTMFSender)
 	stopped := i.stopped
 	i.mu.RUnlock()
 	if stopped {

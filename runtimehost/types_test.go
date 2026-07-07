@@ -1196,6 +1196,126 @@ func TestRuntimeIMSRecoveryAfterByeCancelRecoverableResults(t *testing.T) {
 	}
 }
 
+func TestRuntimeSendDialogAutoDTMFUsesRTPWhenAvailable(t *testing.T) {
+	agent := &runtimeAutoDTMFAgent{
+		rtpResult: voicehost.DialogRTPDTMFResult{
+			Accepted:   true,
+			StatusCode: 200,
+			Reason:     "OK",
+			RTP: voicehost.RTPRelayDTMFResult{
+				Packets:    6,
+				Signal:     "5",
+				DurationMS: 120,
+			},
+		},
+		infoResult: voicehost.DialogDTMFResult{Accepted: true, StatusCode: 200, Reason: "INFO OK"},
+	}
+	inst := &Instance{state: State{DeviceID: "dev-auto-dtmf", Phase: PhaseReady, IMSReady: true}, voice: agent}
+
+	result, err := inst.SendDialogAutoDTMF(context.Background(), voicehost.DialogDTMFRequest{
+		DeviceID:   " dev-auto-dtmf ",
+		CallID:     " call-rtp ",
+		Signal:     "5",
+		DurationMS: 120,
+	})
+	if err != nil {
+		t.Fatalf("SendDialogAutoDTMF() error = %v", err)
+	}
+	if !result.Accepted || result.Route != voicehost.DialogDTMFRouteRTP || result.RTP.RTP.Packets != 6 {
+		t.Fatalf("SendDialogAutoDTMF() result=%+v, want RTP success", result)
+	}
+	if len(agent.rtpRequests) != 1 || len(agent.infoRequests) != 0 {
+		t.Fatalf("rtpRequests=%+v infoRequests=%+v, want RTP only", agent.rtpRequests, agent.infoRequests)
+	}
+	got := agent.rtpRequests[0]
+	if got.DeviceID != "dev-auto-dtmf" || got.CallID != "call-rtp" ||
+		got.Direction != voicehost.RTPDTMFClientToIMS || got.Signal != "5" || got.DurationMS != 120 {
+		t.Fatalf("RTP request=%+v", got)
+	}
+}
+
+func TestRuntimeSendDialogAutoDTMFFallsBackToInfoWhenRTPRelayUnavailable(t *testing.T) {
+	agent := &runtimeAutoDTMFAgent{
+		rtpResult: voicehost.DialogRTPDTMFResult{
+			Accepted:   false,
+			StatusCode: 409,
+			Reason:     "RTP relay unavailable",
+		},
+		rtpErr: errors.Join(voicehost.ErrRTPRelayConfig, errors.New("payload unavailable")),
+		infoResult: voicehost.DialogDTMFResult{
+			Accepted:   true,
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string]string{"X-IMS": "info-dtmf-ok"},
+		},
+	}
+	inst := &Instance{state: State{DeviceID: "dev-auto-dtmf", Phase: PhaseReady, IMSReady: true}, voice: agent}
+
+	result, err := inst.SendDialogAutoDTMF(context.Background(), voicehost.DialogDTMFRequest{
+		CallID:     "call-info",
+		Signal:     "#",
+		DurationMS: 90,
+	})
+	if err != nil {
+		t.Fatalf("SendDialogAutoDTMF() error = %v", err)
+	}
+	if !result.Accepted || result.Route != voicehost.DialogDTMFRouteInfo || result.INFO.Headers["X-IMS"] != "info-dtmf-ok" {
+		t.Fatalf("SendDialogAutoDTMF() result=%+v, want INFO fallback success", result)
+	}
+	if len(agent.rtpRequests) != 1 || len(agent.infoRequests) != 1 {
+		t.Fatalf("rtpRequests=%+v infoRequests=%+v, want RTP then INFO", agent.rtpRequests, agent.infoRequests)
+	}
+	if agent.infoRequests[0].Signal != "#" || agent.infoRequests[0].DurationMS != 90 {
+		t.Fatalf("INFO request=%+v", agent.infoRequests[0])
+	}
+}
+
+func TestRuntimeSendDialogAutoDTMFDoesNotFallbackOnInvalidInput(t *testing.T) {
+	agent := &runtimeAutoDTMFAgent{
+		rtpErr:     voicehost.ErrRTPRelayConfig,
+		infoResult: voicehost.DialogDTMFResult{Accepted: true, StatusCode: 200, Reason: "OK"},
+	}
+	inst := &Instance{state: State{DeviceID: "dev-auto-dtmf", Phase: PhaseReady, IMSReady: true}, voice: agent}
+
+	result, err := inst.SendDialogAutoDTMF(context.Background(), voicehost.DialogDTMFRequest{
+		CallID:     "call-invalid",
+		Signal:     "12",
+		DurationMS: 90,
+	})
+	if !errors.Is(err, voicehost.ErrInvalidDTMF) {
+		t.Fatalf("SendDialogAutoDTMF() result=%+v err=%v, want invalid DTMF", result, err)
+	}
+	if result.Accepted || result.StatusCode != 400 || result.Route != "" {
+		t.Fatalf("SendDialogAutoDTMF() result=%+v, want local 400", result)
+	}
+	if len(agent.rtpRequests) != 0 || len(agent.infoRequests) != 0 {
+		t.Fatalf("rtpRequests=%+v infoRequests=%+v, want no sends", agent.rtpRequests, agent.infoRequests)
+	}
+}
+
+func TestRuntimeSendDialogAutoDTMFDoesNotFallbackOnDialogMiss(t *testing.T) {
+	agent := &runtimeAutoDTMFAgent{
+		rtpResult:  voicehost.DialogRTPDTMFResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"},
+		infoResult: voicehost.DialogDTMFResult{Accepted: true, StatusCode: 200, Reason: "INFO OK"},
+	}
+	inst := &Instance{state: State{DeviceID: "dev-auto-dtmf", Phase: PhaseReady, IMSReady: true}, voice: agent}
+
+	result, err := inst.SendDialogAutoDTMF(context.Background(), voicehost.DialogDTMFRequest{
+		CallID:     "call-missing",
+		Signal:     "7",
+		DurationMS: 100,
+	})
+	if err != nil {
+		t.Fatalf("SendDialogAutoDTMF() error = %v", err)
+	}
+	if result.Accepted || result.StatusCode != 481 || result.Route != voicehost.DialogDTMFRouteRTP {
+		t.Fatalf("SendDialogAutoDTMF() result=%+v, want RTP dialog miss", result)
+	}
+	if len(agent.rtpRequests) != 1 || len(agent.infoRequests) != 0 {
+		t.Fatalf("rtpRequests=%+v infoRequests=%+v, want RTP only", agent.rtpRequests, agent.infoRequests)
+	}
+}
+
 func TestRuntimeIMSRecoveryRetriesSMSPartAfterTransportFailure(t *testing.T) {
 	firstTransport := &runtimeVoiceTransport{errors: []error{errors.New("stale sms pcscf flow")}}
 	recoveredTransport := &runtimeVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
@@ -2039,6 +2159,25 @@ func (t *runtimeVoiceTransport) RoundTripRequest(ctx context.Context, msg voicec
 func (t *runtimeVoiceTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
 	t.writes = append(t.writes, msg)
 	return nil
+}
+
+type runtimeAutoDTMFAgent struct {
+	rtpRequests  []voicehost.DialogRTPDTMFRequest
+	infoRequests []voicehost.DialogDTMFRequest
+	rtpResult    voicehost.DialogRTPDTMFResult
+	infoResult   voicehost.DialogDTMFResult
+	rtpErr       error
+	infoErr      error
+}
+
+func (a *runtimeAutoDTMFAgent) SendDialogRTPDTMF(ctx context.Context, req voicehost.DialogRTPDTMFRequest) (voicehost.DialogRTPDTMFResult, error) {
+	a.rtpRequests = append(a.rtpRequests, req)
+	return a.rtpResult, a.rtpErr
+}
+
+func (a *runtimeAutoDTMFAgent) SendDialogDTMF(ctx context.Context, req voicehost.DialogDTMFRequest) (voicehost.DialogDTMFResult, error) {
+	a.infoRequests = append(a.infoRequests, req)
+	return a.infoResult, a.infoErr
 }
 
 type runtimeDialogRecoveryAgent struct {

@@ -279,7 +279,9 @@ protocol layers needed by VoHive:
   relay-level generated DTMF packet scheduling toward IMS or client media legs
   with per-direction sequence/timestamp/SSRC state, call-dialog RTP DTMF send
   entry points, and SRTP plaintext-stage DTMF inspection/remapping plus
-  generated-packet protection during media transforms
+  generated-packet protection during media transforms, plus a runtime automatic
+  DTMF route helper that prefers RTP telephone-event delivery and falls back to
+  SIP INFO only when relay media configuration is unavailable
 - inbound IMS voice agent helpers that bridge IMS-originated INVITEs to a local
   SIP client, parse SDP answers, forward ACK/BYE/CANCEL dialog requests, and
   support RTP relay allocation with IMS-offer/client-answer SDP rewriting,

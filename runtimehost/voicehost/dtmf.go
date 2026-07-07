@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -13,6 +14,8 @@ const (
 	DTMFRelayContentType  = "application/dtmf-relay"
 	DefaultDTMFDurationMS = 160
 	MaxDTMFDurationMS     = 5000
+	DialogDTMFRouteRTP    = "rtp"
+	DialogDTMFRouteInfo   = "info"
 )
 
 var ErrInvalidDTMF = errors.New("invalid DTMF relay")
@@ -56,6 +59,17 @@ type DialogRTPDTMFResult struct {
 	StatusCode int
 	Reason     string
 	RTP        RTPRelayDTMFResult
+}
+
+type DialogAutoDTMFResult struct {
+	Accepted                   bool
+	StatusCode                 int
+	Reason                     string
+	Route                      string
+	RegistrationRecoveryNeeded bool
+	RetryAfter                 time.Duration
+	RTP                        DialogRTPDTMFResult
+	INFO                       DialogDTMFResult
 }
 
 func (a *IMSOutboundAgent) SendDialogDTMF(ctx context.Context, req DialogDTMFRequest) (DialogDTMFResult, error) {
