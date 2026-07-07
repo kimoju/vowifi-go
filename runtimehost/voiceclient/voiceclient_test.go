@@ -2264,6 +2264,29 @@ func TestBuildRegistrationBindingDoesNotUseOtherContactExpires(t *testing.T) {
 	}
 }
 
+func TestBuildRegistrationBindingParsesCarrierContactParamVariants(t *testing.T) {
+	binding := BuildRegistrationBinding(IMSProfile{IMPU: "sip:fallback@example"}, "sip:user@192.0.2.10:5060;transport=udp;ob", RegisterResponse{
+		Headers: map[string][]string{
+			"p-associated-uri": {`SIP:user@example;user=phone, "Voice, Alias" <tel:+18005551212>`},
+			"contact":          {`<sip:user@192.0.2.10:5060;ob;transport=udp;expires=222>;q="0.5";expires="777"`},
+			"expires":          {"1200"},
+		},
+	}, 3600)
+	if binding.Expires != 777 {
+		t.Fatalf("Expires=%d binding=%+v", binding.Expires, binding)
+	}
+	if binding.PublicIdentity != "SIP:user@example;user=phone" ||
+		len(binding.AssociatedURIs) != 2 ||
+		binding.AssociatedURIs[1] != "tel:+18005551212" {
+		t.Fatalf("associated binding=%+v", binding)
+	}
+	if !strings.Contains(binding.RegistrarContact, `q="0.5"`) ||
+		!strings.Contains(binding.RegistrarContact, "transport=udp") ||
+		!strings.Contains(binding.RegistrarContact, "ob") {
+		t.Fatalf("RegistrarContact=%q", binding.RegistrarContact)
+	}
+}
+
 func TestBuildIMSDialogRequestsUseRegistrationRouteSet(t *testing.T) {
 	cfg := DialogRequestConfig{
 		Profile: IMSProfile{UserAgent: "VoHive"},

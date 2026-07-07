@@ -215,3 +215,39 @@ func TestClassifyEmergencySIPFailureMapsLocationAlternativeAndRecovery(t *testin
 		t.Fatalf("success response should not be classified as failure: %+v", success)
 	}
 }
+
+func TestClassifyEmergencySIPFailureParsesCarrierContactVariants(t *testing.T) {
+	failure := ClassifyEmergencySIPFailure(voiceclient.SIPResponse{
+		StatusCode: 380,
+		Reason:     "Alternative Service",
+		Headers: map[string][]string{
+			"contact": {
+				`urn:service:sos.police;q=0.9, sip:ecscf.example;lr;transport=udp;q="0.7";expires=60`,
+				`"Backup, Emergency" <sip:ecscf-backup.example;transport=tcp;lr>;q=0.5;expires=120`,
+			},
+		},
+	})
+	if !failure.AlternativeService || !failure.RouteRefreshNeeded || !failure.Retryable {
+		t.Fatalf("failure=%+v", failure)
+	}
+	if !sameStrings(failure.AlternativeServiceURNs, []string{"urn:service:sos.police"}) {
+		t.Fatalf("AlternativeServiceURNs=%+v", failure.AlternativeServiceURNs)
+	}
+	wantContacts := []string{
+		"urn:service:sos.police",
+		"sip:ecscf.example;lr;transport=udp",
+		"sip:ecscf-backup.example;transport=tcp;lr",
+	}
+	if !sameStrings(failure.ContactURIs, wantContacts) {
+		t.Fatalf("ContactURIs=%+v, want %+v", failure.ContactURIs, wantContacts)
+	}
+
+	validation := EmergencyRegistrationBindingValidation(voiceclient.RegistrationBinding{
+		RegistrarContact: `sip:user@192.0.2.10:5060;expires=1800;reg-type="SOS";q=0.4`,
+		ServiceRoutes:    []string{"<sip:pcscf-emergency.ims.example;lr>"},
+		Expires:          1800,
+	})
+	if !validation.Valid || !validation.ContactMarked {
+		t.Fatalf("validation=%+v", validation)
+	}
+}

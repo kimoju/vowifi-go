@@ -590,6 +590,30 @@ func TestSIPURIAddrParsesHostPortAndIPv6(t *testing.T) {
 	}
 }
 
+func TestSIPRedirectTargetsHonorContactQAndExpiresVariants(t *testing.T) {
+	resp := SIPResponse{
+		StatusCode: 302,
+		Reason:     "Moved Temporarily",
+		Headers: map[string][]string{
+			"contact": {
+				`<sip:expired@198.51.100.1:5060>;expires=0, sip:low@198.51.100.2:5060;transport=udp;q=0.1`,
+				`"Preferred, Edge" <sips:preferred@[2001:db8::5];transport=tcp;lr>;q="0.9";expires=60`,
+				`<tel:+18005551212>;q=1, <sip:backup@198.51.100.3:5070;lr>;q=0.4`,
+			},
+		},
+	}
+	got := sipRedirectTargets(resp)
+	want := []string{"[2001:db8::5]:5061", "198.51.100.3:5070", "198.51.100.2:5060"}
+	if len(got) != len(want) {
+		t.Fatalf("sipRedirectTargets()=%+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sipRedirectTargets()[%d]=%q, want %q (all=%+v)", i, got[i], want[i], got)
+		}
+	}
+}
+
 func TestWireRegisterTransportIgnoresUDPKeepaliveBeforeResponse(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

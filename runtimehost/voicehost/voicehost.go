@@ -818,14 +818,40 @@ func (g *Gateway) HandleClientInfo(deviceID string, req *sip.Request, tx sip.Ser
 	if tx == nil || req == nil {
 		return
 	}
-	sender, _ := g.GetAgent(deviceID).(DialogInfoSender)
-	if sender == nil {
+	agent := g.GetAgent(deviceID)
+	sender, _ := agent.(DialogInfoSender)
+	autoDTMF, _ := agent.(DialogAutoDTMFSender)
+	if sender == nil && autoDTMF == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
 	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
+		return
+	}
+	if autoDTMF != nil && isClientDTMFInfoRequest(req) {
+		signal, duration, parseErr := ParseDTMFRelayBody(req.Body())
+		if parseErr != nil {
+			_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Invalid DTMF relay", nil))
+			return
+		}
+		result, err := autoDTMF.SendDialogAutoDTMF(context.Background(), DialogDTMFRequest{
+			DeviceID:   strings.TrimSpace(deviceID),
+			CallID:     callID,
+			Signal:     signal,
+			DurationMS: duration,
+			Headers:    sipRequestHeaderMap(req),
+		})
+		if err != nil && result.StatusCode == 0 {
+			_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi DTMF failed", nil))
+			return
+		}
+		_ = tx.Respond(clientAutoDTMFResponse(req, result))
+		return
+	}
+	if sender == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
 	result, err := sender.SendDialogInfo(context.Background(), DialogInfoRequest{
@@ -856,6 +882,47 @@ func (g *Gateway) HandleClientInfo(deviceID string, req *sip.Request, tx sip.Ser
 		res.AppendHeader(sip.NewHeader(key, value))
 	}
 	_ = tx.Respond(res)
+}
+
+func isClientDTMFInfoRequest(req *sip.Request) bool {
+	if req == nil {
+		return false
+	}
+	if isDTMFRelayContentType(sipHeaderValue(req, "Content-Type")) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(sipHeaderValue(req, "Info-Package")), DTMFInfoPackage)
+}
+
+func isDTMFRelayContentType(contentType string) bool {
+	contentType, _, _ = strings.Cut(strings.TrimSpace(contentType), ";")
+	return strings.EqualFold(strings.TrimSpace(contentType), DTMFRelayContentType)
+}
+
+func clientAutoDTMFResponse(req *sip.Request, result DialogAutoDTMFResult) *sip.Response {
+	statusCode := localDialogInfoStatusCode(result.StatusCode, result.Accepted)
+	reason := firstVoiceNonEmpty(result.Reason, "OK")
+	var body []byte
+	var contentType string
+	headers := map[string]string(nil)
+	if result.Route == DialogDTMFRouteInfo {
+		body = append([]byte(nil), result.INFO.Body...)
+		contentType = strings.TrimSpace(result.INFO.ContentType)
+		headers = result.INFO.Headers
+	}
+	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
+	if contentType != "" && len(body) > 0 {
+		res.AppendHeader(sip.NewHeader("Content-Type", contentType))
+	}
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || isProtectedDialogHeader(key) {
+			continue
+		}
+		res.AppendHeader(sip.NewHeader(key, value))
+	}
+	return res
 }
 
 func (g *Gateway) HandleClientMessage(deviceID string, req *sip.Request, tx sip.ServerTransaction) {

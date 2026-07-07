@@ -34,6 +34,7 @@ type RTPRelayConfig struct {
 	Transforms          RTPRelayTransforms
 	RTCPFeedbackHandler RTCPFeedbackHandler
 	RTPDTMFHandler      RTPDTMFHandler
+	RTCPReportSchedule  RTPRelayRTCPReportScheduleConfig
 }
 
 type RTPRelayTransform func([]byte) ([]byte, error)
@@ -215,6 +216,9 @@ type RTPRelaySession struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	rtcpReportScheduleMu sync.Mutex
+	rtcpReportSchedule   *rtpRelayRTCPReportScheduler
+
 	dtmfMu                 sync.Mutex
 	dtmfClientToIMSState   rtpDTMFSequenceState
 	dtmfIMSToClientState   rtpDTMFSequenceState
@@ -366,6 +370,10 @@ func newRTPRelaySession(ctx context.Context, cfg RTPRelayConfig) (*RTPRelaySessi
 	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, s.allowIMSToClientRTP, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes, &s.imsToClientRTPDrops, s.transforms.IMSToClientRTP, "", RTPDTMFIMSToClient, s.currentIMSRTPDTMFPayloads, s.currentClientRTPDTMFPayloads, RTPDTMFIMSToClient, s.imsRTPClockRate)
 	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, nil, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes, &s.clientToIMSRTCPDrops, s.transforms.ClientToIMSRTCP, RTCPFeedbackClientToIMS, "", nil, nil, "", 0)
 	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, nil, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes, &s.imsToClientRTCPDrops, s.transforms.IMSToClientRTCP, RTCPFeedbackIMSToClient, "", nil, nil, "", 0)
+	if err := s.StartRTCPReportSchedule(childCtx, cfg.RTCPReportSchedule); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -630,6 +638,7 @@ func (s *RTPRelaySession) Close() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	s.StopRTCPReportSchedule()
 	var err error
 	if s.clientConn != nil {
 		err = errors.Join(err, s.clientConn.Close())

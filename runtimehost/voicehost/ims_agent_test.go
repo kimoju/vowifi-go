@@ -1778,6 +1778,66 @@ func TestIMSOutboundAgentDoesNotAutoRefreshUASSessionTimer(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentStopsAutoRefreshWhileTerminating(t *testing.T) {
+	transport := newBlockingMethodTransport("BYE", voiceclient.SIPResponse{StatusCode: 200, Reason: "OK"})
+	agent := &IMSOutboundAgent{
+		Transport:          transport,
+		SessionRefreshLead: 800 * time.Millisecond,
+	}
+	agent.storeDialog("call-terminating-refresh", imsDialogState{cfg: sessionTimerDialogConfig("call-terminating-refresh", 2)})
+	agent.scheduleDialogSessionRefresh("call-terminating-refresh")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := agent.EndVoiceCallWithResult(context.Background(), DialogInfo{CallID: "call-terminating-refresh"})
+		done <- err
+	}()
+	transport.waitBlocked(t)
+	time.Sleep(300 * time.Millisecond)
+	requests := transport.requestSnapshot()
+	if len(requests) != 1 || requests[0].Method != "BYE" {
+		t.Fatalf("requests while BYE blocked=%+v, want only BYE", requests)
+	}
+	transport.release()
+	if err := <-done; err != nil {
+		t.Fatalf("EndVoiceCallWithResult() error = %v", err)
+	}
+	if _, ok := agent.dialogs["call-terminating-refresh"]; ok {
+		t.Fatal("dialog should close after accepted BYE")
+	}
+}
+
+func TestIMSOutboundAgentResumesAutoRefreshAfterRejectedBye(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{StatusCode: 503, Reason: "Service Unavailable"},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{Transport: transport}
+	cfg := sessionTimerDialogConfig("call-rejected-bye-refresh", 2)
+	cfg.SessionExpires = 3600
+	agent.storeDialog("call-rejected-bye-refresh", imsDialogState{cfg: cfg})
+	agent.scheduleDialogSessionRefresh("call-rejected-bye-refresh")
+
+	result, err := agent.EndVoiceCallWithResult(context.Background(), DialogInfo{CallID: "call-rejected-bye-refresh"})
+	if err == nil || result.StatusCode != 503 {
+		t.Fatalf("EndVoiceCallWithResult() result=%+v err=%v, want rejected BYE", result, err)
+	}
+	agent.mu.Lock()
+	state := agent.dialogs["call-rejected-bye-refresh"]
+	agent.mu.Unlock()
+	if state.terminating || state.refreshTimer == nil {
+		t.Fatalf("state after rejected BYE terminating=%t refreshTimer=%v", state.terminating, state.refreshTimer)
+	}
+	agent.StopSessionTimers()
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-rejected-bye-refresh"}); err != nil {
+		t.Fatalf("EndVoiceCall() retry error = %v", err)
+	}
+	if len(transport.requests) != 2 || transport.requests[0].Headers["CSeq"] != "2 BYE" ||
+		transport.requests[1].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE requests=%+v", transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentRewritesInDialogUpdateThroughRelay(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
@@ -2965,4 +3025,81 @@ func waitForIMSRequests(t *testing.T, transport *fakeIMSVoiceTransport, n int) [
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func sessionTimerDialogConfig(callID string, cseq int) voiceclient.DialogRequestConfig {
+	return voiceclient.DialogRequestConfig{
+		Profile:          voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		LocalURI:         "sip:user@ims.example",
+		ContactURI:       "sip:user@192.0.2.10:5060",
+		RemoteURI:        "sip:+18005551212@ims.example",
+		RemoteTargetURI:  "sip:+18005551212@ims.example",
+		CallID:           callID,
+		LocalTag:         "local-tag",
+		RemoteTag:        "remote-tag",
+		CSeq:             cseq,
+		SessionExpires:   1,
+		SessionRefresher: "uac",
+	}
+}
+
+type blockingMethodTransport struct {
+	mu          sync.Mutex
+	requests    []voiceclient.SIPRequestMessage
+	method      string
+	response    voiceclient.SIPResponse
+	blocked     chan struct{}
+	released    chan struct{}
+	blockedOnce sync.Once
+}
+
+func newBlockingMethodTransport(method string, response voiceclient.SIPResponse) *blockingMethodTransport {
+	return &blockingMethodTransport{
+		method:   method,
+		response: response,
+		blocked:  make(chan struct{}),
+		released: make(chan struct{}),
+	}
+}
+
+func (t *blockingMethodTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	t.mu.Lock()
+	t.requests = append(t.requests, msg)
+	shouldBlock := strings.EqualFold(msg.Method, t.method)
+	t.mu.Unlock()
+	if shouldBlock {
+		t.blockedOnce.Do(func() { close(t.blocked) })
+		select {
+		case <-ctx.Done():
+			return voiceclient.SIPResponse{}, ctx.Err()
+		case <-t.released:
+		}
+	}
+	return t.response, nil
+}
+
+func (t *blockingMethodTransport) WriteRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.requests = append(t.requests, msg)
+	return nil
+}
+
+func (t *blockingMethodTransport) waitBlocked(testingT *testing.T) {
+	testingT.Helper()
+	select {
+	case <-t.blocked:
+	case <-time.After(2 * time.Second):
+		testingT.Fatal("timed out waiting for blocked request")
+	}
+}
+
+func (t *blockingMethodTransport) release() {
+	close(t.released)
+}
+
+func (t *blockingMethodTransport) requestSnapshot() []voiceclient.SIPRequestMessage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]voiceclient.SIPRequestMessage(nil), t.requests...)
 }

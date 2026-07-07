@@ -314,17 +314,42 @@ func emergencyHeaderURI(value string) string {
 	if value == "" {
 		return ""
 	}
-	if strings.HasPrefix(value, "<") {
-		end := strings.Index(value, ">")
+	if start := strings.IndexByte(value, '<'); start >= 0 {
+		end := strings.IndexByte(value[start+1:], '>')
 		if end < 0 {
 			return ""
 		}
-		return strings.TrimSpace(value[1:end])
+		return strings.TrimSpace(value[start+1 : start+1+end])
 	}
-	if uri, _, ok := strings.Cut(value, ";"); ok {
-		return strings.TrimSpace(uri)
+	parts, err := splitSIPHeaderSegments(value, ';')
+	if err != nil || len(parts) == 0 {
+		if uri, _, ok := strings.Cut(value, ";"); ok {
+			return strings.TrimSpace(uri)
+		}
+		return value
 	}
-	return value
+	uri := strings.TrimSpace(parts[0])
+	for _, part := range parts[1:] {
+		part = strings.TrimSpace(part)
+		if part == "" || emergencyContactHeaderParam(part) {
+			continue
+		}
+		uri += ";" + part
+	}
+	return uri
+}
+
+func emergencyContactHeaderParam(param string) bool {
+	key, _, ok := strings.Cut(strings.TrimSpace(param), "=")
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "expires", "q":
+		return true
+	default:
+		return false
+	}
 }
 
 func emergencyResponseMentionsLocation(resp voiceclient.SIPResponse) bool {

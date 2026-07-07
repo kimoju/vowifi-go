@@ -164,6 +164,20 @@ func (a *fakeOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRe
 	return a.reinviteResult, nil
 }
 
+type fakeAutoDTMFAgent struct {
+	*fakeOutboundAgent
+	autoDTMFs     []DialogDTMFRequest
+	autoResult    DialogAutoDTMFResult
+	autoErr       error
+	autoCallCount int
+}
+
+func (a *fakeAutoDTMFAgent) SendDialogAutoDTMF(ctx context.Context, req DialogDTMFRequest) (DialogAutoDTMFResult, error) {
+	a.autoCallCount++
+	a.autoDTMFs = append(a.autoDTMFs, req)
+	return a.autoResult, a.autoErr
+}
+
 func isZeroFakeDialogInfoResult(result DialogInfoResult) bool {
 	return !result.Accepted &&
 		result.StatusCode == 0 &&
@@ -483,6 +497,96 @@ func TestGatewayHandleClientInfoSendsDialogInfo(t *testing.T) {
 	}
 	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 202 || tx.responses[0].Reason != "Accepted" ||
 		string(tx.responses[0].Body()) != "ok" || tx.responses[0].GetHeader("X-IMS").Value() != "info-ok" {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
+func TestGatewayHandleClientInfoUsesAutoDTMFRoute(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeAutoDTMFAgent{
+		fakeOutboundAgent: &fakeOutboundAgent{infoResult: DialogInfoResult{Accepted: true, StatusCode: 202, Reason: "INFO Accepted"}},
+		autoResult: DialogAutoDTMFResult{
+			Accepted:   true,
+			StatusCode: 200,
+			Reason:     "OK",
+			Route:      DialogDTMFRouteRTP,
+			RTP:        DialogRTPDTMFResult{Accepted: true, StatusCode: 200, Reason: "OK"},
+		},
+	}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newInfoRequest("call-dtmf-auto", "application/dtmf-relay; charset=utf-8", "Signal=3\r\nDuration=120\r\n")
+	req.AppendHeader(sip.NewHeader("Info-Package", "dtmf"))
+	req.AppendHeader(sip.NewHeader("X-Client", "dtmf"))
+
+	g.HandleClientInfo("dev-1", req, tx)
+
+	if agent.autoCallCount != 1 || len(agent.autoDTMFs) != 1 {
+		t.Fatalf("auto DTMF calls=%d requests=%+v", agent.autoCallCount, agent.autoDTMFs)
+	}
+	if len(agent.infos) != 0 {
+		t.Fatalf("infos=%+v, want none when auto DTMF handles request", agent.infos)
+	}
+	got := agent.autoDTMFs[0]
+	if got.DeviceID != "dev-1" || got.CallID != "call-dtmf-auto" ||
+		got.Signal != "3" || got.DurationMS != 120 || got.Headers["X-Client"] != "dtmf" {
+		t.Fatalf("auto DTMF request=%+v", got)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 200 ||
+		tx.responses[0].Reason != "OK" || len(tx.responses[0].Body()) != 0 {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
+func TestGatewayHandleClientInfoAutoDTMFInfoFallbackResponse(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeAutoDTMFAgent{
+		fakeOutboundAgent: &fakeOutboundAgent{},
+		autoResult: DialogAutoDTMFResult{
+			Accepted:   true,
+			StatusCode: 202,
+			Reason:     "Accepted",
+			Route:      DialogDTMFRouteInfo,
+			INFO: DialogDTMFResult{
+				Accepted:    true,
+				StatusCode:  202,
+				Reason:      "Accepted",
+				ContentType: "application/dtmf-relay",
+				Body:        []byte("Signal=4\r\nDuration=90\r\n"),
+				Headers:     map[string]string{"X-IMS": "info-fallback"},
+			},
+		},
+	}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newInfoRequest("call-dtmf-info", "application/dtmf-relay", "Signal=4\r\nDuration=90\r\n")
+
+	g.HandleClientInfo("dev-1", req, tx)
+
+	if len(agent.autoDTMFs) != 1 || len(agent.infos) != 0 {
+		t.Fatalf("autoDTMFs=%+v infos=%+v", agent.autoDTMFs, agent.infos)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 202 ||
+		tx.responses[0].GetHeader("Content-Type").Value() != "application/dtmf-relay" ||
+		tx.responses[0].GetHeader("X-IMS").Value() != "info-fallback" ||
+		!strings.Contains(string(tx.responses[0].Body()), "Signal=4") {
+		t.Fatalf("responses=%+v", tx.responses)
+	}
+}
+
+func TestGatewayHandleClientInfoRejectsInvalidAutoDTMFBody(t *testing.T) {
+	g := NewGateway()
+	agent := &fakeAutoDTMFAgent{fakeOutboundAgent: &fakeOutboundAgent{}}
+	g.RegisterAgent("dev-1", agent)
+	tx := &fakeServerTransaction{}
+	req := newInfoRequest("call-dtmf-invalid", "application/dtmf-relay", "Signal=12\r\nDuration=100\r\n")
+
+	g.HandleClientInfo("dev-1", req, tx)
+
+	if len(agent.autoDTMFs) != 0 || len(agent.infos) != 0 {
+		t.Fatalf("autoDTMFs=%+v infos=%+v, want no backend send", agent.autoDTMFs, agent.infos)
+	}
+	if len(tx.responses) != 1 || tx.responses[0].StatusCode != 400 || tx.responses[0].Reason != "Invalid DTMF relay" {
 		t.Fatalf("responses=%+v", tx.responses)
 	}
 }

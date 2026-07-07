@@ -88,6 +88,7 @@ type imsDialogState struct {
 	relay        *RTPRelaySession
 	localSDPBody []byte
 	early        bool
+	terminating  bool
 	refreshTimer *time.Timer
 	refreshSeq   uint64
 }
@@ -364,10 +365,13 @@ func (a *IMSOutboundAgent) EndVoiceCallWithResult(ctx context.Context, info Dial
 	}
 	applyDialogUpdateHeaders(bye.Headers, info.Headers)
 	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	state.terminating = true
+	stopDialogSessionRefresh(&state)
 	a.dialogs[callID] = state
 	a.mu.Unlock()
 	resp, err := a.roundTripRequest(ctx, bye)
 	if err != nil {
+		a.resumeDialogSessionRefreshAfterTerminating(callID)
 		return DialogInfoResult{Accepted: false, Reason: "IMS BYE failed", RegistrationRecoveryNeeded: true}, err
 	}
 	defaultReason := "OK"
@@ -385,6 +389,7 @@ func (a *IMSOutboundAgent) EndVoiceCallWithResult(ctx context.Context, info Dial
 		Headers:                    firstValueSIPHeaders(resp.Headers),
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		a.resumeDialogSessionRefreshAfterTerminating(callID)
 		return result, fmt.Errorf("IMS BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
 	if state.relay != nil {
@@ -898,6 +903,10 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 	if !ok {
 		a.mu.Unlock()
 		return DialogUpdateResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	if state.terminating {
+		a.mu.Unlock()
+		return DialogUpdateResult{Accepted: false, StatusCode: 481, Reason: "dialog terminating"}, nil
 	}
 	cfg := state.cfg
 	if len(body) > 0 && state.relay != nil {
@@ -1730,12 +1739,8 @@ func (a *IMSOutboundAgent) StopSessionTimers() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for callID, state := range a.dialogs {
-		if state.refreshTimer != nil {
-			state.refreshTimer.Stop()
-			state.refreshTimer = nil
-			state.refreshSeq++
-			a.dialogs[callID] = state
-		}
+		stopDialogSessionRefresh(&state)
+		a.dialogs[callID] = state
 	}
 }
 
@@ -1750,14 +1755,10 @@ func (a *IMSOutboundAgent) scheduleDialogSessionRefresh(callID string) {
 		a.mu.Unlock()
 		return
 	}
-	if state.refreshTimer != nil {
-		state.refreshTimer.Stop()
-		state.refreshTimer = nil
-	}
-	state.refreshSeq++
+	stopDialogSessionRefresh(&state)
 	seq := state.refreshSeq
 	delay := sessionRefreshDelay(state.cfg.SessionExpires, state.cfg.SessionRefresher, a.SessionRefreshLead)
-	if delay <= 0 || state.early {
+	if delay <= 0 || state.early || state.terminating {
 		a.dialogs[callID] = state
 		a.mu.Unlock()
 		return
@@ -1777,12 +1778,38 @@ func (a *IMSOutboundAgent) runDialogSessionRefresh(callID string, seq uint64) {
 	a.mu.Lock()
 	state, ok := a.dialogs[callID]
 	if !ok || state.refreshSeq != seq || state.early ||
+		state.terminating ||
 		state.cfg.SessionExpires <= 0 || normalizeSessionRefresher(state.cfg.SessionRefresher) != "uac" {
 		a.mu.Unlock()
 		return
 	}
 	a.mu.Unlock()
 	_, _ = a.SendDialogUpdate(context.Background(), DialogUpdateRequest{CallID: callID})
+}
+
+func stopDialogSessionRefresh(state *imsDialogState) {
+	if state == nil {
+		return
+	}
+	if state.refreshTimer != nil {
+		state.refreshTimer.Stop()
+		state.refreshTimer = nil
+	}
+	state.refreshSeq++
+}
+
+func (a *IMSOutboundAgent) resumeDialogSessionRefreshAfterTerminating(callID string) {
+	callID = strings.TrimSpace(callID)
+	if a == nil || callID == "" {
+		return
+	}
+	a.mu.Lock()
+	if state, ok := a.dialogs[callID]; ok {
+		state.terminating = false
+		a.dialogs[callID] = state
+	}
+	a.mu.Unlock()
+	a.scheduleDialogSessionRefresh(callID)
 }
 
 func sessionRefreshDelay(expires int, refresher string, lead time.Duration) time.Duration {

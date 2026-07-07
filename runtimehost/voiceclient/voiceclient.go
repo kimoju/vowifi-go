@@ -2052,16 +2052,27 @@ func minExpiresHeader(headers map[string][]string) int {
 }
 
 func headerParamInt(value, name string) (int, bool) {
+	raw, ok := headerParamValue(value, name)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(raw)
+	return n, err == nil
+}
+
+func headerParamValue(value, name string) (string, bool) {
 	name = strings.ToLower(strings.TrimSpace(name))
-	for _, part := range strings.Split(value, ";") {
+	if name == "" {
+		return "", false
+	}
+	for _, part := range splitSIPHeaderParams(value) {
 		key, raw, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if !ok || strings.ToLower(strings.TrimSpace(key)) != name {
 			continue
 		}
-		n, err := strconv.Atoi(strings.Trim(raw, `"`))
-		return n, err == nil
+		return strings.Trim(strings.TrimSpace(raw), `"`), true
 	}
-	return 0, false
+	return "", false
 }
 
 func securityVerifyFromChallenge(headers map[string][]string) string {

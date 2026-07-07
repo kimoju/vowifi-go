@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -553,8 +554,16 @@ func sipRedirectStatus(code int) bool {
 }
 
 func sipRedirectTargets(resp SIPResponse) []string {
-	var targets []string
+	type redirectContact struct {
+		target string
+		q      float64
+	}
+
+	var contacts []redirectContact
 	for _, contact := range headerListValues(resp.Headers, "Contact") {
+		if sipContactExpired(contact) {
+			continue
+		}
 		uri := extractAddressURI(contact)
 		if uri == "" || uri == "*" {
 			continue
@@ -563,9 +572,51 @@ func sipRedirectTargets(resp SIPResponse) []string {
 		if err != nil {
 			continue
 		}
-		targets = appendSIPTargets(targets, target)
+		q := sipContactQ(contact)
+		duplicate := -1
+		for i, existing := range contacts {
+			if existing.target == target {
+				duplicate = i
+				break
+			}
+		}
+		if duplicate >= 0 {
+			if q > contacts[duplicate].q {
+				contacts[duplicate].q = q
+			}
+			continue
+		}
+		contacts = append(contacts, redirectContact{target: target, q: q})
+	}
+	sort.SliceStable(contacts, func(i, j int) bool {
+		return contacts[i].q > contacts[j].q
+	})
+	targets := make([]string, 0, len(contacts))
+	for _, contact := range contacts {
+		targets = appendSIPTargets(targets, contact.target)
 	}
 	return targets
+}
+
+func sipContactQ(contact string) float64 {
+	value, ok := headerParamValue(contact, "q")
+	if !ok {
+		return 1
+	}
+	q, err := strconv.ParseFloat(value, 64)
+	if err != nil || q < 0 || q > 1 {
+		return 1
+	}
+	return q
+}
+
+func sipContactExpired(contact string) bool {
+	value, ok := headerParamValue(contact, "expires")
+	if !ok {
+		return false
+	}
+	expires, err := strconv.Atoi(value)
+	return err == nil && expires <= 0
 }
 
 func sipTargetsWithRedirects(targets []string, currentIndex int, redirects []string) ([]string, int, bool) {

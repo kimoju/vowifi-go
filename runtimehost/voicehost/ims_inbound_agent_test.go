@@ -1421,6 +1421,11 @@ func TestIMSInboundAgentPropagatesSessionTimerHeaders(t *testing.T) {
 	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-session-timer"}); err != nil {
 		t.Fatalf("EndInboundCall() error = %v", err)
 	}
+	if len(transport.requests) != 3 || transport.requests[2].Method != "BYE" ||
+		transport.requests[2].Headers["Session-Expires"] != "" ||
+		transport.requests[2].Headers["Min-SE"] != "" {
+		t.Fatalf("client BYE after session timer=%+v", transport.requests)
+	}
 }
 
 func TestIMSInboundAgentRetriesInviteSessionTimerMinSE(t *testing.T) {

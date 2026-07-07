@@ -24,6 +24,10 @@ type DialogDTMFSender interface {
 	SendDialogDTMF(context.Context, DialogDTMFRequest) (DialogDTMFResult, error)
 }
 
+type DialogAutoDTMFSender interface {
+	SendDialogAutoDTMF(context.Context, DialogDTMFRequest) (DialogAutoDTMFResult, error)
+}
+
 type DialogRTPDTMFSender interface {
 	SendDialogRTPDTMF(context.Context, DialogRTPDTMFRequest) (DialogRTPDTMFResult, error)
 }

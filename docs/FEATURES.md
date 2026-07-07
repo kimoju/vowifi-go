@@ -270,7 +270,8 @@ protocol layers needed by VoHive:
   Report block generation from observed RTP streams, Sender Report and SDES
   packet construction, relay-side clear-RTP reception snapshots, SRTP plaintext
   observer integration for encrypted relay streams, and generated Receiver/
-  Sender Report send paths toward IMS or client media legs
+  Sender Report send paths toward IMS or client media legs, with optional
+  relay lifecycle scheduling for periodic RTCP Receiver/Sender Reports
 - RTP telephone-event DTMF helpers for RFC 4733-style packet construction,
   RFC 4733-style packet-train generation with marker/sequence/timestamp/end
   repetition semantics, SDP dynamic payload discovery, relay-side event
@@ -280,7 +281,8 @@ protocol layers needed by VoHive:
   with per-direction sequence/timestamp/SSRC state, call-dialog RTP DTMF send
   entry points, and SRTP plaintext-stage DTMF inspection/remapping plus
   generated-packet protection during media transforms, plus a runtime automatic
-  DTMF route helper that prefers RTP telephone-event delivery and falls back to
+  DTMF route helper, wired into the local voice gateway for softphone INFO
+  DTMF requests, that prefers RTP telephone-event delivery and falls back to
   SIP INFO only when relay media configuration is unavailable
 - inbound IMS voice agent helpers that bridge IMS-originated INVITEs to a local
   SIP client, parse SDP answers, forward ACK/BYE/CANCEL dialog requests, and
