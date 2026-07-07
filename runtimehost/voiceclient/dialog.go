@@ -117,8 +117,8 @@ func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage,
 		msg.Headers["Content-Type"] = "application/sdp"
 		msg.Headers["Accept"] = "application/sdp"
 	}
-	msg.Headers["P-Preferred-Service"] = imsMMTelService
-	msg.Headers["Accept-Contact"] = imsMMTelAcceptContact
+	setDefaultDialogRequestHeader(msg.Headers, "P-Preferred-Service", imsMMTelService)
+	setDefaultDialogRequestHeader(msg.Headers, "Accept-Contact", imsMMTelAcceptContact)
 	msg.Headers["Supported"] = "100rel, timer, replaces, outbound"
 	applySessionIntervalHeaders(msg.Headers, cfg)
 	if cfg.MinSE > 0 {
@@ -725,6 +725,18 @@ func setDialogRequestHeader(headers map[string]string, name, value string) {
 	for key := range headers {
 		if strings.EqualFold(key, name) {
 			headers[key] = value
+			return
+		}
+	}
+	headers[name] = value
+}
+
+func setDefaultDialogRequestHeader(headers map[string]string, name, value string) {
+	for key, existing := range headers {
+		if strings.EqualFold(key, name) {
+			if strings.TrimSpace(existing) == "" {
+				headers[key] = value
+			}
 			return
 		}
 	}

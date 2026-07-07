@@ -2627,6 +2627,42 @@ func TestBuildIMSDialogINVITEAppliesEmergencyHeaders(t *testing.T) {
 	}
 }
 
+func TestBuildIMSDialogINVITEPreservesCarrierEmergencyHeaders(t *testing.T) {
+	const emergencyAcceptContact = `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";require;explicit`
+	cfg := DialogRequestConfig{
+		Profile: IMSProfile{UserAgent: "VoHive"},
+		Registration: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@example",
+		},
+		RemoteURI:       "sip:911@ims.example",
+		RemoteTargetURI: "urn:service:sos",
+		CallID:          "call-carrier-emergency",
+		LocalTag:        "ltag",
+		CarrierHeaders: map[string]string{
+			"P-Preferred-Service": "urn:urn-7:3gpp-service.ims.icsi.mmtel",
+			"Accept-Contact":      emergencyAcceptContact,
+			"Geolocation":         "<cid:location-1>;inserted-by=endpoint",
+			"Geolocation-Routing": "yes",
+		},
+	}
+	invite, err := BuildInviteRequest(cfg, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatalf("BuildInviteRequest() error = %v", err)
+	}
+	if invite.Headers["Accept-Contact"] != emergencyAcceptContact ||
+		invite.Headers["Geolocation"] != "<cid:location-1>;inserted-by=endpoint" ||
+		invite.Headers["Geolocation-Routing"] != "yes" {
+		t.Fatalf("carrier emergency INVITE headers=%+v", invite.Headers)
+	}
+	if invite.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.mmtel" {
+		t.Fatalf("P-Preferred-Service=%q", invite.Headers["P-Preferred-Service"])
+	}
+	if invite.Headers["Content-Type"] != "application/sdp" {
+		t.Fatalf("Content-Type=%q", invite.Headers["Content-Type"])
+	}
+}
+
 func TestBuildIMSDialogRequestsInjectCarrierHeaders(t *testing.T) {
 	cfg := DialogRequestConfig{
 		Profile: IMSProfile{IMPU: "sip:user@example"},
