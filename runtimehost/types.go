@@ -1731,30 +1731,69 @@ func (i *Instance) TriggerMOBIKE(oldIP, newIP string) error {
 	if i == nil {
 		return errors.New("runtime instance is nil")
 	}
+	oldIP = strings.TrimSpace(oldIP)
+	newIP = strings.TrimSpace(newIP)
 	i.mu.RLock()
 	tunnel := i.tunnel
 	deviceID := i.state.DeviceID
 	i.mu.RUnlock()
-	reason := "mobike"
-	if tunnel != nil {
-		res, err := tunnel.MOBIKE(context.Background(), swu.MOBIKERequest{
-			DeviceID: deviceID,
-			OldIP:    strings.TrimSpace(oldIP),
-			NewIP:    strings.TrimSpace(newIP),
-			At:       time.Now(),
-		})
-		if err != nil {
-			return fmt.Errorf("MOBIKE update failed: %w", err)
-		}
-		reason = firstRuntimeNonEmpty(res.Reason, reason)
+	ctx := context.Background()
+	pendingReason := runtimeMOBIKEReason("pending", oldIP, newIP, "")
+	i.updateRuntimeReason(ctx, pendingReason)
+	if tunnel == nil {
+		i.updateRuntimeReason(ctx, runtimeMOBIKEReason("skipped", oldIP, newIP, "tunnel unavailable"))
+		return nil
+	}
+
+	res, err := tunnel.MOBIKE(ctx, swu.MOBIKERequest{
+		DeviceID: deviceID,
+		OldIP:    oldIP,
+		NewIP:    newIP,
+		At:       time.Now(),
+	})
+	if err != nil {
+		i.updateRuntimeReason(ctx, runtimeMOBIKEReason("failed", oldIP, newIP, err.Error()))
+		return fmt.Errorf("MOBIKE update failed: %w", err)
+	}
+	status := "complete"
+	if res.Rekeyed {
+		status = "rekeyed"
+	}
+	i.updateRuntimeReason(ctx, runtimeMOBIKEReason(status, oldIP, newIP, res.Reason))
+	return nil
+}
+
+func (i *Instance) updateRuntimeReason(ctx context.Context, reason string) {
+	if i == nil {
+		return
 	}
 	i.mu.Lock()
-	i.state.LastReason = reason
+	i.state.LastReason = strings.TrimSpace(reason)
 	i.state.UpdatedAt = time.Now()
 	i.mu.Unlock()
-	i.notify(context.Background())
-	i.dispatchRuntimeState(context.Background())
-	return nil
+	i.notify(ctx)
+	i.dispatchRuntimeState(ctx)
+}
+
+func runtimeMOBIKEReason(status, oldIP, newIP, detail string) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "update"
+	}
+	reason := "mobike " + status
+	if oldIP = strings.TrimSpace(oldIP); oldIP != "" {
+		reason += " " + oldIP
+	}
+	if newIP = strings.TrimSpace(newIP); newIP != "" {
+		if oldIP != "" {
+			reason += " ->"
+		}
+		reason += " " + newIP
+	}
+	if detail = strings.TrimSpace(detail); detail != "" {
+		reason += ": " + detail
+	}
+	return reason
 }
 
 func (i *Instance) Status() string {

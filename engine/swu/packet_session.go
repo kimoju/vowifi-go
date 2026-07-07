@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	ErrInvalidPacketTunnel    = errors.New("invalid swu packet tunnel")
-	ErrPacketTunnelClosed     = errors.New("swu packet tunnel closed")
-	ErrUnsupportedInnerPacket = errors.New("unsupported inner packet")
+	ErrInvalidPacketTunnel       = errors.New("invalid swu packet tunnel")
+	ErrPacketTunnelClosed        = errors.New("swu packet tunnel closed")
+	ErrUnsupportedInnerPacket    = errors.New("unsupported inner packet")
+	ErrInvalidChildSARekeyPolicy = errors.New("invalid swu child sa rekey policy")
 )
 
 type ESPPacketTransport interface {
@@ -42,6 +43,150 @@ func (f ESPPacketTransportFunc) SendESPPacket(ctx context.Context, packet []byte
 }
 
 type ChildSARekeyHandler func(context.Context) (ikev2.ChildSAResult, error)
+
+type ChildSARekeyAction uint8
+
+const (
+	ChildSARekeyNoAction ChildSARekeyAction = iota
+	ChildSARekeyDue
+)
+
+func (a ChildSARekeyAction) String() string {
+	switch a {
+	case ChildSARekeyNoAction:
+		return "none"
+	case ChildSARekeyDue:
+		return "rekey"
+	default:
+		return fmt.Sprintf("child sa rekey action %d", a)
+	}
+}
+
+type ChildSARekeyPolicy struct {
+	Lifetime time.Duration
+	LeadTime time.Duration
+	Disabled bool
+}
+
+type ChildSARekeyDecision struct {
+	Action        ChildSARekeyAction
+	EstablishedAt time.Time
+	DueAt         time.Time
+	NextDue       time.Time
+	Age           time.Duration
+	Lifetime      time.Duration
+	LeadTime      time.Duration
+	Reason        string
+}
+
+type ChildSARekeySnapshot struct {
+	Enabled       bool
+	EstablishedAt time.Time
+	DueAt         time.Time
+	Lifetime      time.Duration
+	LeadTime      time.Duration
+}
+
+type ChildSARekeyState struct {
+	policy        ChildSARekeyPolicy
+	establishedAt time.Time
+	enabled       bool
+}
+
+func NewChildSARekeyState(policy ChildSARekeyPolicy, establishedAt time.Time) (*ChildSARekeyState, error) {
+	normalized, enabled, err := normalizeChildSARekeyPolicy(policy)
+	if err != nil {
+		return nil, err
+	}
+	if establishedAt.IsZero() {
+		establishedAt = time.Now()
+	}
+	return &ChildSARekeyState{
+		policy:        normalized,
+		establishedAt: establishedAt,
+		enabled:       enabled,
+	}, nil
+}
+
+func (s *ChildSARekeyState) Advance(now time.Time) ChildSARekeyDecision {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if s == nil || !s.enabled {
+		return ChildSARekeyDecision{
+			Action: ChildSARekeyNoAction,
+			Reason: "rekey disabled",
+		}
+	}
+	dueAt := s.dueAt()
+	decision := s.decision(now, ChildSARekeyNoAction, "child sa rekey not due")
+	if !now.Before(dueAt) {
+		decision.Action = ChildSARekeyDue
+		decision.Reason = "child sa rekey due"
+	}
+	return decision
+}
+
+func (s *ChildSARekeyState) RecordRekey(at time.Time) {
+	if s == nil || !s.enabled {
+		return
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	s.establishedAt = at
+}
+
+func (s *ChildSARekeyState) Snapshot() ChildSARekeySnapshot {
+	if s == nil || !s.enabled {
+		return ChildSARekeySnapshot{}
+	}
+	return ChildSARekeySnapshot{
+		Enabled:       true,
+		EstablishedAt: s.establishedAt,
+		DueAt:         s.dueAt(),
+		Lifetime:      s.policy.Lifetime,
+		LeadTime:      s.policy.LeadTime,
+	}
+}
+
+func (s *ChildSARekeyState) decision(now time.Time, action ChildSARekeyAction, reason string) ChildSARekeyDecision {
+	dueAt := s.dueAt()
+	age := time.Duration(0)
+	if !s.establishedAt.IsZero() && now.After(s.establishedAt) {
+		age = now.Sub(s.establishedAt)
+	}
+	return ChildSARekeyDecision{
+		Action:        action,
+		EstablishedAt: s.establishedAt,
+		DueAt:         dueAt,
+		NextDue:       dueAt,
+		Age:           age,
+		Lifetime:      s.policy.Lifetime,
+		LeadTime:      s.policy.LeadTime,
+		Reason:        reason,
+	}
+}
+
+func (s *ChildSARekeyState) dueAt() time.Time {
+	return s.establishedAt.Add(s.policy.Lifetime - s.policy.LeadTime)
+}
+
+func normalizeChildSARekeyPolicy(policy ChildSARekeyPolicy) (ChildSARekeyPolicy, bool, error) {
+	if policy.Lifetime < 0 {
+		return ChildSARekeyPolicy{}, false, fmt.Errorf("%w: lifetime is negative", ErrInvalidChildSARekeyPolicy)
+	}
+	if policy.LeadTime < 0 {
+		return ChildSARekeyPolicy{}, false, fmt.Errorf("%w: lead time is negative", ErrInvalidChildSARekeyPolicy)
+	}
+	if policy.Disabled || policy.Lifetime == 0 {
+		return ChildSARekeyPolicy{Disabled: true}, false, nil
+	}
+	if policy.LeadTime >= policy.Lifetime {
+		return ChildSARekeyPolicy{}, false, fmt.Errorf("%w: lead time must be less than lifetime", ErrInvalidChildSARekeyPolicy)
+	}
+	return policy, true, nil
+}
 
 type ESPPacketTransportCloser interface {
 	ESPPacketTransport
@@ -97,6 +242,7 @@ type PacketSessionConfig struct {
 	Random        io.Reader
 	MOBIKEHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	RekeyHandler  ChildSARekeyHandler
+	RekeyPolicy   ChildSARekeyPolicy
 	MOBIKENAT     *MOBIKENATState
 	Liveness      *IKELivenessState
 	DPDHandler    func(context.Context) error
@@ -112,6 +258,7 @@ type PacketSession struct {
 	random        io.Reader
 	mobikeHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
 	rekeyHandler  ChildSARekeyHandler
+	rekeyState    *ChildSARekeyState
 	mobikeNAT     *MOBIKENATState
 	liveness      *IKELivenessState
 	dpdHandler    func(context.Context) error
@@ -151,6 +298,10 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 	if result.EstablishedAt.IsZero() {
 		result.EstablishedAt = time.Now()
 	}
+	rekeyState, err := NewChildSARekeyState(cfg.RekeyPolicy, result.EstablishedAt)
+	if err != nil {
+		return nil, err
+	}
 	return &PacketSession{
 		result:        result,
 		outbound:      outbound,
@@ -159,6 +310,7 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 		random:        cfg.Random,
 		mobikeHandler: cfg.MOBIKEHandler,
 		rekeyHandler:  cfg.RekeyHandler,
+		rekeyState:    rekeyState,
 		mobikeNAT:     cfg.MOBIKENAT,
 		liveness:      cfg.Liveness,
 		dpdHandler:    cfg.DPDHandler,
@@ -190,6 +342,10 @@ func (s *PacketSession) Result() TunnelResult {
 }
 
 func (s *PacketSession) RekeyChildSA(ctx context.Context) (TunnelResult, error) {
+	return s.rekeyChildSA(ctx, time.Time{})
+}
+
+func (s *PacketSession) rekeyChildSA(ctx context.Context, rekeyedAt time.Time) (TunnelResult, error) {
 	if s == nil {
 		return TunnelResult{}, ErrInvalidPacketTunnel
 	}
@@ -229,6 +385,9 @@ func (s *PacketSession) RekeyChildSA(ctx context.Context) (TunnelResult, error) 
 	s.result.Ready = true
 	s.result.ChildSAIdentifier = childSAIdentifier(child)
 	s.result.Reason = "child sa rekeyed"
+	if s.rekeyState != nil {
+		s.rekeyState.RecordRekey(rekeyedAt)
+	}
 	if local := firstPacketNonEmpty(
 		childConfigurationAddress(child, ikev2.ConfigInternalIPv4Address),
 		childConfigurationAddress(child, ikev2.ConfigInternalIPv6Address),
@@ -239,6 +398,46 @@ func (s *PacketSession) RekeyChildSA(ctx context.Context) (TunnelResult, error) 
 		s.result.DNSServers = dns
 	}
 	return cloneTunnelResult(s.result), nil
+}
+
+func (s *PacketSession) AdvanceChildSARekey(ctx context.Context, now time.Time) (ChildSARekeyDecision, error) {
+	if s == nil {
+		return ChildSARekeyDecision{}, ErrInvalidPacketTunnel
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := contextReady(ctx); err != nil {
+		return ChildSARekeyDecision{}, err
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ChildSARekeyDecision{}, ErrPacketTunnelClosed
+	}
+	if s.rekeyState == nil {
+		s.mu.Unlock()
+		return ChildSARekeyDecision{Action: ChildSARekeyNoAction, Reason: "rekey disabled"}, nil
+	}
+	decision := s.rekeyState.Advance(now)
+	s.mu.Unlock()
+	if decision.Action != ChildSARekeyDue {
+		return decision, nil
+	}
+	_, err := s.rekeyChildSA(ctx, now)
+	return decision, err
+}
+
+func (s *PacketSession) ChildSARekeySnapshot() ChildSARekeySnapshot {
+	if s == nil {
+		return ChildSARekeySnapshot{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rekeyState == nil {
+		return ChildSARekeySnapshot{}
+	}
+	return s.rekeyState.Snapshot()
 }
 
 func (s *PacketSession) MOBIKE(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
@@ -367,7 +566,17 @@ func (s *PacketSession) AdvanceIKELiveness(ctx context.Context, now time.Time) (
 		}
 		err := dpdHandler(ctx)
 		s.RecordIKELivenessResult(now, err == nil)
+		if err != nil {
+			if snapshot := s.IKELivenessSnapshot(); snapshot.Dead {
+				decision.Dead = true
+				decision.MissedDPDProbes = snapshot.MissedDPDProbes
+				decision.Reason = firstPacketNonEmpty(err.Error(), "dpd probe failed")
+				s.markTunnelNotReady(ikeLivenessDeadReason(decision))
+			}
+		}
 		return decision, err
+	case IKELivenessDeclareDead:
+		s.markTunnelNotReady(ikeLivenessDeadReason(decision))
 	}
 	return decision, nil
 }
@@ -415,6 +624,29 @@ func (s *PacketSession) IKELivenessSnapshot() IKELivenessSnapshot {
 		return IKELivenessSnapshot{}
 	}
 	return s.liveness.Snapshot()
+}
+
+func (s *PacketSession) markTunnelNotReady(reason string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.result.Ready = false
+	s.result.IKEEstablished = false
+	s.result.IPsecEstablished = false
+	s.result.Reason = firstPacketNonEmpty(reason, "ike liveness dead")
+}
+
+func ikeLivenessDeadReason(decision IKELivenessDecision) string {
+	reason := firstPacketNonEmpty(decision.Reason, "dpd timeout")
+	if strings.Contains(strings.ToLower(reason), "ike liveness") {
+		return reason
+	}
+	return "ike liveness dead: " + reason
 }
 
 func completeMOBIKEResult(res MOBIKEResult, req MOBIKERequest, current TunnelResult, fallbackReason string) MOBIKEResult {

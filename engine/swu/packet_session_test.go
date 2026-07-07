@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,6 +212,59 @@ func TestPacketSessionRekeyChildSAErrorKeepsOldSAAndResult(t *testing.T) {
 	}
 	if gotSPI := binary.BigEndian.Uint32(transport.packets[0][0:4]); gotSPI != 0x22222222 {
 		t.Fatalf("outbound SPI=%08x, want old remote SPI", gotSPI)
+	}
+}
+
+func TestPacketSessionAdvanceChildSARekeyTriggersWhenDue(t *testing.T) {
+	start := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	newChild := packetRekeyChildSA(true)
+	rekeyCalls := 0
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: &captureESPPacketTransport{},
+		Result: TunnelResult{
+			Ready:             true,
+			Mode:              DataplaneModeUserspace,
+			IKEEstablished:    true,
+			IPsecEstablished:  true,
+			ChildSAIdentifier: "11111111/22222222",
+			EstablishedAt:     start,
+		},
+		RekeyHandler: func(context.Context) (ikev2.ChildSAResult, error) {
+			rekeyCalls++
+			return newChild, nil
+		},
+		RekeyPolicy: ChildSARekeyPolicy{
+			Lifetime: time.Minute,
+			LeadTime: 10 * time.Second,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	early, err := session.AdvanceChildSARekey(context.Background(), start.Add(49*time.Second))
+	if err != nil {
+		t.Fatalf("AdvanceChildSARekey(early) error = %v", err)
+	}
+	if early.Action != ChildSARekeyNoAction || rekeyCalls != 0 || !early.NextDue.Equal(start.Add(50*time.Second)) {
+		t.Fatalf("early decision=%+v rekeyCalls=%d", early, rekeyCalls)
+	}
+
+	dueAt := start.Add(50 * time.Second)
+	due, err := session.AdvanceChildSARekey(context.Background(), dueAt)
+	if err != nil {
+		t.Fatalf("AdvanceChildSARekey(due) error = %v", err)
+	}
+	if due.Action != ChildSARekeyDue || rekeyCalls != 1 {
+		t.Fatalf("due decision=%+v rekeyCalls=%d", due, rekeyCalls)
+	}
+	if result := session.Result(); !result.IsReady() || result.ChildSAIdentifier != "33333333/44444444" ||
+		result.Reason != "child sa rekeyed" {
+		t.Fatalf("result after due rekey=%+v", result)
+	}
+	snapshot := session.ChildSARekeySnapshot()
+	if !snapshot.Enabled || !snapshot.EstablishedAt.Equal(dueAt) || !snapshot.DueAt.Equal(dueAt.Add(50*time.Second)) {
+		t.Fatalf("rekey snapshot=%+v", snapshot)
 	}
 }
 
@@ -515,6 +569,94 @@ func TestPacketSessionAdvanceIKELivenessSendsDPD(t *testing.T) {
 	}
 	if snapshot := session.IKELivenessSnapshot(); snapshot.OutstandingDPD || snapshot.MissedDPDProbes != 0 {
 		t.Fatalf("liveness snapshot after successful DPD=%+v", snapshot)
+	}
+}
+
+func TestPacketSessionAdvanceIKELivenessMarksResultDeadOnDPDHandlerTimeout(t *testing.T) {
+	start := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	liveness, err := NewIKELivenessState(IKELivenessConfig{
+		DisableKeepalive:   true,
+		DPDInterval:        30 * time.Second,
+		DPDTimeout:         10 * time.Second,
+		MaxMissedDPDProbes: 1,
+	}, start)
+	if err != nil {
+		t.Fatalf("NewIKELivenessState() error = %v", err)
+	}
+	wantErr := errors.New("dpd exchange timeout")
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: &captureESPPacketTransport{},
+		Result: TunnelResult{
+			Ready:            true,
+			IKEEstablished:   true,
+			IPsecEstablished: true,
+			Reason:           "packet tunnel ready",
+			EstablishedAt:    start,
+		},
+		Liveness: liveness,
+		DPDHandler: func(ctx context.Context) error {
+			return wantErr
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+
+	decision, err := session.AdvanceIKELiveness(context.Background(), start.Add(30*time.Second))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("AdvanceIKELiveness() err=%v, want dpd exchange timeout", err)
+	}
+	if decision.Action != IKELivenessSendDPD || !decision.Dead || decision.MissedDPDProbes != 1 {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if result := session.Result(); result.IsReady() || !strings.Contains(result.Reason, "dpd exchange timeout") {
+		t.Fatalf("result after DPD handler timeout=%+v", result)
+	}
+}
+
+func TestPacketSessionAdvanceIKELivenessMarksResultDeadOnDPDTimeout(t *testing.T) {
+	start := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	liveness, err := NewIKELivenessState(IKELivenessConfig{
+		DisableKeepalive:   true,
+		DPDInterval:        30 * time.Second,
+		DPDTimeout:         10 * time.Second,
+		MaxMissedDPDProbes: 1,
+	}, start)
+	if err != nil {
+		t.Fatalf("NewIKELivenessState() error = %v", err)
+	}
+	if first := liveness.Advance(start.Add(30 * time.Second)); first.Action != IKELivenessSendDPD {
+		t.Fatalf("first liveness decision=%+v", first)
+	}
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: &captureESPPacketTransport{},
+		Result: TunnelResult{
+			Ready:            true,
+			IKEEstablished:   true,
+			IPsecEstablished: true,
+			Reason:           "packet tunnel ready",
+			EstablishedAt:    start,
+		},
+		Liveness: liveness,
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+
+	decision, err := session.AdvanceIKELiveness(context.Background(), start.Add(40*time.Second))
+	if err != nil {
+		t.Fatalf("AdvanceIKELiveness(timeout) error = %v", err)
+	}
+	if decision.Action != IKELivenessDeclareDead || !decision.Dead {
+		t.Fatalf("timeout decision=%+v", decision)
+	}
+	result := session.Result()
+	if result.IsReady() || result.IKEEstablished || result.IPsecEstablished ||
+		!strings.Contains(result.Reason, "ike liveness dead") ||
+		!strings.Contains(result.Reason, "dpd") {
+		t.Fatalf("result after DPD timeout=%+v", result)
 	}
 }
 

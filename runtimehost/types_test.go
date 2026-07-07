@@ -1906,6 +1906,7 @@ func TestStopClosesTunnel(t *testing.T) {
 }
 
 func TestTriggerMOBIKEDelegatesToTunnel(t *testing.T) {
+	dispatch := &runtimeDispatcher{}
 	session := &runtimeTunnelSession{
 		result: swu.TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true},
 		mobikeResult: swu.MOBIKEResult{
@@ -1920,6 +1921,7 @@ func TestTriggerMOBIKEDelegatesToTunnel(t *testing.T) {
 		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
 		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
 		TunnelManager: &runtimeTunnelManager{session: session},
+		Dispatch:      dispatch,
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -1930,8 +1932,54 @@ func TestTriggerMOBIKEDelegatesToTunnel(t *testing.T) {
 	if session.mobikeRequest.OldIP != "198.51.100.1" || session.mobikeRequest.NewIP != "198.51.100.2" {
 		t.Fatalf("mobike request=%+v", session.mobikeRequest)
 	}
-	if inst.State().LastReason != "mobike rekeyed" {
+	wantReason := "mobike rekeyed 198.51.100.1 -> 198.51.100.2: mobike rekeyed"
+	if inst.State().LastReason != wantReason {
 		t.Fatalf("state=%+v", inst.State())
+	}
+	if len(dispatch.events) != 3 {
+		t.Fatalf("events=%d, want ready/pending/complete", len(dispatch.events))
+	}
+	pending, ok := dispatch.events[1].(eventhost.RuntimeStateSnapshot)
+	if !ok || pending.LastReason != "mobike pending 198.51.100.1 -> 198.51.100.2" {
+		t.Fatalf("pending event=%+v ok=%t", dispatch.events[1], ok)
+	}
+	complete, ok := dispatch.events[2].(eventhost.RuntimeStateSnapshot)
+	if !ok || complete.LastReason != wantReason {
+		t.Fatalf("complete event=%+v ok=%t", dispatch.events[2], ok)
+	}
+}
+
+func TestTriggerMOBIKERecordsFailedRuntimeState(t *testing.T) {
+	dispatch := &runtimeDispatcher{}
+	wantErr := errors.New("update timeout")
+	session := &runtimeTunnelSession{
+		result:    swu.TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true},
+		mobikeErr: wantErr,
+	}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: &runtimeTunnelManager{session: session},
+		Dispatch:      dispatch,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	err = inst.TriggerMOBIKE("198.51.100.10", "198.51.100.20")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("TriggerMOBIKE() err=%v, want update timeout", err)
+	}
+	wantReason := "mobike failed 198.51.100.10 -> 198.51.100.20: update timeout"
+	if inst.State().LastReason != wantReason {
+		t.Fatalf("state=%+v", inst.State())
+	}
+	if len(dispatch.events) != 3 {
+		t.Fatalf("events=%d, want ready/pending/failed", len(dispatch.events))
+	}
+	failed, ok := dispatch.events[2].(eventhost.RuntimeStateSnapshot)
+	if !ok || failed.LastReason != wantReason {
+		t.Fatalf("failed event=%+v ok=%t", dispatch.events[2], ok)
 	}
 }
 

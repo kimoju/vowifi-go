@@ -234,6 +234,10 @@ func TestIKEPacketTunnelManagerWiresChildSARekeyHandler(t *testing.T) {
 		ChildSPI:     oldChild.LocalSPI,
 		Transport:    transport,
 		ESPTransport: &captureESPPacketTransport{},
+		ChildSARekey: ChildSARekeyPolicy{
+			Lifetime: time.Hour,
+			LeadTime: 5 * time.Minute,
+		},
 		InitRunner: func(ctx context.Context, cfg ikev2.InitConfig) (ikev2.InitResult, error) {
 			return init, nil
 		},
@@ -263,6 +267,9 @@ func TestIKEPacketTunnelManagerWiresChildSARekeyHandler(t *testing.T) {
 	defer session.Close(context.Background())
 	if gotPacketConfig.RekeyHandler == nil {
 		t.Fatal("packet session config missing rekey handler")
+	}
+	if gotPacketConfig.RekeyPolicy.Lifetime != time.Hour || gotPacketConfig.RekeyPolicy.LeadTime != 5*time.Minute {
+		t.Fatalf("packet session rekey policy=%+v", gotPacketConfig.RekeyPolicy)
 	}
 	firstChild, err := gotPacketConfig.RekeyHandler(context.Background())
 	if err != nil {

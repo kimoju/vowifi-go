@@ -77,6 +77,7 @@ type IKEPacketTunnelManagerConfig struct {
 	AdditionalAddresses      []net.IP
 	NoAdditionalAddresses    bool
 	Liveness                 IKELivenessConfig
+	ChildSARekey             ChildSARekeyPolicy
 	DisableControlPlaneHooks bool
 }
 
@@ -225,6 +226,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		Random:        random,
 		MOBIKEHandler: mobikeHandler,
 		RekeyHandler:  rekeyHandler,
+		RekeyPolicy:   m.Config.ChildSARekey,
 		MOBIKENAT: NewMOBIKENATState(MOBIKENATStateConfig{
 			MOBIKESupported: result.MOBIKESupported,
 			LocalIP:         transportCfg.LocalIP,
