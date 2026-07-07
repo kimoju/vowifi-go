@@ -3,6 +3,7 @@ package voiceclient
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -31,6 +32,20 @@ type VoiceSDPMedia struct {
 	ExplicitRTCP bool
 	RTCPMux      bool
 	Codecs       []VoiceSDPCodec
+}
+
+type VoiceSDPMediaDirection struct {
+	Direction           string
+	SessionDirection    string
+	AudioDirection      string
+	SessionConnectionIP string
+	AudioConnectionIP   string
+	EffectiveIP         string
+	AudioPort           int
+	Held                bool
+	Disabled            bool
+	CanSend             bool
+	CanReceive          bool
 }
 
 func ParseVoiceSDPMedia(body []byte) (VoiceSDPMedia, error) {
@@ -178,6 +193,76 @@ func ValidateIMSVoiceSDPMedia(media VoiceSDPMedia) error {
 	return nil
 }
 
+func ParseVoiceSDPMediaDirection(body []byte) (VoiceSDPMediaDirection, error) {
+	lines := voiceSDPLines(body)
+	var out VoiceSDPMediaDirection
+	beforeFirstMedia := true
+	inFirstAudio := false
+	sawAudio := false
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "m=") {
+			if sawAudio && inFirstAudio {
+				break
+			}
+			beforeFirstMedia = false
+			inFirstAudio = false
+			fields := strings.Fields(line)
+			if len(fields) >= 4 && strings.EqualFold(fields[0], "m=audio") {
+				port, err := parseVoiceSDPPort(fields[1])
+				if err != nil {
+					return VoiceSDPMediaDirection{}, fmt.Errorf("%w: invalid audio port", ErrInvalidVoiceSDP)
+				}
+				out.AudioPort = port
+				inFirstAudio = true
+				sawAudio = true
+			}
+			continue
+		}
+		if direction, ok, err := parseVoiceSDPDirectionLine(line); err != nil {
+			return VoiceSDPMediaDirection{}, err
+		} else if ok {
+			if beforeFirstMedia {
+				out.SessionDirection = direction
+				continue
+			}
+			if inFirstAudio {
+				out.AudioDirection = direction
+			}
+			continue
+		}
+		if ip, ok, err := parseVoiceSDPConnectionLine(line); err != nil {
+			return VoiceSDPMediaDirection{}, err
+		} else if ok {
+			if beforeFirstMedia {
+				out.SessionConnectionIP = ip
+				continue
+			}
+			if inFirstAudio {
+				out.AudioConnectionIP = ip
+			}
+		}
+	}
+	if !sawAudio {
+		return VoiceSDPMediaDirection{}, fmt.Errorf("%w: missing audio m-line", ErrInvalidVoiceSDP)
+	}
+	out.EffectiveIP = out.AudioConnectionIP
+	if out.EffectiveIP == "" {
+		out.EffectiveIP = out.SessionConnectionIP
+	}
+	out.Direction = firstNonEmpty(out.AudioDirection, out.SessionDirection, "sendrecv")
+	out.Disabled = out.AudioPort == 0 || voiceSDPConnectionIPIsUnspecified(out.EffectiveIP)
+	if out.Disabled {
+		out.Direction = "inactive"
+	}
+	out.CanSend, out.CanReceive = voiceSDPDirectionCapabilities(out.Direction)
+	out.Held = !out.CanSend || !out.CanReceive
+	return out, nil
+}
+
 func VoiceSDPCodecIsAMR(codec VoiceSDPCodec) bool {
 	name := strings.ToUpper(strings.TrimSpace(codec.EncodingName))
 	return name == VoiceSDPCodecAMR || name == VoiceSDPCodecAMRWB
@@ -319,6 +404,61 @@ func parseVoiceSDPFmtpLine(line string) (int, string, bool, error) {
 		return 0, "", true, err
 	}
 	return payload, strings.TrimSpace(fmtp), true, nil
+}
+
+func parseVoiceSDPDirectionLine(line string) (string, bool, error) {
+	trimmed := strings.ToLower(strings.TrimSpace(line))
+	if !strings.HasPrefix(trimmed, "a=") {
+		return "", false, nil
+	}
+	switch trimmed {
+	case "a=sendrecv":
+		return "sendrecv", true, nil
+	case "a=sendonly":
+		return "sendonly", true, nil
+	case "a=recvonly":
+		return "recvonly", true, nil
+	case "a=inactive":
+		return "inactive", true, nil
+	default:
+		if strings.HasPrefix(trimmed, "a=send") || strings.HasPrefix(trimmed, "a=recv") || trimmed == "a=hold" {
+			return "", true, fmt.Errorf("%w: invalid media direction", ErrInvalidVoiceSDP)
+		}
+		return "", false, nil
+	}
+}
+
+func parseVoiceSDPConnectionLine(line string) (string, bool, error) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "c=IN") {
+		return "", false, nil
+	}
+	if len(fields) < 3 || (!strings.EqualFold(fields[1], "IP4") && !strings.EqualFold(fields[1], "IP6")) {
+		return "", true, fmt.Errorf("%w: invalid connection line", ErrInvalidVoiceSDP)
+	}
+	ip := strings.TrimSpace(fields[2])
+	if net.ParseIP(ip) == nil {
+		return "", true, fmt.Errorf("%w: invalid connection address", ErrInvalidVoiceSDP)
+	}
+	return ip, true, nil
+}
+
+func voiceSDPConnectionIPIsUnspecified(value string) bool {
+	ip := net.ParseIP(strings.TrimSpace(value))
+	return ip != nil && ip.IsUnspecified()
+}
+
+func voiceSDPDirectionCapabilities(direction string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(direction)) {
+	case "sendrecv":
+		return true, true
+	case "sendonly":
+		return true, false
+	case "recvonly":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func cutVoiceSDPAttributeValue(line, prefix string) (string, bool) {

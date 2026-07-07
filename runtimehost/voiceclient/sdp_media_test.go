@@ -74,6 +74,58 @@ func TestParseVoiceSDPMediaDefaultsStaticCodecsAndRTCP(t *testing.T) {
 	}
 }
 
+func TestParseVoiceSDPMediaDirectionUsesAudioOverride(t *testing.T) {
+	direction, err := ParseVoiceSDPMediaDirection([]byte("v=0\r\n" +
+		"c=IN IP4 203.0.113.8\r\n" +
+		"a=sendonly\r\n" +
+		"m=audio 49170 RTP/AVP 0\r\n" +
+		"c=IN IP4 198.51.100.44\r\n" +
+		"a=recvonly\r\n"))
+	if err != nil {
+		t.Fatalf("ParseVoiceSDPMediaDirection() error = %v", err)
+	}
+	if direction.Direction != "recvonly" ||
+		direction.SessionDirection != "sendonly" ||
+		direction.AudioDirection != "recvonly" ||
+		direction.SessionConnectionIP != "203.0.113.8" ||
+		direction.AudioConnectionIP != "198.51.100.44" ||
+		direction.EffectiveIP != "198.51.100.44" ||
+		!direction.Held ||
+		direction.Disabled ||
+		direction.CanSend ||
+		!direction.CanReceive {
+		t.Fatalf("direction=%+v", direction)
+	}
+}
+
+func TestParseVoiceSDPMediaDirectionTreatsLegacyHoldAsInactive(t *testing.T) {
+	for _, raw := range []string{
+		"v=0\r\nc=IN IP4 203.0.113.8\r\nm=audio 49170 RTP/AVP 0\r\nc=IN IP4 0.0.0.0\r\na=sendrecv\r\n",
+		"v=0\r\nc=IN IP6 2001:db8::1\r\nm=audio 0 RTP/AVP 0\r\na=sendrecv\r\n",
+	} {
+		direction, err := ParseVoiceSDPMediaDirection([]byte(raw))
+		if err != nil {
+			t.Fatalf("ParseVoiceSDPMediaDirection() error = %v", err)
+		}
+		if direction.Direction != "inactive" || !direction.Held || !direction.Disabled ||
+			direction.CanSend || direction.CanReceive {
+			t.Fatalf("direction=%+v, want inactive held media", direction)
+		}
+	}
+}
+
+func TestParseVoiceSDPMediaDirectionRejectsMalformedDirectionAndConnection(t *testing.T) {
+	for _, raw := range []string{
+		"v=0\r\nm=audio 49170 RTP/AVP 0\r\na=sendmostly\r\n",
+		"v=0\r\nm=audio 49170 RTP/AVP 0\r\nc=IN IP4 not-an-ip\r\n",
+	} {
+		_, err := ParseVoiceSDPMediaDirection([]byte(raw))
+		if !errors.Is(err, ErrInvalidVoiceSDP) {
+			t.Fatalf("ParseVoiceSDPMediaDirection(%q) err=%v, want ErrInvalidVoiceSDP", raw, err)
+		}
+	}
+}
+
 func TestValidateIMSVoiceSDPRejectsMalformedAMR(t *testing.T) {
 	tests := map[string]string{
 		"narrowband clock": "v=0\r\nm=audio 49170 RTP/AVP 96\r\na=rtpmap:96 AMR/16000\r\n",
