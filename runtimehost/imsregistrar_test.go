@@ -658,6 +658,97 @@ func TestWireIMSRegistrarRecoveryBackoffDelaysRepeatedRecover(t *testing.T) {
 	_ = res.Close(closeCtx)
 }
 
+func TestIMSRegistrationRecoveryHonorsRetryAfterOnCurrentPCSCF(t *testing.T) {
+	tests := []struct {
+		name       string
+		retryAfter time.Duration
+		waitOK     bool
+		wantErr    error
+		wantWrites int
+	}{
+		{
+			name:       "waits before retrying same target",
+			retryAfter: 3 * time.Second,
+			waitOK:     true,
+			wantWrites: 1,
+		},
+		{
+			name:       "keeps scheduled retry visible when wait is canceled",
+			retryAfter: 4 * time.Second,
+			waitOK:     false,
+			wantErr:    context.Canceled,
+			wantWrites: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var waits []time.Duration
+			transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{{
+				StatusCode: 200,
+				Reason:     "OK",
+				Headers: map[string][]string{
+					"P-Associated-URI": {"<sip:user@ims.example>"},
+					"Contact":          {"<sip:user@192.0.2.10:5060>;expires=600"},
+				},
+			}}}
+			session := voiceclient.RegisterSession{
+				Transport:    transport,
+				Profile:      voiceclient.IMSProfile{IMPI: "impi@example", IMPU: "sip:user@ims.example", Domain: "ims.example"},
+				RegistrarURI: "sip:ims.example",
+				ContactURI:   "sip:user@192.0.2.10:5060",
+				CallID:       "trace-retry-after",
+				Expires:      600,
+			}
+			m := newIMSRegistrationMaintenance(&voiceclient.WireSIPFlow{Network: "udp", ServerAddr: "127.0.0.1:9"}, session, voiceclient.RegisterResult{
+				Registered: true,
+				StatusCode: 200,
+				Reason:     "OK",
+				Binding: voiceclient.RegistrationBinding{
+					ContactURI:     "sip:user@192.0.2.10:5060",
+					PublicIdentity: "sip:user@ims.example",
+					Expires:        600,
+				},
+				NextCSeq: 2,
+			}, WireIMSRegistrar{
+				DisableRefresh:   true,
+				DisableKeepalive: true,
+			}, IMSRegistrationConfig{}, voiceclient.IMSProfile{Domain: "ims.example"})
+			m.waitFunc = func(ctx context.Context, delay time.Duration) bool {
+				waits = append(waits, delay)
+				return tc.waitOK
+			}
+			defer m.flow.Close()
+
+			err := m.recoverRegistration(context.Background(), errors.New("refresh 503 Service Unavailable"), tc.retryAfter)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("recoverRegistration() err=%v, want %v", err, tc.wantErr)
+			}
+			if len(waits) != 1 || waits[0] != tc.retryAfter {
+				t.Fatalf("waits=%v, want [%v]", waits, tc.retryAfter)
+			}
+			if len(transport.requests) != tc.wantWrites {
+				t.Fatalf("requests=%d %+v, want %d", len(transport.requests), transport.requests, tc.wantWrites)
+			}
+			state := m.result("retry-after recovery").RecoveryState
+			if tc.waitOK {
+				if state.Attempts != 1 || state.LastSwitchedTarget || state.LastSucceededAt.IsZero() || !state.NextAttemptAt.IsZero() {
+					t.Fatalf("successful recovery state=%+v", state)
+				}
+				request := transport.requests[0]
+				if request.Headers["Call-ID"] != "trace-retry-after-recovery-1" ||
+					request.Headers["CSeq"] != "1 REGISTER" ||
+					request.Headers["Expires"] != "600" {
+					t.Fatalf("recovery REGISTER headers=%+v", request.Headers)
+				}
+				return
+			}
+			if state.NextAttemptAt.IsZero() || state.LastReason != "refresh 503 Service Unavailable" {
+				t.Fatalf("canceled recovery state=%+v", state)
+			}
+		})
+	}
+}
+
 func TestWireIMSRegistrarMaintainsDefaultFlowWithCRLFKeepalive(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

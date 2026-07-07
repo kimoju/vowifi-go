@@ -19,6 +19,7 @@ type IMSRegisterTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProf
 type IMSVoiceTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, voiceclient.RegistrationBinding) voiceclient.SIPRequestTransport
 type IMSSMSTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, voiceclient.RegistrationBinding, voiceclient.SIPRequestTransport) messaging.SMSTransport
 type IMSUSSDTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, voiceclient.RegistrationBinding, voiceclient.SIPRequestTransport) messaging.USSDTransport
+type imsRegistrationWaitFunc func(context.Context, time.Duration) bool
 
 type WireIMSRegistrar struct {
 	Transport              voiceclient.SIPRegisterTransport
@@ -300,6 +301,7 @@ type imsRegistrationMaintenance struct {
 	authState      voiceclient.DigestAuthState
 	recoveryCount  int
 	recoveryState  IMSRegistrationRecoveryState
+	waitFunc       imsRegistrationWaitFunc
 	cancel         context.CancelFunc
 	done           chan struct{}
 	wg             sync.WaitGroup
@@ -481,6 +483,9 @@ func (m *imsRegistrationMaintenance) keepaliveLoop(ctx context.Context) {
 }
 
 func (m *imsRegistrationMaintenance) wait(ctx context.Context, delay time.Duration) bool {
+	if m != nil && m.waitFunc != nil {
+		return m.waitFunc(ctx, delay)
+	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -564,6 +569,7 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		return err
 	}
 	if retryAfter > 0 && !switchedTarget {
+		m.scheduleRecoveryRetryAfter(cause, retryAfter)
 		if !m.wait(ctx, retryAfter) {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -621,6 +627,19 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	m.recordRecoverySuccessLocked()
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *imsRegistrationMaintenance) scheduleRecoveryRetryAfter(cause error, delay time.Duration) {
+	if m == nil || delay <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed || !m.registered {
+		return
+	}
+	m.recoveryState.LastReason = strings.TrimSpace(fmt.Sprint(cause))
+	m.recoveryState.NextAttemptAt = time.Now().Add(delay)
 }
 
 func (m *imsRegistrationMaintenance) recordRecoveryFailure(cause, err error) {
