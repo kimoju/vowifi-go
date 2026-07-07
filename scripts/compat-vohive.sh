@@ -19,6 +19,7 @@ Environment:
   VOHIVE_COMPAT_RUN             go test -run pattern
   VOHIVE_COMPAT_BUILD_PACKAGES  optional package list for go build
   VOHIVE_COMPAT_TMPDIR          parent directory for temporary compatibility work
+  VOHIVE_COMPAT_KEEP_TMP=1      keep the temporary compatibility workdir
 USAGE
 }
 
@@ -142,15 +143,30 @@ VOHIVE_COMPAT_PACKAGES="${VOHIVE_COMPAT_PACKAGES:-./internal/vowifihost ./intern
 VOHIVE_COMPAT_RUN="${VOHIVE_COMPAT_RUN:-VoWiFi|RuntimeStart|StartRuntime|Tunnel|MOBIKE|Dataplane|IMS|Voice|USSD|E911|Emergency|Websheet}"
 VOHIVE_COMPAT_BUILD_PACKAGES="${VOHIVE_COMPAT_BUILD_PACKAGES:-}"
 VOHIVE_COMPAT_TMPDIR="${VOHIVE_COMPAT_TMPDIR:-${TMPDIR:-/tmp}}"
+VOHIVE_COMPAT_KEEP_TMP="${VOHIVE_COMPAT_KEEP_TMP:-0}"
 
 mkdir -p "$VOHIVE_COMPAT_TMPDIR"
 tmpdir="$(mktemp -d -p "$VOHIVE_COMPAT_TMPDIR" vowifi-go-vohive-compat-XXXXXX)"
+workdir="$tmpdir/vohive"
 cleanup() {
-	rm -rf "$tmpdir"
+	local status=$?
+	if [[ "$status" -ne 0 ]]; then
+		printf '\ncompat-vohive failed.\n' >&2
+		printf '  VoHive source: %s\n' "$VOHIVE_DIR" >&2
+		printf '  temporary copy: %s\n' "$workdir" >&2
+		printf '  test packages: %s\n' "${VOHIVE_COMPAT_PACKAGES:-<none>}" >&2
+		printf '  test run pattern: %s\n' "${VOHIVE_COMPAT_RUN:-<none>}" >&2
+		printf '  build packages: %s\n' "${VOHIVE_COMPAT_BUILD_PACKAGES:-<none>}" >&2
+		printf 'Set VOHIVE_COMPAT_KEEP_TMP=1 to preserve the temporary workdir for inspection.\n' >&2
+	fi
+	if [[ "$VOHIVE_COMPAT_KEEP_TMP" == "1" ]]; then
+		printf '\n==> preserving temporary compatibility workdir: %s\n' "$tmpdir" >&2
+	else
+		rm -rf "$tmpdir"
+	fi
 }
 trap cleanup EXIT
 
-workdir="$tmpdir/vohive"
 if [[ -d "$VOHIVE_DIR/.git" ]]; then
 	run git clone --quiet --shared "$VOHIVE_DIR" "$workdir"
 else

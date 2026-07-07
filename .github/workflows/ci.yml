@@ -23,6 +23,7 @@ permissions:
 
 env:
   GO_VERSION_FILE: go.mod
+  GOWORK: off
 
 jobs:
   go:
@@ -39,7 +40,9 @@ jobs:
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache: true
-          cache-dependency-path: go.sum
+          cache-dependency-path: |
+            go.mod
+            go.sum
 
       - name: Run local CI entry point
         env:

@@ -31,6 +31,8 @@ jobs:
     name: Old VoHive consumer
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      GOWORK: off
 
     steps:
       - name: Checkout vowifi-go
@@ -43,7 +45,9 @@ jobs:
         with:
           go-version-file: vowifi-go/go.mod
           cache: true
-          cache-dependency-path: vowifi-go/go.sum
+          cache-dependency-path: |
+            vowifi-go/go.mod
+            vowifi-go/go.sum
 
       - name: Checkout VoHive default ref
         if: ${{ inputs.vohive-ref == '' }}
@@ -63,7 +67,8 @@ jobs:
       - name: Run compatibility checks
         env:
           VOHIVE_DIR: ${{ github.workspace }}/vohive
-          GO_BIN: go
+          GO: go
+          GOFMT: gofmt
           VOHIVE_COMPAT_PACKAGES: ${{ inputs.compat-packages }}
           VOHIVE_COMPAT_RUN: ${{ inputs.compat-run }}
           VOHIVE_COMPAT_BUILD_PACKAGES: ${{ inputs.compat-build-packages }}

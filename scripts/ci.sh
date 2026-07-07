@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# CI should validate this module as a standalone checkout unless explicitly
+# pointed at a workspace.
+export GOWORK="${GOWORK:-off}"
+
 find_go() {
 	if [[ -n "${GO_BIN:-}" ]]; then
 		printf '%s\n' "$GO_BIN"
@@ -265,6 +269,7 @@ Usage: scripts/ci.sh [all|version|module-path|privacy|download|fmt|tidy|vet|smok
 Environment:
   GO_BIN               path to go binary when it is not on PATH
   GOFMT_BIN            path to gofmt binary
+  GOWORK               Go workspace mode, default: off for hermetic CI
   CI_MODULE_PATH       expected module path, default: github.com/boa-z/vowifi-go
   CI_LEGACY_MODULE     legacy module path rejected in Go files
   CI_LEGACY_MODULE_BASE legacy owner/base used to build the default legacy path
@@ -291,6 +296,7 @@ fi
 
 printf 'Using Go: %s\n' "$("$GO_BIN" version)"
 printf 'Using gofmt: %s\n' "$GOFMT_BIN"
+printf 'Using GOWORK: %s\n' "$GOWORK"
 
 for task in "${tasks[@]}"; do
 	case "$task" in
