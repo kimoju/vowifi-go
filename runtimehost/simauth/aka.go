@@ -30,6 +30,32 @@ const (
 
 type AKAResult = swusim.AKAResult
 
+type AKAAuthResponseClass string
+
+const (
+	AKAAuthResponseClassUnknown     AKAAuthResponseClass = ""
+	AKAAuthResponseClassSuccess     AKAAuthResponseClass = "success"
+	AKAAuthResponseClassSyncFailure AKAAuthResponseClass = "sync_failure"
+	AKAAuthResponseClassMACFailure  AKAAuthResponseClass = "mac_failure"
+	AKAAuthResponseClassAPDUStatus  AKAAuthResponseClass = "apdu_status"
+	AKAAuthResponseClassMalformed   AKAAuthResponseClass = "malformed"
+)
+
+type AKAAuthResponseInfo struct {
+	Class  AKAAuthResponseClass
+	Status uint16
+	Result AKAResult
+	AUTS   AUTSFields
+}
+
+func (i AKAAuthResponseInfo) Success() bool {
+	return i.Class == AKAAuthResponseClassSuccess
+}
+
+func (i AKAAuthResponseInfo) StatusString() string {
+	return fmt.Sprintf("%04X", i.Status)
+}
+
 type AUTSFields struct {
 	SQNMSXorAK []byte
 	MACS       []byte
@@ -243,6 +269,29 @@ func ParseUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAResult, error) {
 	}
 }
 
+func ClassifyUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAAuthResponseInfo, error) {
+	info := AKAAuthResponseInfo{
+		Class:  AKAAuthResponseClassMalformed,
+		Status: uint16(sw1)<<8 | uint16(sw2),
+	}
+	result, err := ParseUSIMAuthResponse(body, sw1, sw2)
+	info.Result = cloneAKAResult(result)
+	switch {
+	case sw1 != 0x90 || sw2 != 0x00:
+		info.Class = AKAAuthResponseClassAPDUStatus
+	case err == nil:
+		info.Class = AKAAuthResponseClassSuccess
+	case errors.Is(err, swusim.ErrSyncFailure):
+		info.Class = AKAAuthResponseClassSyncFailure
+		if fields, fieldsErr := ParseAUTS(result.AUTS); fieldsErr == nil {
+			info.AUTS = fields
+		}
+	case errors.Is(err, swusim.ErrAuthFailure):
+		info.Class = AKAAuthResponseClassMACFailure
+	}
+	return info, err
+}
+
 func ParseAUTS(auts14 []byte) (AUTSFields, error) {
 	if len(auts14) != AKAAUTSLength {
 		return AUTSFields{}, fmt.Errorf("AKA AUTS length must be %d bytes: %d", AKAAUTSLength, len(auts14))
@@ -278,6 +327,15 @@ func (a AUTSFields) SQNMS(ak []byte) ([]byte, error) {
 		sqn[i] = a.SQNMSXorAK[i] ^ ak[i]
 	}
 	return sqn, nil
+}
+
+func cloneAKAResult(in AKAResult) AKAResult {
+	return AKAResult{
+		RES:  append([]byte(nil), in.RES...),
+		CK:   append([]byte(nil), in.CK...),
+		IK:   append([]byte(nil), in.IK...),
+		AUTS: append([]byte(nil), in.AUTS...),
+	}
 }
 
 func parseSimpleTLVData(body []byte) ([]byte, error) {

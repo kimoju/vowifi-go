@@ -30,12 +30,30 @@ const (
 	RecoveryActionRefreshIdentity   RecoveryAction = "refresh_identity_source"
 	RecoveryActionRepairAPDU        RecoveryAction = "repair_apdu_exchange"
 	RecoveryActionInspectATError    RecoveryAction = "inspect_at_error"
+	RecoveryActionReconfigurePort   RecoveryAction = "reconfigure_control_port"
 )
 
 const (
 	APDURecoveryNone        APDURecoveryAction = ""
 	APDURecoveryCorrectLe   APDURecoveryAction = "correct_le"
 	APDURecoveryGetResponse APDURecoveryAction = "get_response"
+)
+
+const (
+	ControlPortTypeUnknown = "unknown"
+	ControlPortTypeAT      = "at"
+	ControlPortTypeQMI     = "qmi"
+)
+
+type ControlPortRecoveryMode string
+
+const (
+	ControlPortRecoveryModeNone            ControlPortRecoveryMode = ""
+	ControlPortRecoveryModeRetryLater      ControlPortRecoveryMode = "retry_later"
+	ControlPortRecoveryModeCFUNCycle       ControlPortRecoveryMode = "cfun_cycle"
+	ControlPortRecoveryModeCFUNReset       ControlPortRecoveryMode = "cfun_reset"
+	ControlPortRecoveryModeVendorReset     ControlPortRecoveryMode = "vendor_reset"
+	ControlPortRecoveryModeQCFGReconfigure ControlPortRecoveryMode = "qcfg_reconfigure"
 )
 
 // RecoveryRecommendation describes a non-executing recovery decision.
@@ -46,6 +64,33 @@ type RecoveryRecommendation struct {
 	RetryAfter        time.Duration
 	ATControlPlan     []ATRecoveryStep
 	HardwareAffecting bool
+}
+
+// ControlPortRecoveryInput describes a modem control-port failure to classify.
+type ControlPortRecoveryInput struct {
+	Err          error
+	Attempt      int
+	PortType     string
+	Operation    string
+	IdentityRead bool
+}
+
+// ControlPortRecoveryDecision describes a non-executing modem recovery decision.
+type ControlPortRecoveryDecision struct {
+	Class                  RecoveryClass
+	Action                 RecoveryAction
+	Mode                   ControlPortRecoveryMode
+	Recoverable            bool
+	RetryAfter             time.Duration
+	ATControlPlan          []ATRecoveryStep
+	ATReconfigurePlan      []ATRecoveryStep
+	RestartControlPort     bool
+	ResetModem             bool
+	ReconfigureControlPort bool
+	HardwareAffecting      bool
+	VendorSpecific         bool
+	IdentityReadFailure    bool
+	Reason                 string
 }
 
 type APDURecoveryPlan struct {
@@ -141,6 +186,53 @@ func RecommendRecovery(class RecoveryClass, attempt int) RecoveryRecommendation 
 		rec.Action = RecoveryActionNone
 	}
 	return rec
+}
+
+// ClassifyControlPortRecovery converts modem control-port failures into a
+// bounded recovery decision. It does not execute AT commands.
+func ClassifyControlPortRecovery(input ControlPortRecoveryInput) ControlPortRecoveryDecision {
+	attempt := input.Attempt
+	if attempt < 0 {
+		attempt = 0
+	}
+	class := ClassifyError(input.Err)
+	identityContext := input.IdentityRead || isIdentityReadOperation(input.Operation)
+	identityFailure := isIdentityReadFailure(input.Err) ||
+		(identityContext && input.Err != nil && hasIdentityFailureSignal(recoveryErrorReason(input.Err)))
+	if class == RecoveryClassNone && identityFailure {
+		class = RecoveryClassControlPortHung
+	}
+
+	rec := RecommendRecovery(class, attempt)
+	decision := ControlPortRecoveryDecision{
+		Class:               class,
+		Action:              rec.Action,
+		Recoverable:         rec.Recoverable,
+		RetryAfter:          rec.RetryAfter,
+		ATControlPlan:       cloneATRecoverySteps(rec.ATControlPlan),
+		IdentityReadFailure: identityFailure,
+		Reason:              recoveryErrorReason(input.Err),
+	}
+	decision.Mode = modeForATControlPlan(decision.ATControlPlan)
+	decision.RestartControlPort = len(decision.ATControlPlan) > 0
+	decision.ResetModem = planResetsModem(decision.ATControlPlan)
+	decision.HardwareAffecting = rec.HardwareAffecting
+
+	if class == RecoveryClassSIMBusy {
+		decision.Mode = ControlPortRecoveryModeRetryLater
+	}
+	if shouldSuggestQCFGReconfigure(input, class, attempt, identityFailure) {
+		decision.Action = RecoveryActionReconfigurePort
+		decision.Mode = ControlPortRecoveryModeQCFGReconfigure
+		decision.ATReconfigurePlan = planQCFGControlPortReconfigure()
+		decision.RestartControlPort = true
+		decision.ResetModem = true
+		decision.ReconfigureControlPort = true
+		decision.HardwareAffecting = true
+	}
+	decision.VendorSpecific = planHasVendorSpecific(decision.ATControlPlan) ||
+		planHasVendorSpecific(decision.ATReconfigurePlan)
+	return decision
 }
 
 // PlanATControlRecovery returns a non-executing recovery sequence for a stuck AT control path.
@@ -395,6 +487,29 @@ func needsATControlRecovery(class RecoveryClass) bool {
 	return class == RecoveryClassControlPortHung || class == RecoveryClassATError
 }
 
+func planQCFGControlPortReconfigure() []ATRecoveryStep {
+	return []ATRecoveryStep{
+		{
+			Command:         `AT+QCFG="usbnet"`,
+			Timeout:         5 * time.Second,
+			ContinueOnError: true,
+			VendorSpecific:  true,
+		},
+		{
+			Command:        `AT+QCFG="usbnet",0`,
+			Timeout:        5 * time.Second,
+			DelayAfter:     time.Second,
+			VendorSpecific: true,
+		},
+		{
+			Command:        "AT+CFUN=1,1",
+			Timeout:        10 * time.Second,
+			DelayAfter:     20 * time.Second,
+			VendorSpecific: true,
+		},
+	}
+}
+
 func sleepATRecoveryDelay(ctx context.Context, delay time.Duration) error {
 	if delay <= 0 {
 		return nil
@@ -462,6 +577,142 @@ func classifyErrorText(text string) RecoveryClass {
 	default:
 		return RecoveryClassNone
 	}
+}
+
+func cloneATRecoverySteps(steps []ATRecoveryStep) []ATRecoveryStep {
+	if len(steps) == 0 {
+		return nil
+	}
+	return append([]ATRecoveryStep(nil), steps...)
+}
+
+func modeForATControlPlan(steps []ATRecoveryStep) ControlPortRecoveryMode {
+	if len(steps) == 0 {
+		return ControlPortRecoveryModeNone
+	}
+	for _, step := range steps {
+		switch normalizeATRecoveryCommand(step.Command) {
+		case "AT!RESET":
+			return ControlPortRecoveryModeVendorReset
+		case "AT+CFUN=1,1":
+			return ControlPortRecoveryModeCFUNReset
+		}
+	}
+	return ControlPortRecoveryModeCFUNCycle
+}
+
+func planResetsModem(steps []ATRecoveryStep) bool {
+	for _, step := range steps {
+		switch normalizeATRecoveryCommand(step.Command) {
+		case "AT!RESET", "AT+CFUN=1,1":
+			return true
+		}
+	}
+	return false
+}
+
+func planHasVendorSpecific(steps []ATRecoveryStep) bool {
+	for _, step := range steps {
+		if step.VendorSpecific {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeATRecoveryCommand(command string) string {
+	return strings.ToUpper(strings.TrimSpace(command))
+}
+
+func shouldSuggestQCFGReconfigure(input ControlPortRecoveryInput, class RecoveryClass, attempt int, identityFailure bool) bool {
+	if class != RecoveryClassControlPortHung && class != RecoveryClassATError {
+		return false
+	}
+	if hasQCFGReconfigureSignal(input.Err) {
+		return true
+	}
+	if normalizeControlPortType(input.PortType) != ControlPortTypeQMI {
+		return false
+	}
+	if attempt > 0 {
+		return true
+	}
+	return identityFailure && hasQMIUnavailableSignal(input.Err)
+}
+
+func normalizeControlPortType(portType string) string {
+	switch strings.ToLower(strings.TrimSpace(portType)) {
+	case ControlPortTypeAT, "serial", "tty":
+		return ControlPortTypeAT
+	case ControlPortTypeQMI, "qmi_uim", "uim", "cdc-wdm", "wwan":
+		return ControlPortTypeQMI
+	default:
+		return ControlPortTypeUnknown
+	}
+}
+
+func isIdentityReadOperation(operation string) bool {
+	s := strings.ToLower(strings.TrimSpace(operation))
+	s = strings.ReplaceAll(s, "-", "_")
+	return strings.Contains(s, "identity") ||
+		strings.Contains(s, "imei") ||
+		strings.Contains(s, "imsi") ||
+		strings.Contains(s, "isim") ||
+		strings.Contains(s, "cimi") ||
+		strings.Contains(s, "cgsn")
+}
+
+func isIdentityReadFailure(err error) bool {
+	s := strings.ToLower(recoveryErrorReason(err))
+	if s == "" {
+		return false
+	}
+	hasIdentity := strings.Contains(s, "identity") ||
+		strings.Contains(s, "imei") ||
+		strings.Contains(s, "imsi") ||
+		strings.Contains(s, "cimi") ||
+		strings.Contains(s, "cgsn")
+	return hasIdentity && hasIdentityFailureSignal(s)
+}
+
+func hasIdentityFailureSignal(text string) bool {
+	s := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(s, "parse") ||
+		strings.Contains(s, "empty") ||
+		strings.Contains(s, "invalid") ||
+		strings.Contains(s, "unavailable") ||
+		strings.Contains(s, "failed") ||
+		strings.Contains(s, "failure") ||
+		strings.Contains(s, "no response") ||
+		strings.Contains(s, "timeout") ||
+		strings.Contains(s, "timed out")
+}
+
+func hasQCFGReconfigureSignal(err error) bool {
+	s := strings.ToLower(recoveryErrorReason(err))
+	return strings.Contains(s, "qcfg") ||
+		strings.Contains(s, "usbnet") ||
+		strings.Contains(s, "composition")
+}
+
+func hasQMIUnavailableSignal(err error) bool {
+	s := strings.ToLower(recoveryErrorReason(err))
+	if !strings.Contains(s, "qmi") && !strings.Contains(s, "cdc-wdm") {
+		return false
+	}
+	return strings.Contains(s, "unavailable") ||
+		strings.Contains(s, "not found") ||
+		strings.Contains(s, "no such device") ||
+		strings.Contains(s, "endpoint") ||
+		strings.Contains(s, "client") ||
+		strings.Contains(s, "service")
+}
+
+func recoveryErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.TrimSpace(err.Error())
 }
 
 func isFileNotFoundStatus(sw1, sw2 byte) bool {

@@ -31,6 +31,11 @@ const (
 	AKAAppPreferenceAuto       = "auto"
 	AKAAppPreferenceISIM       = "isim"
 	AKAAppPreferenceISIMStrict = "isim_strict"
+
+	IMSIdentityDomainStatusMatch    = "match"
+	IMSIdentityDomainStatusMissing  = "missing"
+	IMSIdentityDomainStatusUnknown  = "unknown"
+	IMSIdentityDomainStatusMismatch = "mismatch"
 )
 
 type Profile struct {
@@ -58,6 +63,14 @@ type IMSIdentityResolution struct {
 	FallbackUsed     bool
 	FallbackReason   string
 	RecoveryClass    simtransport.RecoveryClass
+}
+
+type IMSIdentityDomainValidation struct {
+	Domain        string
+	Status        string
+	MatchedDomain string
+	MatchedRole   string
+	Candidates    []carrier.IMSIdentityDomainCandidate
 }
 
 type EffectiveCarrier struct {
@@ -260,6 +273,33 @@ func ExtractIMEI(value string) string {
 	return ""
 }
 
+func ValidateIMSIdentityDomain(domain string, network carrier.NetworkConfig, mcc, mnc string) IMSIdentityDomainValidation {
+	normalized := normalizeIdentityDomain(domain)
+	candidates := carrier.IMSIdentityDomainCandidates(network, mcc, mnc)
+	result := IMSIdentityDomainValidation{
+		Domain:     normalized,
+		Status:     IMSIdentityDomainStatusMismatch,
+		Candidates: append([]carrier.IMSIdentityDomainCandidate(nil), candidates...),
+	}
+	if normalized == "" {
+		result.Status = IMSIdentityDomainStatusMissing
+		return result
+	}
+	if len(candidates) == 0 {
+		result.Status = IMSIdentityDomainStatusUnknown
+		return result
+	}
+	for _, candidate := range candidates {
+		if strings.EqualFold(normalized, candidate.Domain) {
+			result.Status = IMSIdentityDomainStatusMatch
+			result.MatchedDomain = candidate.Domain
+			result.MatchedRole = candidate.Role
+			return result
+		}
+	}
+	return result
+}
+
 func prepareProfile(p Profile) (Profile, []FallbackMetadata, error) {
 	profile := Profile{
 		IMSI: strings.TrimSpace(p.IMSI),
@@ -331,6 +371,11 @@ func normalizeMNC(mnc string) string {
 		return ""
 	}
 	return mnc
+}
+
+func normalizeIdentityDomain(domain string) string {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	return strings.TrimSuffix(domain, ".")
 }
 
 func plmnFromIMSI(imsi string) (string, string) {

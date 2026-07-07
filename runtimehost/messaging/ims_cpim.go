@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
 	"mime/quotedprintable"
 	"net/textproto"
 	"sort"
@@ -86,6 +87,16 @@ func ParseIMSCPIMMessage(body []byte) (IMSCPIMMessage, error) {
 	content, _, err = decodeIMSContentTransferEncoding(contentHeaders, content)
 	if err != nil {
 		return IMSCPIMMessage{}, fmt.Errorf("CPIM content: %w", err)
+	}
+	if strings.HasPrefix(contentType, "multipart/") {
+		selectedHeaders, selectedType, selectedTypeParams, selectedBody, err := selectIMSCPIMMultipartContent(contentTypeParams, content)
+		if err != nil {
+			return IMSCPIMMessage{}, fmt.Errorf("CPIM content: %w", err)
+		}
+		contentHeaders = selectedHeaders
+		contentType = selectedType
+		contentTypeParams = selectedTypeParams
+		content = selectedBody
 	}
 	return IMSCPIMMessage{
 		Headers:           messageHeaders,
@@ -646,6 +657,115 @@ func decodeIMSBase64Content(body []byte) ([]byte, error) {
 		return decoded, nil
 	}
 	return nil, err
+}
+
+type imsCPIMMultipartPart struct {
+	Headers           map[string][]string
+	ContentType       string
+	ContentTypeParams map[string]string
+	Body              []byte
+}
+
+func selectIMSCPIMMultipartContent(contentTypeParams map[string]string, body []byte) (map[string][]string, string, map[string]string, []byte, error) {
+	boundary := strings.TrimSpace(contentTypeParams["boundary"])
+	if boundary == "" {
+		return nil, "", nil, nil, errors.New("CPIM content multipart boundary is empty")
+	}
+	parts, err := readIMSCPIMMultipartLeafParts(body, boundary, 0)
+	if err != nil {
+		return nil, "", nil, nil, err
+	}
+	for _, priority := range imsCPIMMultipartContentPriorities() {
+		for _, part := range parts {
+			if part.ContentType != priority {
+				continue
+			}
+			body, _, err := decodeIMSContentTransferEncoding(part.Headers, part.Body)
+			if err != nil {
+				return nil, "", nil, nil, err
+			}
+			return part.Headers, part.ContentType, part.ContentTypeParams, append([]byte(nil), body...), nil
+		}
+	}
+	return nil, "", nil, nil, errors.New("CPIM content multipart has no supported parts")
+}
+
+func readIMSCPIMMultipartLeafParts(body []byte, boundary string, depth int) ([]imsCPIMMultipartPart, error) {
+	if depth > imsMultipartMaxDepth {
+		return nil, fmt.Errorf("CPIM content multipart nesting exceeds %d levels", imsMultipartMaxDepth)
+	}
+	parts, err := readIMSCPIMMultipartParts(body, boundary)
+	if err != nil {
+		return nil, err
+	}
+	var out []imsCPIMMultipartPart
+	for _, part := range parts {
+		if strings.HasPrefix(part.ContentType, "multipart/") {
+			boundary := strings.TrimSpace(part.ContentTypeParams["boundary"])
+			if boundary == "" {
+				return nil, errors.New("CPIM content multipart boundary is empty")
+			}
+			body, _, err := decodeIMSContentTransferEncoding(part.Headers, part.Body)
+			if err != nil {
+				return nil, err
+			}
+			nested, err := readIMSCPIMMultipartLeafParts(body, boundary, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, nested...)
+			continue
+		}
+		out = append(out, part)
+	}
+	return out, nil
+}
+
+func readIMSCPIMMultipartParts(body []byte, boundary string) ([]imsCPIMMultipartPart, error) {
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	var parts []imsCPIMMultipartPart
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		partBody, err := io.ReadAll(part)
+		_ = part.Close()
+		if err != nil {
+			return nil, err
+		}
+		headers := mapFromMIMEHeader(part.Header)
+		rawContentType := textproto.MIMEHeader(part.Header).Get("Content-Type")
+		if strings.TrimSpace(rawContentType) == "" {
+			rawContentType = "text/plain"
+			setCPIMHeader(headers, "Content-Type", rawContentType)
+		}
+		contentType, contentTypeParams := parseIMSMessageContentType(rawContentType)
+		if contentType == "" {
+			contentType = "text/plain"
+		}
+		parts = append(parts, imsCPIMMultipartPart{
+			Headers:           headers,
+			ContentType:       contentType,
+			ContentTypeParams: contentTypeParams,
+			Body:              partBody,
+		})
+	}
+	if len(parts) == 0 {
+		return nil, errors.New("CPIM content multipart has no parts")
+	}
+	return parts, nil
+}
+
+func imsCPIMMultipartContentPriorities() []string {
+	return []string{
+		IMS3GPPSMSContentType,
+		imsIMDNContentType,
+		"text/plain",
+	}
 }
 
 func cloneCPIMHeaders(headers map[string][]string) map[string][]string {

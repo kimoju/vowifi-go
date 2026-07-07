@@ -501,6 +501,72 @@ const (
 	sipFailureTransport
 )
 
+// SIPRecoveryPlan describes how an IMS client should recover after a SIP failure.
+type SIPRecoveryPlan struct {
+	Method                string
+	StatusCode            int
+	RetryAfter            time.Duration
+	RetryAfterPresent     bool
+	Recoverable           bool
+	TargetFailover        bool
+	RegistrationRefresh   bool
+	RegistrationRequired  bool
+	AuthenticationRefresh bool
+	TransportFailure      bool
+	TimedOut              bool
+	FinalResponseTimeout  bool
+}
+
+// SIPResponseRecoveryPlan classifies a final SIP response for IMS retry handling.
+func SIPResponseRecoveryPlan(method string, resp SIPResponse) SIPRecoveryPlan {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	failure := sipTransactionFailureFor(method, resp, nil)
+	scope := sipRecoveryDialog
+	if strings.EqualFold(method, "REGISTER") {
+		scope = sipRecoveryRegister
+	}
+	recovery := sipResponseFailureRecovery(scope, resp.StatusCode)
+	plan := SIPRecoveryPlan{
+		Method:               failure.Method,
+		StatusCode:           failure.StatusCode,
+		RetryAfter:           failure.RetryAfter,
+		RetryAfterPresent:    failure.RetryAfterPresent,
+		Recoverable:          recovery.Recoverable,
+		TargetFailover:       recovery.TargetFailover,
+		TimedOut:             failure.TimedOut,
+		FinalResponseTimeout: failure.FinalResponseTimeout,
+	}
+	switch resp.StatusCode {
+	case 401, 407:
+		plan.AuthenticationRefresh = true
+	case 423:
+		plan.RegistrationRefresh = strings.EqualFold(method, "REGISTER")
+	case 408, 430, 480, 500, 502, 503, 504, 580:
+		plan.RegistrationRequired = !strings.EqualFold(method, "REGISTER")
+	default:
+		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			plan.RegistrationRequired = !strings.EqualFold(method, "REGISTER")
+		}
+	}
+	return plan
+}
+
+// SIPTransportRecoveryPlan classifies transport errors for IMS retry handling.
+func SIPTransportRecoveryPlan(method string, err error) SIPRecoveryPlan {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	failure := sipTransactionFailureFor(method, SIPResponse{}, err)
+	recovery := sipTransportFailureRecovery(err)
+	return SIPRecoveryPlan{
+		Method:               failure.Method,
+		Recoverable:          recovery.Recoverable,
+		TargetFailover:       recovery.TargetFailover,
+		RegistrationRequired: recovery.Recoverable && !strings.EqualFold(method, "REGISTER"),
+		TransportFailure:     err != nil,
+		TimedOut:             failure.TimedOut,
+		FinalResponseTimeout: failure.FinalResponseTimeout,
+	}
+}
+
 type sipRecoveryScope int
 
 const (

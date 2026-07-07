@@ -831,6 +831,28 @@ func TestIMSInboundWireServerRejectsUnsupportedRequireOptions(t *testing.T) {
 	}
 }
 
+func TestClassifyIMSInboundRequireOptions(t *testing.T) {
+	classification := ClassifyIMSInboundRequireOptions(map[string][]string{
+		"Require": {
+			" 100rel, unknown-feature, timer ",
+			"UNKNOWN-FEATURE, norefersub, outbound, another-feature, 100REL",
+		},
+		"Supported": {"path"},
+	})
+	if got := strings.Join(classification.Required, ", "); got != "100rel, unknown-feature, timer, norefersub, outbound, another-feature" {
+		t.Fatalf("Required=%q", got)
+	}
+	if got := strings.Join(classification.Supported, ", "); got != "100rel, timer, norefersub, outbound" {
+		t.Fatalf("Supported=%q", got)
+	}
+	if got := strings.Join(classification.Unsupported, ", "); got != "unknown-feature, another-feature" {
+		t.Fatalf("Unsupported=%q", got)
+	}
+	if got := classification.UnsupportedHeader(); got != "unknown-feature, another-feature" {
+		t.Fatalf("UnsupportedHeader()=%q", got)
+	}
+}
+
 func TestIMSInboundWireServerAllowsSupportedRequireOptions(t *testing.T) {
 	var handled IMSMessageRequest
 	server := &IMSInboundWireServer{

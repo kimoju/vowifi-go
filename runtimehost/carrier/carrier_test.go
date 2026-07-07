@@ -322,6 +322,29 @@ func TestLoadCarrierOverridesNormalizesAccessProfileMetadata(t *testing.T) {
 	}
 }
 
+func TestIMSIdentityDomainCandidatesNormalizeAndDeriveDefaults(t *testing.T) {
+	candidates := IMSIdentityDomainCandidates(NetworkConfig{
+		IMSRealm:             " IMS.EXAMPLE.TEST. ",
+		PrivateIdentityRealm: " PRIVATE.EXAMPLE.TEST. ",
+		EmergencyDomain:      " IMS.EXAMPLE.TEST. ",
+	}, "", "")
+	want := []IMSIdentityDomainCandidate{
+		{Domain: "ims.example.test", Role: IMSIdentityDomainRoleIMSRealm},
+		{Domain: "private.example.test", Role: IMSIdentityDomainRolePrivateIdentityRealm},
+	}
+	if !reflect.DeepEqual(candidates, want) {
+		t.Fatalf("IMSIdentityDomainCandidates(custom)=%+v, want %+v", candidates, want)
+	}
+
+	candidates = IMSIdentityDomainCandidates(NetworkConfig{}, "001", "10")
+	want = []IMSIdentityDomainCandidate{
+		{Domain: "ims.mnc010.mcc001.3gppnetwork.org", Role: IMSIdentityDomainRoleIMSRealm},
+	}
+	if !reflect.DeepEqual(candidates, want) {
+		t.Fatalf("IMSIdentityDomainCandidates(defaults)=%+v, want %+v", candidates, want)
+	}
+}
+
 func TestDeriveIdentitiesUsePrivateIdentityRealm(t *testing.T) {
 	network := NetworkConfig{
 		IMSRealm:             " IMS.EXAMPLE.TEST. ",

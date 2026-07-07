@@ -15,6 +15,15 @@ const (
 	EntitlementRefreshReasonRefreshWindow = "refresh-window"
 )
 
+type EntitlementCacheAction string
+
+const (
+	EntitlementCacheActionNone         EntitlementCacheAction = ""
+	EntitlementCacheActionUseCache     EntitlementCacheAction = "use-cache"
+	EntitlementCacheActionRefresh      EntitlementCacheAction = "refresh"
+	EntitlementCacheActionDeferRefresh EntitlementCacheAction = "defer-refresh"
+)
+
 const (
 	entitlementRefreshReasonNone          = EntitlementRefreshReasonNone
 	entitlementRefreshReasonNoCache       = EntitlementRefreshReasonNoCache
@@ -56,6 +65,25 @@ type EntitlementSnapshot struct {
 	Info                  EntitlementInfo
 	ServiceURNs           []string
 	Routes                []EmergencyRoute
+}
+
+// EntitlementCacheDecision is a protocol-facing cache and retry decision.
+//
+// CanUseCache reports normal local reuse. CanUseStaleOnError is narrower: it
+// applies only after a refresh attempt fails while stale-if-error is active.
+type EntitlementCacheDecision struct {
+	Action                EntitlementCacheAction
+	RefreshReason         string
+	Cached                bool
+	CanUseCache           bool
+	RefreshRequired       bool
+	RefreshNow            bool
+	DeferRefresh          bool
+	NextAttemptAt         time.Time
+	RetryAfter            time.Time
+	RetryAfterDelay       time.Duration
+	CanUseStaleOnError    bool
+	StaleIfErrorExpiresAt time.Time
 }
 
 // NewEntitlementCache returns a zero-state cache with the supplied policy.
@@ -114,6 +142,12 @@ func (c *EntitlementCache) NeedRefresh(now time.Time) bool {
 	return c.Snapshot(now).RefreshRequired
 }
 
+// CacheDecision classifies the current cache state for entitlement refresh orchestration.
+func (c *EntitlementCache) CacheDecision(now time.Time) EntitlementCacheDecision {
+	now = entitlementCacheNow(now)
+	return ClassifyEntitlementCacheDecision(c.Snapshot(now), now)
+}
+
 // Usable reports whether cached entitlement data can still be used locally.
 func (c *EntitlementCache) Usable(now time.Time) bool {
 	return c.Snapshot(now).Usable()
@@ -163,6 +197,46 @@ func (c *EntitlementCache) Reset() {
 // NeedsRefresh reports whether this snapshot should be refreshed.
 func (s EntitlementSnapshot) NeedsRefresh() bool {
 	return s.RefreshRequired
+}
+
+// CacheDecision classifies this snapshot for entitlement refresh orchestration.
+func (s EntitlementSnapshot) CacheDecision(now time.Time) EntitlementCacheDecision {
+	return ClassifyEntitlementCacheDecision(s, now)
+}
+
+// ClassifyEntitlementCacheDecision returns a typed decision for TS.43/E911
+// entitlement cache reuse, refresh, Retry-After backoff, and stale-if-error use.
+func ClassifyEntitlementCacheDecision(snapshot EntitlementSnapshot, now time.Time) EntitlementCacheDecision {
+	now = entitlementCacheNow(now)
+	decision := EntitlementCacheDecision{
+		RefreshReason:         snapshot.RefreshReason,
+		Cached:                snapshot.Cached,
+		CanUseCache:           snapshot.Usable(),
+		RefreshRequired:       snapshot.RefreshRequired,
+		RetryAfter:            snapshot.RetryAfter,
+		CanUseStaleOnError:    snapshot.CanUseStaleOnError(),
+		StaleIfErrorExpiresAt: snapshot.StaleIfErrorExpiresAt,
+	}
+	if decision.RefreshRequired && !snapshot.RetryAfter.IsZero() && now.Before(snapshot.RetryAfter) {
+		decision.Action = EntitlementCacheActionDeferRefresh
+		decision.DeferRefresh = true
+		decision.NextAttemptAt = snapshot.RetryAfter
+		decision.RetryAfterDelay = snapshot.RetryAfter.Sub(now)
+		return decision
+	}
+	if decision.RefreshRequired {
+		decision.Action = EntitlementCacheActionRefresh
+		decision.RefreshNow = true
+		return decision
+	}
+	if decision.CanUseCache {
+		decision.Action = EntitlementCacheActionUseCache
+		return decision
+	}
+	decision.Action = EntitlementCacheActionRefresh
+	decision.RefreshRequired = true
+	decision.RefreshNow = true
+	return decision
 }
 
 // Usable reports whether this snapshot can be reused for local emergency routing.

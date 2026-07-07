@@ -246,6 +246,134 @@ func TestParseIMSCPIMMessageDecodesWrappedBase64ContentTransferEncoding(t *testi
 	}
 }
 
+func TestParseIMSCPIMMessageSelectsMultipartSMSByPriority(t *testing.T) {
+	boundary := "cpim-mixed-boundary"
+	wantBody := []byte{0x00, 0x34, 0x00, 0x05, 0x05, 0x01, 0x80, 0xf6}
+	multipartBody := strings.Join([]string{
+		"--" + boundary,
+		"Content-Type: application/json",
+		"",
+		`{"ignored":true}`,
+		"--" + boundary,
+		"Content-Type: text/plain; charset=UTF-8",
+		"",
+		"fallback text",
+		"--" + boundary,
+		`Content-Type: Application/Vnd.3Gpp.Sms; Charset="UTF-8"`,
+		"Content-ID: <sms-part@ims.test>",
+		"Content-Transfer-Encoding: base64",
+		"",
+		base64.StdEncoding.EncodeToString(wantBody),
+		"--" + boundary + "--",
+		"",
+	}, "\r\n")
+	body, err := BuildIMSCPIMMessageWithHeaders(map[string][]string{
+		"From": {"<sip:alice@example.com>"},
+		"To":   {"<sip:bob@example.com>"},
+	}, map[string][]string{
+		"Content-Type": {`multipart/mixed; boundary="` + boundary + `"`},
+	}, []byte(multipartBody))
+	if err != nil {
+		t.Fatalf("BuildIMSCPIMMessageWithHeaders() error = %v", err)
+	}
+
+	parsed, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v body=%s", err, body)
+	}
+
+	if parsed.ContentType != IMS3GPPSMSContentType {
+		t.Fatalf("ContentType=%q want %q", parsed.ContentType, IMS3GPPSMSContentType)
+	}
+	if got := parsed.ContentTypeParams["charset"]; got != "UTF-8" {
+		t.Fatalf("charset=%q params=%+v", got, parsed.ContentTypeParams)
+	}
+	if !bytes.Equal(parsed.Body, wantBody) {
+		t.Fatalf("Body=%x want %x", parsed.Body, wantBody)
+	}
+	content := textproto.MIMEHeader(parsed.ContentHeaders)
+	if got := content.Get("Content-ID"); got != "<sms-part@ims.test>" {
+		t.Fatalf("Content-ID=%q", got)
+	}
+	if got := content.Get("Content-Type"); got != `Application/Vnd.3Gpp.Sms; Charset="UTF-8"` {
+		t.Fatalf("Content-Type=%q", got)
+	}
+}
+
+func TestParseIMSCPIMMessageSelectsMultipartIMDNBeforeText(t *testing.T) {
+	boundary := "cpim-alternative-boundary"
+	payload := `<imdn><message-id>msg-multipart</message-id></imdn>`
+	multipartBody := strings.Join([]string{
+		"--" + boundary,
+		"Content-Type: text/plain",
+		"",
+		"delivery report fallback",
+		"--" + boundary,
+		"Content-Type: message/imdn+xml; charset=UTF-8",
+		"",
+		payload,
+		"--" + boundary + "--",
+		"",
+	}, "\r\n")
+	body, err := BuildIMSCPIMMessageWithHeaders(map[string][]string{
+		"From": {"<sip:alice@example.com>"},
+	}, map[string][]string{
+		"Content-Type": {`multipart/alternative; boundary="` + boundary + `"`},
+	}, []byte(multipartBody))
+	if err != nil {
+		t.Fatalf("BuildIMSCPIMMessageWithHeaders() error = %v", err)
+	}
+
+	parsed, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	if parsed.ContentType != imsIMDNContentType || string(parsed.Body) != payload {
+		t.Fatalf("parsed contentType=%q body=%q", parsed.ContentType, parsed.Body)
+	}
+	if got := parsed.ContentTypeParams["charset"]; got != "UTF-8" {
+		t.Fatalf("charset=%q params=%+v", got, parsed.ContentTypeParams)
+	}
+}
+
+func TestParseIMSCPIMMessageRejectsMultipartBoundaryErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		body        []byte
+		want        string
+	}{
+		{
+			name:        "missing boundary parameter",
+			contentType: "multipart/mixed",
+			body:        []byte("not multipart"),
+			want:        "multipart boundary is empty",
+		},
+		{
+			name:        "body has no matching boundary",
+			contentType: `multipart/mixed; boundary="expected-boundary"`,
+			body:        []byte("--other-boundary\r\nContent-Type: text/plain\r\n\r\nhello\r\n--other-boundary--\r\n"),
+			want:        "multipart has no parts",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := BuildIMSCPIMMessageWithHeaders(nil, map[string][]string{
+				"Content-Type": {tt.contentType},
+			}, tt.body)
+			if err != nil {
+				t.Fatalf("BuildIMSCPIMMessageWithHeaders() error = %v", err)
+			}
+
+			_, err = ParseIMSCPIMMessage(body)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ParseIMSCPIMMessage() err=%v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseIMSCPIMMessageNormalizesIMDNNamespaceAlias(t *testing.T) {
 	payload := "<imdn><message-id>msg-aliased</message-id></imdn>"
 	body := []byte(strings.Join([]string{

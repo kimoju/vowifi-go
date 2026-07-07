@@ -151,6 +151,35 @@ type SMSStatusReport struct {
 	RawTPDU               []byte
 }
 
+// SMSStatusReportClass groups TP-ST values into the delivery classes defined for
+// SMS-STATUS-REPORT.
+type SMSStatusReportClass string
+
+const (
+	SMSStatusReportClassCompleted         SMSStatusReportClass = "completed"
+	SMSStatusReportClassTemporaryRetrying SMSStatusReportClass = "temporary-retrying"
+	SMSStatusReportClassPermanentFailure  SMSStatusReportClass = "permanent-failure"
+	SMSStatusReportClassTemporaryFailure  SMSStatusReportClass = "temporary-failure"
+	SMSStatusReportClassReserved          SMSStatusReportClass = "reserved"
+)
+
+// SMSStatusReportDisposition describes carrier retry and finality metadata for
+// an SMS-STATUS-REPORT TP-ST value.
+type SMSStatusReportDisposition struct {
+	Status                byte
+	Class                 SMSStatusReportClass
+	State                 string
+	Text                  string
+	Delivered             bool
+	Failed                bool
+	Temporary             bool
+	Permanent             bool
+	ServiceCenterRetrying bool
+	Terminal              bool
+	Retryable             bool
+	Reserved              bool
+}
+
 func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 	number := normalizeSMSNumber(to)
 	if number == "" {
@@ -1660,6 +1689,41 @@ func smsStatusReportState(status byte) string {
 		return "failed"
 	}
 	return "accepted"
+}
+
+func ClassifySMSStatusReport(status byte) SMSStatusReportDisposition {
+	disposition := SMSStatusReportDisposition{
+		Status: status,
+		State:  smsStatusReportState(status),
+		Text:   SMSStatusReportText(status),
+	}
+	switch {
+	case status <= 0x1f:
+		disposition.Class = SMSStatusReportClassCompleted
+		disposition.Delivered = true
+		disposition.Terminal = true
+	case status <= 0x3f:
+		disposition.Class = SMSStatusReportClassTemporaryRetrying
+		disposition.Temporary = true
+		disposition.ServiceCenterRetrying = true
+	case status <= 0x5f:
+		disposition.Class = SMSStatusReportClassPermanentFailure
+		disposition.Failed = true
+		disposition.Permanent = true
+		disposition.Terminal = true
+	case status <= 0x7f:
+		disposition.Class = SMSStatusReportClassTemporaryFailure
+		disposition.Failed = true
+		disposition.Temporary = true
+		disposition.Terminal = true
+		disposition.Retryable = true
+	default:
+		disposition.Class = SMSStatusReportClassReserved
+		disposition.Failed = true
+		disposition.Terminal = true
+		disposition.Reserved = true
+	}
+	return disposition
 }
 
 func SMSStatusReportText(status byte) string {

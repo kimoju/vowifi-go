@@ -48,6 +48,86 @@ func TestParseAndSelectSDPRTCPFeedbackAttributes(t *testing.T) {
 	}
 }
 
+func TestBuildSDPRTCPFeedbackPolicyClassifiesWildcardAndPayloadFeedback(t *testing.T) {
+	raw := []byte("v=0\r\n" +
+		"m=audio 49170 RTP/SAVPF 96 97\r\n" +
+		"a=rtcp-fb:* nack pli\r\n" +
+		"a=rtcp-fb:* ccm fir\r\n" +
+		"a=rtcp-fb:96 transport-cc\r\n" +
+		"a=rtcp-fb:97 nack\r\n" +
+		"a=rtcp-fb:97 goog-remb\r\n" +
+		"a=rtcp-fb:97 nack rpsi\r\n" +
+		"a=rtcp-fb:97 nack sli\r\n")
+	attrs, err := ParseSDPRTCPFeedbackAttributes(raw)
+	if err != nil {
+		t.Fatalf("ParseSDPRTCPFeedbackAttributes() error = %v", err)
+	}
+
+	policy96 := BuildSDPRTCPFeedbackPolicy(attrs, 96)
+	if policy96.Payload != 96 ||
+		!policy96.Allows(RTCPFeedbackPictureLossIndication) ||
+		!policy96.Allows(RTCPFeedbackFullIntraRequest) ||
+		!policy96.Allows(RTCPFeedbackTransportLayerCongestionControl) ||
+		policy96.Allows(RTCPFeedbackTransportLayerNack) ||
+		policy96.Allows(RTCPFeedbackReceiverEstimatedMaximumBitrate) ||
+		policy96.Allows(RTCPFeedbackSliceLossIndication) {
+		t.Fatalf("policy96=%+v", policy96)
+	}
+
+	policy97 := BuildSDPRTCPFeedbackPolicy(attrs, 97)
+	if policy97.Payload != 97 ||
+		!policy97.Allows(RTCPFeedbackPictureLossIndication) ||
+		!policy97.Allows(RTCPFeedbackFullIntraRequest) ||
+		!policy97.Allows(RTCPFeedbackTransportLayerNack) ||
+		!policy97.Allows(RTCPFeedbackReceiverEstimatedMaximumBitrate) ||
+		!policy97.Allows(RTCPFeedbackSliceLossIndication) ||
+		policy97.Allows(RTCPFeedbackTransportLayerCongestionControl) ||
+		policy97.Allows(RTCPFeedbackRapidResynchronizationRequest) ||
+		policy97.Allows(RTCPFeedbackUnknown) {
+		t.Fatalf("policy97=%+v", policy97)
+	}
+}
+
+func TestSelectSDPRTCPFeedbackAnswerNegotiatesPolicy(t *testing.T) {
+	offer := []SDPRTCPFeedbackAttribute{
+		{Payload: "*", Type: "nack", Parameter: "pli"},
+		{Payload: "*", Type: "ccm", Parameter: "fir"},
+		{Payload: "96", Type: "transport-cc"},
+		{Payload: "97", Type: "nack"},
+	}
+	local := []SDPRTCPFeedbackAttribute{
+		{Payload: "*", Type: "nack", Parameter: "pli"},
+		{Payload: "*", Type: "ccm", Parameter: "fir"},
+		{Payload: "*", Type: "transport-cc"},
+	}
+
+	selected := SelectSDPRTCPFeedbackAnswer(offer, local, []int{96, 97})
+	if len(selected) != 3 {
+		t.Fatalf("selected=%+v", selected)
+	}
+	if selected[0].Payload != "*" || selected[0].RTCPFeedbackKind() != RTCPFeedbackPictureLossIndication ||
+		selected[1].Payload != "*" || selected[1].RTCPFeedbackKind() != RTCPFeedbackFullIntraRequest ||
+		selected[2].Payload != "96" || selected[2].RTCPFeedbackKind() != RTCPFeedbackTransportLayerCongestionControl {
+		t.Fatalf("selected=%+v", selected)
+	}
+
+	policy96 := BuildSDPRTCPFeedbackPolicy(selected, 96)
+	if !policy96.Allows(RTCPFeedbackPictureLossIndication) ||
+		!policy96.Allows(RTCPFeedbackFullIntraRequest) ||
+		!policy96.Allows(RTCPFeedbackTransportLayerCongestionControl) ||
+		policy96.Allows(RTCPFeedbackTransportLayerNack) {
+		t.Fatalf("policy96=%+v", policy96)
+	}
+
+	policy97 := BuildSDPRTCPFeedbackPolicy(selected, 97)
+	if !policy97.Allows(RTCPFeedbackPictureLossIndication) ||
+		!policy97.Allows(RTCPFeedbackFullIntraRequest) ||
+		policy97.Allows(RTCPFeedbackTransportLayerCongestionControl) ||
+		policy97.Allows(RTCPFeedbackTransportLayerNack) {
+		t.Fatalf("policy97=%+v", policy97)
+	}
+}
+
 func TestRewriteSDPRTCPFeedbackReplacesOnlyAudioFeedback(t *testing.T) {
 	body := []byte("v=0\r\n" +
 		"c=IN IP4 203.0.113.8\r\n" +

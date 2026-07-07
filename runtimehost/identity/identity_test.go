@@ -440,6 +440,52 @@ func TestExtractIMEIIgnoresNonIMEIDeviceID(t *testing.T) {
 	}
 }
 
+func TestValidateIMSIdentityDomainClassifiesCarrierDomains(t *testing.T) {
+	network := carrier.NetworkConfig{
+		IMSRealm:             " IMS.EXAMPLE.TEST. ",
+		PrivateIdentityRealm: " PRIVATE.EXAMPLE.TEST. ",
+		EmergencyDomain:      " SOS.EXAMPLE.TEST. ",
+	}
+	result := ValidateIMSIdentityDomain(" private.example.test. ", network, "", "")
+	if result.Status != IMSIdentityDomainStatusMatch ||
+		result.Domain != "private.example.test" ||
+		result.MatchedDomain != "private.example.test" ||
+		result.MatchedRole != carrier.IMSIdentityDomainRolePrivateIdentityRealm {
+		t.Fatalf("ValidateIMSIdentityDomain(match)=%+v", result)
+	}
+	if want := []carrier.IMSIdentityDomainCandidate{
+		{Domain: "ims.example.test", Role: carrier.IMSIdentityDomainRoleIMSRealm},
+		{Domain: "private.example.test", Role: carrier.IMSIdentityDomainRolePrivateIdentityRealm},
+		{Domain: "sos.example.test", Role: carrier.IMSIdentityDomainRoleEmergencyDomain},
+	}; !reflect.DeepEqual(result.Candidates, want) {
+		t.Fatalf("Candidates=%+v, want %+v", result.Candidates, want)
+	}
+
+	result = ValidateIMSIdentityDomain("visited.example.test", network, "", "")
+	if result.Status != IMSIdentityDomainStatusMismatch || result.MatchedDomain != "" || result.MatchedRole != "" {
+		t.Fatalf("ValidateIMSIdentityDomain(mismatch)=%+v", result)
+	}
+
+	result = ValidateIMSIdentityDomain(" ", network, "", "")
+	if result.Status != IMSIdentityDomainStatusMissing || result.Domain != "" {
+		t.Fatalf("ValidateIMSIdentityDomain(missing)=%+v", result)
+	}
+}
+
+func TestValidateIMSIdentityDomainUsesPLMNDerivedDefaults(t *testing.T) {
+	result := ValidateIMSIdentityDomain("IMS.MNC010.MCC001.3GPPNETWORK.ORG.", carrier.NetworkConfig{}, "001", "10")
+	if result.Status != IMSIdentityDomainStatusMatch ||
+		result.MatchedDomain != "ims.mnc010.mcc001.3gppnetwork.org" ||
+		result.MatchedRole != carrier.IMSIdentityDomainRoleIMSRealm {
+		t.Fatalf("ValidateIMSIdentityDomain(default match)=%+v", result)
+	}
+
+	result = ValidateIMSIdentityDomain("ims.example.test", carrier.NetworkConfig{}, "", "")
+	if result.Status != IMSIdentityDomainStatusUnknown || len(result.Candidates) != 0 {
+		t.Fatalf("ValidateIMSIdentityDomain(unknown)=%+v", result)
+	}
+}
+
 func fallbackByField(fallbacks []FallbackMetadata, field string) (FallbackMetadata, bool) {
 	for _, meta := range fallbacks {
 		if meta.Field == field {

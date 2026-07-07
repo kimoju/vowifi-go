@@ -93,6 +93,16 @@ type SDPRTCPFeedbackAttribute struct {
 	Parameter string
 }
 
+type SDPRTCPFeedbackPolicy struct {
+	Payload                         int
+	TransportLayerNack              bool
+	PictureLossIndication           bool
+	FullIntraRequest                bool
+	ReceiverEstimatedMaximumBitrate bool
+	TransportLayerCongestionControl bool
+	SliceLossIndication             bool
+}
+
 func InspectRTCPFeedback(direction RTCPFeedbackDirection, packet []byte, handler RTCPFeedbackHandler) (RTCPFeedbackSummary, error) {
 	var summary RTCPFeedbackSummary
 	packets, err := rtcp.Unmarshal(packet)
@@ -143,6 +153,88 @@ func (a SDPRTCPFeedbackAttribute) SDPValue() string {
 		value += " " + parameter
 	}
 	return value
+}
+
+func (a SDPRTCPFeedbackAttribute) AppliesToPayload(payload int) bool {
+	if a.SDPValue() == "" {
+		return false
+	}
+	return sdpRTCPFeedbackPayloadAllowed(a.Payload, []int{payload})
+}
+
+func (a SDPRTCPFeedbackAttribute) RTCPFeedbackKind() RTCPFeedbackKind {
+	if a.SDPValue() == "" {
+		return RTCPFeedbackUnknown
+	}
+	feedbackType := strings.ToLower(strings.TrimSpace(a.Type))
+	parameter := strings.ToLower(strings.TrimSpace(a.Parameter))
+	switch feedbackType {
+	case "nack":
+		switch parameter {
+		case "":
+			return RTCPFeedbackTransportLayerNack
+		case "pli":
+			return RTCPFeedbackPictureLossIndication
+		case "sli":
+			return RTCPFeedbackSliceLossIndication
+		}
+	case "ccm":
+		if parameter == "fir" {
+			return RTCPFeedbackFullIntraRequest
+		}
+	case "goog-remb":
+		if parameter == "" {
+			return RTCPFeedbackReceiverEstimatedMaximumBitrate
+		}
+	case "transport-cc":
+		if parameter == "" {
+			return RTCPFeedbackTransportLayerCongestionControl
+		}
+	}
+	return RTCPFeedbackUnknown
+}
+
+func BuildSDPRTCPFeedbackPolicy(attrs []SDPRTCPFeedbackAttribute, payload int) SDPRTCPFeedbackPolicy {
+	policy := SDPRTCPFeedbackPolicy{Payload: payload}
+	for _, attr := range attrs {
+		if !attr.AppliesToPayload(payload) {
+			continue
+		}
+		switch attr.RTCPFeedbackKind() {
+		case RTCPFeedbackTransportLayerNack:
+			policy.TransportLayerNack = true
+		case RTCPFeedbackPictureLossIndication:
+			policy.PictureLossIndication = true
+		case RTCPFeedbackFullIntraRequest:
+			policy.FullIntraRequest = true
+		case RTCPFeedbackReceiverEstimatedMaximumBitrate:
+			policy.ReceiverEstimatedMaximumBitrate = true
+		case RTCPFeedbackTransportLayerCongestionControl:
+			policy.TransportLayerCongestionControl = true
+		case RTCPFeedbackSliceLossIndication:
+			policy.SliceLossIndication = true
+		}
+	}
+	return policy
+}
+
+func (p SDPRTCPFeedbackPolicy) Allows(kind RTCPFeedbackKind) bool {
+	switch kind {
+	case RTCPFeedbackTransportLayerNack:
+		return p.TransportLayerNack
+	case RTCPFeedbackPictureLossIndication:
+		return p.PictureLossIndication
+	case RTCPFeedbackFullIntraRequest:
+		return p.FullIntraRequest
+	case RTCPFeedbackReceiverEstimatedMaximumBitrate:
+		return p.ReceiverEstimatedMaximumBitrate
+	case RTCPFeedbackTransportLayerCongestionControl:
+		return p.TransportLayerCongestionControl
+	case RTCPFeedbackSliceLossIndication:
+		return p.SliceLossIndication
+	default:
+		return false
+	}
 }
 
 func ParseSDPRTCPFeedbackAttributes(body []byte) ([]SDPRTCPFeedbackAttribute, error) {

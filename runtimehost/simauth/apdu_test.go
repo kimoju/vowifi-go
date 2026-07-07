@@ -661,6 +661,55 @@ func TestBuildAndParseUSIMAuth(t *testing.T) {
 	}
 }
 
+func TestClassifyUSIMAuthResponse(t *testing.T) {
+	successBody := append([]byte{0xDB, 0x04, 0x11, 0x22, 0x33, 0x44, 0x10}, bytesFrom(0x01, 16)...)
+	successBody = append(successBody, 0x10)
+	successBody = append(successBody, bytesFrom(0x21, 16)...)
+
+	info, err := ClassifyUSIMAuthResponse(successBody, 0x90, 0x00)
+	if err != nil {
+		t.Fatalf("ClassifyUSIMAuthResponse(success) error = %v", err)
+	}
+	if !info.Success() || info.Class != AKAAuthResponseClassSuccess || info.StatusString() != "9000" {
+		t.Fatalf("success info = %+v, want success/9000", info)
+	}
+	if hex.EncodeToString(info.Result.RES) != "11223344" || len(info.Result.CK) != AKACKLength || len(info.Result.IK) != AKAIKLength {
+		t.Fatalf("success result = %+v", info.Result)
+	}
+
+	auts := bytesFrom(0xA0, AKAAUTSLength)
+	syncBody := append([]byte{0xDC, AKAAUTSLength}, auts...)
+	info, err = ClassifyUSIMAuthResponse(syncBody, 0x90, 0x00)
+	if !errors.Is(err, swusim.ErrSyncFailure) {
+		t.Fatalf("ClassifyUSIMAuthResponse(sync) err=%v, want ErrSyncFailure", err)
+	}
+	if info.Class != AKAAuthResponseClassSyncFailure || info.StatusString() != "9000" {
+		t.Fatalf("sync info = %+v, want sync failure/9000", info)
+	}
+	if got, want := hex.EncodeToString(info.Result.AUTS), hex.EncodeToString(auts); got != want {
+		t.Fatalf("sync AUTS = %s, want %s", got, want)
+	}
+	if hex.EncodeToString(info.AUTS.SQNMSXorAK) != "a0a1a2a3a4a5" ||
+		hex.EncodeToString(info.AUTS.MACS) != "a6a7a8a9aaabacad" {
+		t.Fatalf("sync AUTS fields = %+v", info.AUTS)
+	}
+
+	info, err = ClassifyUSIMAuthResponse([]byte{0xDD, 0x00}, 0x90, 0x00)
+	if !errors.Is(err, swusim.ErrAuthFailure) || info.Class != AKAAuthResponseClassMACFailure {
+		t.Fatalf("MAC failure info=%+v err=%v, want MAC failure", info, err)
+	}
+
+	info, err = ClassifyUSIMAuthResponse(nil, 0x69, 0x85)
+	if err == nil || info.Class != AKAAuthResponseClassAPDUStatus || info.Status != 0x6985 || info.StatusString() != "6985" {
+		t.Fatalf("APDU status info=%+v err=%v, want 6985 status error", info, err)
+	}
+
+	info, err = ClassifyUSIMAuthResponse([]byte{0xDB, 0x02, 0x11, 0x22}, 0x90, 0x00)
+	if err == nil || info.Class != AKAAuthResponseClassMalformed {
+		t.Fatalf("malformed info=%+v err=%v, want malformed", info, err)
+	}
+}
+
 func TestAKAProviderExposesSyncFailureAUTS(t *testing.T) {
 	rand16 := bytesFrom(0x10, 16)
 	autn16 := bytesFrom(0x30, 16)

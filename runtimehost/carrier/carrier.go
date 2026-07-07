@@ -160,6 +160,17 @@ type IMSAccessProfile struct {
 	VisitedNetworkID     string
 }
 
+const (
+	IMSIdentityDomainRoleIMSRealm             = "ims_realm"
+	IMSIdentityDomainRolePrivateIdentityRealm = "private_identity_realm"
+	IMSIdentityDomainRoleEmergencyDomain      = "emergency_domain"
+)
+
+type IMSIdentityDomainCandidate struct {
+	Domain string
+	Role   string
+}
+
 type EffectiveCarrierConfig struct {
 	MCC      string        `json:"mcc"`
 	MNC      string        `json:"mnc"`
@@ -599,6 +610,15 @@ func PCSCFCandidates(network NetworkConfig) []string {
 	return append([]string(nil), network.PCSCFFQDNs...)
 }
 
+func IMSIdentityDomainCandidates(network NetworkConfig, mcc, mnc string) []IMSIdentityDomainCandidate {
+	network = normalizeNetworkConfig(mcc, mnc, network)
+	var out []IMSIdentityDomainCandidate
+	out = appendIMSIdentityDomainCandidate(out, network.IMSRealm, IMSIdentityDomainRoleIMSRealm)
+	out = appendIMSIdentityDomainCandidate(out, network.PrivateIdentityRealm, IMSIdentityDomainRolePrivateIdentityRealm)
+	out = appendIMSIdentityDomainCandidate(out, network.EmergencyDomain, IMSIdentityDomainRoleEmergencyDomain)
+	return out
+}
+
 func stringsFromNetworkJSON(raw json.RawMessage, strict bool) ([]string, error) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || string(raw) == "null" {
@@ -662,6 +682,19 @@ func appendNetworkStrings(out []string, values ...string) []string {
 		}
 	}
 	return out
+}
+
+func appendIMSIdentityDomainCandidate(out []IMSIdentityDomainCandidate, domain, role string) []IMSIdentityDomainCandidate {
+	domain = normalizeDomainName(domain)
+	if domain == "" {
+		return out
+	}
+	for _, existing := range out {
+		if existing.Domain == domain {
+			return out
+		}
+	}
+	return append(out, IMSIdentityDomainCandidate{Domain: domain, Role: role})
 }
 
 func firstNetworkString(values ...string) string {

@@ -259,6 +259,177 @@ func TestRecommendRecoveryForDecisionMetadata(t *testing.T) {
 	}
 }
 
+func TestClassifyControlPortRecovery(t *testing.T) {
+	tests := []struct {
+		name        string
+		in          ControlPortRecoveryInput
+		wantClass   RecoveryClass
+		wantAction  RecoveryAction
+		wantMode    ControlPortRecoveryMode
+		wantControl []ATRecoveryStep
+		wantReconf  []ATRecoveryStep
+		wantRestart bool
+		wantReset   bool
+		wantReconfB bool
+		wantVendor  bool
+		wantIdent   bool
+		wantRetry   time.Duration
+	}{
+		{
+			name: "AT identity parse hang uses CFUN cycle",
+			in: ControlPortRecoveryInput{
+				Err:      errors.New("AT+CGSN: parse IMEI from OK"),
+				PortType: ControlPortTypeAT,
+				Attempt:  0,
+			},
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionATControlRecovery,
+			wantMode:    ControlPortRecoveryModeCFUNCycle,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 0),
+			wantRestart: true,
+			wantIdent:   true,
+		},
+		{
+			name: "second control hang attempt classifies CFUN modem reset",
+			in: ControlPortRecoveryInput{
+				Err:      context.DeadlineExceeded,
+				PortType: "serial",
+				Attempt:  1,
+			},
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionATControlRecovery,
+			wantMode:    ControlPortRecoveryModeCFUNReset,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 1),
+			wantRestart: true,
+			wantReset:   true,
+		},
+		{
+			name: "later control hang attempt classifies vendor reset",
+			in: ControlPortRecoveryInput{
+				Err:      errors.New("control port hung"),
+				PortType: ControlPortTypeAT,
+				Attempt:  2,
+			},
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionATControlRecovery,
+			wantMode:    ControlPortRecoveryModeVendorReset,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 2),
+			wantRestart: true,
+			wantReset:   true,
+			wantVendor:  true,
+		},
+		{
+			name: "QMI identity unavailable suggests QCFG reconfigure",
+			in: ControlPortRecoveryInput{
+				Err:       errors.New("QMI UIM service unavailable while reading IMSI"),
+				PortType:  ControlPortTypeQMI,
+				Operation: "read_imsi",
+				Attempt:   0,
+			},
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionReconfigurePort,
+			wantMode:    ControlPortRecoveryModeQCFGReconfigure,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 0),
+			wantReconf:  planQCFGControlPortReconfigure(),
+			wantRestart: true,
+			wantReset:   true,
+			wantReconfB: true,
+			wantVendor:  true,
+			wantIdent:   true,
+		},
+		{
+			name: "QCFG text forces reconfigure on retry",
+			in: ControlPortRecoveryInput{
+				Err:      errors.New(`control port hang after AT+QCFG="usbnet"`),
+				PortType: ControlPortTypeAT,
+				Attempt:  1,
+			},
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionReconfigurePort,
+			wantMode:    ControlPortRecoveryModeQCFGReconfigure,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 1),
+			wantReconf:  planQCFGControlPortReconfigure(),
+			wantRestart: true,
+			wantReset:   true,
+			wantReconfB: true,
+			wantVendor:  true,
+		},
+		{
+			name: "SIM busy retries later without reset",
+			in: ControlPortRecoveryInput{
+				Err:      errors.New("AT CME ERROR: SIM busy"),
+				PortType: ControlPortTypeAT,
+			},
+			wantClass:  RecoveryClassSIMBusy,
+			wantAction: RecoveryActionRetryLater,
+			wantMode:   ControlPortRecoveryModeRetryLater,
+			wantRetry:  2 * time.Second,
+		},
+		{
+			name: "unknown error has no recovery",
+			in: ControlPortRecoveryInput{
+				Err:      errors.New("permanent profile error"),
+				PortType: ControlPortTypeQMI,
+			},
+			wantClass: RecoveryClassNone,
+		},
+		{
+			name: "identity operation alone does not make permanent error recoverable",
+			in: ControlPortRecoveryInput{
+				Err:       errors.New("permanent profile error"),
+				Operation: "read_imsi",
+				PortType:  ControlPortTypeQMI,
+			},
+			wantClass: RecoveryClassNone,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClassifyControlPortRecovery(tt.in)
+			if got.Class != tt.wantClass ||
+				got.Action != tt.wantAction ||
+				got.Mode != tt.wantMode ||
+				got.RestartControlPort != tt.wantRestart ||
+				got.ResetModem != tt.wantReset ||
+				got.ReconfigureControlPort != tt.wantReconfB ||
+				got.VendorSpecific != tt.wantVendor ||
+				got.IdentityReadFailure != tt.wantIdent ||
+				got.RetryAfter != tt.wantRetry {
+				t.Fatalf("decision = %+v", got)
+			}
+			if got.Recoverable != tt.wantClass.Recoverable() {
+				t.Fatalf("Recoverable = %t, want %t", got.Recoverable, tt.wantClass.Recoverable())
+			}
+			if !reflect.DeepEqual(got.ATControlPlan, tt.wantControl) {
+				t.Fatalf("ATControlPlan = %#v, want %#v", got.ATControlPlan, tt.wantControl)
+			}
+			if !reflect.DeepEqual(got.ATReconfigurePlan, tt.wantReconf) {
+				t.Fatalf("ATReconfigurePlan = %#v, want %#v", got.ATReconfigurePlan, tt.wantReconf)
+			}
+		})
+	}
+}
+
+func TestClassifyControlPortRecoveryClonesPlans(t *testing.T) {
+	decision := ClassifyControlPortRecovery(ControlPortRecoveryInput{
+		Err:     context.DeadlineExceeded,
+		Attempt: 0,
+	})
+	if len(decision.ATControlPlan) == 0 {
+		t.Fatalf("decision=%+v, want AT control plan", decision)
+	}
+	decision.ATControlPlan[0].Command = "changed"
+
+	next := ClassifyControlPortRecovery(ControlPortRecoveryInput{
+		Err:     context.DeadlineExceeded,
+		Attempt: 0,
+	})
+	if next.ATControlPlan[0].Command != "AT+CFUN=0" {
+		t.Fatalf("ATControlPlan was shared: %#v", next.ATControlPlan)
+	}
+}
+
 func TestRunATRecoveryPlanSkipsVendorSpecificByDefault(t *testing.T) {
 	plan := PlanATControlRecovery(RecoveryClassControlPortHung, 2)
 	executor := &recordingATRecoveryExecutor{}

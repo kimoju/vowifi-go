@@ -238,6 +238,80 @@ func TestEntitlementCacheSurfacesRetryAfterAndStaleIfError(t *testing.T) {
 	}
 }
 
+func TestEntitlementCacheDecisionClassifiesReuseRefreshAndBackoff(t *testing.T) {
+	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	cache := NewEntitlementCache(EntitlementCachePolicy{RefreshBefore: time.Minute})
+	cache.Store(EntitlementInfo{
+		Status:      1000,
+		UserData:    "token-1",
+		ServiceURNs: []string{"fire"},
+		CacheMaxAge: 5 * time.Minute,
+	}, base)
+
+	fresh := cache.CacheDecision(base.Add(time.Minute))
+	if fresh.Action != EntitlementCacheActionUseCache || !fresh.CanUseCache || fresh.RefreshNow || fresh.DeferRefresh {
+		t.Fatalf("fresh decision=%+v", fresh)
+	}
+
+	refreshing := cache.CacheDecision(base.Add(4 * time.Minute))
+	if refreshing.Action != EntitlementCacheActionRefresh || !refreshing.RefreshNow || !refreshing.CanUseCache ||
+		refreshing.RefreshReason != EntitlementRefreshReasonRefreshWindow {
+		t.Fatalf("refresh-window decision=%+v", refreshing)
+	}
+
+	cache.Store(EntitlementInfo{
+		Status:       1000,
+		UserData:     "token-2",
+		ExpiresIn:    time.Minute,
+		RetryAfterIn: 3 * time.Minute,
+		StaleIfError: 5 * time.Minute,
+	}, base)
+	deferred := cache.CacheDecision(base.Add(2 * time.Minute))
+	if deferred.Action != EntitlementCacheActionDeferRefresh || !deferred.DeferRefresh || deferred.RefreshNow ||
+		deferred.CanUseCache || !deferred.CanUseStaleOnError {
+		t.Fatalf("deferred decision=%+v", deferred)
+	}
+	if got, want := deferred.NextAttemptAt, base.Add(3*time.Minute); !got.Equal(want) {
+		t.Fatalf("NextAttemptAt=%s, want %s", got, want)
+	}
+	if deferred.RetryAfterDelay != time.Minute {
+		t.Fatalf("RetryAfterDelay=%s, want 1m", deferred.RetryAfterDelay)
+	}
+
+	afterBackoff := cache.CacheDecision(base.Add(3 * time.Minute))
+	if afterBackoff.Action != EntitlementCacheActionRefresh || !afterBackoff.RefreshNow || afterBackoff.DeferRefresh ||
+		!afterBackoff.CanUseStaleOnError {
+		t.Fatalf("after-backoff decision=%+v", afterBackoff)
+	}
+}
+
+func TestEntitlementCacheDecisionClassifiesNoCacheAndFailedRetryAfter(t *testing.T) {
+	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	cache := NewEntitlementCache(EntitlementCachePolicy{})
+
+	empty := cache.CacheDecision(base)
+	if empty.Action != EntitlementCacheActionRefresh || !empty.RefreshNow ||
+		empty.RefreshReason != EntitlementRefreshReasonNoCache || empty.CanUseCache {
+		t.Fatalf("empty decision=%+v", empty)
+	}
+
+	cache.Store(EntitlementInfo{
+		Status:       6004,
+		RetryAfterIn: 2 * time.Minute,
+	}, base)
+	wait := cache.CacheDecision(base.Add(30 * time.Second))
+	if wait.Action != EntitlementCacheActionDeferRefresh || !wait.DeferRefresh || wait.RefreshNow ||
+		wait.RefreshReason != EntitlementRefreshReasonStatus || wait.RetryAfterDelay != 90*time.Second {
+		t.Fatalf("failed wait decision=%+v", wait)
+	}
+
+	retry := cache.CacheDecision(base.Add(2 * time.Minute))
+	if retry.Action != EntitlementCacheActionRefresh || !retry.RefreshNow || retry.DeferRefresh ||
+		retry.CanUseCache || retry.CanUseStaleOnError {
+		t.Fatalf("failed retry decision=%+v", retry)
+	}
+}
+
 func TestEntitlementCacheUsesPolicyDefaultsAndServiceFallback(t *testing.T) {
 	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
 	cache := NewEntitlementCache(EntitlementCachePolicy{

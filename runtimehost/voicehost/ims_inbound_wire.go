@@ -46,6 +46,18 @@ type IMSInboundWireResponse struct {
 	NoResponse bool
 }
 
+// IMSInboundRequireOptionClassification partitions inbound Require option-tags by local support.
+type IMSInboundRequireOptionClassification struct {
+	Required    []string
+	Supported   []string
+	Unsupported []string
+}
+
+// UnsupportedHeader renders unsupported option-tags for a SIP Unsupported response header.
+func (c IMSInboundRequireOptionClassification) UnsupportedHeader() string {
+	return strings.Join(c.Unsupported, ", ")
+}
+
 type imsInboundWireTransaction struct {
 	responses []IMSInboundWireResponse
 	expires   time.Time
@@ -701,6 +713,37 @@ const wireMMTelAcceptContact = `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.i
 
 func wireSupportedOptionsHeader() string {
 	return strings.Join(wireSupportedOptionTags, ", ")
+}
+
+// ClassifyIMSInboundRequireOptions classifies Require option-tags against inbound IMS wire support.
+func ClassifyIMSInboundRequireOptions(headers map[string][]string) IMSInboundRequireOptionClassification {
+	var out IMSInboundRequireOptionClassification
+	seenRequired := make(map[string]struct{})
+	for key, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), "Require") {
+			continue
+		}
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				tag := strings.TrimSpace(part)
+				if tag == "" {
+					continue
+				}
+				lower := strings.ToLower(tag)
+				if _, ok := seenRequired[lower]; ok {
+					continue
+				}
+				seenRequired[lower] = struct{}{}
+				out.Required = append(out.Required, tag)
+				if wireOptionTagSupported(tag) {
+					out.Supported = append(out.Supported, tag)
+				} else {
+					out.Unsupported = append(out.Unsupported, tag)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
@@ -1370,28 +1413,7 @@ func wireMaxForwardsRejection(req voiceclient.SIPIncomingRequest) (int, string, 
 }
 
 func wireUnsupportedRequiredOptions(req voiceclient.SIPIncomingRequest) []string {
-	var unsupported []string
-	seen := make(map[string]struct{})
-	for key, values := range req.Headers {
-		if !strings.EqualFold(key, "Require") {
-			continue
-		}
-		for _, value := range values {
-			for _, part := range strings.Split(value, ",") {
-				tag := strings.TrimSpace(part)
-				if tag == "" || wireOptionTagSupported(tag) {
-					continue
-				}
-				lower := strings.ToLower(tag)
-				if _, ok := seen[lower]; ok {
-					continue
-				}
-				seen[lower] = struct{}{}
-				unsupported = append(unsupported, tag)
-			}
-		}
-	}
-	return unsupported
+	return ClassifyIMSInboundRequireOptions(req.Headers).Unsupported
 }
 
 func wireOptionTagSupported(tag string) bool {

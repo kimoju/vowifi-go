@@ -871,6 +871,92 @@ func TestParseSMSStatusReportTPDUStatesAndText(t *testing.T) {
 	}
 }
 
+func TestClassifySMSStatusReport(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   byte
+		want     SMSStatusReportDisposition
+		wantText string
+	}{
+		{
+			name:   "completed",
+			status: 0x00,
+			want: SMSStatusReportDisposition{
+				Status:    0x00,
+				Class:     SMSStatusReportClassCompleted,
+				State:     "delivered",
+				Delivered: true,
+				Terminal:  true,
+			},
+			wantText: "received by SME",
+		},
+		{
+			name:   "service center retrying",
+			status: 0x22,
+			want: SMSStatusReportDisposition{
+				Status:                0x22,
+				Class:                 SMSStatusReportClassTemporaryRetrying,
+				State:                 "accepted",
+				Temporary:             true,
+				ServiceCenterRetrying: true,
+			},
+			wantText: "still retrying",
+		},
+		{
+			name:   "permanent failure",
+			status: 0x46,
+			want: SMSStatusReportDisposition{
+				Status:    0x46,
+				Class:     SMSStatusReportClassPermanentFailure,
+				State:     "failed",
+				Failed:    true,
+				Permanent: true,
+				Terminal:  true,
+			},
+			wantText: "validity period expired",
+		},
+		{
+			name:   "temporary failure stopped retrying",
+			status: 0x60,
+			want: SMSStatusReportDisposition{
+				Status:    0x60,
+				Class:     SMSStatusReportClassTemporaryFailure,
+				State:     "failed",
+				Failed:    true,
+				Temporary: true,
+				Terminal:  true,
+				Retryable: true,
+			},
+			wantText: "stopped retrying",
+		},
+		{
+			name:   "reserved",
+			status: 0x80,
+			want: SMSStatusReportDisposition{
+				Status:   0x80,
+				Class:    SMSStatusReportClassReserved,
+				State:    "failed",
+				Failed:   true,
+				Terminal: true,
+				Reserved: true,
+			},
+			wantText: "reserved",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClassifySMSStatusReport(tt.status)
+			tt.want.Text = got.Text
+			if got != tt.want {
+				t.Fatalf("ClassifySMSStatusReport(0x%02x)=%+v want %+v", tt.status, got, tt.want)
+			}
+			if !strings.Contains(got.Text, tt.wantText) {
+				t.Fatalf("ClassifySMSStatusReport(0x%02x).Text=%q, want %q", tt.status, got.Text, tt.wantText)
+			}
+		})
+	}
+}
+
 func mustHex(tb testing.TB, s string) []byte {
 	tb.Helper()
 	out, err := hex.DecodeString(s)

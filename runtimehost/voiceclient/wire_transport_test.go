@@ -222,6 +222,102 @@ func TestSIPTransactionFailureForClassifiesTimeoutsAndRetryAfter(t *testing.T) {
 	}
 }
 
+func TestSIPResponseRecoveryPlanClassifiesIMSRecovery(t *testing.T) {
+	tests := []struct {
+		name          string
+		method        string
+		resp          SIPResponse
+		want          SIPRecoveryPlan
+		wantRetry     time.Duration
+		wantRetrySeen bool
+	}{
+		{
+			name:   "register service unavailable fails over with retry after",
+			method: "REGISTER",
+			resp: SIPResponse{
+				StatusCode: 503,
+				Headers:    map[string][]string{"Retry-After": {"11"}},
+			},
+			want: SIPRecoveryPlan{
+				Method:         "REGISTER",
+				StatusCode:     503,
+				Recoverable:    true,
+				TargetFailover: true,
+			},
+			wantRetry:     11 * time.Second,
+			wantRetrySeen: true,
+		},
+		{
+			name:   "dialog service unavailable requires registration recovery",
+			method: "MESSAGE",
+			resp:   SIPResponse{StatusCode: 503, RetryAfter: 7 * time.Second},
+			want: SIPRecoveryPlan{
+				Method:               "MESSAGE",
+				StatusCode:           503,
+				Recoverable:          true,
+				TargetFailover:       true,
+				RegistrationRequired: true,
+			},
+			wantRetry:     7 * time.Second,
+			wantRetrySeen: true,
+		},
+		{
+			name:   "register authentication challenge refreshes credentials",
+			method: "REGISTER",
+			resp:   SIPResponse{StatusCode: 401},
+			want: SIPRecoveryPlan{
+				Method:                "REGISTER",
+				StatusCode:            401,
+				AuthenticationRefresh: true,
+			},
+		},
+		{
+			name:   "register interval too brief refreshes registration",
+			method: "REGISTER",
+			resp:   SIPResponse{StatusCode: 423},
+			want: SIPRecoveryPlan{
+				Method:              "REGISTER",
+				StatusCode:          423,
+				RegistrationRefresh: true,
+			},
+		},
+		{
+			name:   "dialog temporarily unavailable is terminal",
+			method: "INVITE",
+			resp:   SIPResponse{StatusCode: 480},
+			want: SIPRecoveryPlan{
+				Method:               "INVITE",
+				StatusCode:           480,
+				RegistrationRequired: true,
+			},
+		},
+	}
+	for _, tc := range tests {
+		got := SIPResponseRecoveryPlan(tc.method, tc.resp)
+		if got.Method != tc.want.Method || got.StatusCode != tc.want.StatusCode ||
+			got.Recoverable != tc.want.Recoverable || got.TargetFailover != tc.want.TargetFailover ||
+			got.RegistrationRefresh != tc.want.RegistrationRefresh ||
+			got.RegistrationRequired != tc.want.RegistrationRequired ||
+			got.AuthenticationRefresh != tc.want.AuthenticationRefresh ||
+			got.RetryAfter != tc.wantRetry || got.RetryAfterPresent != tc.wantRetrySeen {
+			t.Fatalf("%s plan=%+v", tc.name, got)
+		}
+	}
+}
+
+func TestSIPTransportRecoveryPlanClassifiesTransportFailures(t *testing.T) {
+	got := SIPTransportRecoveryPlan("MESSAGE", sipTestTimeoutError{})
+	if got.Method != "MESSAGE" || !got.TransportFailure || !got.TimedOut ||
+		!got.Recoverable || !got.TargetFailover || !got.RegistrationRequired {
+		t.Fatalf("timeout recovery plan=%+v", got)
+	}
+	got = SIPTransportRecoveryPlan("REGISTER", context.Canceled)
+	if got.Method != "REGISTER" || !got.TransportFailure || got.Recoverable ||
+		got.TargetFailover || got.RegistrationRequired {
+		t.Fatalf("canceled recovery plan=%+v", got)
+	}
+}
+
 func TestSIPTransactionTimerPolicyDefaults(t *testing.T) {
 	invite := DefaultSIPTransactionTimerPolicy(" invite ")
 	if !invite.Invite || invite.Method != "INVITE" ||
