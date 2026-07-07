@@ -101,14 +101,47 @@ func (e *RedactionError) Unwrap() error {
 }
 
 func ParseTranscriptJSON(raw []byte) (Transcript, error) {
-	return decodeTranscriptJSON(json.NewDecoder(bytes.NewReader(raw)))
+	transcript, err := decodeTranscriptJSON(json.NewDecoder(bytes.NewReader(raw)))
+	if err != nil {
+		return Transcript{}, err
+	}
+	if err := ValidateTranscript(transcript); err != nil {
+		return Transcript{}, err
+	}
+	return transcript, nil
 }
 
 func DecodeTranscriptJSON(r io.Reader) (Transcript, error) {
 	if r == nil {
 		return Transcript{}, fmt.Errorf("%w: nil reader", ErrInvalidTranscript)
 	}
-	return decodeTranscriptJSON(json.NewDecoder(r))
+	transcript, err := decodeTranscriptJSON(json.NewDecoder(r))
+	if err != nil {
+		return Transcript{}, err
+	}
+	if err := ValidateTranscript(transcript); err != nil {
+		return Transcript{}, err
+	}
+	return transcript, nil
+}
+
+func ParseAndRedactTranscriptJSON(raw []byte) (Transcript, error) {
+	transcript, err := decodeTranscriptJSON(json.NewDecoder(bytes.NewReader(raw)))
+	if err != nil {
+		return Transcript{}, err
+	}
+	return RedactTranscript(transcript)
+}
+
+func DecodeAndRedactTranscriptJSON(r io.Reader) (Transcript, error) {
+	if r == nil {
+		return Transcript{}, fmt.Errorf("%w: nil reader", ErrInvalidTranscript)
+	}
+	transcript, err := decodeTranscriptJSON(json.NewDecoder(r))
+	if err != nil {
+		return Transcript{}, err
+	}
+	return RedactTranscript(transcript)
 }
 
 func decodeTranscriptJSON(dec *json.Decoder) (Transcript, error) {
@@ -124,13 +157,20 @@ func decodeTranscriptJSON(dec *json.Decoder) (Transcript, error) {
 		}
 		return Transcript{}, fmt.Errorf("%w: trailing JSON value", ErrInvalidTranscript)
 	}
-	if err := ValidateTranscript(transcript); err != nil {
+	if err := ValidateTranscriptStructure(transcript); err != nil {
 		return Transcript{}, err
 	}
 	return transcript, nil
 }
 
 func ValidateTranscript(transcript Transcript) error {
+	if err := ValidateTranscriptStructure(transcript); err != nil {
+		return err
+	}
+	return ValidateTranscriptRedaction(transcript)
+}
+
+func ValidateTranscriptStructure(transcript Transcript) error {
 	if transcript.Schema != TranscriptSchemaVersion {
 		return fmt.Errorf("%w: schema must be %q", ErrInvalidTranscript, TranscriptSchemaVersion)
 	}
@@ -151,7 +191,31 @@ func ValidateTranscript(transcript Transcript) error {
 			return fmt.Errorf("%w: events[%d].wire is required", ErrInvalidTranscript, i)
 		}
 	}
-	return ValidateTranscriptRedaction(transcript)
+	return nil
+}
+
+func RedactTranscript(transcript Transcript) (Transcript, error) {
+	if err := ValidateTranscriptStructure(transcript); err != nil {
+		return Transcript{}, err
+	}
+	redactor := NewRedactor()
+	out := Transcript{
+		Schema: transcript.Schema,
+		Name:   redactor.RedactString(transcript.Name),
+		Events: make([]TranscriptEvent, len(transcript.Events)),
+	}
+	for i, event := range transcript.Events {
+		out.Events[i] = TranscriptEvent{
+			Label:     redactor.RedactString(event.Label),
+			Direction: event.Direction,
+			Transport: event.Transport,
+			Wire:      redactor.RedactString(event.Wire),
+		}
+	}
+	if err := ValidateTranscript(out); err != nil {
+		return Transcript{}, err
+	}
+	return out, nil
 }
 
 func ValidateTranscriptRedaction(transcript Transcript) error {

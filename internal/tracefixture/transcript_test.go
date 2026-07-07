@@ -145,6 +145,90 @@ func TestParseTranscriptJSONRejectsSensitiveFixture(t *testing.T) {
 	}
 }
 
+func TestParseAndRedactTranscriptJSONSanitizesSensitiveFixture(t *testing.T) {
+	raw := marshalTranscript(t, Transcript{
+		Schema: TranscriptSchemaVersion,
+		Name:   "register-001010123456789",
+		Events: []TranscriptEvent{
+			{
+				Label:     "register-001010123456789",
+				Direction: "outbound",
+				Transport: "udp",
+				Wire: strings.Join([]string{
+					"REGISTER sip:ims.example.invalid SIP/2.0",
+					"Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bKfixture1",
+					"From: <sip:001010123456789@ims.example.invalid>;tag=fixture1",
+					"To: <tel:+15550101234>",
+					"Call-ID: fixture-call",
+					"CSeq: 1 REGISTER",
+					`Authorization: Digest username="001010123456789@ims.example.invalid", nonce="secret", response="0123456789abcdef0123456789abcdef"`,
+					"Content-Length: 0",
+					"",
+					"",
+				}, "\r\n"),
+			},
+			{
+				Label:     "challenge-001010123456789",
+				Direction: "inbound",
+				Transport: "udp",
+				Wire: strings.Join([]string{
+					"SIP/2.0 401 Unauthorized",
+					"Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bKfixture1",
+					"From: <sip:001010123456789@ims.example.invalid>;tag=fixture1",
+					"To: <tel:+15550101234>;tag=fixture2",
+					"Call-ID: fixture-call",
+					"CSeq: 1 REGISTER",
+					`WWW-Authenticate: Digest realm="ims.example.invalid", nonce="secret"`,
+					`Security-Server: ipsec-3gpp;alg=hmac-sha-1-96;spi-c=00112233;spi-s=44556677`,
+					"Content-Length: 0",
+					"",
+					"",
+				}, "\r\n"),
+			},
+		},
+	})
+
+	if _, err := ParseTranscriptJSON(raw); !errors.Is(err, ErrSensitiveFixture) {
+		t.Fatalf("ParseTranscriptJSON error = %v, want ErrSensitiveFixture", err)
+	}
+	transcript, err := ParseAndRedactTranscriptJSON(raw)
+	if err != nil {
+		t.Fatalf("ParseAndRedactTranscriptJSON returned error: %v", err)
+	}
+	if err := ValidateTranscript(transcript); err != nil {
+		t.Fatalf("redacted transcript did not validate: %v", err)
+	}
+	joined := transcript.Name + "\n" + transcript.Events[0].Label + "\n" + transcript.Events[0].Wire + "\n" + transcript.Events[1].Label + "\n" + transcript.Events[1].Wire
+	for _, sensitive := range []string{
+		"001010123456789",
+		"+15550101234",
+		"192.0.2.10",
+		"0123456789abcdef0123456789abcdef",
+		`nonce="secret"`,
+		"00112233",
+		"44556677",
+	} {
+		if strings.Contains(joined, sensitive) {
+			t.Fatalf("redacted transcript still contains %q:\n%s", sensitive, joined)
+		}
+	}
+	if strings.Count(joined, "sip:<redacted-sip-user-1>@<redacted-domain-1>.invalid") != 2 {
+		t.Fatalf("shared SIP placeholder was not reused:\n%s", joined)
+	}
+	for _, want := range []string{
+		"Authorization: <redacted>",
+		"WWW-Authenticate: <redacted>",
+		"Security-Server: <redacted>",
+		"<redacted-id-1>",
+		"tel:<redacted-msisdn-1>",
+		"<redacted-ipv4-1>",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("redacted transcript missing %q:\n%s", want, joined)
+		}
+	}
+}
+
 func TestParseTranscriptJSONRejectsInvalidShape(t *testing.T) {
 	tests := []struct {
 		name string
