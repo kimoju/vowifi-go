@@ -862,6 +862,96 @@ func TestRegisterSessionInstallsSecurityPlanBeforeAuthenticatedRegister(t *testi
 	}
 }
 
+func TestRegisterSessionSecurityVerifyExactEchoesRawSecurityServer(t *testing.T) {
+	selectedRaw := `IPSEC-3GPP;Q="0.7";PORT-S="5063";SPI-S="222";PORT-C="5062";SPI-C="111";EALG="NULL";ALG="HMAC-SHA-1-96";note="v,1;quoted";PROT=ESP;MODE=TRANSPORT`
+	fallbackRaw := `ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065;q=0.1`
+	rawSecurityServer := selectedRaw + `,` + fallbackRaw
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce", algorithm=MD5, qop="auth"`},
+				"Security-Server":  {rawSecurityServer},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	installer := &fakeSecurityPlanInstaller{transport: transport}
+	result, err := RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@192.0.2.10:5060",
+		CNonce:       "cnonce",
+		SecurityClients: []SecurityAgreement{{
+			Algorithm:  DefaultSecurityAlgorithm,
+			SPIClient:  7001,
+			SPIServer:  7002,
+			PortClient: 5062,
+			PortServer: 5063,
+		}},
+		SecurityPlanInstaller: installer,
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", result, len(transport.requests))
+	}
+	if got := transport.requests[1].Headers["Security-Verify"]; got != rawSecurityServer {
+		t.Fatalf("Security-Verify=%q, want exact raw %q", got, rawSecurityServer)
+	}
+	if len(installer.calls) != 1 || installer.calls[0].Source != selectedRaw || installer.calls[0].SPIClient != 111 || installer.calls[0].QValue != "0.7" {
+		t.Fatalf("installer calls=%+v, want selected raw %q", installer.calls, selectedRaw)
+	}
+	if len(result.Binding.SecurityVerify) != 1 || result.Binding.SecurityVerify[0] != rawSecurityServer {
+		t.Fatalf("binding SecurityVerify=%q, want raw %q", result.Binding.SecurityVerify, rawSecurityServer)
+	}
+	if len(result.Binding.SecurityServer) != 2 || result.Binding.SecurityAgreement.Raw != selectedRaw || result.Binding.SecurityPlan.Source != selectedRaw {
+		t.Fatalf("binding security=%+v, want selected raw %q", result.Binding, selectedRaw)
+	}
+}
+
+func TestRegisterSessionCompletesSingleSecurityClientProposal(t *testing.T) {
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce", algorithm=MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	result, err := RegisterSession{
+		Transport:      transport,
+		Profile:        IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:   "sip:ims.example",
+		ContactURI:     "sip:user@192.0.2.10:5060",
+		CNonce:         "cnonce",
+		SecurityClient: SecurityAgreement{Algorithm: DefaultSecurityAlgorithm},
+		SecurityRandom: strings.NewReader("\x00\x00\x00e\x00\x00\x00f"),
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", result, len(transport.requests))
+	}
+	first := transport.requests[0].Headers["Security-Client"]
+	second := transport.requests[1].Headers["Security-Client"]
+	if first == "" || first != second || result.Binding.SecurityClient != first {
+		t.Fatalf("Security-Client not stable: first=%q second=%q binding=%q", first, second, result.Binding.SecurityClient)
+	}
+	for _, want := range []string{"spi-c=101", "spi-s=102", "port-c=5062", "port-s=5063"} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("Security-Client=%q missing %q", first, want)
+		}
+	}
+}
+
 func TestRegisterSessionOffersMultipleSecurityClientProposals(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{

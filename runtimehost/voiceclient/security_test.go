@@ -52,3 +52,27 @@ func TestSelectSecurityAgreementPrefersInstallableIPSecSA(t *testing.T) {
 		})
 	}
 }
+
+func TestSelectSecurityAgreementPreservesSelectedRawFormatting(t *testing.T) {
+	const selectedRaw = `IPSEC-3GPP;Q="0.7";PORT-S="5063";SPI-S="222";PORT-C="5062";SPI-C="111";EALG="NULL";ALG="HMAC-SHA-1-96";note="v,1;quoted";PROT=ESP;MODE=TRANSPORT`
+	selected, ok := SelectSecurityAgreement([]string{
+		`ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065;q=1.0,` + selectedRaw,
+	}, SecurityAgreement{
+		Protocol:            DefaultSecurityProtocol,
+		Algorithm:           DefaultSecurityAlgorithm,
+		EncryptionAlgorithm: DefaultSecurityEAlg,
+	})
+	if !ok {
+		t.Fatal("SelectSecurityAgreement() ok=false")
+	}
+	if selected.Raw != selectedRaw || selected.Parameters["note"] != "v,1;quoted" || selected.SPIClient != 111 || selected.SPIServer != 222 {
+		t.Fatalf("selected=%+v, want raw %q", selected, selectedRaw)
+	}
+	plan, ok := BuildIMSSecurityAssociationPlan(selected)
+	if !ok {
+		t.Fatalf("BuildIMSSecurityAssociationPlan(%+v) ok=false", selected)
+	}
+	if plan.Source != selectedRaw || plan.QValue != "0.7" || plan.Mode != "transport" {
+		t.Fatalf("plan=%+v, want source %q", plan, selectedRaw)
+	}
+}

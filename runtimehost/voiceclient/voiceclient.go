@@ -1198,7 +1198,7 @@ func (s RegisterSession) securityClientAgreements() []SecurityAgreement {
 		return completeSecurityClientAgreements(s.SecurityClients, s.SecurityRandom)
 	}
 	if !isZeroSecurityAgreement(s.SecurityClient) {
-		return []SecurityAgreement{completeSecurityAgreement(s.SecurityClient)}
+		return []SecurityAgreement{completeSecurityClientAgreement(s.SecurityClient, s.SecurityRandom)}
 	}
 	return []SecurityAgreement{DefaultSecurityClientAgreement(s.SecurityRandom)}
 }
@@ -1531,10 +1531,13 @@ func buildRegistrationBinding(profile IMSProfile, contactURI string, resp Regist
 func buildRegistrationBindingForClients(profile IMSProfile, contactURI string, resp RegisterResponse, requestedExpires int, securityClients []SecurityAgreement, securityFallback map[string][]string) RegistrationBinding {
 	associated := normalizeAddressValues(headerListValues(resp.Headers, "P-Associated-URI"))
 	securityServer := trimHeaderValues(headerListValues(resp.Headers, "Security-Server"))
+	securityVerify := securityServerHeaderValues(resp.Headers)
 	if len(securityServer) == 0 && securityFallback != nil {
 		securityServer = trimHeaderValues(headerListValues(securityFallback, "Security-Server"))
 	}
-	securityVerify := append([]string(nil), securityServer...)
+	if len(securityVerify) == 0 && securityFallback != nil {
+		securityVerify = securityServerHeaderValues(securityFallback)
+	}
 	securityClientHeader := ""
 	if len(securityClients) > 0 {
 		securityClientHeader = BuildSecurityClientHeaderList(securityClients)
@@ -2108,15 +2111,19 @@ func headerParamValue(value, name string) (string, bool) {
 }
 
 func securityVerifyFromChallenge(headers map[string][]string) string {
-	values := trimHeaderValues(headerListValues(headers, "Security-Server"))
+	values := securityServerHeaderValues(headers)
 	if len(values) == 0 {
 		return ""
 	}
 	return strings.Join(values, ", ")
 }
 
+func securityServerHeaderValues(headers map[string][]string) []string {
+	return trimHeaderValues(rawHeaderValues(headers, "Security-Server"))
+}
+
 func securityPlanFromChallenge(headers map[string][]string, clients []SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
-	return securityPlanFromValues(headerListValues(headers, "Security-Server"), clients)
+	return securityPlanFromValues(securityServerHeaderValues(headers), clients)
 }
 
 func securityPlanFromValues(values []string, clients []SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
