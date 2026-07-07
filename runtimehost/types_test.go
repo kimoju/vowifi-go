@@ -208,6 +208,30 @@ func (m *runtimeDefaultRecoveringIdentityATModem) GetISIMIdentity() (identity.Id
 	return m.id, nil
 }
 
+type runtimeQCFGRecoveringIMEIATModem struct {
+	testModem
+	reconfigured bool
+	calls        []string
+}
+
+func (m *runtimeQCFGRecoveringIMEIATModem) ExecuteATSilent(cmd string, timeout time.Duration) (string, error) {
+	m.calls = append(m.calls, cmd)
+	switch cmd {
+	case `AT+QCFG="usbnet"`, `AT+QCFG="usbnet",0`:
+		return "\r\nOK\r\n", nil
+	case "AT+CFUN=1,1":
+		m.reconfigured = true
+		return "\r\nOK\r\n", nil
+	case "AT+CGSN", "AT+CGSN=1", "AT+GSN":
+		if m.reconfigured {
+			return "\r\n490154203237518\r\n\r\nOK\r\n", nil
+		}
+		return "", errors.New("QMI UIM service unavailable while reading IMEI")
+	default:
+		return "", errors.New("unexpected AT command")
+	}
+}
+
 func TestModemAccessAdapterReadsISIMIdentity(t *testing.T) {
 	direct := identity.Identity{
 		IMPI:   "001010123456789@private.example.test",
@@ -393,6 +417,54 @@ func TestModemAccessAdapterRunsDefaultATRecoveryForIMEIRead(t *testing.T) {
 		t.Fatalf("GetIMEI() = %q", imei)
 	}
 	wantCalls := []string{"AT+CGSN", "AT+CGSN=1", "AT+GSN", "AT+CFUN=0", "AT+CFUN=1", "AT+CGSN"}
+	if !reflect.DeepEqual(modem.calls, wantCalls) {
+		t.Fatalf("AT calls=%+v want %+v", modem.calls, wantCalls)
+	}
+}
+
+func TestModemAccessAdapterDoesNotRunVendorQCFGRecoveryByDefault(t *testing.T) {
+	modem := &runtimeQCFGRecoveringIMEIATModem{}
+	access := NewModemAccessAdapterWithRecovery(modem, SIMAccessRecoveryOptions{
+		ControlPortType: simtransport.ControlPortTypeQMI,
+		Delay:           func(context.Context, time.Duration) error { return nil },
+	})
+	reader, ok := access.(interface{ GetIMEI() (string, error) })
+	if !ok {
+		t.Fatal("modem access adapter does not expose GetIMEI")
+	}
+	_, err := reader.GetIMEI()
+	if err == nil {
+		t.Fatal("GetIMEI() err=nil, want QMI unavailable without vendor recovery opt-in")
+	}
+	wantCalls := []string{"AT+CGSN", "AT+CGSN=1", "AT+GSN"}
+	if !reflect.DeepEqual(modem.calls, wantCalls) {
+		t.Fatalf("AT calls=%+v want only initial IMEI reads", modem.calls)
+	}
+}
+
+func TestModemAccessAdapterRunsVendorQCFGRecoveryForIMEIRead(t *testing.T) {
+	modem := &runtimeQCFGRecoveringIMEIATModem{}
+	access := NewModemAccessAdapterWithRecovery(modem, SIMAccessRecoveryOptions{
+		AllowVendorSpecific: true,
+		ControlPortType:     simtransport.ControlPortTypeQMI,
+		Delay:               func(context.Context, time.Duration) error { return nil },
+	})
+	reader, ok := access.(interface{ GetIMEI() (string, error) })
+	if !ok {
+		t.Fatal("modem access adapter does not expose GetIMEI")
+	}
+	imei, err := reader.GetIMEI()
+	if err != nil {
+		t.Fatalf("GetIMEI() error = %v", err)
+	}
+	if imei != "490154203237518" {
+		t.Fatalf("GetIMEI() = %q", imei)
+	}
+	wantCalls := []string{
+		"AT+CGSN", "AT+CGSN=1", "AT+GSN",
+		`AT+QCFG="usbnet"`, `AT+QCFG="usbnet",0`, "AT+CFUN=1,1",
+		"AT+CGSN",
+	}
 	if !reflect.DeepEqual(modem.calls, wantCalls) {
 		t.Fatalf("AT calls=%+v want %+v", modem.calls, wantCalls)
 	}

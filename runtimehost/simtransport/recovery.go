@@ -292,6 +292,31 @@ func ClassifyISIMReadRecovery(err error, attempt int, portType string) ControlPo
 	})
 }
 
+func (d ControlPortRecoveryDecision) ATRecoverySteps() []ATRecoveryStep {
+	return ControlPortRecoverySteps(d)
+}
+
+func ControlPortRecoverySteps(decision ControlPortRecoveryDecision) []ATRecoveryStep {
+	if len(decision.ATReconfigurePlan) > 0 {
+		return cloneATRecoverySteps(decision.ATReconfigurePlan)
+	}
+	return cloneATRecoverySteps(decision.ATControlPlan)
+}
+
+func ExecutableATRecoverySteps(steps []ATRecoveryStep, opts ATRecoveryOptions) []ATRecoveryStep {
+	if len(steps) == 0 {
+		return nil
+	}
+	out := make([]ATRecoveryStep, 0, len(steps))
+	for _, step := range steps {
+		if step.VendorSpecific && !opts.AllowVendorSpecific {
+			continue
+		}
+		out = append(out, step)
+	}
+	return out
+}
+
 // PlanATControlRecovery returns a non-executing recovery sequence for a stuck AT control path.
 func PlanATControlRecovery(class RecoveryClass, attempt int) []ATRecoveryStep {
 	if !needsATControlRecovery(class) {
@@ -333,6 +358,14 @@ func PlanATControlRecovery(class RecoveryClass, attempt int) []ATRecoveryStep {
 			},
 		}
 	}
+}
+
+func ExecuteControlPortRecovery(ctx context.Context, control ATCommander, decision ControlPortRecoveryDecision, opts ATRecoveryOptions) error {
+	steps := ControlPortRecoverySteps(decision)
+	if len(steps) == 0 {
+		return nil
+	}
+	return ExecuteATControlRecovery(ctx, control, steps, opts)
 }
 
 // ExecuteATControlRecovery runs planned AT control recovery steps through an ATCommander.

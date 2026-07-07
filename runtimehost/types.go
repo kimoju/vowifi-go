@@ -127,6 +127,7 @@ type SIMAccessRecoveryRequest struct {
 	Attempt            int
 	Class              simtransport.RecoveryClass
 	Err                error
+	Decision           simtransport.ControlPortRecoveryDecision
 	DestructiveAllowed bool
 }
 
@@ -136,6 +137,7 @@ type SIMAccessRecoveryHook interface {
 
 type SIMAccessRecoveryOptions struct {
 	AllowVendorSpecific bool
+	ControlPortType     string
 	DryRun              bool
 	Delay               simtransport.ATRecoveryDelayFunc
 }
@@ -173,7 +175,7 @@ func (a *modemAccessAdapter) GetIMEI() (string, error) {
 	if err == nil {
 		return imei, nil
 	}
-	req, ok := newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationIMEI, 1, err)
+	req, ok := a.newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationIMEI, 1, err)
 	if !ok {
 		return "", err
 	}
@@ -221,7 +223,7 @@ func (a *modemAccessAdapter) GetISIMIdentity() (identity.Identity, error) {
 	if err == nil {
 		return id, nil
 	}
-	req, ok := newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationISIMIdentity, 1, err)
+	req, ok := a.newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationISIMIdentity, 1, err)
 	if !ok {
 		return identity.Identity{}, err
 	}
@@ -291,16 +293,26 @@ func (a *modemAccessAdapter) recoverSIMAccess(req SIMAccessRecoveryRequest) (boo
 	if !ok {
 		return false, nil
 	}
-	steps := simtransport.PlanATControlRecovery(req.Class, defaultATRecoveryPlanAttempt(req.Attempt))
-	if len(steps) == 0 {
-		return false, nil
+	decision := req.Decision
+	if !decision.Recoverable {
+		decision = simtransport.ClassifyControlPortRecovery(simtransport.ControlPortRecoveryInput{
+			Err:          req.Err,
+			Attempt:      defaultATRecoveryPlanAttempt(req.Attempt),
+			PortType:     a.recovery.ControlPortType,
+			Operation:    req.Operation,
+			IdentityRead: true,
+		})
 	}
+	steps := simtransport.ControlPortRecoverySteps(decision)
 	opts := simtransport.ATRecoveryOptions{
 		AllowVendorSpecific: req.DestructiveAllowed || a.recovery.AllowVendorSpecific,
 		DryRun:              a.recovery.DryRun,
 		Delay:               a.recovery.Delay,
 	}
-	return true, simtransport.ExecuteATControlRecovery(context.Background(), at, steps, opts)
+	if len(simtransport.ExecutableATRecoverySteps(steps, opts)) == 0 && !opts.DryRun {
+		return false, nil
+	}
+	return true, simtransport.ExecuteControlPortRecovery(context.Background(), at, decision, opts)
 }
 
 func defaultATRecoveryPlanAttempt(attempt int) int {
@@ -310,16 +322,23 @@ func defaultATRecoveryPlanAttempt(attempt int) int {
 	return attempt - 1
 }
 
-func newSIMAccessRecoveryRequest(operation string, attempt int, err error) (SIMAccessRecoveryRequest, bool) {
-	class := simtransport.ClassifyError(err)
-	if !class.Recoverable() {
+func (a *modemAccessAdapter) newSIMAccessRecoveryRequest(operation string, attempt int, err error) (SIMAccessRecoveryRequest, bool) {
+	decision := simtransport.ClassifyControlPortRecovery(simtransport.ControlPortRecoveryInput{
+		Err:          err,
+		Attempt:      defaultATRecoveryPlanAttempt(attempt),
+		PortType:     a.recovery.ControlPortType,
+		Operation:    operation,
+		IdentityRead: true,
+	})
+	if !decision.Recoverable {
 		return SIMAccessRecoveryRequest{}, false
 	}
 	return SIMAccessRecoveryRequest{
 		Operation:          operation,
 		Attempt:            attempt,
-		Class:              class,
+		Class:              decision.Class,
 		Err:                err,
+		Decision:           decision,
 		DestructiveAllowed: false,
 	}, true
 }

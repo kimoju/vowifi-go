@@ -430,6 +430,61 @@ func TestClassifyControlPortRecoveryClonesPlans(t *testing.T) {
 	}
 }
 
+func TestControlPortRecoveryStepsPreferReconfigurePlanAndClone(t *testing.T) {
+	decision := ClassifyControlPortRecovery(ControlPortRecoveryInput{
+		Err:       errors.New("QMI UIM service unavailable while reading IMEI"),
+		PortType:  ControlPortTypeQMI,
+		Operation: "read_imei",
+	})
+	steps := decision.ATRecoverySteps()
+	if !reflect.DeepEqual(steps, planQCFGControlPortReconfigure()) {
+		t.Fatalf("ATRecoverySteps()=%#v, want QCFG reconfigure plan", steps)
+	}
+	if len(steps) == 0 {
+		t.Fatal("ATRecoverySteps() returned empty plan")
+	}
+	steps[0].Command = "changed"
+	if again := decision.ATRecoverySteps(); again[0].Command != `AT+QCFG="usbnet"` {
+		t.Fatalf("ATRecoverySteps() did not clone plan: %#v", again)
+	}
+
+	if executable := ExecutableATRecoverySteps(steps, ATRecoveryOptions{}); len(executable) != 0 {
+		t.Fatalf("ExecutableATRecoverySteps(default)=%#v, want no vendor-specific steps", executable)
+	}
+	executable := ExecutableATRecoverySteps(decision.ATRecoverySteps(), ATRecoveryOptions{AllowVendorSpecific: true})
+	if !reflect.DeepEqual(executable, planQCFGControlPortReconfigure()) {
+		t.Fatalf("ExecutableATRecoverySteps(allow)=%#v, want QCFG reconfigure plan", executable)
+	}
+}
+
+func TestExecuteControlPortRecoveryRunsReconfigurePlanWhenAllowed(t *testing.T) {
+	decision := ClassifyControlPortRecovery(ControlPortRecoveryInput{
+		Err:       errors.New("QMI UIM service unavailable while reading IMEI"),
+		PortType:  ControlPortTypeQMI,
+		Operation: "read_imei",
+	})
+	executor := &recoveryFakeAT{responses: []string{"OK", "OK", "OK"}}
+	var delays []time.Duration
+
+	err := ExecuteControlPortRecovery(context.Background(), executor, decision, ATRecoveryOptions{
+		AllowVendorSpecific: true,
+		Delay: func(ctx context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteControlPortRecovery() error = %v", err)
+	}
+	wantCalls := []string{`AT+QCFG="usbnet"`, `AT+QCFG="usbnet",0`, "AT+CFUN=1,1"}
+	if !reflect.DeepEqual(executor.calls, wantCalls) {
+		t.Fatalf("calls=%#v, want %#v", executor.calls, wantCalls)
+	}
+	if !reflect.DeepEqual(delays, []time.Duration{time.Second, 20 * time.Second}) {
+		t.Fatalf("delays=%#v, want QCFG and reset delays", delays)
+	}
+}
+
 func TestClassifyIMEIReadRecovery(t *testing.T) {
 	tests := []struct {
 		name        string
