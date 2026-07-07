@@ -119,7 +119,8 @@ protocol layers needed by VoHive:
   registration state
 - IMS recovery re-registration on reusable SIP flows can advance to the next
   resolved P-CSCF candidate after recoverable failures, preserving the candidate
-  list instead of repeatedly selecting the same failed proxy
+  list instead of repeatedly selecting the same failed proxy, with optional
+  bounded recovery backoff and public recovery-state snapshots
 - IMS registration recovery hooks exposed from the wire registrar to the
   runtime, returning refreshed binding, voice, SMS, and USSD transports after
   re-registration

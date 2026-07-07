@@ -463,11 +463,23 @@ type IMSRegistrationResult struct {
 	Server         string
 	Profile        voiceclient.IMSProfile
 	Binding        voiceclient.RegistrationBinding
+	RecoveryState  IMSRegistrationRecoveryState
 	VoiceTransport voiceclient.SIPRequestTransport
 	SMSTransport   messaging.SMSTransport
 	USSDTransport  messaging.USSDTransport
 	Close          func(context.Context) error
 	Recover        func(context.Context) (IMSRegistrationResult, error)
+}
+
+type IMSRegistrationRecoveryState struct {
+	Attempts            int
+	ConsecutiveFailures int
+	LastReason          string
+	LastError           string
+	LastAttemptAt       time.Time
+	LastSucceededAt     time.Time
+	NextAttemptAt       time.Time
+	LastSwitchedTarget  bool
 }
 
 type IMSRegistrar interface {

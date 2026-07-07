@@ -21,37 +21,39 @@ type IMSSMSTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, 
 type IMSUSSDTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, voiceclient.RegistrationBinding, voiceclient.SIPRequestTransport) messaging.USSDTransport
 
 type WireIMSRegistrar struct {
-	Transport             voiceclient.SIPRegisterTransport
-	TransportFactory      IMSRegisterTransportFactory
-	VoiceTransport        voiceclient.SIPRequestTransport
-	VoiceFactory          IMSVoiceTransportFactory
-	SMSTransport          messaging.SMSTransport
-	SMSFactory            IMSSMSTransportFactory
-	USSDTransport         messaging.USSDTransport
-	USSDFactory           IMSUSSDTransportFactory
-	RegistrarURI          string
-	ContactURI            string
-	ContactHost           string
-	ContactPort           int
-	Network               string
-	ServerAddr            string
-	LocalAddr             string
-	Resolver              voiceclient.SIPServerResolver
-	Timeout               time.Duration
-	Expires               int
-	DisableRefresh        bool
-	RefreshInterval       time.Duration
-	RefreshLead           time.Duration
-	RefreshRetryInterval  time.Duration
-	DisableKeepalive      bool
-	KeepaliveInterval     time.Duration
-	UserAgent             string
-	CallID                string
-	CNonce                string
-	RetransmitInterval    time.Duration
-	MaxRetransmitInterval time.Duration
-	MaxRetransmits        int
-	SecurityPlanInstaller voiceclient.SecurityPlanInstaller
+	Transport              voiceclient.SIPRegisterTransport
+	TransportFactory       IMSRegisterTransportFactory
+	VoiceTransport         voiceclient.SIPRequestTransport
+	VoiceFactory           IMSVoiceTransportFactory
+	SMSTransport           messaging.SMSTransport
+	SMSFactory             IMSSMSTransportFactory
+	USSDTransport          messaging.USSDTransport
+	USSDFactory            IMSUSSDTransportFactory
+	RegistrarURI           string
+	ContactURI             string
+	ContactHost            string
+	ContactPort            int
+	Network                string
+	ServerAddr             string
+	LocalAddr              string
+	Resolver               voiceclient.SIPServerResolver
+	Timeout                time.Duration
+	Expires                int
+	DisableRefresh         bool
+	RefreshInterval        time.Duration
+	RefreshLead            time.Duration
+	RefreshRetryInterval   time.Duration
+	RecoveryBackoffInitial time.Duration
+	RecoveryBackoffMax     time.Duration
+	DisableKeepalive       bool
+	KeepaliveInterval      time.Duration
+	UserAgent              string
+	CallID                 string
+	CNonce                 string
+	RetransmitInterval     time.Duration
+	MaxRetransmitInterval  time.Duration
+	MaxRetransmits         int
+	SecurityPlanInstaller  voiceclient.SecurityPlanInstaller
 }
 
 func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationConfig) (IMSRegistrationResult, error) {
@@ -297,6 +299,7 @@ type imsRegistrationMaintenance struct {
 	authHeaderName string
 	authState      voiceclient.DigestAuthState
 	recoveryCount  int
+	recoveryState  IMSRegistrationRecoveryState
 	cancel         context.CancelFunc
 	done           chan struct{}
 	wg             sync.WaitGroup
@@ -372,6 +375,7 @@ func (m *imsRegistrationMaintenance) result(defaultReason string) IMSRegistratio
 	statusCode := m.statusCode
 	reason := m.reason
 	binding := m.binding
+	recoveryState := m.recoveryState
 	m.mu.Unlock()
 
 	if statusCode == 0 && registered {
@@ -387,6 +391,7 @@ func (m *imsRegistrationMaintenance) result(defaultReason string) IMSRegistratio
 		Server:         firstRuntimeNonEmpty(binding.PublicIdentity, m.profile.Domain),
 		Profile:        m.profile,
 		Binding:        binding,
+		RecoveryState:  recoveryState,
 		VoiceTransport: voiceTransport,
 		SMSTransport:   smsTransport,
 		USSDTransport:  ussdTransport,
@@ -538,6 +543,21 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		m.mu.Unlock()
 		return nil
 	}
+	if !m.recoveryState.NextAttemptAt.IsZero() {
+		delay := time.Until(m.recoveryState.NextAttemptAt)
+		m.mu.Unlock()
+		if delay > 0 && !m.wait(ctx, delay) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return context.Canceled
+		}
+		m.mu.Lock()
+		if m.closed || !m.registered {
+			m.mu.Unlock()
+			return nil
+		}
+	}
 	m.mu.Unlock()
 	switchedTarget, err := m.resetFlowForRecovery(ctx)
 	if err != nil {
@@ -557,6 +577,11 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		return nil
 	}
 	m.recoveryCount++
+	m.recoveryState.Attempts = m.recoveryCount
+	m.recoveryState.LastReason = strings.TrimSpace(fmt.Sprint(cause))
+	m.recoveryState.LastError = ""
+	m.recoveryState.LastAttemptAt = time.Now()
+	m.recoveryState.LastSwitchedTarget = switchedTarget
 	session := m.session
 	session.CallID = imsRecoveryCallID(session.CallID, m.recoveryCount)
 	m.mu.Unlock()
@@ -566,6 +591,7 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		m.recordRecoveryFailure(cause, err)
 		return fmt.Errorf("IMS registration recovery failed after %v: %w", cause, err)
 	}
 	if !result.Registered {
@@ -573,6 +599,7 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		m.registered = false
 		m.statusCode = result.StatusCode
 		m.reason = result.Reason
+		m.recordRecoveryFailureLocked(cause, fmt.Errorf("%d %s", result.StatusCode, result.Reason))
 		m.mu.Unlock()
 		return fmt.Errorf("IMS registration recovery did not register: %d %s", result.StatusCode, result.Reason)
 	}
@@ -591,8 +618,69 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	m.authHeader = result.AuthHeader
 	m.authHeaderName = result.AuthHeaderName
 	m.authState = result.AuthState
+	m.recordRecoverySuccessLocked()
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *imsRegistrationMaintenance) recordRecoveryFailure(cause, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordRecoveryFailureLocked(cause, err)
+}
+
+func (m *imsRegistrationMaintenance) recordRecoveryFailureLocked(cause, err error) {
+	if m == nil {
+		return
+	}
+	m.recoveryState.ConsecutiveFailures++
+	m.recoveryState.LastReason = strings.TrimSpace(fmt.Sprint(cause))
+	m.recoveryState.LastError = strings.TrimSpace(fmt.Sprint(err))
+	if m.recoveryState.LastAttemptAt.IsZero() {
+		m.recoveryState.LastAttemptAt = time.Now()
+	}
+	delay := m.recoveryBackoffDelayLocked()
+	if delay > 0 {
+		m.recoveryState.NextAttemptAt = time.Now().Add(delay)
+	} else {
+		m.recoveryState.NextAttemptAt = time.Time{}
+	}
+}
+
+func (m *imsRegistrationMaintenance) recordRecoverySuccessLocked() {
+	if m == nil {
+		return
+	}
+	m.recoveryState.ConsecutiveFailures = 0
+	m.recoveryState.LastError = ""
+	m.recoveryState.NextAttemptAt = time.Time{}
+	m.recoveryState.LastSucceededAt = time.Now()
+}
+
+func (m *imsRegistrationMaintenance) recoveryBackoffDelayLocked() time.Duration {
+	if m == nil || m.recoveryState.ConsecutiveFailures <= 0 {
+		return 0
+	}
+	base := m.config.RecoveryBackoffInitial
+	if base <= 0 {
+		return 0
+	}
+	maxDelay := m.config.RecoveryBackoffMax
+	if maxDelay <= 0 {
+		maxDelay = 30 * time.Second
+	}
+	delay := base
+	for i := 1; i < m.recoveryState.ConsecutiveFailures; i++ {
+		if delay >= maxDelay/2 {
+			delay = maxDelay
+			break
+		}
+		delay *= 2
+	}
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	return delay
 }
 
 func (m *imsRegistrationMaintenance) resetFlowForRecovery(ctx context.Context) (bool, error) {

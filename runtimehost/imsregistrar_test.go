@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -543,6 +544,11 @@ func TestWireIMSRegistrarRecoverReturnsUpdatedBinding(t *testing.T) {
 	if recovered.Recover == nil || recovered.Close == nil {
 		t.Fatalf("recovered lifecycle hooks missing: close=%v recover=%v", recovered.Close != nil, recovered.Recover != nil)
 	}
+	if recovered.RecoveryState.Attempts != 1 || recovered.RecoveryState.ConsecutiveFailures != 0 ||
+		recovered.RecoveryState.LastAttemptAt.IsZero() || recovered.RecoveryState.LastSucceededAt.IsZero() ||
+		!recovered.RecoveryState.NextAttemptAt.IsZero() {
+		t.Fatalf("recovered state=%+v", recovered.RecoveryState)
+	}
 	if err := recovered.Close(context.Background()); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -557,6 +563,99 @@ func TestWireIMSRegistrarRecoverReturnsUpdatedBinding(t *testing.T) {
 	if !strings.Contains(requests[2].wire, "Expires: 0\r\n") {
 		t.Fatalf("deregister wire=%q", requests[2].wire)
 	}
+}
+
+func TestWireIMSRegistrarRecoveryBackoffDelaysRepeatedRecover(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	type seenRequest struct {
+		addr string
+		wire string
+	}
+	seen := make(chan []seenRequest, 1)
+	noImmediateRetry := make(chan bool, 1)
+	go func() {
+		var requests []seenRequest
+		buf := make([]byte, 65535)
+		for i := 0; i < 2; i++ {
+			_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				seen <- append(requests, seenRequest{wire: "read error: " + err.Error()})
+				return
+			}
+			wire := string(append([]byte(nil), buf[:n]...))
+			requests = append(requests, seenRequest{addr: addr.String(), wire: wire})
+			resp := "SIP/2.0 200 OK\r\n" +
+				"P-Associated-URI: <sip:user@ims.example>\r\n" +
+				"Contact: <sip:user@192.0.2.10:5060>;expires=600\r\n" +
+				"Content-Length: 0\r\n\r\n"
+			if i == 1 {
+				resp = "SIP/2.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+			}
+			_, _ = pc.WriteTo([]byte(resp), addr)
+		}
+		_ = pc.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			noImmediateRetry <- true
+			seen <- requests
+			return
+		}
+		requests = append(requests, seenRequest{addr: addr.String(), wire: string(append([]byte(nil), buf[:n]...))})
+		noImmediateRetry <- false
+		seen <- requests
+	}()
+
+	res, err := WireIMSRegistrar{
+		ServerAddr:             pc.LocalAddr().String(),
+		ContactHost:            "192.0.2.10",
+		ContactPort:            5060,
+		Expires:                600,
+		DisableRefresh:         true,
+		DisableKeepalive:       true,
+		RecoveryBackoffInitial: 200 * time.Millisecond,
+		RecoveryBackoffMax:     200 * time.Millisecond,
+		Timeout:                time.Second,
+		MaxRetransmits:         1,
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-1",
+		TraceID:  "trace-recovery-backoff",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if _, err := res.Recover(context.Background()); err == nil {
+		t.Fatal("first Recover() err=nil, want failed recovery")
+	}
+	retryCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := res.Recover(retryCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Recover() err=%v, want context deadline from backoff wait", err)
+	}
+	select {
+	case ok := <-noImmediateRetry:
+		if !ok {
+			t.Fatal("second recovery sent REGISTER before backoff elapsed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for immediate retry check")
+	}
+	requests := <-seen
+	if len(requests) != 2 {
+		t.Fatalf("requests=%d %+v", len(requests), requests)
+	}
+	if !strings.Contains(requests[1].wire, "Call-ID: trace-recovery-backoff-recovery-1\r\n") {
+		t.Fatalf("first recovery wire=%q", requests[1].wire)
+	}
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer closeCancel()
+	_ = res.Close(closeCtx)
 }
 
 func TestWireIMSRegistrarMaintainsDefaultFlowWithCRLFKeepalive(t *testing.T) {
