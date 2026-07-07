@@ -1619,6 +1619,58 @@ func TestRegisterSessionDeregisterRetriesDigestChallenge(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionDeregisterReinstallsSecurityAgreement(t *testing.T) {
+	transport := &securityAwareRegisterTransport{fakeRegisterTransport: fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-dereg-sa", algorithm=MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=801;spi-s=802;port-c=5070;port-s=5071;q=0.9`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}}
+	installer := &fakeSecurityPlanInstaller{transport: &transport.fakeRegisterTransport}
+	session := RegisterSession{
+		Transport:             transport,
+		Profile:               IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:          "sip:ims.example",
+		ContactURI:            "sip:user@192.0.2.10:5060",
+		CallID:                "call-dereg-sa",
+		CNonce:                "cnonce",
+		SecurityPlanInstaller: installer,
+		SecurityLocalAddr:     "192.0.2.20:45000",
+		SecurityRemoteAddr:    "198.51.100.10:5060",
+	}
+	result, err := session.Deregister(context.Background(), DeregisterRequest{
+		Binding: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
+		},
+		CSeq: 9,
+	})
+	if err != nil {
+		t.Fatalf("Deregister() error = %v", err)
+	}
+	if !result.Deregistered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", result, len(transport.requests))
+	}
+	if len(installer.calls) != 1 || len(installer.requestsAtCall) != 1 || installer.requestsAtCall[0] != 1 {
+		t.Fatalf("installer calls=%+v requestsAtCall=%+v", installer.calls, installer.requestsAtCall)
+	}
+	if len(transport.securityRequests) != 1 || len(transport.requestsAtSecurity) != 1 || transport.requestsAtSecurity[0] != 1 {
+		t.Fatalf("security requests=%+v requestsAtSecurity=%+v", transport.securityRequests, transport.requestsAtSecurity)
+	}
+	req := transport.securityRequests[0]
+	if req.Plan.SPIClient != 801 || req.Plan.SPIServer != 802 || req.LocalEndpoint.Port != 5070 || req.RemoteEndpoint.Port != 5071 {
+		t.Fatalf("security request=%+v", req)
+	}
+	if got := transport.requests[1].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=801") {
+		t.Fatalf("Security-Verify=%q", got)
+	}
+}
+
 func TestRegisterSessionDeregisterFailureInfoCapturesDiagnosticHeaders(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{{
 		StatusCode: 480,
@@ -2026,6 +2078,65 @@ func TestRegisterSessionRefreshRetriesDigestChallenge(t *testing.T) {
 	if second["Expires"] != "600" || second["CSeq"] != "12 REGISTER" || !strings.Contains(second["Authorization"], `nonce="nonce-refresh"`) ||
 		!strings.Contains(second["Security-Verify"], "spi-c=701") {
 		t.Fatalf("second refresh headers=%+v", second)
+	}
+}
+
+func TestRegisterSessionRefreshReinstallsSecurityAgreement(t *testing.T) {
+	transport := &securityAwareRegisterTransport{fakeRegisterTransport: fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-refresh-sa", algorithm=MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=901;spi-s=902;port-c=5072;port-s=5073;q=0.8`},
+			},
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"Contact": {`<sip:user@192.0.2.10:5060>;expires=600`},
+			},
+		},
+	}}}
+	installer := &fakeSecurityPlanInstaller{transport: &transport.fakeRegisterTransport}
+	session := RegisterSession{
+		Transport:             transport,
+		Profile:               IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:          "sip:ims.example",
+		ContactURI:            "sip:user@192.0.2.10:5060",
+		CallID:                "call-refresh-sa",
+		CNonce:                "cnonce",
+		SecurityPlanInstaller: installer,
+		SecurityLocalAddr:     "192.0.2.20:45000",
+		SecurityRemoteAddr:    "198.51.100.10:5060",
+	}
+	result, err := session.Refresh(context.Background(), RefreshRequest{
+		Binding: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			Expires:        600,
+			SecurityClient: "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=101;spi-s=102;port-c=5062;port-s=5063",
+		},
+		CSeq: 11,
+	})
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if !result.Refreshed || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", result, len(transport.requests))
+	}
+	if len(installer.calls) != 1 || len(installer.requestsAtCall) != 1 || installer.requestsAtCall[0] != 1 {
+		t.Fatalf("installer calls=%+v requestsAtCall=%+v", installer.calls, installer.requestsAtCall)
+	}
+	if len(transport.securityRequests) != 1 || len(transport.requestsAtSecurity) != 1 || transport.requestsAtSecurity[0] != 1 {
+		t.Fatalf("security requests=%+v requestsAtSecurity=%+v", transport.securityRequests, transport.requestsAtSecurity)
+	}
+	req := transport.securityRequests[0]
+	if req.Plan.SPIClient != 901 || req.Plan.SPIServer != 902 || req.LocalEndpoint.Port != 5072 || req.RemoteEndpoint.Port != 5073 {
+		t.Fatalf("security request=%+v", req)
+	}
+	if result.Binding.SecurityAgreement.SPIClient != 901 || !strings.Contains(transport.requests[1].Headers["Security-Verify"], "spi-c=901") {
+		t.Fatalf("binding=%+v headers=%+v", result.Binding, transport.requests[1].Headers)
 	}
 }
 

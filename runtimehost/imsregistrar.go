@@ -522,7 +522,17 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 	if registered {
 		_, deregisterErr = m.session.Deregister(ctx, req)
 	}
-	return errors.Join(deregisterErr, m.flow.Close())
+	return errors.Join(deregisterErr, cleanupIMSRegistrationSecurityPlans(ctx, m.session.SecurityPlanInstaller), m.flow.Close())
+}
+
+func cleanupIMSRegistrationSecurityPlans(ctx context.Context, installer voiceclient.SecurityPlanInstaller) error {
+	cleaner, ok := installer.(interface {
+		Cleanup(context.Context) error
+	})
+	if !ok {
+		return nil
+	}
+	return cleaner.Cleanup(ctx)
 }
 
 func (m *imsRegistrationMaintenance) refreshLoop(ctx context.Context) {

@@ -521,6 +521,16 @@ func TestWireIMSRegistrarPassesSecurityPlanInstallerRequest(t *testing.T) {
 	}
 }
 
+func TestCleanupIMSRegistrationSecurityPlansUsesInstallerCleanup(t *testing.T) {
+	installer := &wireIMSRegistrarSecurityInstaller{}
+	if err := cleanupIMSRegistrationSecurityPlans(context.Background(), installer); err != nil {
+		t.Fatalf("cleanupIMSRegistrationSecurityPlans() error = %v", err)
+	}
+	if installer.cleanupCalls != 1 {
+		t.Fatalf("cleanupCalls=%d, want 1", installer.cleanupCalls)
+	}
+}
+
 func TestWireIMSRegistrarUsesTunnelInnerIPForContact(t *testing.T) {
 	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{{
 		StatusCode: 200,
@@ -1695,8 +1705,9 @@ func (t *wireIMSRegistrarTransport) RoundTripRegister(ctx context.Context, msg v
 }
 
 type wireIMSRegistrarSecurityInstaller struct {
-	requests    []voiceclient.IMSSecurityAssociationInstallRequest
-	legacyCalls []voiceclient.IMSSecurityAssociationPlan
+	requests     []voiceclient.IMSSecurityAssociationInstallRequest
+	legacyCalls  []voiceclient.IMSSecurityAssociationPlan
+	cleanupCalls int
 }
 
 func (i *wireIMSRegistrarSecurityInstaller) InstallSecurityPlan(ctx context.Context, plan voiceclient.IMSSecurityAssociationPlan) error {
@@ -1715,6 +1726,11 @@ func (i *wireIMSRegistrarSecurityInstaller) InstallSecurityPlanRequest(ctx conte
 		req.SelectedParameters = selected
 	}
 	i.requests = append(i.requests, req)
+	return nil
+}
+
+func (i *wireIMSRegistrarSecurityInstaller) Cleanup(ctx context.Context) error {
+	i.cleanupCalls++
 	return nil
 }
 

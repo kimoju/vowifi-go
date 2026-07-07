@@ -978,12 +978,19 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 	if err != nil {
 		return deregisterFailureResult(resp, attempts), err
 	}
-	authInput, syncFailure, _, err := s.digestAuthInputForChallenge(ch, registrarURI)
+	authInput, syncFailure, akaKeys, err := s.digestAuthInputForChallenge(ch, registrarURI)
 	if err != nil {
 		return deregisterFailureResult(resp, attempts), err
 	}
 	authz, err = BuildDigestAuthorization(ch, authInput)
 	if err != nil {
+		return deregisterFailureResult(resp, attempts), err
+	}
+	securityReq, securityOK, err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClientsFromBinding(req.Binding), akaKeys)
+	if err != nil {
+		return deregisterFailureResult(resp, attempts), err
+	}
+	if err := s.useChallengeSecurityAssociation(ctx, securityReq, securityOK); err != nil {
 		return deregisterFailureResult(resp, attempts), err
 	}
 	cseq++
@@ -1000,7 +1007,7 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 		if err != nil {
 			return deregisterFailureResult(resp2, attempts), err
 		}
-		authInput, syncFailure, _, err = s.digestAuthInputForChallenge(ch, registrarURI)
+		authInput, syncFailure, akaKeys, err = s.digestAuthInputForChallenge(ch, registrarURI)
 		if err != nil {
 			return deregisterFailureResult(resp2, attempts), err
 		}
@@ -1009,6 +1016,13 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 		}
 		authz, err = BuildDigestAuthorization(ch, authInput)
 		if err != nil {
+			return deregisterFailureResult(resp2, attempts), err
+		}
+		securityReq, securityOK, err = s.installChallengeSecurityPlan(ctx, resp2.Headers, securityClientsFromBinding(req.Binding), akaKeys)
+		if err != nil {
+			return deregisterFailureResult(resp2, attempts), err
+		}
+		if err := s.useChallengeSecurityAssociation(ctx, securityReq, securityOK); err != nil {
 			return deregisterFailureResult(resp2, attempts), err
 		}
 		cseq++
@@ -1137,7 +1151,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if err != nil {
 		return refreshFailureResult(resp, attempts, "", "", DigestAuthState{}), err
 	}
-	authInput, syncFailure, _, err := s.digestAuthInputForChallenge(ch, registrarURI)
+	authInput, syncFailure, akaKeys, err := s.digestAuthInputForChallenge(ch, registrarURI)
 	if err != nil {
 		return refreshFailureResult(resp, attempts, "", "", DigestAuthState{}), err
 	}
@@ -1149,6 +1163,13 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		authState = DigestAuthState{}
 	} else {
 		authState = newDigestAuthState(authHeaderName, ch, authInput, authz)
+	}
+	securityReq, securityOK, err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClientsFromBinding(req.Binding), akaKeys)
+	if err != nil {
+		return refreshFailureResult(resp, attempts, authz, authHeaderName, authState), err
+	}
+	if err := s.useChallengeSecurityAssociation(ctx, securityReq, securityOK); err != nil {
+		return refreshFailureResult(resp, attempts, authz, authHeaderName, authState), err
 	}
 	cseq++
 	resp2, err := sendRefresh(cseq, authHeaderName, authz, resp.Headers)
@@ -1165,7 +1186,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		if err != nil {
 			return refreshFailureResult(resp2, attempts, authz, authHeaderName, authState), err
 		}
-		authInput, syncFailure, _, err = s.digestAuthInputForChallenge(ch, registrarURI)
+		authInput, syncFailure, akaKeys, err = s.digestAuthInputForChallenge(ch, registrarURI)
 		if err != nil {
 			return refreshFailureResult(resp2, attempts, authz, authHeaderName, authState), err
 		}
@@ -1178,6 +1199,13 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		}
 		authState = newDigestAuthState(authHeaderName, ch, authInput, authz)
 		challengeHeaders = resp2.Headers
+		securityReq, securityOK, err = s.installChallengeSecurityPlan(ctx, challengeHeaders, securityClientsFromBinding(req.Binding), akaKeys)
+		if err != nil {
+			return refreshFailureResult(resp2, attempts, authz, authHeaderName, authState), err
+		}
+		if err := s.useChallengeSecurityAssociation(ctx, securityReq, securityOK); err != nil {
+			return refreshFailureResult(resp2, attempts, authz, authHeaderName, authState), err
+		}
 		cseq++
 		resp2, err = sendRefresh(cseq, authHeaderName, authz, challengeHeaders)
 		if err != nil {
