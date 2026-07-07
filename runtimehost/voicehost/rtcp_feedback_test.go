@@ -151,3 +151,80 @@ func TestInspectRTCPFeedbackReportsReceptionBlocks(t *testing.T) {
 		t.Fatalf("sender report block=%+v", got)
 	}
 }
+
+func TestInspectRTCPFeedbackReportsPLIAndFIRAndXR(t *testing.T) {
+	raw, err := rtcp.Marshal([]rtcp.Packet{
+		&rtcp.PictureLossIndication{
+			SenderSSRC: 0x11111111,
+			MediaSSRC:  0x22222222,
+		},
+		&rtcp.FullIntraRequest{
+			SenderSSRC: 0x33333333,
+			MediaSSRC:  0x44444444,
+			FIR: []rtcp.FIREntry{
+				{SSRC: 0x55555555, SequenceNumber: 7},
+				{SSRC: 0x66666666, SequenceNumber: 8},
+			},
+		},
+		&rtcp.ExtendedReport{
+			SenderSSRC: 0x77777777,
+			Reports: []rtcp.ReportBlock{
+				&rtcp.ReceiverReferenceTimeReportBlock{NTPTimestamp: 0x0102030405060708},
+				&rtcp.DLRRReportBlock{Reports: []rtcp.DLRRReport{{
+					SSRC:   0x88888888,
+					LastRR: 0x00010002,
+					DLRR:   0x00030004,
+				}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal() error = %v", err)
+	}
+
+	var events []RTCPFeedbackEvent
+	summary, err := InspectRTCPFeedback(RTCPFeedbackClientToIMS, raw, func(event RTCPFeedbackEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("InspectRTCPFeedback() error = %v", err)
+	}
+	if summary.Packets != 3 || summary.PictureLossIndications != 1 || summary.FullIntraRequests != 1 || summary.ExtendedReports != 1 {
+		t.Fatalf("summary=%+v", summary)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events=%d, want 3", len(events))
+	}
+
+	byKind := make(map[RTCPFeedbackKind]RTCPFeedbackEvent, len(events))
+	for _, event := range events {
+		byKind[event.Kind] = event
+	}
+
+	pli := byKind[RTCPFeedbackPictureLossIndication]
+	if pli.PacketType != "206" || pli.SenderSSRC != 0x11111111 || pli.MediaSSRC != 0x22222222 ||
+		!uint32SliceContains(pli.DestinationSSRCs, 0x22222222) {
+		t.Fatalf("PLI event=%+v", pli)
+	}
+
+	fir := byKind[RTCPFeedbackFullIntraRequest]
+	if fir.PacketType != "206" || fir.SenderSSRC != 0x33333333 || fir.MediaSSRC != 0x44444444 || fir.FIRCount != 2 ||
+		!uint32SliceContains(fir.DestinationSSRCs, 0x55555555) || !uint32SliceContains(fir.DestinationSSRCs, 0x66666666) {
+		t.Fatalf("FIR event=%+v", fir)
+	}
+
+	xr := byKind[RTCPFeedbackExtendedReport]
+	if xr.PacketType != "207" || xr.SSRC != 0x77777777 || xr.SenderSSRC != 0x77777777 || xr.ReportCount != 2 ||
+		!uint32SliceContains(xr.DestinationSSRCs, 0x77777777) || !uint32SliceContains(xr.DestinationSSRCs, 0x88888888) {
+		t.Fatalf("XR event=%+v", xr)
+	}
+}
+
+func uint32SliceContains(values []uint32, want uint32) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

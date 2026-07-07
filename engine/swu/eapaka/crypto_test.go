@@ -511,6 +511,41 @@ func TestParseReauthenticationRequestRejectsDuplicateControlAttributes(t *testin
 	}
 }
 
+func TestParseReauthenticationRequestRejectsDuplicateCryptoAttributes(t *testing.T) {
+	identity := "reauth-identity@example"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	for _, tc := range []struct {
+		name  string
+		extra Attribute
+	}{
+		{
+			name:  "iv",
+			extra: IVAttribute(bytes.Repeat([]byte{0x99}, 16)),
+		},
+		{
+			name:  "encrypted_data",
+			extra: EncrDataAttribute(bytes.Repeat([]byte{0x77}, 16)),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := signedReauthenticationRequestWithOptions(t, TypeAKA, keys, 12, nonceS, nil, []Attribute{tc.extra})
+			_, err := ParseReauthenticationRequest(request, keys)
+			if !errors.Is(err, ErrInvalidAttribute) {
+				t.Fatalf("ParseReauthenticationRequest() err=%v, want ErrInvalidAttribute", err)
+			}
+		})
+	}
+}
+
 func TestDeriveReauthenticationKeys(t *testing.T) {
 	identity := "reauth-identity@example"
 	aka := sim.AKAResult{
@@ -1055,6 +1090,33 @@ func TestBuildChallengeResponseRejectsBadRequestMAC(t *testing.T) {
 	}
 }
 
+func TestBuildChallengeResponseRejectsDuplicateRequestMAC(t *testing.T) {
+	identity := "user@example.com"
+	aka := sim.AKAResult{RES: []byte{1, 2, 3, 4}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}
+	req := signedChallengeRequest(t, identity, aka)
+	req.Attributes = append(req.Attributes, req.Attributes[len(req.Attributes)-1])
+	_, _, err := BuildChallengeResponse(identity, req, aka)
+	if !errors.Is(err, ErrInvalidMAC) {
+		t.Fatalf("BuildChallengeResponse(duplicate AT_MAC) err=%v, want ErrInvalidMAC", err)
+	}
+}
+
+func TestBuildChallengeResponseRejectsDuplicateCheckcode(t *testing.T) {
+	identity := "user@example.com"
+	aka := sim.AKAResult{RES: []byte{1, 2, 3, 4}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}
+	transcript := identityTranscriptPackets(t, identity)
+	req := signedChallengeRequestWithCheckcode(t, identity, aka, transcript)
+	checkcode, ok := FindAttribute(req.Attributes, AttributeCheckcode)
+	if !ok {
+		t.Fatal("missing test AT_CHECKCODE")
+	}
+	req.Attributes = append(req.Attributes[:len(req.Attributes)-1], checkcode, req.Attributes[len(req.Attributes)-1])
+	_, _, err := BuildChallengeResponseWithCheckcode(identity, req, aka, transcript)
+	if !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("BuildChallengeResponseWithCheckcode(duplicate AT_CHECKCODE) err=%v, want ErrInvalidAttribute", err)
+	}
+}
+
 func TestBuildChallengeResponseRejectsMissingRAND(t *testing.T) {
 	identity := "user@example.com"
 	aka := sim.AKAResult{RES: []byte{1, 2, 3, 4}, CK: bytes.Repeat([]byte{2}, 16), IK: bytes.Repeat([]byte{3}, 16)}
@@ -1218,6 +1280,26 @@ func TestMACRejectsInvalidKAutLength(t *testing.T) {
 	}
 	if _, err := CalculateAKAPrimeMAC(bytes.Repeat([]byte{0x01}, 16), raw, nil); !errors.Is(err, ErrInvalidKeyMaterial) {
 		t.Fatalf("CalculateAKAPrimeMAC(short K_aut) err=%v, want ErrInvalidKeyMaterial", err)
+	}
+}
+
+func TestMACRejectsDuplicateATMAC(t *testing.T) {
+	raw, err := (Packet{
+		Code:       CodeResponse,
+		Identifier: 1,
+		Type:       TypeAKA,
+		Subtype:    SubtypeChallenge,
+		Attributes: []Attribute{MACAttribute(nil), MACAttribute(nil)},
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
+	}
+	kAut := bytes.Repeat([]byte{0x01}, KeyLengthKAut)
+	if _, err := CalculateMAC(kAut, raw, nil); !errors.Is(err, ErrInvalidMAC) {
+		t.Fatalf("CalculateMAC(duplicate AT_MAC) err=%v, want ErrInvalidMAC", err)
+	}
+	if err := VerifyMAC(kAut, raw, nil); !errors.Is(err, ErrInvalidMAC) {
+		t.Fatalf("VerifyMAC(duplicate AT_MAC) err=%v, want ErrInvalidMAC", err)
 	}
 }
 

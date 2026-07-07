@@ -29,6 +29,10 @@ type SRTPKeys struct {
 	MasterSalt []byte
 }
 
+func (k SRTPKeys) IsZero() bool {
+	return len(k.MasterKey) == 0 && len(k.MasterSalt) == 0
+}
+
 type SDPCryptoInlineKeyParams struct {
 	MasterKey  []byte
 	MasterSalt []byte
@@ -41,6 +45,10 @@ type SRTPMediaConfig struct {
 	Profile               SRTPProtectionProfile
 	ClientKeys            SRTPKeys
 	IMSKeys               SRTPKeys
+	ClientProtectKeys     SRTPKeys
+	ClientUnprotectKeys   SRTPKeys
+	IMSProtectKeys        SRTPKeys
+	IMSUnprotectKeys      SRTPKeys
 	ReplayWindowSize      uint
 	RTCPFeedbackHandler   RTCPFeedbackHandler
 	RTPDTMFHandler        RTPDTMFHandler
@@ -300,29 +308,39 @@ func NewSRTPMediaSession(cfg SRTPMediaConfig) (*SRTPMediaSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSRTPKeys(profile, cfg.ClientKeys, "client"); err != nil {
+	clientProtectKeys := resolveSRTPDirectionKeys(cfg.ClientProtectKeys, cfg.ClientKeys)
+	clientUnprotectKeys := resolveSRTPDirectionKeys(cfg.ClientUnprotectKeys, cfg.ClientKeys)
+	imsProtectKeys := resolveSRTPDirectionKeys(cfg.IMSProtectKeys, cfg.IMSKeys)
+	imsUnprotectKeys := resolveSRTPDirectionKeys(cfg.IMSUnprotectKeys, cfg.IMSKeys)
+	if err := validateSRTPKeys(profile, clientProtectKeys, "client protect"); err != nil {
 		return nil, err
 	}
-	if err := validateSRTPKeys(profile, cfg.IMSKeys, "ims"); err != nil {
+	if err := validateSRTPKeys(profile, clientUnprotectKeys, "client unprotect"); err != nil {
+		return nil, err
+	}
+	if err := validateSRTPKeys(profile, imsProtectKeys, "ims protect"); err != nil {
+		return nil, err
+	}
+	if err := validateSRTPKeys(profile, imsUnprotectKeys, "ims unprotect"); err != nil {
 		return nil, err
 	}
 	window := cfg.ReplayWindowSize
 	if window == 0 {
 		window = 64
 	}
-	clientProtect, err := srtp.CreateContext(cfg.ClientKeys.MasterKey, cfg.ClientKeys.MasterSalt, profile)
+	clientProtect, err := srtp.CreateContext(clientProtectKeys.MasterKey, clientProtectKeys.MasterSalt, profile)
 	if err != nil {
 		return nil, fmt.Errorf("%w: client protect: %v", ErrSRTPMediaConfig, err)
 	}
-	clientUnprotect, err := srtp.CreateContext(cfg.ClientKeys.MasterKey, cfg.ClientKeys.MasterSalt, profile, srtp.SRTPReplayProtection(window), srtp.SRTCPReplayProtection(window))
+	clientUnprotect, err := srtp.CreateContext(clientUnprotectKeys.MasterKey, clientUnprotectKeys.MasterSalt, profile, srtp.SRTPReplayProtection(window), srtp.SRTCPReplayProtection(window))
 	if err != nil {
 		return nil, fmt.Errorf("%w: client unprotect: %v", ErrSRTPMediaConfig, err)
 	}
-	imsProtect, err := srtp.CreateContext(cfg.IMSKeys.MasterKey, cfg.IMSKeys.MasterSalt, profile)
+	imsProtect, err := srtp.CreateContext(imsProtectKeys.MasterKey, imsProtectKeys.MasterSalt, profile)
 	if err != nil {
 		return nil, fmt.Errorf("%w: ims protect: %v", ErrSRTPMediaConfig, err)
 	}
-	imsUnprotect, err := srtp.CreateContext(cfg.IMSKeys.MasterKey, cfg.IMSKeys.MasterSalt, profile, srtp.SRTPReplayProtection(window), srtp.SRTCPReplayProtection(window))
+	imsUnprotect, err := srtp.CreateContext(imsUnprotectKeys.MasterKey, imsUnprotectKeys.MasterSalt, profile, srtp.SRTPReplayProtection(window), srtp.SRTCPReplayProtection(window))
 	if err != nil {
 		return nil, fmt.Errorf("%w: ims unprotect: %v", ErrSRTPMediaConfig, err)
 	}
@@ -577,6 +595,13 @@ func validateSRTPKeys(profile srtp.ProtectionProfile, keys SRTPKeys, label strin
 		return fmt.Errorf("%w: %s master salt length %d != %d", ErrSRTPMediaConfig, label, len(keys.MasterSalt), saltLen)
 	}
 	return nil
+}
+
+func resolveSRTPDirectionKeys(explicit, fallback SRTPKeys) SRTPKeys {
+	if !explicit.IsZero() {
+		return explicit
+	}
+	return fallback
 }
 
 func validateSDPCryptoTag(tag string) error {

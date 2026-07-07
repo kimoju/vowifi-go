@@ -169,6 +169,83 @@ func TestParseGeolocationHeaderParsesMultipleLocationsAndParameters(t *testing.T
 	}
 }
 
+func TestBuildAndNormalizeGeolocationHeader(t *testing.T) {
+	got := BuildGeolocationHeader(
+		GeolocationHeaderValue{
+			URI: "cid:loc-1@example.test",
+			Parameters: map[string]string{
+				"Purpose":     "emergency, callback",
+				"Inserted-By": "endpoint",
+			},
+		},
+		GeolocationHeaderValue{
+			URI: "<geo:47.6205,-122.3493>;routing-allowed=yes",
+		},
+	)
+	want := `<cid:loc-1@example.test>;inserted-by=endpoint;purpose="emergency, callback", <geo:47.6205,-122.3493>;routing-allowed=yes`
+	if got != want {
+		t.Fatalf("BuildGeolocationHeader()=%q, want %q", got, want)
+	}
+
+	normalized, err := NormalizeGeolocationHeader(` <cid:loc-1@example.test> ; Purpose = "emergency, callback" ; Inserted-By = endpoint , <geo:47.6205,-122.3493>;routing-allowed="yes" `)
+	if err != nil {
+		t.Fatalf("NormalizeGeolocationHeader() error = %v", err)
+	}
+	if normalized != want {
+		t.Fatalf("NormalizeGeolocationHeader()=%q, want %q", normalized, want)
+	}
+}
+
+func TestBuildEmergencySIPRequestInfoUsesStructuredGeolocationValues(t *testing.T) {
+	info := BuildEmergencySIPRequestInfo(EmergencySIPHeaderConfig{
+		ServiceURN: "police",
+		GeolocationValues: []GeolocationHeaderValue{
+			{
+				URI: "cid:location-inline",
+				Parameters: map[string]string{
+					"inserted-by": "endpoint",
+				},
+			},
+			{
+				URI: "https://lis.example.test/location/abc",
+				Parameters: map[string]string{
+					"purpose": "emergency, callback",
+				},
+			},
+		},
+		Address: EmergencyAddress{
+			Latitude:  "47.6205",
+			Longitude: "-122.3493",
+		},
+		GeolocationRouting: true,
+	})
+	want := `<cid:location-inline>;inserted-by=endpoint, <https://lis.example.test/location/abc>;purpose="emergency, callback"`
+	if info.RequestURI != "urn:service:sos.police" {
+		t.Fatalf("RequestURI=%q", info.RequestURI)
+	}
+	if info.Headers["Geolocation"] != want {
+		t.Fatalf("Geolocation=%q, want %q", info.Headers["Geolocation"], want)
+	}
+	if info.Headers["Geolocation-Routing"] != GeolocationRoutingYes {
+		t.Fatalf("Geolocation-Routing=%q", info.Headers["Geolocation-Routing"])
+	}
+}
+
+func TestNormalizeGeolocationHeaderRejectsMalformedValues(t *testing.T) {
+	for _, header := range []string{
+		`<cid:loc-1`,
+		`<cid:loc-1> garbage`,
+		`;inserted-by=endpoint`,
+		`<cid:loc-1>;=endpoint`,
+	} {
+		t.Run(header, func(t *testing.T) {
+			if _, err := NormalizeGeolocationHeader(header); err == nil {
+				t.Fatal("NormalizeGeolocationHeader() error = nil")
+			}
+		})
+	}
+}
+
 func TestParseGeolocationRoutingHeaderNormalizesValues(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

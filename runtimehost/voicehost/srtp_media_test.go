@@ -74,6 +74,138 @@ func TestSRTPMediaSessionProtectsRTPAndRTCP(t *testing.T) {
 	}
 }
 
+func TestSRTPMediaSessionSupportsAsymmetricDirectionKeys(t *testing.T) {
+	clientSendKeys := testSRTPKeys(0x11, 0x21)
+	relayToClientKeys := testSRTPKeys(0x12, 0x22)
+	imsSendKeys := testSRTPKeys(0x13, 0x23)
+	relayToIMSKeys := testSRTPKeys(0x14, 0x24)
+	relay := newTestSRTPMediaSession(t, SRTPMediaConfig{
+		Profile:             SRTPProfileAes128CmHmacSha1_80,
+		ClientProtectKeys:   relayToClientKeys,
+		ClientUnprotectKeys: clientSendKeys,
+		IMSProtectKeys:      relayToIMSKeys,
+		IMSUnprotectKeys:    imsSendKeys,
+	})
+	clientSender := newTestSRTPMediaSession(t, SRTPMediaConfig{
+		Profile:    SRTPProfileAes128CmHmacSha1_80,
+		ClientKeys: clientSendKeys,
+		IMSKeys:    relayToIMSKeys,
+	})
+	clientReceiver := newTestSRTPMediaSession(t, SRTPMediaConfig{
+		Profile:    SRTPProfileAes128CmHmacSha1_80,
+		ClientKeys: relayToClientKeys,
+		IMSKeys:    relayToIMSKeys,
+	})
+	imsSender := newTestSRTPMediaSession(t, SRTPMediaConfig{
+		Profile:    SRTPProfileAes128CmHmacSha1_80,
+		ClientKeys: relayToClientKeys,
+		IMSKeys:    imsSendKeys,
+	})
+	imsReceiver := newTestSRTPMediaSession(t, SRTPMediaConfig{
+		Profile:    SRTPProfileAes128CmHmacSha1_80,
+		ClientKeys: relayToClientKeys,
+		IMSKeys:    relayToIMSKeys,
+	})
+
+	toClientPlain := testRTPPacket(21, 0x11111111, []byte{0x01})
+	toClientProtected, err := relay.ProtectClientRTP(toClientPlain)
+	if err != nil {
+		t.Fatalf("ProtectClientRTP() error = %v", err)
+	}
+	if _, err := relay.UnprotectClientRTP(toClientProtected); err == nil {
+		t.Fatalf("UnprotectClientRTP(relay-to-client key) error = nil, want auth failure")
+	}
+	gotToClientPlain, err := clientReceiver.UnprotectClientRTP(toClientProtected)
+	if err != nil {
+		t.Fatalf("client receiver UnprotectClientRTP() error = %v", err)
+	}
+	if !bytes.Equal(gotToClientPlain, toClientPlain) {
+		t.Fatalf("client received RTP=%x, want %x", gotToClientPlain, toClientPlain)
+	}
+
+	fromClientPlain := testRTPPacket(22, 0x11111111, []byte{0x02})
+	fromClientProtected, err := clientSender.ProtectClientRTP(fromClientPlain)
+	if err != nil {
+		t.Fatalf("client sender ProtectClientRTP() error = %v", err)
+	}
+	gotFromClientPlain, err := relay.UnprotectClientRTP(fromClientProtected)
+	if err != nil {
+		t.Fatalf("relay UnprotectClientRTP() error = %v", err)
+	}
+	if !bytes.Equal(gotFromClientPlain, fromClientPlain) {
+		t.Fatalf("relay decrypted client RTP=%x, want %x", gotFromClientPlain, fromClientPlain)
+	}
+
+	transforms := relay.RelayTransforms()
+	clientRelayPlain := testRTPPacket(23, 0x11111111, []byte{0x03})
+	clientRelayProtected, err := clientSender.ProtectClientRTP(clientRelayPlain)
+	if err != nil {
+		t.Fatalf("client sender ProtectClientRTP(relay) error = %v", err)
+	}
+	clientToIMS, err := transforms.ClientToIMSRTP(clientRelayProtected)
+	if err != nil {
+		t.Fatalf("ClientToIMSRTP() error = %v", err)
+	}
+	gotClientToIMS, err := imsReceiver.UnprotectIMSRTP(clientToIMS)
+	if err != nil {
+		t.Fatalf("ims receiver UnprotectIMSRTP() error = %v", err)
+	}
+	if !bytes.Equal(gotClientToIMS, clientRelayPlain) {
+		t.Fatalf("IMS received RTP=%x, want %x", gotClientToIMS, clientRelayPlain)
+	}
+
+	imsRelayPlain := testRTPPacket(31, 0x22222222, []byte{0x04})
+	imsRelayProtected, err := imsSender.ProtectIMSRTP(imsRelayPlain)
+	if err != nil {
+		t.Fatalf("ims sender ProtectIMSRTP() error = %v", err)
+	}
+	imsToClient, err := transforms.IMSToClientRTP(imsRelayProtected)
+	if err != nil {
+		t.Fatalf("IMSToClientRTP() error = %v", err)
+	}
+	gotIMSToClient, err := clientReceiver.UnprotectClientRTP(imsToClient)
+	if err != nil {
+		t.Fatalf("client receiver UnprotectClientRTP(relay) error = %v", err)
+	}
+	if !bytes.Equal(gotIMSToClient, imsRelayPlain) {
+		t.Fatalf("client received relayed RTP=%x, want %x", gotIMSToClient, imsRelayPlain)
+	}
+
+	clientRTCP := testRTCPPacket(0x33333333)
+	clientRTCPProtected, err := clientSender.ProtectClientRTCP(clientRTCP)
+	if err != nil {
+		t.Fatalf("client sender ProtectClientRTCP() error = %v", err)
+	}
+	clientRTCPToIMS, err := transforms.ClientToIMSRTCP(clientRTCPProtected)
+	if err != nil {
+		t.Fatalf("ClientToIMSRTCP() error = %v", err)
+	}
+	gotClientRTCPToIMS, err := imsReceiver.UnprotectIMSRTCP(clientRTCPToIMS)
+	if err != nil {
+		t.Fatalf("ims receiver UnprotectIMSRTCP() error = %v", err)
+	}
+	if !bytes.Equal(gotClientRTCPToIMS, clientRTCP) {
+		t.Fatalf("IMS received RTCP=%x, want %x", gotClientRTCPToIMS, clientRTCP)
+	}
+
+	imsRTCP := testRTCPPacket(0x44444444)
+	imsRTCPProtected, err := imsSender.ProtectIMSRTCP(imsRTCP)
+	if err != nil {
+		t.Fatalf("ims sender ProtectIMSRTCP() error = %v", err)
+	}
+	imsRTCPToClient, err := transforms.IMSToClientRTCP(imsRTCPProtected)
+	if err != nil {
+		t.Fatalf("IMSToClientRTCP() error = %v", err)
+	}
+	gotIMSRTCPToClient, err := clientReceiver.UnprotectClientRTCP(imsRTCPToClient)
+	if err != nil {
+		t.Fatalf("client receiver UnprotectClientRTCP() error = %v", err)
+	}
+	if !bytes.Equal(gotIMSRTCPToClient, imsRTCP) {
+		t.Fatalf("client received RTCP=%x, want %x", gotIMSRTCPToClient, imsRTCP)
+	}
+}
+
 func TestSRTPMediaSessionRejectsReplay(t *testing.T) {
 	session, err := NewSRTPMediaSession(testSRTPMediaConfig())
 	if err != nil {
@@ -126,6 +258,11 @@ func TestSRTPMediaSessionRejectsInvalidConfig(t *testing.T) {
 	cfg.Profile = "bogus"
 	if _, err := NewSRTPMediaSession(cfg); !errors.Is(err, ErrSRTPMediaConfig) {
 		t.Fatalf("NewSRTPMediaSession(profile) err=%v, want ErrSRTPMediaConfig", err)
+	}
+	cfg = testSRTPMediaConfig()
+	cfg.ClientProtectKeys = SRTPKeys{MasterKey: bytes.Repeat([]byte{0x10}, 16)}
+	if _, err := NewSRTPMediaSession(cfg); !errors.Is(err, ErrSRTPMediaConfig) {
+		t.Fatalf("NewSRTPMediaSession(partial explicit key) err=%v, want ErrSRTPMediaConfig", err)
 	}
 }
 
@@ -423,16 +560,26 @@ func TestSRTPMediaSessionReportsPlaintextRTPInRelayTransform(t *testing.T) {
 
 func testSRTPMediaConfig() SRTPMediaConfig {
 	return SRTPMediaConfig{
-		Profile: SRTPProfileAes128CmHmacSha1_80,
-		ClientKeys: SRTPKeys{
-			MasterKey:  bytes.Repeat([]byte{0x10}, 16),
-			MasterSalt: bytes.Repeat([]byte{0x20}, 14),
-		},
-		IMSKeys: SRTPKeys{
-			MasterKey:  bytes.Repeat([]byte{0x30}, 16),
-			MasterSalt: bytes.Repeat([]byte{0x40}, 14),
-		},
+		Profile:    SRTPProfileAes128CmHmacSha1_80,
+		ClientKeys: testSRTPKeys(0x10, 0x20),
+		IMSKeys:    testSRTPKeys(0x30, 0x40),
 	}
+}
+
+func testSRTPKeys(keyByte, saltByte byte) SRTPKeys {
+	return SRTPKeys{
+		MasterKey:  bytes.Repeat([]byte{keyByte}, 16),
+		MasterSalt: bytes.Repeat([]byte{saltByte}, 14),
+	}
+}
+
+func newTestSRTPMediaSession(t *testing.T, cfg SRTPMediaConfig) *SRTPMediaSession {
+	t.Helper()
+	session, err := NewSRTPMediaSession(cfg)
+	if err != nil {
+		t.Fatalf("NewSRTPMediaSession() error = %v", err)
+	}
+	return session
 }
 
 func testRTPPacket(sequence uint16, ssrc uint32, payload []byte) []byte {

@@ -334,6 +334,9 @@ func rtcpFeedbackEvents(direction RTCPFeedbackDirection, packet rtcp.Packet) []R
 		event.SLICount = len(p.SLI)
 	case *rtcp.ExtendedReport:
 		event.Kind = RTCPFeedbackExtendedReport
+		event.SSRC = p.SenderSSRC
+		event.SenderSSRC = p.SenderSSRC
+		event.ReportCount = len(p.Reports)
 	case *rtcp.SourceDescription:
 		event.Kind = RTCPFeedbackSourceDescription
 	case *rtcp.Goodbye:
@@ -424,6 +427,16 @@ func rtcpPacketType(packet rtcp.Packet) string {
 	if headerer, ok := packet.(rtcpHeaderer); ok {
 		header := headerer.Header()
 		return strconv.Itoa(int(header.Type))
+	}
+	switch packet.(type) {
+	case *rtcp.ExtendedReport:
+		return strconv.Itoa(int(rtcp.TypeExtendedReport))
+	case *rtcp.SourceDescription:
+		return strconv.Itoa(int(rtcp.TypeSourceDescription))
+	case *rtcp.Goodbye:
+		return strconv.Itoa(int(rtcp.TypeGoodbye))
+	case *rtcp.ApplicationDefined:
+		return strconv.Itoa(int(rtcp.TypeApplicationDefined))
 	}
 	name := fmt.Sprintf("%T", packet)
 	name = strings.TrimPrefix(name, "*")

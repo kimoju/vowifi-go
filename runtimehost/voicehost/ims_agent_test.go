@@ -1762,6 +1762,56 @@ func TestIMSOutboundAgentAutoRefreshesUACSessionTimer(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentAutoRefreshIgnoresQuotedSessionExpiresParams(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":              {"<sip:+18005551212@ims.example>;tag=remote-tag"},
+				"Contact":         {"<sip:carrier@198.51.100.1:5060>"},
+				"Session-Expires": {`1;refresher=uac;opaque="quoted;refresher=uas"`},
+			},
+			Body: []byte(sampleSDP("203.0.113.10", 49170)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"X-IMS": {"refresh-ok"}},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSOutboundAgent{
+		Transport:          transport,
+		SessionRefreshLead: 950 * time.Millisecond,
+		Profile:            voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	if _, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
+		CallID: "call-auto-refresh-quoted-param",
+		Callee: "+18005551212",
+		RawSDP: []byte(sampleSDP("192.0.2.50", 4002)),
+	}); err != nil {
+		t.Fatalf("StartOutboundCall() error = %v", err)
+	}
+	requests := waitForIMSRequests(t, transport, 2)
+	agent.StopSessionTimers()
+	if requests[1].Method != "UPDATE" || requests[1].Headers["CSeq"] != "2 UPDATE" ||
+		requests[1].Headers["Session-Expires"] != "1;refresher=uac" || len(requests[1].Body) != 0 {
+		t.Fatalf("refresh UPDATE=%+v body=%q", requests[1], requests[1].Body)
+	}
+	if err := agent.EndVoiceCall(context.Background(), DialogInfo{CallID: "call-auto-refresh-quoted-param"}); err != nil {
+		t.Fatalf("EndVoiceCall() error = %v", err)
+	}
+	requests = transport.requestSnapshot()
+	if len(requests) < 3 || requests[len(requests)-1].Method != "BYE" || requests[len(requests)-1].Headers["CSeq"] != "3 BYE" {
+		t.Fatalf("BYE after quoted-param refresh requests=%+v", requests)
+	}
+}
+
 func TestIMSOutboundAgentDoesNotAutoRefreshUASSessionTimer(t *testing.T) {
 	agent := &IMSOutboundAgent{}
 	agent.storeDialog("call-uas-refresh", imsDialogState{cfg: voiceclient.DialogRequestConfig{
@@ -2389,6 +2439,36 @@ func TestIMSOutboundAgentPracksReliableProvisional(t *testing.T) {
 	}
 	if route := transport.requests[2].Headers["Route"]; route != "<sip:dialog-proxy.ims.example;lr>" {
 		t.Fatalf("BYE Route=%q", route)
+	}
+}
+
+func TestIMSOutboundAgentPrackUsesActualToTagWithQuotedDisplayName(t *testing.T) {
+	cfg := voiceclient.DialogRequestConfig{
+		Profile:         voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		LocalURI:        "sip:user@ims.example",
+		ContactURI:      "sip:user@192.0.2.10:5060",
+		RemoteURI:       "sip:+18005551212@ims.example",
+		RemoteTargetURI: "sip:+18005551212@ims.example",
+		CallID:          "call-prack-quoted-tag",
+		LocalTag:        "local-tag",
+		CSeq:            1,
+	}
+	prack, ok, err := buildReliableProvisionalPRACK(cfg, voiceclient.SIPResponse{
+		StatusCode: 183,
+		Reason:     "Session Progress",
+		Headers: map[string][]string{
+			"To":      {`"ringing;tag=bogus" <sip:+18005551212@ims.example>;tag=early-tag`},
+			"Contact": {"<sip:early@198.51.100.1:5060>"},
+			"Require": {"100rel"},
+			"RSeq":    {"42"},
+		},
+	}, 2)
+	if err != nil || !ok {
+		t.Fatalf("buildReliableProvisionalPRACK() ok=%t err=%v", ok, err)
+	}
+	if prack.Headers["RAck"] != "42 1 INVITE" || !strings.Contains(prack.Headers["To"], "tag=early-tag") ||
+		strings.Contains(prack.Headers["To"], "tag=bogus") {
+		t.Fatalf("PRACK headers=%+v", prack.Headers)
 	}
 }
 

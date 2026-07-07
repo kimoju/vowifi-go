@@ -2046,7 +2046,7 @@ func sessionExpiresResponseHeader(headers map[string][]string) sessionIntervalHe
 
 func parseSessionExpiresHeaderValue(value string) sessionIntervalHeader {
 	for _, entry := range splitVoiceHeaderValues(value) {
-		parts := strings.Split(entry, ";")
+		parts := splitVoiceHeaderParams(entry)
 		if len(parts) == 0 {
 			continue
 		}
@@ -2259,6 +2259,14 @@ func recordRouteSet(headers map[string][]string) []string {
 }
 
 func splitVoiceHeaderValues(value string) []string {
+	return splitVoiceHeaderItems(value, ',')
+}
+
+func splitVoiceHeaderParams(value string) []string {
+	return splitVoiceHeaderItems(value, ';')
+}
+
+func splitVoiceHeaderItems(value string, separator rune) []string {
 	var out []string
 	var cur strings.Builder
 	inQuote := false
@@ -2283,7 +2291,7 @@ func splitVoiceHeaderValues(value string) []string {
 				angleDepth--
 			}
 			cur.WriteRune(r)
-		case r == ',' && !inQuote && angleDepth == 0:
+		case r == separator && !inQuote && angleDepth == 0:
 			if part := strings.TrimSpace(cur.String()); part != "" {
 				out = append(out, part)
 			}
@@ -2340,7 +2348,7 @@ func sipHeaderURI(value string) string {
 }
 
 func sipHeaderTag(value string) string {
-	for _, part := range strings.Split(value, ";") {
+	for _, part := range splitVoiceHeaderParams(value) {
 		key, raw, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if ok && strings.EqualFold(strings.TrimSpace(key), "tag") {
 			return strings.Trim(strings.TrimSpace(raw), `"`)

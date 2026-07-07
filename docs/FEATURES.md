@@ -256,9 +256,10 @@ protocol layers needed by VoHive:
   arguments, with rollback and cleanup support
 - SRTP/SRTCP media helpers and RTP relay transforms for protecting and
   unprotecting RTP/RTCP packets with AES-CM/HMAC-SHA1 and AEAD-AES-GCM
-  profiles, independent client/IMS key material, replay protection, and
-  authentication failure handling, plus SDP `a=crypto` tag, suite, inline key,
-  lifetime, and MKI validation on parse/build boundaries
+  profiles, independent direction-specific client/IMS key material for
+  asymmetric SDES offer/answer keying, replay protection, and authentication
+  failure handling, plus SDP `a=crypto` tag, suite, inline key, lifetime, and
+  MKI validation on parse/build boundaries
 - RTCP feedback inspection for RTP/SRTP relay paths, including Sender/Receiver
   Reports, PLI/FIR/rapid resynchronization requests, NACK, REMB, transport-wide
   congestion control, SLI, XR, SDES, BYE, application-defined packets,

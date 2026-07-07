@@ -81,6 +81,7 @@ type EmergencySIPHeaderConfig struct {
 	ServiceURN         string
 	AccessNetworkInfo  EmergencyAccessNetworkInfo
 	GeolocationURI     string
+	GeolocationValues  []GeolocationHeaderValue
 	Address            EmergencyAddress
 	GeolocationRouting bool
 	PIDFLOContentID    string
@@ -154,19 +155,7 @@ func BuildPAccessNetworkInfo(info EmergencyAccessNetworkInfo) string {
 		b.WriteString(`;i-wlan-node-id=`)
 		b.WriteString(quoteSIPParamValue(nodeID))
 	}
-	keys := make([]string, 0, len(params))
-	for key := range params {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		b.WriteByte(';')
-		b.WriteString(key)
-		if value := strings.TrimSpace(params[key]); value != "" {
-			b.WriteByte('=')
-			b.WriteString(formatSIPParamValue(value))
-		}
-	}
+	appendSIPHeaderParameters(&b, params)
 	return b.String()
 }
 
@@ -235,6 +224,10 @@ func parsePAccessNetworkInfoValue(value string) (EmergencyAccessNetworkInfo, err
 }
 
 func normalizePAccessNetworkInfoParameters(params map[string]string) map[string]string {
+	return normalizeSIPHeaderParameters(params)
+}
+
+func normalizeSIPHeaderParameters(params map[string]string) map[string]string {
 	if len(params) == 0 {
 		return nil
 	}
@@ -250,6 +243,23 @@ func normalizePAccessNetworkInfoParameters(params map[string]string) map[string]
 		return nil
 	}
 	return out
+}
+
+func appendSIPHeaderParameters(b *strings.Builder, params map[string]string) {
+	params = normalizeSIPHeaderParameters(params)
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		b.WriteByte(';')
+		b.WriteString(key)
+		if value := strings.TrimSpace(params[key]); value != "" {
+			b.WriteByte('=')
+			b.WriteString(formatSIPParamValue(value))
+		}
+	}
 }
 
 func formatSIPParamValue(value string) string {
@@ -320,6 +330,24 @@ func ParseGeolocationHeader(header string) ([]GeolocationHeaderValue, error) {
 		out = append(out, value)
 	}
 	return out, nil
+}
+
+func BuildGeolocationHeader(values ...GeolocationHeaderValue) string {
+	var out []string
+	for _, value := range values {
+		if formatted := formatGeolocationHeaderValue(value); formatted != "" {
+			out = append(out, formatted)
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+func NormalizeGeolocationHeader(header string) (string, error) {
+	values, err := ParseGeolocationHeader(header)
+	if err != nil {
+		return "", err
+	}
+	return BuildGeolocationHeader(values...), nil
 }
 
 func NormalizeGeolocationRoutingHeader(header string) (string, error) {
@@ -643,6 +671,9 @@ func emergencyGeolocationHeader(cfg EmergencySIPHeaderConfig) string {
 	if uri := strings.TrimSpace(cfg.GeolocationURI); uri != "" {
 		return formatGeolocationURI(uri)
 	}
+	if geolocation := BuildGeolocationHeader(cfg.GeolocationValues...); geolocation != "" {
+		return geolocation
+	}
 	if len(cfg.PIDFLOBody) > 0 || strings.TrimSpace(cfg.PIDFLOContentID) != "" {
 		if contentID := emergencyContentIDForHeader(cfg.PIDFLOContentID, defaultEmergencyPIDFLOContentID); contentID != "" {
 			return formatGeolocationURI("cid:" + contentID)
@@ -700,6 +731,42 @@ func formatGeolocationURI(uri string) string {
 		return uri
 	}
 	return "<" + uri + ">;inserted-by=endpoint"
+}
+
+func formatGeolocationHeaderValue(value GeolocationHeaderValue) string {
+	uri := strings.TrimSpace(value.URI)
+	if uri == "" {
+		return ""
+	}
+	params := normalizeSIPHeaderParameters(value.Parameters)
+	if strings.HasPrefix(uri, "<") {
+		parsed, err := parseGeolocationHeaderValue(uri)
+		if err != nil {
+			return ""
+		}
+		uri = parsed.URI
+		params = mergeSIPHeaderParameters(parsed.Parameters, params)
+	}
+	if uri == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteByte('<')
+	b.WriteString(uri)
+	b.WriteByte('>')
+	appendSIPHeaderParameters(&b, params)
+	return b.String()
+}
+
+func mergeSIPHeaderParameters(base, override map[string]string) map[string]string {
+	if len(base) == 0 {
+		return normalizeSIPHeaderParameters(override)
+	}
+	out := normalizeSIPHeaderParameters(base)
+	for key, value := range normalizeSIPHeaderParameters(override) {
+		out[key] = value
+	}
+	return out
 }
 
 func parseGeolocationHeaderValue(value string) (GeolocationHeaderValue, error) {

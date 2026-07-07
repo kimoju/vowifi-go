@@ -496,8 +496,14 @@ func DecryptChallengeEncryptedAttributes(request Packet, keys Keys) ([]Attribute
 }
 
 func DecryptPacketEncryptedAttributes(request Packet, keys Keys) ([]Attribute, bool, error) {
-	ivAttr, hasIV := FindAttribute(request.Attributes, AttributeIV)
-	encryptedAttr, hasEncrypted := FindAttribute(request.Attributes, AttributeEncrData)
+	ivAttr, hasIV, err := FindSingleAttribute(request.Attributes, AttributeIV)
+	if err != nil {
+		return nil, true, err
+	}
+	encryptedAttr, hasEncrypted, err := FindSingleAttribute(request.Attributes, AttributeEncrData)
+	if err != nil {
+		return nil, true, err
+	}
 	if !hasIV && !hasEncrypted {
 		return nil, false, nil
 	}
@@ -708,7 +714,9 @@ func parseChallenge(request Packet, keys *Keys) (Challenge, error) {
 		AUTN:       append([]byte(nil), vectors[0].AUTN...),
 		AUTNFields: cloneAUTNFields(vectors[0].AUTNFields),
 	}
-	if macAttr, ok := FindAttribute(request.Attributes, AttributeMAC); ok {
+	if macAttr, ok, err := findChallengeMACAttribute(request.Attributes); err != nil {
+		return Challenge{}, err
+	} else if ok {
 		mac, err := macAttr.MACValue()
 		if err != nil {
 			return Challenge{}, err
@@ -716,13 +724,17 @@ func parseChallenge(request Packet, keys *Keys) (Challenge, error) {
 		out.MAC = mac
 		out.HasMAC = true
 	}
-	if resultInd, ok := FindAttribute(request.Attributes, AttributeResultInd); ok {
+	if resultInd, ok, err := FindSingleAttribute(request.Attributes, AttributeResultInd); err != nil {
+		return Challenge{}, err
+	} else if ok {
 		if err := resultInd.ResultIndValue(); err != nil {
 			return Challenge{}, err
 		}
 		out.ResultInd = true
 	}
-	if checkcodeAttr, ok := FindAttribute(request.Attributes, AttributeCheckcode); ok {
+	if checkcodeAttr, ok, err := FindSingleAttribute(request.Attributes, AttributeCheckcode); err != nil {
+		return Challenge{}, err
+	} else if ok {
 		checkcode, err := checkcodeAttr.CheckcodeValue()
 		if err != nil {
 			return Challenge{}, err
@@ -730,7 +742,9 @@ func parseChallenge(request Packet, keys *Keys) (Challenge, error) {
 		out.Checkcode = checkcode
 		out.HasCheckcode = true
 	}
-	if biddingAttr, ok := FindAttribute(request.Attributes, AttributeBidding); ok {
+	if biddingAttr, ok, err := FindSingleAttribute(request.Attributes, AttributeBidding); err != nil {
+		return Challenge{}, err
+	} else if ok {
 		bidding, err := biddingAttr.BiddingValue()
 		if err != nil {
 			return Challenge{}, err
@@ -743,7 +757,9 @@ func parseChallenge(request Packet, keys *Keys) (Challenge, error) {
 		return Challenge{}, err
 	}
 	out.KDFValues = append([]uint16(nil), kdfs...)
-	if kdfInputAttr, ok := FindAttribute(request.Attributes, AttributeKDFInput); ok {
+	if kdfInputAttr, ok, err := FindSingleAttribute(request.Attributes, AttributeKDFInput); err != nil {
+		return Challenge{}, err
+	} else if ok {
 		kdfInput, err := kdfInputAttr.KDFInputValue()
 		if err != nil {
 			return Challenge{}, err
@@ -759,8 +775,14 @@ func parseChallenge(request Packet, keys *Keys) (Challenge, error) {
 			return Challenge{}, err
 		}
 	}
-	ivAttr, hasIV := FindAttribute(request.Attributes, AttributeIV)
-	encryptedAttr, hasEncrypted := FindAttribute(request.Attributes, AttributeEncrData)
+	ivAttr, hasIV, err := FindSingleAttribute(request.Attributes, AttributeIV)
+	if err != nil {
+		return Challenge{}, err
+	}
+	encryptedAttr, hasEncrypted, err := FindSingleAttribute(request.Attributes, AttributeEncrData)
+	if err != nil {
+		return Challenge{}, err
+	}
 	if hasIV || hasEncrypted {
 		if !hasIV || !hasEncrypted {
 			return Challenge{}, fmt.Errorf("%w: incomplete AT_IV/AT_ENCR_DATA pair", ErrInvalidEncryptedData)
@@ -785,6 +807,26 @@ func parseChallenge(request Packet, keys *Keys) (Challenge, error) {
 		}
 	}
 	return out, nil
+}
+
+func findChallengeMACAttribute(attrs []Attribute) (Attribute, bool, error) {
+	var out Attribute
+	count := 0
+	for _, attr := range attrs {
+		if attr.Type != AttributeMAC {
+			continue
+		}
+		out = attr
+		count++
+	}
+	switch count {
+	case 0:
+		return Attribute{}, false, nil
+	case 1:
+		return out, true, nil
+	default:
+		return Attribute{}, true, fmt.Errorf("%w: duplicate AT_MAC", ErrInvalidMAC)
+	}
 }
 
 func challengeVectors(request Packet) ([]ChallengeVector, error) {
@@ -981,6 +1023,9 @@ func packetWithZeroedMAC(packet []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if length != 20 {
+		return nil, fmt.Errorf("%w: AT_MAC length %d", ErrInvalidMAC, length)
+	}
 	out := append([]byte(nil), packet...)
 	for i := offset + 2; i < offset+length; i++ {
 		out[i] = 0
@@ -996,6 +1041,8 @@ func findMACAttribute(packet []byte) (offset int, length int, err error) {
 	if packetLen < 8 || packetLen > len(packet) {
 		return 0, 0, ErrInvalidPacket
 	}
+	foundOffset := -1
+	foundLength := 0
 	for offset := 8; offset < packetLen; {
 		if packetLen-offset < 4 {
 			return 0, 0, ErrInvalidAttribute
@@ -1005,9 +1052,16 @@ func findMACAttribute(packet []byte) (offset int, length int, err error) {
 			return 0, 0, ErrInvalidAttribute
 		}
 		if packet[offset] == AttributeMAC {
-			return offset, length, nil
+			if foundOffset >= 0 {
+				return 0, 0, fmt.Errorf("%w: duplicate AT_MAC", ErrInvalidMAC)
+			}
+			foundOffset = offset
+			foundLength = length
 		}
 		offset += length
+	}
+	if foundOffset >= 0 {
+		return foundOffset, foundLength, nil
 	}
 	return 0, 0, fmt.Errorf("%w: missing AT_MAC", ErrInvalidMAC)
 }
