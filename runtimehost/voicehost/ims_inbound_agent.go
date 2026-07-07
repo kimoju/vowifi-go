@@ -752,12 +752,35 @@ func (a *IMSInboundAgent) HandleInboundPrack(ctx context.Context, req InboundDia
 	prackCSeq := inboundCSeq(req.CSeq)
 	cfg.CSeq = prackCSeq
 	rack := firstVoiceNonEmpty(req.RAck, firstVoiceHeader(req.Headers, "RAck"))
+	body := inboundDialogBody(req)
+	contentType := firstVoiceNonEmpty(req.ContentType, firstVoiceHeader(req.Headers, "Content-Type"))
+	var srtpNegotiation *inboundSDESRelayNegotiation
+	if len(body) > 0 {
+		remoteSDP, offerBody, err := inboundDialogSDP(req)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid IMS PRACK SDP"}, err
+		}
+		body = offerBody
+		if state.relay != nil {
+			if err := state.relay.SetIMSRemote(remoteSDP); err != nil {
+				return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS PRACK failed"}, err
+			}
+			imsOfferBody := append([]byte(nil), offerBody...)
+			body = RewriteSDPMediaEndpoint(offerBody, state.relay.ClientEndpoint())
+			if negotiation, err := a.newInboundSDESRelayNegotiation(imsOfferBody, state); err != nil {
+				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "RTP relay SRTP PRACK negotiation failed"}, err
+			} else if negotiation != nil {
+				srtpNegotiation = negotiation
+				body = srtpNegotiation.RewriteClientOffer(body)
+			}
+		}
+	}
 	var resp voiceclient.SIPResponse
 	var prack voiceclient.SIPRequestMessage
 	var err error
 	redirectRetries := 0
 	for {
-		prack, err = voiceclient.BuildPrackRequest(cfg, rack)
+		prack, err = voiceclient.BuildPrackRequestWithBody(cfg, rack, contentType, body)
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client PRACK failed"}, err
 		}
@@ -786,7 +809,39 @@ func (a *IMSInboundAgent) HandleInboundPrack(ctx context.Context, req InboundDia
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return InboundCallResult{Accepted: false, StatusCode: inboundStatusCode(resp.StatusCode, 500), Reason: firstVoiceNonEmpty(resp.Reason, "PRACK rejected")}, nil
 	}
-	return InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...), Headers: firstValueSIPHeaders(resp.Headers)}, nil
+	if len(resp.Body) == 0 && srtpNegotiation != nil {
+		return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "missing client PRACK SDP answer"}, ErrSDPSecurityNegotiation
+	}
+	result := InboundCallResult{Accepted: true, StatusCode: inboundStatusCode(resp.StatusCode, 200), Reason: firstVoiceNonEmpty(resp.Reason, "OK"), RawSDP: append([]byte(nil), resp.Body...), Headers: firstValueSIPHeaders(resp.Headers)}
+	if len(resp.Body) > 0 && state.relay != nil {
+		localSDP, err := ParseSDP(resp.Body)
+		if err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid client PRACK SDP answer"}, err
+		}
+		if err := state.relay.SetClientRemote(localSDP); err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client PRACK failed"}, err
+		}
+		if srtpNegotiation != nil {
+			result.RawSDP, localSDP, err = srtpNegotiation.RewriteIMSAnswer(state.relay, resp.Body, localSDP)
+			if err != nil {
+				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP PRACK SDP answer"}, err
+			}
+		} else if _, ok := a.inboundSDESRelayConfig(state); ok {
+			return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "RTP relay SRTP PRACK negotiation unavailable"}, ErrSDPSecurityNegotiation
+		} else {
+			result.RawSDP = RewriteSDPMediaEndpoint(resp.Body, state.relay.IMSEndpoint())
+			localSDP, err = ParseSDP(result.RawSDP)
+			if err != nil {
+				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay PRACK SDP answer"}, err
+			}
+		}
+		result.LocalSDP = localSDP
+	}
+	if srtpNegotiation != nil {
+		state.srtpNegotiation = srtpNegotiation
+		a.storeInboundDialog(callID, state)
+	}
+	return result, nil
 }
 
 func (a *IMSInboundAgent) HandleInboundRefer(ctx context.Context, req InboundDialogRequest) (InboundCallResult, error) {
@@ -1283,7 +1338,7 @@ func inboundOfferSDP(req InboundCallRequest) (SDPInfo, []byte, error) {
 }
 
 func inboundDialogSDP(req InboundDialogRequest) (SDPInfo, []byte, error) {
-	body := append([]byte(nil), req.RawSDP...)
+	body := inboundDialogBody(req)
 	info := req.RemoteSDP
 	if info.MediaPort <= 0 || strings.TrimSpace(info.ConnectionIP) == "" {
 		parsed, err := ParseSDP(body)
@@ -1296,6 +1351,13 @@ func inboundDialogSDP(req InboundDialogRequest) (SDPInfo, []byte, error) {
 		body = BuildSDPAnswer(info)
 	}
 	return info, body, nil
+}
+
+func inboundDialogBody(req InboundDialogRequest) []byte {
+	if len(req.RawSDP) > 0 {
+		return append([]byte(nil), req.RawSDP...)
+	}
+	return append([]byte(nil), req.Body...)
 }
 
 func inboundCSeq(cseq int) int {

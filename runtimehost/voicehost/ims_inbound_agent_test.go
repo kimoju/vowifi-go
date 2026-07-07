@@ -3,6 +3,7 @@ package voicehost
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
@@ -2124,6 +2125,78 @@ func TestIMSInboundAgentUsesRTPRelay(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentRewritesPrackSDPWithRTPRelay(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+			Body:       []byte(sampleSDP("127.0.0.1", 4002)),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Body:       []byte(sampleSDP("127.0.0.1", 4010)),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		MediaRelay: &RTPRelayConfig{
+			ClientListenIP:    "127.0.0.1",
+			ClientAdvertiseIP: "127.0.0.1",
+			IMSListenIP:       "127.0.0.1",
+			IMSAdvertiseIP:    "127.0.0.1",
+		},
+	}
+	if _, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-relay-prack-sdp",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("127.0.0.1", 49170)),
+	}); err != nil {
+		t.Fatalf("HandleInboundInvite() error = %v", err)
+	}
+	result, err := agent.HandleInboundPrack(context.Background(), InboundDialogRequest{
+		CallID:      "in-call-relay-prack-sdp",
+		CSeq:        2,
+		RAck:        "1 1 INVITE",
+		ContentType: "application/sdp",
+		RawSDP:      []byte(sampleSDP("127.0.0.1", 49190)),
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundPrack() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "PRACK" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	prack := transport.requests[1]
+	if prack.Headers["Content-Type"] != "application/sdp" || prack.Headers["RAck"] != "1 1 INVITE" {
+		t.Fatalf("PRACK headers=%+v", prack.Headers)
+	}
+	clientOffer, err := ParseSDP(prack.Body)
+	if err != nil {
+		t.Fatalf("ParseSDP(PRACK body) error = %v", err)
+	}
+	if clientOffer.ConnectionIP != "127.0.0.1" || clientOffer.MediaPort == 49190 || clientOffer.MediaPort <= 0 || clientOffer.RTCPPort <= 0 {
+		t.Fatalf("client PRACK offer=%+v body=%q", clientOffer, prack.Body)
+	}
+	if body := string(prack.Body); strings.Contains(body, "m=audio 49190 ") {
+		t.Fatalf("PRACK body leaked IMS endpoint: %q", body)
+	}
+	if result.LocalSDP.ConnectionIP != "127.0.0.1" || result.LocalSDP.MediaPort == 4010 || result.LocalSDP.MediaPort <= 0 || result.LocalSDP.RTCPPort <= 0 {
+		t.Fatalf("IMS PRACK answer=%+v body=%q", result.LocalSDP, result.RawSDP)
+	}
+	if body := string(result.RawSDP); strings.Contains(body, "m=audio 4010 ") {
+		t.Fatalf("PRACK result body leaked client endpoint: %q", body)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-relay-prack-sdp"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+}
+
 func TestIMSInboundAgentNegotiatesInboundSDESRelay(t *testing.T) {
 	imsPeer := listenTestUDP(t)
 	defer imsPeer.Close()
@@ -2240,6 +2313,163 @@ func TestIMSInboundAgentNegotiatesInboundSDESRelay(t *testing.T) {
 	}
 
 	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-relay-sdes"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+}
+
+func TestIMSInboundAgentNegotiatesSRTPPrackSDP(t *testing.T) {
+	profile := SRTPProfileAes128CmHmacSha1_80
+	imsKeys := testSRTPKeys(0x31, 0x41)
+	clientKeys := testSRTPKeys(0x11, 0x21)
+	imsPrackKeys := testSRTPKeys(0x32, 0x42)
+	clientPrackKeys := testSRTPKeys(0x12, 0x22)
+	imsOffer := sampleSDPWithCrypto(t, "127.0.0.1", 49170, profile, imsKeys)
+	clientAnswer := sampleSDPWithCrypto(t, "127.0.0.1", 4002, profile, clientKeys)
+	imsPrackOffer := sampleSDPWithCrypto(t, "127.0.0.1", 49190, profile, imsPrackKeys)
+	clientPrackAnswer := sampleSDPWithCrypto(t, "127.0.0.1", 4010, profile, clientPrackKeys)
+	remoteSDP, err := ParseSDP([]byte(imsOffer))
+	if err != nil {
+		t.Fatalf("ParseSDP(imsOffer) error = %v", err)
+	}
+	relayRandom := append(bytes.Repeat([]byte{0x55}, 30), bytes.Repeat([]byte{0x66}, 30)...)
+	relayRandom = append(relayRandom, bytes.Repeat([]byte{0x77}, 30)...)
+	relayRandom = append(relayRandom, bytes.Repeat([]byte{0x88}, 30)...)
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@127.0.0.1:5060>"},
+			},
+			Body: []byte(clientAnswer),
+		},
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Body:       []byte(clientPrackAnswer),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		MediaRelay: &RTPRelayConfig{
+			ClientListenIP:    "127.0.0.1",
+			ClientAdvertiseIP: "127.0.0.1",
+			IMSListenIP:       "127.0.0.1",
+			IMSAdvertiseIP:    "127.0.0.1",
+			SRTP: &RTPRelaySRTPConfig{
+				Random: bytes.NewReader(relayRandom),
+			},
+		},
+	}
+	if result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-relay-sdes-prack",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RemoteSDP: remoteSDP,
+		RawSDP:    []byte(imsOffer),
+	}); err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	result, err := agent.HandleInboundPrack(context.Background(), InboundDialogRequest{
+		CallID:      "in-call-relay-sdes-prack",
+		CSeq:        2,
+		RAck:        "1 1 INVITE",
+		ContentType: "application/sdp",
+		RawSDP:      []byte(imsPrackOffer),
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundPrack() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[1].Method != "PRACK" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if body := string(transport.requests[1].Body); !strings.Contains(body, "RTP/SAVP") || !strings.Contains(body, "a=crypto:") ||
+		strings.Contains(body, "m=audio 49190 ") {
+		t.Fatalf("client PRACK offer body=%q", body)
+	}
+	if body := string(result.RawSDP); !strings.Contains(body, "RTP/SAVP") || !strings.Contains(body, "a=crypto:") ||
+		strings.Contains(body, "m=audio 4010 ") {
+		t.Fatalf("IMS PRACK answer body=%q", body)
+	}
+	relayToClientKeys := firstSDPCryptoKeys(t, transport.requests[1].Body)
+	relayToIMSKeys := firstSDPCryptoKeys(t, result.RawSDP)
+	if bytes.Equal(relayToClientKeys.MasterKey, imsPrackKeys.MasterKey) || bytes.Equal(relayToIMSKeys.MasterKey, clientPrackKeys.MasterKey) {
+		t.Fatalf("unexpected PRACK relay keys client=%x ims=%x", relayToClientKeys.MasterKey, relayToIMSKeys.MasterKey)
+	}
+	if result.LocalSDP.MediaPort == 4010 || result.LocalSDP.MediaPort <= 0 {
+		t.Fatalf("IMS PRACK answer=%+v", result.LocalSDP)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-relay-sdes-prack"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+}
+
+func TestIMSInboundAgentRejectsUnsafeSRTPPrackSDP(t *testing.T) {
+	profile := SRTPProfileAes128CmHmacSha1_80
+	imsKeys := testSRTPKeys(0x31, 0x41)
+	clientKeys := testSRTPKeys(0x11, 0x21)
+	imsOffer := sampleSDPWithCrypto(t, "127.0.0.1", 49170, profile, imsKeys)
+	clientAnswer := sampleSDPWithCrypto(t, "127.0.0.1", 4002, profile, clientKeys)
+	remoteSDP, err := ParseSDP([]byte(imsOffer))
+	if err != nil {
+		t.Fatalf("ParseSDP(imsOffer) error = %v", err)
+	}
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@127.0.0.1:5060>"},
+			},
+			Body: []byte(clientAnswer),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		MediaRelay: &RTPRelayConfig{
+			ClientListenIP:    "127.0.0.1",
+			ClientAdvertiseIP: "127.0.0.1",
+			IMSListenIP:       "127.0.0.1",
+			IMSAdvertiseIP:    "127.0.0.1",
+			SRTP: &RTPRelaySRTPConfig{
+				Random: bytes.NewReader(bytes.Repeat([]byte{0x55}, 60)),
+			},
+		},
+	}
+	if result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-relay-sdes-prack-reject",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RemoteSDP: remoteSDP,
+		RawSDP:    []byte(imsOffer),
+	}); err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	result, err := agent.HandleInboundPrack(context.Background(), InboundDialogRequest{
+		CallID:      "in-call-relay-sdes-prack-reject",
+		CSeq:        2,
+		RAck:        "1 1 INVITE",
+		ContentType: "application/sdp",
+		RawSDP:      []byte(sampleSDP("127.0.0.1", 49190)),
+	})
+	if !errors.Is(err, ErrSDPSecurityNegotiation) {
+		t.Fatalf("HandleInboundPrack() err=%v, want ErrSDPSecurityNegotiation", err)
+	}
+	if result.Accepted || result.StatusCode != 488 {
+		t.Fatalf("HandleInboundPrack() result=%+v", result)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("unsafe PRACK SDP should not reach client, requests=%+v", transport.requests)
+	}
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-relay-sdes-prack-reject"}); err != nil {
 		t.Fatalf("EndInboundCall() error = %v", err)
 	}
 }
