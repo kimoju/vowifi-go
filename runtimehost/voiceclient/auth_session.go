@@ -219,8 +219,11 @@ func RoundTripRequestWithDigestAuth(ctx context.Context, transport SIPRequestTra
 		return resp, err
 	}
 	current := msg
-	allowChallengeRetry := true
-	for retries := 0; retries < 2 && allowChallengeRetry; retries++ {
+	allowNonStaleChallengeRetry := true
+	for retries := 0; retries < 2; retries++ {
+		if !allowNonStaleChallengeRetry && !sipDigestChallengeIsStale(resp) {
+			break
+		}
 		retry, result, ok, err := DigestChallengeRetryRequestWithResult(current, resp)
 		if err != nil {
 			return resp, err
@@ -236,9 +239,18 @@ func RoundTripRequestWithDigestAuth(ctx context.Context, transport SIPRequestTra
 		if err != nil {
 			return resp, err
 		}
-		allowChallengeRetry = result.Authorization.SyncFailure
+		allowNonStaleChallengeRetry = result.Authorization.SyncFailure
 	}
 	return resp, ApplyDigestAuthenticationInfo(current, resp)
+}
+
+func sipDigestChallengeIsStale(resp SIPResponse) bool {
+	if !isSIPDigestChallengeStatus(resp.StatusCode) {
+		return false
+	}
+	challengeHeader, _ := digestChallengeHeaders(resp.StatusCode)
+	ch, err := SelectDigestChallenge(resp.Headers, challengeHeader)
+	return err == nil && ch.Stale
 }
 
 func isSIPDigestChallengeStatus(code int) bool {

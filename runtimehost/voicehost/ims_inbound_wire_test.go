@@ -2080,6 +2080,125 @@ func TestIMSInboundWireServerFallsBackToAgentForUnhandledNonUSSDInfo(t *testing.
 	}
 }
 
+func TestIMSInboundWireServerCachesNonInviteTransactionSnapshot(t *testing.T) {
+	t1 := 20 * time.Millisecond
+	server := &IMSInboundWireServer{
+		TransactionTTL: 10 * time.Second,
+		InviteFinalT1:  t1,
+		MessageHandler: IMSMessageHandlerFunc(func(ctx context.Context, req IMSMessageRequest) (IMSMessageResult, error) {
+			return IMSMessageResult{
+				StatusCode:  202,
+				Reason:      "Accepted",
+				ContentType: "application/vnd.3gpp.sms",
+				Body:        []byte{0x02, 0x44},
+			}, nil
+		}),
+	}
+	req := parseWireIncoming(t, wireIMSRequest("wire-cache-message", "MESSAGE", 3, []byte{0x01, 0x44}, "Content-Type: application/vnd.3gpp.sms\r\n"))
+	responses, err := server.HandleRequest(context.Background(), req)
+	if err != nil {
+		t.Fatalf("HandleRequest(MESSAGE) error = %v", err)
+	}
+	if len(responses) != 1 || responses[0].StatusCode != 202 {
+		t.Fatalf("responses=%+v", responses)
+	}
+	snapshot, ok := server.CachedTransactionSnapshot(req)
+	if !ok {
+		t.Fatalf("CachedTransactionSnapshot(MESSAGE) missing")
+	}
+	if snapshot.Method != "MESSAGE" ||
+		snapshot.Invite ||
+		snapshot.State != voiceclient.SIPServerTransactionStateCompleted ||
+		snapshot.Provisional ||
+		!snapshot.Final ||
+		snapshot.Pending ||
+		len(snapshot.StatusCodes) != 1 ||
+		snapshot.StatusCodes[0] != 202 ||
+		snapshot.CleanupAfter != 64*t1 ||
+		snapshot.TimeoutAfter != 0 ||
+		snapshot.ExpiresAt.IsZero() {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	replayed, ok := server.cachedTransaction(wireTransactionKey(req))
+	if !ok || len(replayed) != 1 || replayed[0].StatusCode != 202 || string(replayed[0].Body) != string([]byte{0x02, 0x44}) {
+		t.Fatalf("cached transaction ok=%v responses=%+v", ok, replayed)
+	}
+}
+
+func TestIMSInboundWireServerCachesPendingInviteTransactionSnapshot(t *testing.T) {
+	transport := newBlockingWireInboundTransport()
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		},
+		TransactionTTL: time.Second,
+	}
+	req := parseWireIncoming(t, wireIMSInvite("wire-cache-invite", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170))))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan []IMSInboundWireResponse, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		responses, err := server.HandleRequest(ctx, req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		done <- responses
+	}()
+	if got := transport.readRequest(t); got.Method != "INVITE" {
+		t.Fatalf("client INVITE=%+v", got)
+	}
+	snapshot, ok := server.CachedTransactionSnapshot(req)
+	if !ok {
+		t.Fatalf("CachedTransactionSnapshot(INVITE) missing")
+	}
+	if snapshot.Method != "INVITE" ||
+		!snapshot.Invite ||
+		snapshot.State != voiceclient.SIPServerTransactionStateProceeding ||
+		!snapshot.Provisional ||
+		snapshot.Final ||
+		!snapshot.Pending ||
+		len(snapshot.StatusCodes) != 1 ||
+		snapshot.StatusCodes[0] != 100 ||
+		snapshot.CleanupAfter != 0 ||
+		snapshot.TimeoutAfter != 0 ||
+		snapshot.ExpiresAt.IsZero() {
+		t.Fatalf("pending snapshot=%+v", snapshot)
+	}
+
+	transport.respond(voiceclient.SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=client-tag"}},
+		Body:       []byte(sampleSDP("127.0.0.1", 4002)),
+	})
+	select {
+	case responses := <-done:
+		if len(responses) != 2 || responses[0].StatusCode != 100 || responses[1].StatusCode != 200 {
+			t.Fatalf("responses=%+v", responses)
+		}
+	case err := <-errCh:
+		t.Fatalf("HandleRequest(INVITE) error = %v", err)
+	case <-time.After(time.Second):
+		t.Fatalf("HandleRequest(INVITE) did not finish")
+	}
+	snapshot, ok = server.CachedTransactionSnapshot(req)
+	if !ok {
+		t.Fatalf("CachedTransactionSnapshot(INVITE final) missing")
+	}
+	if snapshot.State != voiceclient.SIPServerTransactionStateTerminated ||
+		!snapshot.Final ||
+		snapshot.Pending ||
+		len(snapshot.StatusCodes) != 2 ||
+		snapshot.StatusCodes[0] != 100 ||
+		snapshot.StatusCodes[1] != 200 {
+		t.Fatalf("final snapshot=%+v", snapshot)
+	}
+}
+
 func TestIMSInboundWireServerRejectsMessageWithoutHandler(t *testing.T) {
 	server := &IMSInboundWireServer{}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{

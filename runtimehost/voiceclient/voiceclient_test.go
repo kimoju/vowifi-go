@@ -3637,6 +3637,50 @@ func TestRoundTripRequestWithDigestAuthRetriesChallenge(t *testing.T) {
 	}
 }
 
+func TestRoundTripRequestWithDigestAuthRetriesStaleChallenge(t *testing.T) {
+	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-stale-old", Algorithm: "MD5", QOP: "auth"}
+	state := newDigestAuthState("Authorization", ch, DigestAuthInput{
+		Method:   "REGISTER",
+		URI:      "sip:ims.example",
+		Username: "impi@example",
+		Password: "secret",
+		CNonce:   "cnonce",
+		NC:       1,
+	}, "")
+	transport := &fakeSIPRequestRoundTripTransport{responses: []SIPResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers:    map[string][]string{"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-stale-first", algorithm=MD5, qop="auth"`}},
+		},
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers:    map[string][]string{"WWW-Authenticate": {`Digest realm="ims.example", nonce="nonce-stale-second", algorithm=MD5, qop="auth", stale=true`}},
+		},
+		{StatusCode: 202, Reason: "Accepted"},
+	}}
+	resp, err := RoundTripRequestWithDigestAuth(context.Background(), transport, SIPRequestMessage{
+		Method:      "MESSAGE",
+		URI:         "sip:+18005551212@pcscf.example",
+		Headers:     map[string]string{"Authorization": "Digest old"},
+		Body:        []byte("hello"),
+		AuthSession: NewDigestAuthSession("Authorization", "", state),
+	})
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequestWithDigestAuth() resp=%+v err=%v", resp, err)
+	}
+	if len(transport.requests) != 3 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if auth := transport.requests[1].Headers["Authorization"]; !strings.Contains(auth, `nonce="nonce-stale-first"`) || !strings.Contains(auth, `nc=00000001`) {
+		t.Fatalf("first retry Authorization=%s", auth)
+	}
+	if auth := transport.requests[2].Headers["Authorization"]; !strings.Contains(auth, `nonce="nonce-stale-second"`) || !strings.Contains(auth, `nc=00000001`) {
+		t.Fatalf("stale retry Authorization=%s", auth)
+	}
+}
+
 func TestRoundTripRequestWithDigestAuthAcksAndRetriesInviteChallenge(t *testing.T) {
 	ch := DigestChallenge{Scheme: "Digest", Realm: "ims.example", Nonce: "nonce-invite-old", Algorithm: "MD5", QOP: "auth"}
 	state := newDigestAuthState("Authorization", ch, DigestAuthInput{

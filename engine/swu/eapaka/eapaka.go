@@ -196,6 +196,9 @@ type AKARecoveryDecision struct {
 }
 
 func (p Packet) MarshalBinary() ([]byte, error) {
+	if !isEAPCode(p.Code) {
+		return nil, fmt.Errorf("%w: EAP code %d", ErrInvalidPacket, p.Code)
+	}
 	if p.Code == CodeSuccess || p.Code == CodeFailure {
 		out := []byte{p.Code, p.Identifier, 0, 4}
 		return out, nil
@@ -235,6 +238,9 @@ func ParsePacket(data []byte) (Packet, error) {
 		return Packet{}, fmt.Errorf("%w: length %d", ErrInvalidPacket, length)
 	}
 	p := Packet{Code: data[0], Identifier: data[1]}
+	if !isEAPCode(p.Code) {
+		return Packet{}, fmt.Errorf("%w: EAP code %d", ErrInvalidPacket, p.Code)
+	}
 	if p.Code == CodeSuccess || p.Code == CodeFailure {
 		if length != 4 {
 			return Packet{}, fmt.Errorf("%w: terminal packet length %d", ErrInvalidPacket, length)
@@ -256,6 +262,15 @@ func ParsePacket(data []byte) (Packet, error) {
 	}
 	p.Attributes = attrs
 	return p, nil
+}
+
+func isEAPCode(code uint8) bool {
+	switch code {
+	case CodeRequest, CodeResponse, CodeSuccess, CodeFailure:
+		return true
+	default:
+		return false
+	}
 }
 
 func MarshalAttributes(attrs []Attribute) ([]byte, error) {

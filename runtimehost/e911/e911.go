@@ -1542,42 +1542,7 @@ func serviceURNsFromAny(value any) []string {
 }
 
 func normalizeEmergencyServiceURN(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	lower := strings.ToLower(s)
-	if strings.HasPrefix(lower, "urn:service:sos") {
-		return lower
-	}
-	switch lower {
-	case "sos", "emergency", "e911", "911":
-		return "urn:service:sos"
-	case "police":
-		return "urn:service:sos.police"
-	case "fire":
-		return "urn:service:sos.fire"
-	case "ambulance", "medical", "ems":
-		return "urn:service:sos.ambulance"
-	case "animal-control", "animalcontrol":
-		return "urn:service:sos.animal-control"
-	case "gas":
-		return "urn:service:sos.gas"
-	case "marine":
-		return "urn:service:sos.marine"
-	case "mountain":
-		return "urn:service:sos.mountain"
-	case "physician":
-		return "urn:service:sos.physician"
-	case "poison":
-		return "urn:service:sos.poison"
-	case "ecall", "manual-ecall", "ecall-manual":
-		return "urn:service:sos.ecall.manual"
-	case "automatic-ecall", "ecall-automatic":
-		return "urn:service:sos.ecall.automatic"
-	default:
-		return ""
-	}
+	return normalizeEmergencyServiceURNValue(s)
 }
 
 func appendEmergencyRoute(out *entitlementResult, route EmergencyRoute) {

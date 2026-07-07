@@ -899,3 +899,20 @@ func TestParseRejectsInvalidLengths(t *testing.T) {
 		t.Fatalf("ParseAttributes() err=%v, want ErrInvalidAttribute", err)
 	}
 }
+
+func TestPacketRejectsInvalidEAPCode(t *testing.T) {
+	raw := []byte{9, 1, 0, 8, TypeAKA, SubtypeIdentity, 0, 0}
+	if _, err := ParsePacket(raw); !errors.Is(err, ErrInvalidPacket) {
+		t.Fatalf("ParsePacket(invalid code) err=%v, want ErrInvalidPacket", err)
+	}
+
+	_, err := Packet{
+		Code:       9,
+		Identifier: 1,
+		Type:       TypeAKA,
+		Subtype:    SubtypeIdentity,
+	}.MarshalBinary()
+	if !errors.Is(err, ErrInvalidPacket) {
+		t.Fatalf("MarshalBinary(invalid code) err=%v, want ErrInvalidPacket", err)
+	}
+}

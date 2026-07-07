@@ -31,6 +31,49 @@ func TestEmergencyServiceURNsForCategory(t *testing.T) {
 	}
 }
 
+func TestClassifyEmergencyServiceNormalizesURNsAndCategories(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		service   string
+		emergency bool
+		urn       string
+		category  EmergencyServiceCategory
+	}{
+		{name: "base alias", service: "112", emergency: true, urn: DefaultEmergencyServiceURN},
+		{name: "service prefix", service: "service:fire", emergency: true, urn: "urn:service:sos.fire", category: EmergencyServiceCategoryFire},
+		{name: "sos shorthand", service: "SOS.POLICE", emergency: true, urn: "urn:service:sos.police", category: EmergencyServiceCategoryPolice},
+		{name: "medical alias", service: "medical", emergency: true, urn: "urn:service:sos.ambulance", category: EmergencyServiceCategoryAmbulance},
+		{name: "ecall automatic", service: "urn:service:sos.ecall.automatic", emergency: true, urn: "urn:service:sos.ecall.automatic", category: EmergencyServiceCategoryAutomaticECall},
+		{name: "registered subservice without category", service: "poison", emergency: true, urn: "urn:service:sos.poison"},
+		{name: "unknown sos subservice", service: "urn:service:sos.private", emergency: true, urn: "urn:service:sos.private"},
+		{name: "sip urn wrapper", service: "sip:urn:service:sos.fire@ecscf.example;transport=tcp", emergency: true, urn: "urn:service:sos.fire", category: EmergencyServiceCategoryFire},
+		{name: "sips display wrapper", service: `"Alt" <sips:urn:service:sos.police@ecscf.example;lr>`, emergency: true, urn: "urn:service:sos.police", category: EmergencyServiceCategoryPolice},
+		{name: "sip dial string wrapper", service: "sip:911@example.test;user=phone", emergency: true, urn: DefaultEmergencyServiceURN},
+		{name: "tel dial string wrapper", service: "tel:112;phone-context=+1", emergency: true, urn: DefaultEmergencyServiceURN},
+		{name: "slash urn wrapper", service: "urn/service/sos/ambulance", emergency: true, urn: "urn:service:sos.ambulance", category: EmergencyServiceCategoryAmbulance},
+		{name: "false prefix", service: "urn:service:sosatellite", emergency: false},
+		{name: "non sos urn", service: "urn:service:directory", emergency: false},
+		{name: "non emergency sip wrapper", service: "sip:service:directory@example.test", emergency: false},
+		{name: "non emergency tel wrapper", service: "tel:+15551212", emergency: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ClassifyEmergencyService(tc.service)
+			if got.Emergency != tc.emergency || got.ServiceURN != tc.urn || got.Category != tc.category {
+				t.Fatalf("ClassifyEmergencyService(%q)=%+v, want emergency=%v urn=%q category=%v", tc.service, got, tc.emergency, tc.urn, tc.category)
+			}
+			if IsEmergencyService(tc.service) != tc.emergency {
+				t.Fatalf("IsEmergencyService(%q)=%v, want %v", tc.service, IsEmergencyService(tc.service), tc.emergency)
+			}
+			if got := EmergencyServiceCategoryForURN(tc.service); got != tc.category {
+				t.Fatalf("EmergencyServiceCategoryForURN(%q)=%v, want %v", tc.service, got, tc.category)
+			}
+			if got := NormalizeEmergencyServiceURN(tc.service); got != tc.urn {
+				t.Fatalf("NormalizeEmergencyServiceURN(%q)=%q, want %q", tc.service, got, tc.urn)
+			}
+		})
+	}
+}
+
 func TestBuildEmergencySIPRequestInfoUsesIMSHeadersAndGeoURI(t *testing.T) {
 	info := BuildEmergencySIPRequestInfo(EmergencySIPHeaderConfig{
 		ServiceURN: "fire",

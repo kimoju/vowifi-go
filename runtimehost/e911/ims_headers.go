@@ -124,20 +124,9 @@ func EmergencyServiceURNsForCategory(category EmergencyServiceCategory) []string
 		return []string{DefaultEmergencyServiceURN}
 	}
 	var out []string
-	for _, mapping := range []struct {
-		category EmergencyServiceCategory
-		urn      string
-	}{
-		{EmergencyServiceCategoryPolice, "urn:service:sos.police"},
-		{EmergencyServiceCategoryAmbulance, "urn:service:sos.ambulance"},
-		{EmergencyServiceCategoryFire, "urn:service:sos.fire"},
-		{EmergencyServiceCategoryMarine, "urn:service:sos.marine"},
-		{EmergencyServiceCategoryMountain, "urn:service:sos.mountain"},
-		{EmergencyServiceCategoryManualECall, "urn:service:sos.ecall.manual"},
-		{EmergencyServiceCategoryAutomaticECall, "urn:service:sos.ecall.automatic"},
-	} {
-		if category&mapping.category != 0 {
-			out = append(out, mapping.urn)
+	for _, descriptor := range emergencyServiceURNDescriptors {
+		if descriptor.category != 0 && category&descriptor.category != 0 {
+			out = append(out, descriptor.urn)
 		}
 	}
 	if len(out) == 0 {

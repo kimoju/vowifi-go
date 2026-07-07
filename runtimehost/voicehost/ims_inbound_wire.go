@@ -53,14 +53,34 @@ type IMSInboundRequireOptionClassification struct {
 	Unsupported []string
 }
 
+// IMSInboundWireTransactionSnapshot describes the cached server transaction
+// state for an inbound SIP request without exposing cached response bodies.
+type IMSInboundWireTransactionSnapshot struct {
+	Method       string
+	Invite       bool
+	State        voiceclient.SIPServerTransactionState
+	StatusCodes  []int
+	Provisional  bool
+	Final        bool
+	Pending      bool
+	CleanupAfter time.Duration
+	TimeoutAfter time.Duration
+	ExpiresAt    time.Time
+}
+
 // UnsupportedHeader renders unsupported option-tags for a SIP Unsupported response header.
 func (c IMSInboundRequireOptionClassification) UnsupportedHeader() string {
 	return strings.Join(c.Unsupported, ", ")
 }
 
 type imsInboundWireTransaction struct {
-	responses []IMSInboundWireResponse
-	expires   time.Time
+	method       string
+	invite       bool
+	state        voiceclient.SIPServerTransactionState
+	responses    []IMSInboundWireResponse
+	expires      time.Time
+	cleanupAfter time.Duration
+	timeoutAfter time.Duration
 }
 
 type imsInboundResponseRetransmit struct {
@@ -230,7 +250,7 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(resp)}
 	}
 	if method != "INVITE" && key != "" && len(responses) > 0 {
-		s.storeTransaction(key, responses)
+		s.storeTransactionForRequest(req, key, responses)
 	}
 	return responses, err
 }
@@ -528,7 +548,7 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 	trying := s.withResponseHeaders(wireResponse(100, "Trying"))
 	responses := []IMSInboundWireResponse{trying}
 	if key != "" {
-		s.storeTransaction(key, []IMSInboundWireResponse{trying})
+		s.storeTransactionForRequest(req, key, []IMSInboundWireResponse{trying})
 	}
 	if emit != nil {
 		if err := emit(trying); err != nil {
@@ -542,7 +562,7 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 		provisional := s.inviteResultResponse(result, 180, "Ringing")
 		if key != "" {
 			pendingResponses = append(pendingResponses, provisional)
-			s.storeTransaction(key, pendingResponses)
+			s.storeTransactionForRequest(req, key, pendingResponses)
 		}
 		if emit != nil {
 			if err := emit(provisional); err != nil {
@@ -558,7 +578,7 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 	responses = append(responses, provisionals...)
 	responses = append(responses, final)
 	if key != "" {
-		s.storeTransaction(key, append(append([]IMSInboundWireResponse(nil), pendingResponses...), final))
+		s.storeTransactionForRequest(req, key, append(append([]IMSInboundWireResponse(nil), pendingResponses...), final))
 	}
 	return responses, err
 }
@@ -1135,19 +1155,133 @@ func (s *IMSInboundWireServer) cachedTransaction(key string) ([]IMSInboundWireRe
 	return cloneWireResponses(tx.responses), true
 }
 
+// CachedTransactionSnapshot returns a diagnostic view of a cached inbound SIP
+// server transaction keyed by req's Via branch, Call-ID, method, and CSeq.
+func (s *IMSInboundWireServer) CachedTransactionSnapshot(req voiceclient.SIPIncomingRequest) (IMSInboundWireTransactionSnapshot, bool) {
+	key := wireTransactionKey(req)
+	if s == nil || key == "" {
+		return IMSInboundWireTransactionSnapshot{}, false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneWireStateLocked(now)
+	tx, ok := s.transactions[key]
+	if !ok || (!tx.expires.IsZero() && now.After(tx.expires)) {
+		return IMSInboundWireTransactionSnapshot{}, false
+	}
+	return tx.snapshot(), true
+}
+
 func (s *IMSInboundWireServer) storeTransaction(key string, responses []IMSInboundWireResponse) {
 	if s == nil || strings.TrimSpace(key) == "" || len(responses) == 0 {
+		return
+	}
+	s.storeTransactionEntry(key, imsInboundWireTransaction{
+		responses: cloneWireResponses(responses),
+		expires:   time.Now().Add(s.transactionTTL()),
+	})
+}
+
+func (s *IMSInboundWireServer) storeTransactionForRequest(req voiceclient.SIPIncomingRequest, key string, responses []IMSInboundWireResponse) {
+	if s == nil || strings.TrimSpace(key) == "" || len(responses) == 0 {
+		return
+	}
+	s.storeTransactionEntry(key, s.transactionForRequest(req, responses))
+}
+
+func (s *IMSInboundWireServer) storeTransactionEntry(key string, tx imsInboundWireTransaction) {
+	if s == nil || strings.TrimSpace(key) == "" || len(tx.responses) == 0 {
 		return
 	}
 	s.mu.Lock()
 	if s.transactions == nil {
 		s.transactions = make(map[string]imsInboundWireTransaction)
 	}
-	s.transactions[key] = imsInboundWireTransaction{
-		responses: cloneWireResponses(responses),
-		expires:   time.Now().Add(s.transactionTTL()),
-	}
+	s.transactions[key] = tx
 	s.mu.Unlock()
+}
+
+func (s *IMSInboundWireServer) transactionForRequest(req voiceclient.SIPIncomingRequest, responses []IMSInboundWireResponse) imsInboundWireTransaction {
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	tx := imsInboundWireTransaction{
+		method:    method,
+		invite:    strings.EqualFold(method, "INVITE"),
+		state:     voiceclient.InitialSIPServerTransactionState(method),
+		responses: cloneWireResponses(responses),
+	}
+	var lastStep voiceclient.SIPServerTransactionStep
+	for _, resp := range responses {
+		if resp.NoResponse || resp.StatusCode <= 0 {
+			continue
+		}
+		lastStep = voiceclient.AdvanceSIPServerTransaction(voiceclient.SIPServerTransactionInput{
+			Method: method,
+			State:  tx.state,
+			Event:  voiceclient.SIPServerTransactionEventResponse,
+			Response: voiceclient.SIPResponse{
+				StatusCode: resp.StatusCode,
+				Reason:     resp.Reason,
+				Headers:    stringToSliceHeaders(resp.Headers),
+				Body:       append([]byte(nil), resp.Body...),
+			},
+			TimerConfig: s.serverTransactionTimerConfig(),
+		})
+		tx.state = lastStep.NextState
+		if lastStep.CleanupAfter > 0 {
+			tx.cleanupAfter = lastStep.CleanupAfter
+		}
+		if lastStep.TimeoutAfter > 0 {
+			tx.timeoutAfter = lastStep.TimeoutAfter
+		}
+	}
+	if tx.state == "" {
+		tx.state = voiceclient.InitialSIPServerTransactionState(method)
+	}
+	tx.expires = time.Now().Add(s.transactionLifetime(tx))
+	return tx
+}
+
+func (s *IMSInboundWireServer) serverTransactionTimerConfig() voiceclient.SIPTransactionTimerConfig {
+	return voiceclient.SIPTransactionTimerConfig{
+		T1: s.inviteFinalT1(),
+		T2: s.inviteFinalT2(),
+	}
+}
+
+func (s *IMSInboundWireServer) transactionLifetime(tx imsInboundWireTransaction) time.Duration {
+	lifetime := s.transactionTTL()
+	for _, candidate := range []time.Duration{tx.cleanupAfter, tx.timeoutAfter} {
+		if candidate > 0 && candidate < lifetime {
+			lifetime = candidate
+		}
+	}
+	return lifetime
+}
+
+func (tx imsInboundWireTransaction) snapshot() IMSInboundWireTransactionSnapshot {
+	snapshot := IMSInboundWireTransactionSnapshot{
+		Method:       tx.method,
+		Invite:       tx.invite,
+		State:        tx.state,
+		CleanupAfter: tx.cleanupAfter,
+		TimeoutAfter: tx.timeoutAfter,
+		ExpiresAt:    tx.expires,
+	}
+	for _, resp := range tx.responses {
+		if resp.NoResponse || resp.StatusCode <= 0 {
+			continue
+		}
+		snapshot.StatusCodes = append(snapshot.StatusCodes, resp.StatusCode)
+		switch {
+		case resp.StatusCode < 200:
+			snapshot.Provisional = true
+		default:
+			snapshot.Final = true
+		}
+	}
+	snapshot.Pending = snapshot.Provisional && !snapshot.Final
+	return snapshot
 }
 
 func (s *IMSInboundWireServer) hasPendingInviteTransactionForCancel(req voiceclient.SIPIncomingRequest) bool {
@@ -1453,6 +1587,17 @@ func cloneSIPHeaders(headers map[string][]string) map[string][]string {
 	out := make(map[string][]string, len(headers))
 	for key, values := range headers {
 		out[key] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func stringToSliceHeaders(headers map[string]string) map[string][]string {
+	out := make(map[string][]string, len(headers))
+	for key, value := range headers {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		out[key] = []string{value}
 	}
 	return out
 }
