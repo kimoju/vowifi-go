@@ -87,3 +87,19 @@ func childSADeleteOutcome(summary ChildSADeleteSummary) ChildSADeleteOutcome {
 		return ChildSADeleteOther
 	}
 }
+
+func cloneChildSADeleteSummary(in ChildSADeleteSummary) ChildSADeleteSummary {
+	out := in
+	out.Deletes = make([]ChildSADeleteMatch, len(in.Deletes))
+	for i, match := range in.Deletes {
+		out.Deletes[i] = ChildSADeleteMatch{
+			ProtocolID:    match.ProtocolID,
+			SPI:           append([]byte(nil), match.SPI...),
+			MatchesLocal:  match.MatchesLocal,
+			MatchesRemote: match.MatchesRemote,
+		}
+	}
+	out.CurrentSPIs = cloneByteSlices(in.CurrentSPIs)
+	out.OtherSPIs = cloneByteSlices(in.OtherSPIs)
+	return out
+}

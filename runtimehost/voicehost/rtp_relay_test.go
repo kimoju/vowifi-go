@@ -1060,6 +1060,98 @@ func TestRTPRelaySessionEmitsQualityEventsOnStatusChange(t *testing.T) {
 	}
 }
 
+func TestRTPRelaySessionEmitsQualityEventsFromRTCPReceiverReports(t *testing.T) {
+	base := time.Date(2026, 7, 7, 10, 32, 0, 0, time.UTC)
+	var events []RTPRelayQualityEvent
+	relay := &RTPRelaySession{
+		clientRTPClockRate: 8000,
+		rtpQualityConfig: RTPRelayQualityConfig{
+			ClientToIMS: RTPStreamDiagnosisConfig{
+				ClockRate:            8000,
+				LossWarningFraction:  10,
+				LossCriticalFraction: 128,
+				JitterWarning:        40 * time.Millisecond,
+				JitterCritical:       80 * time.Millisecond,
+			},
+		},
+		rtpQualityHandler: func(event RTPRelayQualityEvent) {
+			events = append(events, event)
+		},
+	}
+
+	relay.recordRTCPReportQuality(RTCPFeedbackEvent{
+		Direction: RTCPFeedbackClientToIMS,
+		SSRC:      0x61616161,
+		Reports: []RTCPReceptionReport{{
+			SSRC:               0x11111111,
+			FractionLost:       32,
+			TotalLost:          2,
+			LastSequenceNumber: 0x00010010,
+			Jitter:             160,
+		}},
+	}, base)
+	if len(events) != 1 {
+		t.Fatalf("quality events=%+v, want RTCP report warning", events)
+	}
+	event := events[0]
+	if event.Direction != RTCPFeedbackClientToIMS ||
+		event.Status != RTPStreamDiagnosisStatusWarning ||
+		event.PreviousStatus != RTPStreamDiagnosisStatusUnknown ||
+		len(event.Reasons) != 1 ||
+		event.Reasons[0] != RTPStreamDiagnosisReasonPacketLoss ||
+		len(event.Diagnoses) != 0 ||
+		!event.ObservedAt.Equal(base) {
+		t.Fatalf("RTCP warning quality event=%+v", event)
+	}
+	if len(event.Quality.RTCPReports) != 1 ||
+		event.Quality.RTCPReports[0].ReporterSSRC != 0x61616161 ||
+		event.Quality.RTCPReports[0].MediaSSRC != 0x11111111 ||
+		event.Quality.RTCPReports[0].FractionLost != 32 {
+		t.Fatalf("RTCP report quality=%+v", event.Quality.RTCPReports)
+	}
+
+	relay.recordRTCPReportQuality(RTCPFeedbackEvent{
+		Direction: RTCPFeedbackClientToIMS,
+		SSRC:      0x61616161,
+		Reports: []RTCPReceptionReport{{
+			SSRC:               0x11111111,
+			FractionLost:       40,
+			TotalLost:          3,
+			LastSequenceNumber: 0x00010020,
+			Jitter:             240,
+		}},
+	}, base.Add(20*time.Millisecond))
+	if len(events) != 1 {
+		t.Fatalf("duplicate RTCP warning events=%+v", events)
+	}
+
+	relay.recordRTCPReportQuality(RTCPFeedbackEvent{
+		Direction: RTCPFeedbackClientToIMS,
+		SSRC:      0x61616161,
+		Reports: []RTCPReceptionReport{{
+			SSRC:               0x11111111,
+			FractionLost:       160,
+			TotalLost:          8,
+			LastSequenceNumber: 0x00010030,
+			Jitter:             800,
+		}},
+	}, base.Add(40*time.Millisecond))
+	if len(events) != 2 {
+		t.Fatalf("quality events after critical RTCP report=%+v, want status change", events)
+	}
+	event = events[1]
+	if event.Status != RTPStreamDiagnosisStatusCritical ||
+		event.PreviousStatus != RTPStreamDiagnosisStatusWarning ||
+		len(event.Reasons) != 2 ||
+		event.Reasons[0] != RTPStreamDiagnosisReasonPacketLoss ||
+		event.Reasons[1] != RTPStreamDiagnosisReasonJitter ||
+		len(event.Quality.RTCPReports) != 1 ||
+		event.Quality.RTCPReports[0].FractionLost != 160 ||
+		event.Quality.RTCPReports[0].Jitter != 800 {
+		t.Fatalf("critical RTCP quality event=%+v", event)
+	}
+}
+
 func TestRTPRelaySessionRTCPQualityEventDoesNotDeadlock(t *testing.T) {
 	base := time.Date(2026, 7, 7, 10, 31, 0, 0, time.UTC)
 	relay := &RTPRelaySession{

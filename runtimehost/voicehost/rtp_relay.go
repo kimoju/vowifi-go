@@ -690,8 +690,10 @@ func (s *RTPRelaySession) emitRTPQualityEventIfChanged(direction RTCPFeedbackDir
 		observedAt = time.Now()
 	}
 	quality := s.rtpRelayDirectionQuality(direction)
-	diagnoses := DiagnoseRTPStreamStats(quality.RTPStreams, s.rtpQualityDiagnosisConfig(direction))
+	diagnosisConfig := s.rtpQualityDiagnosisConfig(direction)
+	diagnoses := DiagnoseRTPStreamStats(quality.RTPStreams, diagnosisConfig)
 	status, reasons := summarizeRTPRelayQualityDiagnoses(diagnoses)
+	status, reasons = summarizeRTPRelayRTCPReportQuality(quality.RTCPReports, diagnosisConfig, status, reasons)
 	if status == RTPStreamDiagnosisStatusUnknown {
 		return
 	}
@@ -797,6 +799,61 @@ func summarizeRTPRelayQualityDiagnoses(diagnoses []RTPStreamDiagnosis) (RTPStrea
 		}
 	}
 	return status, reasons
+}
+
+func summarizeRTPRelayRTCPReportQuality(reports []RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig, status RTPStreamDiagnosisStatus, reasons []RTPStreamDiagnosisReason) (RTPStreamDiagnosisStatus, []RTPStreamDiagnosisReason) {
+	if len(reports) == 0 {
+		return status, reasons
+	}
+	cfg = normalizeRTPStreamDiagnosisConfig(cfg)
+	seenReasons := make(map[RTPStreamDiagnosisReason]struct{}, len(reasons))
+	for _, reason := range reasons {
+		seenReasons[reason] = struct{}{}
+	}
+	add := func(metric RTPStreamDiagnosisStatus, reason RTPStreamDiagnosisReason) {
+		if rtpStreamDiagnosisStatusRank(metric) > rtpStreamDiagnosisStatusRank(status) {
+			status = metric
+		}
+		if rtpStreamDiagnosisStatusRank(metric) < rtpStreamDiagnosisStatusRank(RTPStreamDiagnosisStatusWarning) {
+			return
+		}
+		if _, ok := seenReasons[reason]; ok {
+			return
+		}
+		seenReasons[reason] = struct{}{}
+		reasons = append(reasons, reason)
+	}
+	for _, report := range reports {
+		add(rtpRelayRTCPReportLossStatus(report, cfg), RTPStreamDiagnosisReasonPacketLoss)
+		add(rtpRelayRTCPReportJitterStatus(report, cfg), RTPStreamDiagnosisReasonJitter)
+	}
+	return status, reasons
+}
+
+func rtpRelayRTCPReportLossStatus(report RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig) RTPStreamDiagnosisStatus {
+	switch {
+	case report.FractionLost >= cfg.LossCriticalFraction:
+		return RTPStreamDiagnosisStatusCritical
+	case report.FractionLost >= cfg.LossWarningFraction:
+		return RTPStreamDiagnosisStatusWarning
+	default:
+		return RTPStreamDiagnosisStatusOK
+	}
+}
+
+func rtpRelayRTCPReportJitterStatus(report RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig) RTPStreamDiagnosisStatus {
+	if cfg.ClockRate <= 0 {
+		return RTPStreamDiagnosisStatusUnknown
+	}
+	jitter := rtpTimestampUnitsDuration(report.Jitter, cfg.ClockRate)
+	switch {
+	case jitter >= cfg.JitterCritical:
+		return RTPStreamDiagnosisStatusCritical
+	case jitter >= cfg.JitterWarning:
+		return RTPStreamDiagnosisStatusWarning
+	default:
+		return RTPStreamDiagnosisStatusOK
+	}
 }
 
 func newRTPRelayQualitySignature(status RTPStreamDiagnosisStatus, reasons []RTPStreamDiagnosisReason) rtpRelayQualitySignature {

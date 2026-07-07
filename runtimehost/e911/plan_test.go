@@ -105,6 +105,9 @@ func TestBuildEmergencyPlanUsesUsableEntitlementForRegistrationAndCall(t *testin
 		plan.Location.ValidationStatus != "validated" {
 		t.Fatalf("location metadata=%+v", plan.Location)
 	}
+	if plan.Location.Revalidation.Required {
+		t.Fatalf("fresh validated location should not require revalidation: %+v", plan.Location.Revalidation)
+	}
 	if !sameStrings(plan.RouteSet, []string{"<sip:pcscf-emergency.ims.example;lr>", "<sips:ecscf.example;lr>"}) {
 		t.Fatalf("RouteSet=%+v", plan.RouteSet)
 	}
@@ -172,10 +175,18 @@ func TestBuildEmergencyPlanKeepsRefreshWindowUsableAndBuildsPIDFLO(t *testing.T)
 		!plan.Location.PIDFLOPresent {
 		t.Fatalf("PIDF-LO location=%+v headers=%+v", plan.Location, plan.Headers)
 	}
+	if !plan.Call.Body.PIDFLOPresent ||
+		plan.Call.Body.PIDFLOContentID != "location-inline" ||
+		plan.Call.Body.PIDFLOContentType != EmergencyPIDFLOContentType {
+		t.Fatalf("call body metadata=%+v", plan.Call.Body)
+	}
 	body := string(plan.Location.PIDFLOBody)
 	if !strings.Contains(body, "<gml:pos>40.7128 -74.0060</gml:pos>") ||
 		!strings.Contains(body, "<timestamp>2026-07-07T09:04:00Z</timestamp>") {
 		t.Fatalf("PIDF-LO body=%s", body)
+	}
+	if string(plan.Call.Body.PIDFLOBody) != body {
+		t.Fatalf("call body PIDF-LO=%s, want location body", string(plan.Call.Body.PIDFLOBody))
 	}
 	if !sameStrings(plan.RouteSet, []string{"<sip:pcscf-ambulance.ims.example;lr>", "<sips:any@example.test;lr>"}) {
 		t.Fatalf("RouteSet=%+v", plan.RouteSet)
@@ -203,6 +214,14 @@ func TestPlanEmergencyCallSurfacesNoCacheRefreshAndNonEmergency(t *testing.T) {
 	if plan.Location.HasLocation {
 		t.Fatalf("no-cache plan should not invent location: %+v", plan.Location)
 	}
+	if !plan.Location.Revalidation.Required ||
+		!plan.Location.Revalidation.Missing ||
+		plan.Location.Revalidation.Reason != EmergencyLocationRevalidationReasonMissing ||
+		!plan.Location.Revalidation.EntitlementRefreshNeeded ||
+		!plan.Location.Revalidation.Retryable ||
+		plan.Location.Revalidation.RetryDeferred {
+		t.Fatalf("missing location revalidation=%+v", plan.Location.Revalidation)
+	}
 
 	nonEmergency, err := PlanEmergencyCall("411", EntitlementSnapshot{}, EmergencySIPHeaderConfig{}, base)
 	if err != nil {
@@ -210,5 +229,69 @@ func TestPlanEmergencyCallSurfacesNoCacheRefreshAndNonEmergency(t *testing.T) {
 	}
 	if nonEmergency.Emergency || nonEmergency.Entitlement.RefreshRequired || nonEmergency.RequestURI != "" {
 		t.Fatalf("non-emergency plan=%+v", nonEmergency)
+	}
+}
+
+func TestBuildEmergencyPlanFlagsExpiredEntitlementLocationForRevalidation(t *testing.T) {
+	base := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	cache := NewEntitlementCache(EntitlementCachePolicy{})
+	cache.Store(EntitlementInfo{
+		Status:       1000,
+		UserData:     "token-1",
+		ServiceURNs:  []string{"fire"},
+		CacheMaxAge:  time.Minute,
+		RetryAfterIn: 3 * time.Minute,
+		StaleIfError: 5 * time.Minute,
+		Address: EmergencyAddress{
+			Latitude:  "47.6205",
+			Longitude: "-122.3493",
+		},
+		LocationValidationStatus: "validated",
+	}, base)
+
+	plan, err := BuildEmergencyPlan(EmergencyPlanConfig{
+		DialString: "911",
+		Cache:      cache,
+		Now:        base.Add(2 * time.Minute),
+		SIPHeaderConfig: EmergencySIPHeaderConfig{
+			ServiceURN:         "service:fire",
+			AccessNetworkInfo:  EmergencyAccessNetworkInfo{Raw: "IEEE-802.11"},
+			GeolocationRouting: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildEmergencyPlan() error = %v", err)
+	}
+	if plan.ServiceURN != "urn:service:sos.fire" || plan.RequestURI != "urn:service:sos.fire" {
+		t.Fatalf("service target service=%q request=%q", plan.ServiceURN, plan.RequestURI)
+	}
+	if plan.Entitlement.Decision.Action != EntitlementCacheActionDeferRefresh ||
+		!plan.Entitlement.RefreshDeferred ||
+		plan.Entitlement.RefreshReason != EntitlementRefreshReasonExpired ||
+		plan.Entitlement.RetryAfterDelay != time.Minute ||
+		!plan.Entitlement.CanUseStaleOnError {
+		t.Fatalf("expired entitlement=%+v", plan.Entitlement)
+	}
+	if plan.Location.Source != EmergencyLocationSourceEntitlement ||
+		!plan.Location.HasLocation ||
+		plan.Location.GeolocationHeader != "<geo:47.6205,-122.3493>;inserted-by=endpoint" {
+		t.Fatalf("expired entitlement location=%+v", plan.Location)
+	}
+	revalidation := plan.Location.Revalidation
+	if !revalidation.Required ||
+		!revalidation.Expired ||
+		revalidation.Missing ||
+		revalidation.Reason != EmergencyLocationRevalidationReasonExpired ||
+		!revalidation.EntitlementRefreshNeeded ||
+		!revalidation.Retryable ||
+		!revalidation.RetryDeferred ||
+		!revalidation.CanUseStaleOnError {
+		t.Fatalf("expired location revalidation=%+v", revalidation)
+	}
+	if got, want := revalidation.NextAttemptAt, base.Add(3*time.Minute); !got.Equal(want) {
+		t.Fatalf("NextAttemptAt=%s, want %s", got, want)
+	}
+	if revalidation.RetryAfterDelay != time.Minute {
+		t.Fatalf("RetryAfterDelay=%s, want 1m", revalidation.RetryAfterDelay)
 	}
 }

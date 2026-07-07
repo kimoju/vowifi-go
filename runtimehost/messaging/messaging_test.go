@@ -318,6 +318,63 @@ func TestSendSMSWithTransportFailureMarksDeliveryFailed(t *testing.T) {
 	}
 }
 
+func TestSendSMSWithTransportFailureQueuesIMSRetry(t *testing.T) {
+	store := &fakeRetryDeliveryStore{}
+	transport := &retrySMSTransport{
+		result: SMSSendResult{State: "failed", SIPCode: 503, ErrorText: "Service Unavailable", RetryAfter: 2 * time.Second},
+		err:    errors.New("Service Unavailable"),
+	}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	svc.SetSMSTransport(transport)
+
+	out, err := svc.SendSMSWithOptions(context.Background(), "+18005551212", "hello", SendOptions{})
+	if err == nil {
+		t.Fatal("SendSMSWithOptions() err=nil, want failure")
+	}
+	if out.State != "failed" || len(transport.requests) != 1 {
+		t.Fatalf("outcome=%+v requests=%+v", out, transport.requests)
+	}
+	if len(store.retryUpserts) != 1 || len(store.retryDeletes) != 0 {
+		t.Fatalf("retry upserts=%+v deletes=%+v", store.retryUpserts, store.retryDeletes)
+	}
+	envelope := store.retryUpserts[0]
+	if !envelope.Pending() ||
+		envelope.Operation != IMSMessagingRetryOperationSMSSubmit ||
+		envelope.Key != IMSMessagingSMSSubmitIdempotencyKey(transport.requests[0]) ||
+		envelope.IdempotencyKey != envelope.Key ||
+		envelope.Plan.Action != IMSMessagingRetryActionRecoverRegistration ||
+		envelope.DueAt.IsZero() ||
+		!envelope.ReplayReady(envelope.DueAt) {
+		t.Fatalf("retry envelope=%+v", envelope)
+	}
+	req, ok := envelope.SMSSubmitRequest()
+	if !ok || req.MessageID != out.MessageID || req.Peer != "+18005551212" || req.Part.Text != "hello" {
+		t.Fatalf("SMSSubmitRequest()=%+v ok=%v", req, ok)
+	}
+}
+
+func TestSendSMSWithTransportSuccessClearsIMSRetry(t *testing.T) {
+	store := &fakeRetryDeliveryStore{}
+	transport := &fakeSMSTransport{}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	svc.SetSMSTransport(transport)
+
+	out, err := svc.SendSMSWithOptions(context.Background(), "+18005551212", "hello", SendOptions{})
+	if err != nil {
+		t.Fatalf("SendSMSWithOptions() error = %v", err)
+	}
+	if out.State != "sent" || len(transport.requests) != 1 {
+		t.Fatalf("outcome=%+v requests=%+v", out, transport.requests)
+	}
+	if len(store.retryUpserts) != 0 || len(store.retryDeletes) != 1 {
+		t.Fatalf("retry upserts=%+v deletes=%+v", store.retryUpserts, store.retryDeletes)
+	}
+	if store.retryDeletes[0].operation != IMSMessagingRetryOperationSMSSubmit ||
+		store.retryDeletes[0].key != IMSMessagingSMSSubmitIdempotencyKey(transport.requests[0]) {
+		t.Fatalf("retry delete=%+v", store.retryDeletes[0])
+	}
+}
+
 func TestSendSMSWithOptionsRejectsInvalidConcatReference(t *testing.T) {
 	svc := NewService("dev-1", "310280233641503", nil, nil)
 	_, err := svc.SendSMSWithOptions(context.Background(), "+18005551212", strings.Repeat("a", 161), SendOptions{
@@ -414,6 +471,41 @@ func TestUSSDTransportSessionLifecycle(t *testing.T) {
 	}
 	if _, err := svc.ContinueUSSD(context.Background(), first.SessionID, "1"); err == nil {
 		t.Fatal("ContinueUSSD() err=nil after session completion, want inactive session error")
+	}
+}
+
+func TestSendUSSDTransportFailureQueuesIMSRetry(t *testing.T) {
+	store := &fakeRetryDeliveryStore{}
+	transport := &fakeUSSDTransport{
+		executeResult: USSDResult{Status: 503, Done: true, RetryAfter: 4 * time.Second},
+		executeErr:    errors.New("Service Unavailable"),
+	}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	svc.SetUSSDTransport(transport)
+
+	_, err := svc.SendUSSD(context.Background(), "*100#")
+	if err == nil {
+		t.Fatal("SendUSSD() err=nil, want failure")
+	}
+	if len(transport.executeRequests) != 1 {
+		t.Fatalf("execute requests=%+v", transport.executeRequests)
+	}
+	if len(store.retryUpserts) != 1 || len(store.retryDeletes) != 0 {
+		t.Fatalf("retry upserts=%+v deletes=%+v", store.retryUpserts, store.retryDeletes)
+	}
+	envelope := store.retryUpserts[0]
+	if !envelope.Pending() ||
+		envelope.Operation != IMSMessagingRetryOperationUSSDSession ||
+		envelope.Method != "INVITE" ||
+		envelope.Key != IMSMessagingUSSDSessionKey(transport.executeRequests[0]) ||
+		envelope.SessionKey != envelope.Key ||
+		envelope.DueAt.IsZero() ||
+		!envelope.ReplayReady(envelope.DueAt) {
+		t.Fatalf("retry envelope=%+v", envelope)
+	}
+	req, ok := envelope.USSDRequest()
+	if !ok || req.Command != "*100#" || req.SessionID != transport.executeRequests[0].SessionID {
+		t.Fatalf("USSDRequest()=%+v ok=%v", req, ok)
 	}
 }
 
@@ -965,22 +1057,30 @@ type fakeSMSTransport struct {
 	failPart int
 }
 
+type retrySMSTransport struct {
+	requests []SMSSendRequest
+	result   SMSSendResult
+	err      error
+}
+
 type fakeUSSDTransport struct {
 	executeRequests  []USSDRequest
 	continueRequests []USSDRequest
 	cancelRequests   []USSDRequest
 	executeResult    USSDResult
 	continueResult   USSDResult
+	executeErr       error
+	continueErr      error
 }
 
 func (t *fakeUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (USSDResult, error) {
 	t.executeRequests = append(t.executeRequests, req)
-	return t.executeResult, nil
+	return t.executeResult, t.executeErr
 }
 
 func (t *fakeUSSDTransport) ContinueUSSD(ctx context.Context, req USSDRequest) (USSDResult, error) {
 	t.continueRequests = append(t.continueRequests, req)
-	return t.continueResult, nil
+	return t.continueResult, t.continueErr
 }
 
 func (t *fakeUSSDTransport) CancelUSSD(ctx context.Context, req USSDRequest) error {
@@ -994,6 +1094,11 @@ func (t *fakeSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) 
 		return SMSSendResult{State: "failed", ErrorText: "part failed"}, errors.New("part failed")
 	}
 	return SMSSendResult{CallID: "call", RPMR: req.Part.PartNo, State: "sent"}, nil
+}
+
+func (t *retrySMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (SMSSendResult, error) {
+	t.requests = append(t.requests, req)
+	return t.result, t.err
 }
 
 type fakeDispatcher struct {
@@ -1020,6 +1125,17 @@ type fakeDeliveryStore struct {
 	reportRPCause       int
 	reportErrText       string
 	recomputedMessageID string
+}
+
+type fakeRetryDelete struct {
+	operation IMSMessagingRetryOperation
+	key       string
+}
+
+type fakeRetryDeliveryStore struct {
+	fakeDeliveryStore
+	retryUpserts []IMSMessagingRetryEnvelope
+	retryDeletes []fakeRetryDelete
 }
 
 func (s *fakeDeliveryStore) CreateSMSDelivery(messageID, imsi, deviceID, peer, content string, partsTotal int, at time.Time) error {
@@ -1058,6 +1174,16 @@ func (s *fakeDeliveryStore) UpdateSMSDeliveryState(messageID, state, lastError s
 
 func (s *fakeDeliveryStore) GetSMSDeliveryStatus(messageID string) (*DeliveryStatus, error) {
 	return nil, ErrDeliveryNotFound
+}
+
+func (s *fakeRetryDeliveryStore) UpsertIMSMessagingRetry(envelope IMSMessagingRetryEnvelope) error {
+	s.retryUpserts = append(s.retryUpserts, envelope)
+	return nil
+}
+
+func (s *fakeRetryDeliveryStore) DeleteIMSMessagingRetry(operation IMSMessagingRetryOperation, key string) error {
+	s.retryDeletes = append(s.retryDeletes, fakeRetryDelete{operation: operation, key: key})
+	return nil
 }
 
 func imsRPDataBody(rpMR byte, tpdu []byte) []byte {

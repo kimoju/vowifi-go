@@ -230,6 +230,142 @@ func TestPlanIMSMessagingRetryDoesNotRetryCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestIMSMessagingRetryEnvelopeJSONAndReplayReadiness(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
+	req := SMSSendRequest{
+		DeviceID:  "dev-1",
+		IMSI:      "310280233641503",
+		Peer:      "+18005551212",
+		MessageID: "retry sms",
+		Part:      SMSPart{PartNo: 1, TotalParts: 1, Text: "hello", Encoding: "gsm7"},
+	}
+	envelope := NewIMSSMSSubmitRetryEnvelope(
+		req,
+		SMSSendResult{SIPCode: 503, State: "failed", ErrorText: "Service Unavailable", RetryAfter: 2 * time.Second},
+		errors.New("Service Unavailable"),
+		IMSMessagingRetryOptions{Attempt: 2, Now: now},
+	)
+
+	if envelope.Version != 1 ||
+		envelope.Operation != IMSMessagingRetryOperationSMSSubmit ||
+		envelope.Method != "MESSAGE" ||
+		envelope.State != IMSMessagingRetryQueueStatePending ||
+		envelope.Key != "sms-submit:retry-sms:part-1" ||
+		envelope.IdempotencyKey != envelope.Key ||
+		envelope.Attempt != 2 ||
+		envelope.NextAttempt != 3 ||
+		!envelope.DueAt.Equal(now.Add(2*time.Second)) ||
+		envelope.Terminal() ||
+		!envelope.Pending() {
+		t.Fatalf("SMS retry envelope=%+v", envelope)
+	}
+	if envelope.ReplayReady(now.Add(2*time.Second - time.Nanosecond)) {
+		t.Fatalf("ReplayReady()=true before due time for %+v", envelope)
+	}
+	if !envelope.ReplayReady(now.Add(2 * time.Second)) {
+		t.Fatalf("ReplayReady()=false at due time for %+v", envelope)
+	}
+	replayReq, ok := envelope.SMSSubmitRequest()
+	if !ok || replayReq.MessageID != req.MessageID || replayReq.Part.Text != req.Part.Text {
+		t.Fatalf("SMSSubmitRequest()=%+v ok=%v", replayReq, ok)
+	}
+
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("Marshal envelope error = %v", err)
+	}
+	var decoded IMSMessagingRetryEnvelope
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("Unmarshal envelope error = %v", err)
+	}
+	decodedReq, ok := decoded.SMSSubmitRequest()
+	if !ok || decoded.Key != envelope.Key || decodedReq.MessageID != req.MessageID || !decoded.ReplayReady(now.Add(2*time.Second)) {
+		t.Fatalf("decoded envelope=%+v req=%+v ok=%v", decoded, decodedReq, ok)
+	}
+}
+
+func TestIMSMessagingRetryQueueSelectsDueAndDropsTerminal(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
+	smsReq := SMSSendRequest{
+		Peer:      "+18005551212",
+		MessageID: "queue sms",
+		Part:      SMSPart{PartNo: 1, Text: "hello"},
+	}
+	smsEnvelope := NewIMSSMSSubmitRetryEnvelope(
+		smsReq,
+		SMSSendResult{SIPCode: 503, State: "failed", ErrorText: "Service Unavailable", RetryAfter: 3 * time.Second},
+		errors.New("Service Unavailable"),
+		IMSMessagingRetryOptions{Attempt: 1, Now: now},
+	)
+	ussdReq := USSDRequest{SessionID: "menu 1", Input: "1"}
+	ussdEnvelope := NewIMSUSSDSessionRetryEnvelope(
+		ussdReq,
+		USSDResult{SessionID: "menu 1", Status: 408, Done: true},
+		errors.New("SIP timeout"),
+		IMSMessagingRetryOptions{
+			Attempt: 1,
+			Now:     now,
+			Policy:  IMSMessagingRetryPolicy{MaxAttempts: 4, BaseDelay: time.Second, MaxDelay: 8 * time.Second},
+		},
+	)
+
+	var queue IMSMessagingRetryQueue
+	queue.Upsert(smsEnvelope)
+	queue.Upsert(ussdEnvelope)
+
+	if due := queue.Due(now.Add(500*time.Millisecond), 0); len(due) != 0 {
+		t.Fatalf("early due=%+v", due)
+	}
+	due := queue.Due(now.Add(3*time.Second), 1)
+	if len(due) != 1 || due[0].Key != ussdEnvelope.Key || due[0].Operation != IMSMessagingRetryOperationUSSDSession {
+		t.Fatalf("limited due=%+v", due)
+	}
+	due = queue.Due(now.Add(3*time.Second), 0)
+	if len(due) != 2 || due[0].Key != ussdEnvelope.Key || due[1].Key != smsEnvelope.Key {
+		t.Fatalf("due order=%+v", due)
+	}
+
+	terminal := NewIMSSMSSubmitRetryEnvelope(
+		smsReq,
+		SMSSendResult{SIPCode: 202, State: "accepted"},
+		nil,
+		IMSMessagingRetryOptions{Attempt: 2, Now: now.Add(4 * time.Second)},
+	)
+	queue.Upsert(terminal)
+	if len(queue.Envelopes) != 1 || queue.Envelopes[0].Key != ussdEnvelope.Key {
+		t.Fatalf("queue after terminal SMS=%+v", queue.Envelopes)
+	}
+}
+
+func TestIMSUSSDRetryEnvelopeUsesSessionKeyAndPayload(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
+	req := USSDRequest{DeviceID: "dev-1", IMSI: "310280233641503", SessionID: "ussd menu", Input: "2"}
+	envelope := NewIMSUSSDSessionRetryEnvelope(
+		req,
+		USSDResult{SessionID: "ussd menu", Status: 408, Done: true},
+		errors.New("SIP timeout"),
+		IMSMessagingRetryOptions{Attempt: 1, Now: now},
+	)
+
+	if envelope.Operation != IMSMessagingRetryOperationUSSDSession ||
+		envelope.Method != "INFO" ||
+		envelope.State != IMSMessagingRetryQueueStatePending ||
+		envelope.Key != "ussd-session:ussd-menu" ||
+		envelope.SessionKey != envelope.Key ||
+		envelope.IdempotencyKey != "" ||
+		!envelope.DueAt.Equal(now.Add(time.Second)) ||
+		!envelope.ReplayReady(now.Add(time.Second)) {
+		t.Fatalf("USSD retry envelope=%+v", envelope)
+	}
+	replayReq, ok := envelope.USSDRequest()
+	if !ok || replayReq.SessionID != req.SessionID || replayReq.Input != req.Input {
+		t.Fatalf("USSDRequest()=%+v ok=%v", replayReq, ok)
+	}
+	if _, ok := envelope.SMSSubmitRequest(); ok {
+		t.Fatalf("SMSSubmitRequest() ok=true for USSD envelope")
+	}
+}
+
 func TestIMSMessagingRetryKeysAreStable(t *testing.T) {
 	smsKey := IMSMessagingSMSSubmitIdempotencyKey(SMSSendRequest{
 		Peer: "+18005551212",

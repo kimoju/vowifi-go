@@ -13,6 +13,14 @@ const (
 	EmergencyLocationSourceEntitlement = "entitlement"
 )
 
+const (
+	EmergencyLocationRevalidationReasonNone    = ""
+	EmergencyLocationRevalidationReasonMissing = "missing-location"
+	EmergencyLocationRevalidationReasonExpired = "expired-location"
+	EmergencyLocationRevalidationReasonInvalid = "invalid-location"
+	EmergencyLocationRevalidationReasonPending = "pending-location-validation"
+)
+
 type EmergencyNumberClassification struct {
 	Input           string
 	DialString      string
@@ -83,6 +91,7 @@ type EmergencyLocationPlan struct {
 	Address                  EmergencyAddress
 	HasLocation              bool
 	ValidationStatus         string
+	Revalidation             EmergencyLocationRevalidationPlan
 	GeolocationURI           string
 	GeolocationHeader        string
 	GeolocationRouting       bool
@@ -93,6 +102,22 @@ type EmergencyLocationPlan struct {
 	PIDFLOBody               []byte
 	Routes                   []EmergencyRoute
 	RouteSet                 []string
+}
+
+type EmergencyLocationRevalidationPlan struct {
+	Required                 bool
+	Reason                   string
+	Missing                  bool
+	Expired                  bool
+	Invalid                  bool
+	Pending                  bool
+	EntitlementRefreshNeeded bool
+	Retryable                bool
+	RetryDeferred            bool
+	RetryAfter               time.Time
+	RetryAfterDelay          time.Duration
+	NextAttemptAt            time.Time
+	CanUseStaleOnError       bool
 }
 
 type EmergencyRegistrationPlan struct {
@@ -112,6 +137,14 @@ type EmergencyCallPlan struct {
 	Routes      []EmergencyRoute
 	RouteSet    []string
 	RequestInfo EmergencySIPRequestInfo
+	Body        EmergencyBodyPlan
+}
+
+type EmergencyBodyPlan struct {
+	PIDFLOPresent     bool
+	PIDFLOContentID   string
+	PIDFLOContentType string
+	PIDFLOBody        []byte
 }
 
 func ClassifyEmergencyNumber(value string) EmergencyNumberClassification {
@@ -186,7 +219,7 @@ func BuildEmergencyPlan(cfg EmergencyPlanConfig) (EmergencyPlan, error) {
 	plan.RouteSet = copyStringSlice(info.RouteSet)
 	plan.Profile = profile
 	plan.Registration = registration
-	plan.Location = emergencyLocationPlan(locationSource, sipCfg.Address, snapshot, info)
+	plan.Location = emergencyLocationPlan(locationSource, sipCfg.Address, snapshot, decision, info)
 	plan.Call = EmergencyCallPlan{
 		Required:    true,
 		RequestURI:  info.RequestURI,
@@ -194,6 +227,7 @@ func BuildEmergencyPlan(cfg EmergencyPlanConfig) (EmergencyPlan, error) {
 		Routes:      copyEmergencyRoutes(info.Routes),
 		RouteSet:    copyStringSlice(info.RouteSet),
 		RequestInfo: cloneEmergencySIPRequestInfo(info),
+		Body:        emergencyBodyPlan(info),
 	}
 	return plan, nil
 }
@@ -371,18 +405,21 @@ func emergencyPlanRegistration(cfg EmergencyPlanConfig, profile voiceclient.IMSP
 	return out, nil
 }
 
-func emergencyLocationPlan(source string, address EmergencyAddress, snapshot EntitlementSnapshot, info EmergencySIPRequestInfo) EmergencyLocationPlan {
+func emergencyLocationPlan(source string, address EmergencyAddress, snapshot EntitlementSnapshot, decision EntitlementCacheDecision, info EmergencySIPRequestInfo) EmergencyLocationPlan {
 	geolocationHeader := emergencyStringHeaderValue(info.Headers, "Geolocation")
 	routingHeader := emergencyStringHeaderValue(info.Headers, "Geolocation-Routing")
 	contentID := strings.TrimSpace(info.PIDFLOContentID)
 	if len(info.PIDFLOBody) > 0 || contentID != "" {
 		contentID = emergencyContentIDForHeader(contentID, defaultEmergencyPIDFLOContentID)
 	}
+	hasLocation := emergencyAddressHasPIDFLOLocation(address) || geolocationHeader != ""
+	validationStatus := strings.TrimSpace(snapshot.Info.LocationValidationStatus)
 	out := EmergencyLocationPlan{
 		Source:                   source,
 		Address:                  cloneEmergencyAddress(address),
-		HasLocation:              emergencyAddressHasPIDFLOLocation(address) || geolocationHeader != "",
-		ValidationStatus:         strings.TrimSpace(snapshot.Info.LocationValidationStatus),
+		HasLocation:              hasLocation,
+		ValidationStatus:         validationStatus,
+		Revalidation:             emergencyLocationRevalidationPlan(source, hasLocation, validationStatus, snapshot, decision),
 		GeolocationURI:           emergencyPlanGeolocationURI(geolocationHeader),
 		GeolocationHeader:        geolocationHeader,
 		GeolocationRouting:       strings.EqualFold(routingHeader, GeolocationRoutingYes),
@@ -394,6 +431,58 @@ func emergencyLocationPlan(source string, address EmergencyAddress, snapshot Ent
 		RouteSet:                 copyStringSlice(info.RouteSet),
 	}
 	if out.PIDFLOPresent {
+		out.PIDFLOContentType = EmergencyPIDFLOContentType
+	}
+	return out
+}
+
+func emergencyLocationRevalidationPlan(source string, hasLocation bool, validationStatus string, snapshot EntitlementSnapshot, decision EntitlementCacheDecision) EmergencyLocationRevalidationPlan {
+	out := EmergencyLocationRevalidationPlan{
+		RetryAfter:         decision.RetryAfter,
+		RetryAfterDelay:    decision.RetryAfterDelay,
+		NextAttemptAt:      decision.NextAttemptAt,
+		CanUseStaleOnError: decision.CanUseStaleOnError,
+	}
+	if !hasLocation {
+		out.Missing = true
+		out.Reason = EmergencyLocationRevalidationReasonMissing
+	}
+	if !out.Missing && source == EmergencyLocationSourceEntitlement && !snapshot.Usable() && snapshot.RefreshReason == EntitlementRefreshReasonExpired {
+		out.Expired = true
+		out.Reason = EmergencyLocationRevalidationReasonExpired
+	}
+	switch strings.ToLower(strings.TrimSpace(validationStatus)) {
+	case "invalid":
+		if out.Reason == EmergencyLocationRevalidationReasonNone {
+			out.Reason = EmergencyLocationRevalidationReasonInvalid
+		}
+		out.Invalid = true
+	case "pending":
+		if out.Reason == EmergencyLocationRevalidationReasonNone {
+			out.Reason = EmergencyLocationRevalidationReasonPending
+		}
+		out.Pending = true
+	}
+	out.Required = out.Reason != EmergencyLocationRevalidationReasonNone
+	if out.Required {
+		out.EntitlementRefreshNeeded = true
+		out.Retryable = true
+		out.RetryDeferred = decision.DeferRefresh
+	}
+	return out
+}
+
+func emergencyBodyPlan(info EmergencySIPRequestInfo) EmergencyBodyPlan {
+	contentID := strings.TrimSpace(info.PIDFLOContentID)
+	if len(info.PIDFLOBody) > 0 || contentID != "" {
+		contentID = emergencyContentIDForHeader(contentID, defaultEmergencyPIDFLOContentID)
+	}
+	out := EmergencyBodyPlan{
+		PIDFLOContentID: contentID,
+		PIDFLOBody:      append([]byte(nil), info.PIDFLOBody...),
+	}
+	if len(info.PIDFLOBody) > 0 {
+		out.PIDFLOPresent = true
 		out.PIDFLOContentType = EmergencyPIDFLOContentType
 	}
 	return out

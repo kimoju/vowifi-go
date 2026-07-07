@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -100,12 +101,205 @@ type IMSMessagingRetryPlan struct {
 	Reason                     string                     `json:"reason,omitempty"`
 }
 
+type IMSMessagingRetryQueueState string
+
+const (
+	IMSMessagingRetryQueueStatePending  IMSMessagingRetryQueueState = "pending"
+	IMSMessagingRetryQueueStateTerminal IMSMessagingRetryQueueState = "terminal"
+)
+
+type IMSMessagingRetryPayload struct {
+	SMSSubmit *SMSSendRequest `json:"sms_submit,omitempty"`
+	USSD      *USSDRequest    `json:"ussd,omitempty"`
+}
+
+type IMSMessagingRetryEnvelope struct {
+	Version        int                         `json:"version"`
+	Key            string                      `json:"key"`
+	Operation      IMSMessagingRetryOperation  `json:"operation"`
+	Method         string                      `json:"method,omitempty"`
+	State          IMSMessagingRetryQueueState `json:"state"`
+	Attempt        int                         `json:"attempt"`
+	NextAttempt    int                         `json:"next_attempt,omitempty"`
+	IdempotencyKey string                      `json:"idempotency_key,omitempty"`
+	SessionKey     string                      `json:"session_key,omitempty"`
+	DueAt          time.Time                   `json:"due_at,omitempty"`
+	CreatedAt      time.Time                   `json:"created_at,omitempty"`
+	UpdatedAt      time.Time                   `json:"updated_at,omitempty"`
+	TerminalAt     time.Time                   `json:"terminal_at,omitempty"`
+	LastError      string                      `json:"last_error,omitempty"`
+	Plan           IMSMessagingRetryPlan       `json:"plan"`
+	Payload        IMSMessagingRetryPayload    `json:"payload,omitempty"`
+}
+
+type IMSMessagingRetryQueue struct {
+	Envelopes []IMSMessagingRetryEnvelope `json:"envelopes,omitempty"`
+}
+
 func DefaultIMSMessagingRetryPolicy() IMSMessagingRetryPolicy {
 	return IMSMessagingRetryPolicy{
 		MaxAttempts: 4,
 		BaseDelay:   time.Second,
 		MaxDelay:    5 * time.Minute,
 	}
+}
+
+func NewIMSSMSSubmitRetryEnvelope(req SMSSendRequest, result SMSSendResult, err error, opts IMSMessagingRetryOptions) IMSMessagingRetryEnvelope {
+	plan := PlanIMSSMSSubmitRetry(req, result, err, opts)
+	return NewIMSMessagingRetryEnvelope(plan, IMSMessagingRetryPayload{SMSSubmit: &req}, opts.Now)
+}
+
+func NewIMSUSSDSessionRetryEnvelope(req USSDRequest, result USSDResult, err error, opts IMSMessagingRetryOptions) IMSMessagingRetryEnvelope {
+	plan := PlanIMSUSSDSessionRetry(req, result, err, opts)
+	return NewIMSMessagingRetryEnvelope(plan, IMSMessagingRetryPayload{USSD: &req}, opts.Now)
+}
+
+func NewIMSMessagingRetryEnvelope(plan IMSMessagingRetryPlan, payload IMSMessagingRetryPayload, now time.Time) IMSMessagingRetryEnvelope {
+	operation := normalizeIMSMessagingRetryOperation(plan.Operation)
+	method := normalizeIMSMessagingRetryMethod(plan.Method, operation)
+	idempotencyKey := strings.TrimSpace(plan.IdempotencyKey)
+	sessionKey := strings.TrimSpace(plan.SessionKey)
+	key := strings.TrimSpace(plan.RetryKey)
+	if operation == IMSMessagingRetryOperationSMSSubmit && payload.SMSSubmit != nil {
+		if idempotencyKey == "" {
+			idempotencyKey = IMSMessagingSMSSubmitIdempotencyKey(*payload.SMSSubmit)
+		}
+		if key == "" {
+			key = idempotencyKey
+		}
+	}
+	if operation == IMSMessagingRetryOperationUSSDSession && payload.USSD != nil {
+		if sessionKey == "" {
+			sessionKey = IMSMessagingUSSDSessionKey(*payload.USSD)
+		}
+		if key == "" {
+			key = sessionKey
+		}
+	}
+	state := IMSMessagingRetryQueueStateTerminal
+	dueAt := time.Time{}
+	terminalAt := time.Time{}
+	if plan.Retry && !plan.Terminal && key != "" {
+		state = IMSMessagingRetryQueueStatePending
+		dueAt = plan.NextAttemptAt
+		if dueAt.IsZero() && !now.IsZero() {
+			dueAt = now.Add(plan.Delay)
+		}
+	} else if !now.IsZero() {
+		terminalAt = now
+	}
+	return IMSMessagingRetryEnvelope{
+		Version:        1,
+		Key:            key,
+		Operation:      operation,
+		Method:         method,
+		State:          state,
+		Attempt:        plan.Attempt,
+		NextAttempt:    plan.NextAttempt,
+		IdempotencyKey: idempotencyKey,
+		SessionKey:     sessionKey,
+		DueAt:          dueAt,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		TerminalAt:     terminalAt,
+		LastError:      strings.TrimSpace(plan.Reason),
+		Plan:           plan,
+		Payload:        payload,
+	}
+}
+
+func (e IMSMessagingRetryEnvelope) Pending() bool {
+	return e.State == IMSMessagingRetryQueueStatePending && e.Plan.Retry && !e.Plan.Terminal && strings.TrimSpace(e.Key) != ""
+}
+
+func (e IMSMessagingRetryEnvelope) Terminal() bool {
+	return e.State == IMSMessagingRetryQueueStateTerminal || e.Plan.Terminal || !e.Plan.Retry
+}
+
+func (e IMSMessagingRetryEnvelope) Due(now time.Time) bool {
+	if !e.Pending() || !e.hasReplayPayload() {
+		return false
+	}
+	if e.DueAt.IsZero() {
+		return true
+	}
+	if now.IsZero() {
+		return false
+	}
+	return !e.DueAt.After(now)
+}
+
+func (e IMSMessagingRetryEnvelope) ReplayReady(now time.Time) bool {
+	return e.Due(now)
+}
+
+func (e IMSMessagingRetryEnvelope) SMSSubmitRequest() (SMSSendRequest, bool) {
+	if e.Operation != IMSMessagingRetryOperationSMSSubmit || e.Payload.SMSSubmit == nil {
+		return SMSSendRequest{}, false
+	}
+	return *e.Payload.SMSSubmit, true
+}
+
+func (e IMSMessagingRetryEnvelope) USSDRequest() (USSDRequest, bool) {
+	if e.Operation != IMSMessagingRetryOperationUSSDSession || e.Payload.USSD == nil {
+		return USSDRequest{}, false
+	}
+	return *e.Payload.USSD, true
+}
+
+func (q *IMSMessagingRetryQueue) Upsert(envelope IMSMessagingRetryEnvelope) {
+	if q == nil || strings.TrimSpace(envelope.Key) == "" {
+		return
+	}
+	q.Delete(envelope.Operation, envelope.Key)
+	if envelope.Terminal() || !envelope.hasReplayPayload() {
+		return
+	}
+	q.Envelopes = append(q.Envelopes, envelope)
+	sort.SliceStable(q.Envelopes, func(i, j int) bool {
+		return imsMessagingRetryEnvelopeLess(q.Envelopes[i], q.Envelopes[j])
+	})
+}
+
+func (q *IMSMessagingRetryQueue) Delete(operation IMSMessagingRetryOperation, key string) {
+	if q == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	out := q.Envelopes[:0]
+	for _, envelope := range q.Envelopes {
+		if envelope.retryQueueKeyMatches(operation, key) {
+			continue
+		}
+		out = append(out, envelope)
+	}
+	q.Envelopes = out
+}
+
+func (q IMSMessagingRetryQueue) Due(now time.Time, limit int) []IMSMessagingRetryEnvelope {
+	return SelectDueIMSMessagingRetryEnvelopes(q.Envelopes, now, limit)
+}
+
+func SelectDueIMSMessagingRetryEnvelopes(envelopes []IMSMessagingRetryEnvelope, now time.Time, limit int) []IMSMessagingRetryEnvelope {
+	if len(envelopes) == 0 {
+		return nil
+	}
+	out := make([]IMSMessagingRetryEnvelope, 0, len(envelopes))
+	for _, envelope := range envelopes {
+		if envelope.Due(now) {
+			out = append(out, envelope)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return imsMessagingRetryEnvelopeLess(out[i], out[j])
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
 }
 
 func PlanIMSSMSSubmitRetry(req SMSSendRequest, result SMSSendResult, err error, opts IMSMessagingRetryOptions) IMSMessagingRetryPlan {
@@ -395,6 +589,40 @@ func imsMessagingRetryErrorText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func (e IMSMessagingRetryEnvelope) hasReplayPayload() bool {
+	switch e.Operation {
+	case IMSMessagingRetryOperationSMSSubmit:
+		return e.Payload.SMSSubmit != nil
+	case IMSMessagingRetryOperationUSSDSession:
+		return e.Payload.USSD != nil
+	default:
+		return false
+	}
+}
+
+func (e IMSMessagingRetryEnvelope) retryQueueKeyMatches(operation IMSMessagingRetryOperation, key string) bool {
+	if strings.TrimSpace(e.Key) != key {
+		return false
+	}
+	return operation == "" || e.Operation == operation
+}
+
+func imsMessagingRetryEnvelopeLess(a, b IMSMessagingRetryEnvelope) bool {
+	if a.DueAt.IsZero() != b.DueAt.IsZero() {
+		return a.DueAt.IsZero()
+	}
+	if !a.DueAt.Equal(b.DueAt) {
+		return a.DueAt.Before(b.DueAt)
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	if a.Operation != b.Operation {
+		return a.Operation < b.Operation
+	}
+	return a.Key < b.Key
 }
 
 func intString(v int) string {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -173,6 +174,44 @@ type CarrierPolicy struct {
 	E911     E911Config
 	Network  NetworkConfig
 	IMS      IMSAccessProfile
+}
+
+type IMSRegistrationPlanInput struct {
+	IMSI        string
+	MCC         string
+	MNC         string
+	LocalIP     string
+	ContactHost string
+	ContactPort int
+	UserAgent   string
+}
+
+type IMSRegistrationPlan struct {
+	IMSI                 string            `json:"imsi,omitempty"`
+	MCC                  string            `json:"mcc,omitempty"`
+	MNC                  string            `json:"mnc,omitempty"`
+	PresetID             string            `json:"preset_id,omitempty"`
+	IMSAPN               string            `json:"ims_apn,omitempty"`
+	Domain               string            `json:"domain,omitempty"`
+	PrivateIdentityRealm string            `json:"private_identity_realm,omitempty"`
+	NAIRealm             string            `json:"nai_realm,omitempty"`
+	IMPI                 string            `json:"impi,omitempty"`
+	IMPU                 string            `json:"impu,omitempty"`
+	PermanentNAI         string            `json:"permanent_nai,omitempty"`
+	RegistrarURI         string            `json:"registrar_uri,omitempty"`
+	ContactURI           string            `json:"contact_uri,omitempty"`
+	ContactHost          string            `json:"contact_host,omitempty"`
+	ContactPort          int               `json:"contact_port,omitempty"`
+	PCSCFFQDNs           []string          `json:"pcscf_fqdns,omitempty"`
+	EPDGFQDN             string            `json:"epdg_fqdn,omitempty"`
+	UserAgent            string            `json:"user_agent,omitempty"`
+	Headers              map[string]string `json:"headers,omitempty"`
+	E911                 E911Config        `json:"e911"`
+	EmergencyAPN         string            `json:"emergency_apn,omitempty"`
+	EmergencyDomain      string            `json:"emergency_domain,omitempty"`
+	EmergencyServiceURNs []string          `json:"emergency_service_urns,omitempty"`
+	Ready                bool              `json:"ready"`
+	Missing              []string          `json:"missing,omitempty"`
 }
 
 const (
@@ -404,6 +443,58 @@ func CarrierPolicyForConfig(imsi string, cfg EffectiveCarrierConfig) CarrierPoli
 	}
 }
 
+func PlanIMSRegistration(in IMSRegistrationPlanInput) IMSRegistrationPlan {
+	policy := CarrierPolicyForSubscriber(CarrierPolicyInput{
+		IMSI: in.IMSI,
+		MCC:  in.MCC,
+		MNC:  in.MNC,
+	})
+	return PlanIMSRegistrationForPolicy(policy, in)
+}
+
+func PlanIMSRegistrationForPolicy(policy CarrierPolicy, in IMSRegistrationPlanInput) IMSRegistrationPlan {
+	policy = normalizeCarrierPolicy(policy, strings.TrimSpace(in.IMSI))
+	ims := policy.IMS
+	contactHost := firstNetworkString(in.ContactHost, in.LocalIP)
+	contactPort := in.ContactPort
+	if contactPort <= 0 {
+		contactPort = 5060
+	}
+	userAgent := strings.TrimSpace(in.UserAgent)
+	if userAgent == "" {
+		userAgent = "vowifi-go"
+	}
+	headers := imsRegistrationHeaders(ims)
+	plan := IMSRegistrationPlan{
+		IMSI:                 strings.TrimSpace(ims.IMSI),
+		MCC:                  policy.MCC,
+		MNC:                  policy.MNC,
+		PresetID:             policy.PresetID,
+		IMSAPN:               ims.IMSAPN,
+		Domain:               ims.IMSRealm,
+		PrivateIdentityRealm: ims.PrivateIdentityRealm,
+		NAIRealm:             ims.NAIRealm,
+		IMPI:                 ims.IMSPrivateIdentity,
+		IMPU:                 ims.IMSPublicIdentity,
+		PermanentNAI:         ims.PermanentNAI,
+		RegistrarURI:         imsRegistrarURI(ims.IMSRealm),
+		ContactHost:          strings.TrimSpace(contactHost),
+		ContactPort:          contactPort,
+		PCSCFFQDNs:           append([]string(nil), ims.PCSCFFQDNs...),
+		EPDGFQDN:             ims.EPDGFQDN,
+		UserAgent:            userAgent,
+		Headers:              headers,
+		E911:                 policy.E911,
+		EmergencyAPN:         ims.EmergencyAPN,
+		EmergencyDomain:      ims.EmergencyDomain,
+		EmergencyServiceURNs: append([]string(nil), ims.EmergencyServiceURNs...),
+	}
+	plan.ContactURI = imsContactURI(ims, plan.ContactHost, plan.ContactPort)
+	plan.Missing = imsRegistrationPlanMissingFields(plan)
+	plan.Ready = len(plan.Missing) == 0
+	return plan
+}
+
 func imsAccessProfileForConfig(imsi string, cfg EffectiveCarrierConfig) IMSAccessProfile {
 	profile := NormalizeSubscriberProfile(SubscriberProfileInput{
 		IMSI: imsi,
@@ -431,6 +522,166 @@ func imsAccessProfileForConfig(imsi string, cfg EffectiveCarrierConfig) IMSAcces
 		AccessNetworkInfo:    network.AccessNetworkInfo,
 		VisitedNetworkID:     network.VisitedNetworkID,
 	}
+}
+
+func normalizeCarrierPolicy(policy CarrierPolicy, fallbackIMSI string) CarrierPolicy {
+	network := mergeNetworkAliasConfig(policy.Network, networkConfigFromIMSAccessProfile(policy.IMS))
+	cfg := normalizeConfig(EffectiveCarrierConfig{
+		MCC:      firstNetworkString(policy.MCC, policy.IMS.MCC),
+		MNC:      firstNetworkString(policy.MNC, policy.IMS.MNC),
+		PresetID: firstNetworkString(policy.PresetID, policy.IMS.PresetID),
+		E911:     policy.E911,
+		Network:  network,
+	})
+	imsi := firstNetworkString(policy.IMS.IMSI, fallbackIMSI)
+	normalized := CarrierPolicyForConfig(imsi, cfg)
+	if value := strings.TrimSpace(policy.IMS.IMSPrivateIdentity); value != "" {
+		normalized.IMS.IMSPrivateIdentity = value
+	}
+	if value := strings.TrimSpace(policy.IMS.IMSPublicIdentity); value != "" {
+		normalized.IMS.IMSPublicIdentity = value
+	}
+	if value := strings.TrimSpace(policy.IMS.PermanentNAI); value != "" {
+		normalized.IMS.PermanentNAI = value
+	}
+	if value := strings.TrimSpace(policy.IMS.IMSI); value != "" {
+		normalized.IMS.IMSI = value
+	}
+	return normalized
+}
+
+func networkConfigFromIMSAccessProfile(profile IMSAccessProfile) NetworkConfig {
+	return NetworkConfig{
+		IMSRealm:             profile.IMSRealm,
+		PrivateIdentityRealm: profile.PrivateIdentityRealm,
+		NAIRealm:             profile.NAIRealm,
+		IMSAPN:               profile.IMSAPN,
+		EmergencyAPN:         profile.EmergencyAPN,
+		PCSCFFQDNs:           append([]string(nil), profile.PCSCFFQDNs...),
+		EPDGFQDN:             profile.EPDGFQDN,
+		EmergencyDomain:      profile.EmergencyDomain,
+		EmergencyServiceURNs: append([]string(nil), profile.EmergencyServiceURNs...),
+		AccessNetworkInfo:    profile.AccessNetworkInfo,
+		VisitedNetworkID:     profile.VisitedNetworkID,
+	}
+}
+
+func imsRegistrationHeaders(ims IMSAccessProfile) map[string]string {
+	headers := map[string]string{}
+	if value := strings.TrimSpace(ims.AccessNetworkInfo); value != "" {
+		headers["P-Access-Network-Info"] = value
+	}
+	if value := formatVisitedNetworkIDHeader(ims.VisitedNetworkID); value != "" {
+		headers["P-Visited-Network-ID"] = value
+	}
+	if len(headers) == 0 {
+		return nil
+	}
+	return headers
+}
+
+func imsRegistrarURI(domain string) string {
+	domain = normalizeDomainName(domain)
+	if domain == "" {
+		return ""
+	}
+	return "sip:" + domain
+}
+
+func imsContactURI(ims IMSAccessProfile, host string, port int) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	user := sipUserFromIdentity(ims.IMSPublicIdentity)
+	if user == "" {
+		user = sipUserFromIdentity(ims.IMSPrivateIdentity)
+	}
+	if user == "" {
+		user = "ue"
+	}
+	if port <= 0 {
+		port = 5060
+	}
+	return "sip:" + user + "@" + formatSIPHost(host) + ":" + strconv.Itoa(port)
+}
+
+func imsRegistrationPlanMissingFields(plan IMSRegistrationPlan) []string {
+	var missing []string
+	missing = appendMissingRegistrationField(missing, "ims_domain", plan.Domain)
+	missing = appendMissingRegistrationField(missing, "ims_private_identity", plan.IMPI)
+	missing = appendMissingRegistrationField(missing, "ims_public_identity", plan.IMPU)
+	missing = appendMissingRegistrationField(missing, "registrar_uri", plan.RegistrarURI)
+	missing = appendMissingRegistrationField(missing, "contact_host", plan.ContactHost)
+	missing = appendMissingRegistrationField(missing, "contact_uri", plan.ContactURI)
+	if len(plan.PCSCFFQDNs) == 0 {
+		missing = append(missing, "pcscf_fqdn")
+	}
+	missing = appendMissingRegistrationField(missing, "epdg_fqdn", plan.EPDGFQDN)
+	return missing
+}
+
+func appendMissingRegistrationField(missing []string, field, value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return append(missing, field)
+	}
+	return missing
+}
+
+func sipUserFromIdentity(identity string) string {
+	identity = strings.TrimSpace(identity)
+	lower := strings.ToLower(identity)
+	switch {
+	case strings.HasPrefix(lower, "sip:"):
+		identity = identity[len("sip:"):]
+	case strings.HasPrefix(lower, "sips:"):
+		identity = identity[len("sips:"):]
+	}
+	if user, _, ok := strings.Cut(identity, "@"); ok {
+		identity = user
+	}
+	if user, _, ok := strings.Cut(identity, ";"); ok {
+		identity = user
+	}
+	if user, _, ok := strings.Cut(identity, "?"); ok {
+		identity = user
+	}
+	return strings.TrimSpace(identity)
+}
+
+func formatSIPHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" || strings.HasPrefix(host, "[") {
+		return host
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
+func formatVisitedNetworkIDHeader(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return ""
+	}
+	if strings.Contains(value, ",") || (strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)) {
+		return value
+	}
+	return quoteSIPQuotedString(value)
+}
+
+func quoteSIPQuotedString(value string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range value {
+		if r == '\\' || r == '"' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 var blockedMCC = map[string]struct{}{

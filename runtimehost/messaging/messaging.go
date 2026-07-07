@@ -210,6 +210,11 @@ type DeliveryStore interface {
 	GetSMSDeliveryStatus(messageID string) (*DeliveryStatus, error)
 }
 
+type IMSMessagingRetryStore interface {
+	UpsertIMSMessagingRetry(IMSMessagingRetryEnvelope) error
+	DeleteIMSMessagingRetry(operation IMSMessagingRetryOperation, key string) error
+}
+
 func RPCauseText(code int) string {
 	if code == 0 {
 		return ""
@@ -274,6 +279,26 @@ func (s *Service) currentUSSDTransport() USSDTransport {
 	return s.ussdTransport
 }
 
+func (s *Service) retryStore() IMSMessagingRetryStore {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	store, _ := s.store.(IMSMessagingRetryStore)
+	return store
+}
+
+func (s *Service) recordIMSMessagingRetry(envelope IMSMessagingRetryEnvelope) {
+	store := s.retryStore()
+	if store == nil || strings.TrimSpace(envelope.Key) == "" {
+		return
+	}
+	if envelope.Pending() {
+		_ = store.UpsertIMSMessagingRetry(envelope)
+		return
+	}
+	_ = store.DeleteIMSMessagingRetry(envelope.Operation, envelope.Key)
+}
+
 func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts SendOptions) (SendOutcome, error) {
 	to = strings.TrimSpace(to)
 	if to == "" {
@@ -299,14 +324,19 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 		partNow := time.Now()
 		res := SMSSendResult{State: "sent"}
 		var sendErr error
+		req := SMSSendRequest{
+			DeviceID:  s.deviceID,
+			IMSI:      s.imsi,
+			Peer:      to,
+			MessageID: id,
+			Part:      part,
+		}
 		if transport := s.smsTransport(); transport != nil {
-			res, sendErr = transport.SendSMSPart(ctx, SMSSendRequest{
-				DeviceID:  s.deviceID,
-				IMSI:      s.imsi,
-				Peer:      to,
-				MessageID: id,
-				Part:      part,
-			})
+			res, sendErr = transport.SendSMSPart(ctx, req)
+			s.recordIMSMessagingRetry(NewIMSSMSSubmitRetryEnvelope(req, res, sendErr, IMSMessagingRetryOptions{
+				Attempt: 1,
+				Now:     time.Now(),
+			}))
 		}
 		if res.State == "" {
 			res.State = "sent"
@@ -359,12 +389,17 @@ func (s *Service) SendUSSD(ctx context.Context, command string) (*USSDResult, er
 	if transport == nil {
 		return &USSDResult{SessionID: sessionID, Text: "", Done: true}, nil
 	}
-	res, err := transport.ExecuteUSSD(ctx, USSDRequest{
+	req := USSDRequest{
 		DeviceID:  s.deviceID,
 		IMSI:      s.imsi,
 		SessionID: sessionID,
 		Command:   command,
-	})
+	}
+	res, err := transport.ExecuteUSSD(ctx, req)
+	s.recordIMSMessagingRetry(NewIMSUSSDSessionRetryEnvelope(req, res, err, IMSMessagingRetryOptions{
+		Attempt: 1,
+		Now:     time.Now(),
+	}))
 	if err != nil {
 		return nil, err
 	}
@@ -387,12 +422,17 @@ func (s *Service) ContinueUSSD(ctx context.Context, sessionID, input string) (*U
 	if !s.hasUSSDSession(sessionID) {
 		return nil, fmt.Errorf("ussd session %s is not active", sessionID)
 	}
-	res, err := transport.ContinueUSSD(ctx, USSDRequest{
+	req := USSDRequest{
 		DeviceID:  s.deviceID,
 		IMSI:      s.imsi,
 		SessionID: sessionID,
 		Input:     input,
-	})
+	}
+	res, err := transport.ContinueUSSD(ctx, req)
+	s.recordIMSMessagingRetry(NewIMSUSSDSessionRetryEnvelope(req, res, err, IMSMessagingRetryOptions{
+		Attempt: 1,
+		Now:     time.Now(),
+	}))
 	if err != nil {
 		return nil, err
 	}
