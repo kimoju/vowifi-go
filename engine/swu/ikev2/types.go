@@ -24,6 +24,7 @@ const (
 	PayloadSK       uint8 = 46
 	PayloadCP       uint8 = 47
 	PayloadEAP      uint8 = 48
+	PayloadSKF      uint8 = 53
 )
 
 const (
@@ -119,10 +120,12 @@ func MarshalPayloads(payloads []Payload) (first uint8, data []byte, err error) {
 	first = payloads[0].Type
 	for i, p := range payloads {
 		next := PayloadNoNext
-		if p.Type == PayloadSK && p.NextPayload != PayloadNoNext {
-			next = p.NextPayload
+		if isEncryptedPayload(p.Type) {
 			if i+1 < len(payloads) {
-				return 0, nil, fmt.Errorf("%w: SK payload must be last", ErrInvalidLength)
+				return 0, nil, fmt.Errorf("%w: encrypted payload must be last", ErrInvalidLength)
+			}
+			if p.NextPayload != PayloadNoNext {
+				next = p.NextPayload
 			}
 		} else if i+1 < len(payloads) {
 			next = payloads[i+1].Type
@@ -158,7 +161,7 @@ func ParsePayloads(first uint8, data []byte) ([]Payload, error) {
 		}
 		current := next
 		next = rest[0]
-		if current == PayloadSK {
+		if isEncryptedPayload(current) {
 			next = PayloadNoNext
 		}
 		out = append(out, Payload{
@@ -205,4 +208,8 @@ func ParseMessage(data []byte) (Message, error) {
 		return Message{}, err
 	}
 	return Message{Header: h, Payloads: payloads}, nil
+}
+
+func isEncryptedPayload(payloadType uint8) bool {
+	return payloadType == PayloadSK || payloadType == PayloadSKF
 }
