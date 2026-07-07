@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -29,16 +30,14 @@ type WireRegisterTransport struct {
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
 	FinalResponseDrain    time.Duration
+	TLSConfig             *tls.Config
 }
 
 func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg RegisterMessage) (RegisterResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	network := strings.ToLower(strings.TrimSpace(t.Network))
-	if network == "" {
-		network = "udp"
-	}
+	network := sipNetworkForRequest(t.Network, msg.URI)
 	targets, err := sipTargetsForRequest(ctx, t.Resolver, network, t.ServerAddr, msg.URI)
 	if err != nil {
 		return RegisterResponse{}, err
@@ -53,10 +52,10 @@ func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg Regist
 		target := targets[idx]
 		var resp RegisterResponse
 		var err error
-		switch network {
-		case "udp", "udp4", "udp6":
+		switch {
+		case isSIPUDPNetwork(network):
 			resp, err = t.roundTripUDP(ctx, network, target, timeout, msg)
-		case "tcp", "tcp4", "tcp6":
+		case isSIPStreamNetwork(network):
 			resp, err = t.roundTripTCP(ctx, network, target, timeout, msg)
 		default:
 			return RegisterResponse{}, fmt.Errorf("unsupported SIP register network %q", network)
@@ -105,33 +104,167 @@ func sipTargetsForRequest(ctx context.Context, resolver SIPServerResolver, netwo
 	return targets, nil
 }
 
-func dialSIPConn(ctx context.Context, network, target, localAddr string, timeout time.Duration) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: timeout}
-	switch network {
-	case "udp", "udp4", "udp6":
-		if strings.TrimSpace(localAddr) != "" {
-			addr, err := net.ResolveUDPAddr(network, localAddr)
-			if err != nil {
-				return nil, err
-			}
-			dialer.LocalAddr = addr
-		}
-	case "tcp", "tcp4", "tcp6":
-		if strings.TrimSpace(localAddr) != "" {
-			addr, err := net.ResolveTCPAddr(network, localAddr)
-			if err != nil {
-				return nil, err
-			}
-			dialer.LocalAddr = addr
-		}
-	default:
-		return nil, fmt.Errorf("unsupported SIP network %q", network)
+func sipNetworkForRequest(network, uri string) string {
+	network = normalizeSIPNetwork(network)
+	if network != "" {
+		return network
 	}
-	return dialer.DialContext(ctx, network, target)
+	endpoint, err := parseSIPURIEndpoint(uri)
+	if err == nil && endpoint.Secure {
+		return "tls"
+	}
+	return "udp"
+}
+
+func normalizeSIPNetwork(network string) string {
+	network = strings.ToLower(strings.TrimSpace(network))
+	switch network {
+	case "udp", "udp4", "udp6", "tcp", "tcp4", "tcp6", "tls", "tls4", "tls6":
+		return network
+	default:
+		return network
+	}
+}
+
+func isSIPUDPNetwork(network string) bool {
+	switch normalizeSIPNetwork(network) {
+	case "udp", "udp4", "udp6":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSIPTCPNetwork(network string) bool {
+	switch normalizeSIPNetwork(network) {
+	case "tcp", "tcp4", "tcp6":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSIPTLSNetwork(network string) bool {
+	switch normalizeSIPNetwork(network) {
+	case "tls", "tls4", "tls6":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSIPStreamNetwork(network string) bool {
+	return isSIPTCPNetwork(network) || isSIPTLSNetwork(network)
+}
+
+func sipDialNetwork(network string) (string, error) {
+	switch normalizeSIPNetwork(network) {
+	case "", "udp":
+		return "udp", nil
+	case "udp4":
+		return "udp4", nil
+	case "udp6":
+		return "udp6", nil
+	case "tcp", "tls":
+		return "tcp", nil
+	case "tcp4", "tls4":
+		return "tcp4", nil
+	case "tcp6", "tls6":
+		return "tcp6", nil
+	default:
+		return "", fmt.Errorf("unsupported SIP network %q", network)
+	}
+}
+
+func dialSIPConn(ctx context.Context, network, target, localAddr string, timeout time.Duration, tlsConfig *tls.Config, tlsServerName string) (net.Conn, error) {
+	network = normalizeSIPNetwork(network)
+	dialNetwork, err := sipDialNetwork(network)
+	if err != nil {
+		return nil, err
+	}
+	dialer := net.Dialer{Timeout: timeout}
+	switch {
+	case isSIPUDPNetwork(network):
+		if strings.TrimSpace(localAddr) != "" {
+			addr, err := net.ResolveUDPAddr(dialNetwork, localAddr)
+			if err != nil {
+				return nil, err
+			}
+			dialer.LocalAddr = addr
+		}
+	case isSIPStreamNetwork(network):
+		if strings.TrimSpace(localAddr) != "" {
+			addr, err := net.ResolveTCPAddr(dialNetwork, localAddr)
+			if err != nil {
+				return nil, err
+			}
+			dialer.LocalAddr = addr
+		}
+	}
+	if isSIPTLSNetwork(network) {
+		tlsDialer := tls.Dialer{
+			NetDialer: &dialer,
+			Config:    sipTLSConfigForTarget(tlsConfig, target, tlsServerName),
+		}
+		return tlsDialer.DialContext(ctx, dialNetwork, target)
+	}
+	return dialer.DialContext(ctx, dialNetwork, target)
+}
+
+func sipTLSConfigForTarget(cfg *tls.Config, target, serverName string) *tls.Config {
+	var out *tls.Config
+	if cfg != nil {
+		out = cfg.Clone()
+	} else {
+		out = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	if out.ServerName == "" {
+		out.ServerName = firstNonEmptySIPString(sipHostForTLSName(serverName), sipHostForTLSName(target))
+	}
+	if out.MinVersion == 0 {
+		out.MinVersion = tls.VersionTLS12
+	}
+	return out
+}
+
+func sipTLSServerNameForURI(uri string) string {
+	endpoint, err := parseSIPURIEndpoint(uri)
+	if err != nil {
+		return ""
+	}
+	return endpoint.Host
+}
+
+func sipHostForTLSName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	if strings.HasPrefix(value, "[") {
+		if end := strings.IndexByte(value, ']'); end > 0 {
+			return strings.TrimSpace(value[1:end])
+		}
+	}
+	if idx := strings.LastIndex(value, ":"); idx > 0 && strings.Count(value, ":") == 1 {
+		return strings.TrimSpace(value[:idx])
+	}
+	return strings.Trim(value, "[]")
+}
+
+func firstNonEmptySIPString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target string, timeout time.Duration, msg RegisterMessage) (RegisterResponse, error) {
-	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout)
+	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout, nil, "")
 	if err != nil {
 		return RegisterResponse{}, err
 	}
@@ -205,7 +338,7 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 }
 
 func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target string, timeout time.Duration, msg RegisterMessage) (RegisterResponse, error) {
-	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout)
+	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout, t.TLSConfig, sipTLSServerNameForURI(msg.URI))
 	if err != nil {
 		return RegisterResponse{}, err
 	}
@@ -219,8 +352,9 @@ func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target
 		Headers: cloneStringMap(msg.Headers),
 		Body:    append([]byte(nil), msg.Body...),
 	}
-	ensureSIPRequestVia(&attempt, "TCP", conn.LocalAddr())
-	wire, err := buildSIPRequestWire(attempt, "TCP", conn.LocalAddr())
+	transport := transportName(network)
+	ensureSIPRequestVia(&attempt, transport, conn.LocalAddr())
+	wire, err := buildSIPRequestWire(attempt, transport, conn.LocalAddr())
 	if err != nil {
 		return RegisterResponse{}, err
 	}

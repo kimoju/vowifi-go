@@ -3,6 +3,7 @@ package voiceclient
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -32,6 +33,7 @@ type WireSIPTransport struct {
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
 	FinalResponseDrain    time.Duration
+	TLSConfig             *tls.Config
 }
 
 func (t WireSIPTransport) RoundTripRequest(ctx context.Context, msg SIPRequestMessage) (SIPResponse, error) {
@@ -46,10 +48,7 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	network := strings.ToLower(strings.TrimSpace(t.Network))
-	if network == "" {
-		network = "udp"
-	}
+	network := sipNetworkForRequest(t.Network, msg.URI)
 	targets, err := sipTargetsForRequest(ctx, t.Resolver, network, t.ServerAddr, msg.URI)
 	if err != nil {
 		return SIPResponse{}, err
@@ -93,7 +92,7 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 }
 
 func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target string, timeout time.Duration, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
-	conn, err := t.dialTarget(ctx, network, target, timeout)
+	conn, err := t.dialTarget(ctx, network, target, timeout, msg.URI)
 	if err != nil {
 		return SIPResponse{}, err
 	}
@@ -110,7 +109,7 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 	if _, err := conn.Write(wire); err != nil {
 		return SIPResponse{}, err
 	}
-	if strings.HasPrefix(network, "tcp") {
+	if isSIPStreamNetwork(network) {
 		reader := bufio.NewReader(conn)
 		return readFinalSIPResponse(ctx, reader, attempt, onProvisional)
 	}
@@ -178,10 +177,7 @@ func (t WireSIPTransport) WriteRequest(ctx context.Context, msg SIPRequestMessag
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	network := strings.ToLower(strings.TrimSpace(t.Network))
-	if network == "" {
-		network = "udp"
-	}
+	network := sipNetworkForRequest(t.Network, msg.URI)
 	targets, err := sipTargetsForRequest(ctx, t.Resolver, network, t.ServerAddr, msg.URI)
 	if err != nil {
 		return err
@@ -211,7 +207,7 @@ func (t WireSIPTransport) WriteRequest(ctx context.Context, msg SIPRequestMessag
 }
 
 func (t WireSIPTransport) writeTarget(ctx context.Context, network, target string, timeout time.Duration, msg SIPRequestMessage) error {
-	conn, err := t.dialTarget(ctx, network, target, timeout)
+	conn, err := t.dialTarget(ctx, network, target, timeout, msg.URI)
 	if err != nil {
 		return err
 	}
@@ -229,10 +225,10 @@ func (t WireSIPTransport) writeTarget(ctx context.Context, network, target strin
 	return err
 }
 
-func (t WireSIPTransport) dialTarget(ctx context.Context, network, target string, timeout time.Duration) (net.Conn, error) {
-	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout)
+func (t WireSIPTransport) dialTarget(ctx context.Context, network, target string, timeout time.Duration, uri string) (net.Conn, error) {
+	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout, t.TLSConfig, sipTLSServerNameForURI(uri))
 	if err != nil {
-		if strings.HasPrefix(strings.ToLower(network), "udp") || strings.HasPrefix(strings.ToLower(network), "tcp") {
+		if isSIPUDPNetwork(network) || isSIPStreamNetwork(network) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("unsupported SIP network %q", network)
@@ -273,7 +269,10 @@ func shouldReportSIPProvisionalResponse(method string) bool {
 }
 
 func transportName(network string) string {
-	if strings.HasPrefix(strings.ToLower(network), "tcp") {
+	if isSIPTLSNetwork(network) {
+		return "TLS"
+	}
+	if isSIPTCPNetwork(network) {
 		return "TCP"
 	}
 	return "UDP"

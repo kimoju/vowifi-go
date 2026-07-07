@@ -564,6 +564,93 @@ func TestWireSIPFlowFailsOverTCPResetAndReusesResolvedTarget(t *testing.T) {
 	}
 }
 
+func TestWireSIPFlowReusesTLSFlowForRegisterAndDialog(t *testing.T) {
+	ln := listenTestSIPTLS(t)
+	defer ln.Close()
+
+	seen := make(chan []string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			seen <- []string{"accept error: " + err.Error()}
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		var requests []string
+		for i := 0; i < 2; i++ {
+			raw, err := readSIPStreamMessage(reader)
+			if err != nil {
+				seen <- append(requests, "read error: "+err.Error())
+				return
+			}
+			requests = append(requests, string(raw))
+			status := "SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"
+			if i == 1 {
+				status = "SIP/2.0 202 Accepted\r\nContent-Length: 0\r\n\r\n"
+			}
+			_, _ = conn.Write([]byte(status))
+		}
+		seen <- requests
+	}()
+
+	resolverCalls := 0
+	flow := &WireSIPFlow{
+		Resolver: SIPServerCandidateResolverFunc(func(ctx context.Context, network, uri string) ([]string, error) {
+			resolverCalls++
+			if network != "tls" {
+				t.Errorf("resolver network=%q, want tls", network)
+			}
+			return []string{ln.Addr().String()}, nil
+		}),
+		Timeout:   time.Second,
+		TLSConfig: testSIPClientTLSConfig(),
+	}
+	defer flow.Close()
+
+	resp, err := flow.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sips:ims.example",
+		Headers: map[string]string{
+			"To":           "<sips:user@example>",
+			"From":         "<sips:user@example>;tag=t",
+			"Contact":      "<sips:user@192.0.2.10:5061>",
+			"Call-ID":      "flow-tls-register",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("RoundTripRegister(tls) response=%+v err=%v", resp, err)
+	}
+	resp, err = flow.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sip:+18005551212@example",
+		Headers: map[string]string{
+			"To":           "<sip:+18005551212@example>",
+			"From":         "<sip:user@example>;tag=sms",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-tls-message",
+			"CSeq":         "1 MESSAGE",
+			"Max-Forwards": "70",
+		},
+		Body: []byte("hello"),
+	})
+	if err != nil || resp.StatusCode != 202 {
+		t.Fatalf("RoundTripRequest(tls) response=%+v err=%v", resp, err)
+	}
+	requests := <-seen
+	if len(requests) != 2 ||
+		!strings.Contains(requests[0], "REGISTER sips:ims.example SIP/2.0") ||
+		!strings.Contains(requests[0], "Via: SIP/2.0/TLS") ||
+		!strings.Contains(requests[1], "MESSAGE sip:+18005551212@example SIP/2.0") ||
+		!strings.Contains(requests[1], "Via: SIP/2.0/TLS") {
+		t.Fatalf("TLS flow requests=%+v", requests)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("resolver calls=%d, want 1", resolverCalls)
+	}
+}
+
 func TestWireSIPFlowRegisterFollowsRedirectContactTarget(t *testing.T) {
 	first, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

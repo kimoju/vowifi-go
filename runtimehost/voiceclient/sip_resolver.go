@@ -435,7 +435,8 @@ func sipResolverProto(network string, secure bool) string {
 	if secure {
 		return "tcp"
 	}
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(network)), "tcp") {
+	network = strings.ToLower(strings.TrimSpace(network))
+	if strings.HasPrefix(network, "tcp") || strings.HasPrefix(network, "tls") {
 		return "tcp"
 	}
 	return "udp"

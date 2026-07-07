@@ -3,8 +3,14 @@ package voiceclient
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"errors"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -770,6 +776,21 @@ func TestSIPURIAddrParsesHostPortAndIPv6(t *testing.T) {
 	}
 }
 
+func TestSIPNetworkForRequestAndResolverProtoHandleSIPSAndTLS(t *testing.T) {
+	if got := sipNetworkForRequest("", "sips:user@ims.example"); got != "tls" {
+		t.Fatalf("sipNetworkForRequest(sips)=%q, want tls", got)
+	}
+	if got := sipNetworkForRequest("tcp", "sips:user@ims.example"); got != "tcp" {
+		t.Fatalf("sipNetworkForRequest(explicit tcp)=%q, want tcp", got)
+	}
+	if got := sipResolverProto("tls", false); got != "tcp" {
+		t.Fatalf("sipResolverProto(tls)=%q, want tcp", got)
+	}
+	if got := transportName("tls6"); got != "TLS" {
+		t.Fatalf("transportName(tls6)=%q, want TLS", got)
+	}
+}
+
 func TestSIPRedirectTargetsHonorContactQAndExpiresVariants(t *testing.T) {
 	resp := SIPResponse{
 		StatusCode: 302,
@@ -791,6 +812,108 @@ func TestSIPRedirectTargetsHonorContactQAndExpiresVariants(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("sipRedirectTargets()[%d]=%q, want %q (all=%+v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+func TestWireRegisterTransportRoundTripRegisterOverTLS(t *testing.T) {
+	ln := listenTestSIPTLS(t)
+	defer ln.Close()
+
+	seen := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			seen <- "accept error: " + err.Error()
+			return
+		}
+		defer conn.Close()
+		raw, err := readSIPStreamMessage(bufio.NewReader(conn))
+		if err != nil {
+			seen <- "read error: " + err.Error()
+			return
+		}
+		seen <- string(raw)
+		_, _ = conn.Write([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"))
+	}()
+
+	resp, err := WireRegisterTransport{
+		Network:    "tls",
+		ServerAddr: ln.Addr().String(),
+		Timeout:    time.Second,
+		TLSConfig:  testSIPClientTLSConfig(),
+	}.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sips:ims.example",
+		Headers: map[string]string{
+			"To":           "<sips:user@example>",
+			"From":         "<sips:user@example>;tag=t",
+			"Contact":      "<sips:user@192.0.2.10:5061>",
+			"Call-ID":      "tls-register",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRegister(tls) error = %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("response=%+v", resp)
+	}
+	wire := <-seen
+	if !strings.Contains(wire, "REGISTER sips:ims.example SIP/2.0") ||
+		!strings.Contains(wire, "Via: SIP/2.0/TLS") {
+		t.Fatalf("REGISTER TLS wire=%q", wire)
+	}
+}
+
+func TestWireSIPTransportRoundTripOverTLS(t *testing.T) {
+	ln := listenTestSIPTLS(t)
+	defer ln.Close()
+
+	seen := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			seen <- "accept error: " + err.Error()
+			return
+		}
+		defer conn.Close()
+		raw, err := readSIPStreamMessage(bufio.NewReader(conn))
+		if err != nil {
+			seen <- "read error: " + err.Error()
+			return
+		}
+		seen <- string(raw)
+		_, _ = conn.Write([]byte("SIP/2.0 202 Accepted\r\nContent-Length: 5\r\n\r\nhello"))
+	}()
+
+	resp, err := WireSIPTransport{
+		ServerAddr: ln.Addr().String(),
+		Timeout:    time.Second,
+		TLSConfig:  testSIPClientTLSConfig(),
+	}.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "MESSAGE",
+		URI:    "sips:+18005551212@example",
+		Headers: map[string]string{
+			"To":           "<sips:+18005551212@example>",
+			"From":         "<sips:user@example>;tag=t",
+			"Contact":      "<sips:user@192.0.2.10:5061>",
+			"Call-ID":      "tls-message",
+			"CSeq":         "1 MESSAGE",
+			"Max-Forwards": "70",
+		},
+		Body: []byte("ping"),
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRequest(tls) error = %v", err)
+	}
+	if resp.StatusCode != 202 || string(resp.Body) != "hello" {
+		t.Fatalf("response=%+v body=%q", resp, resp.Body)
+	}
+	wire := <-seen
+	if !strings.Contains(wire, "MESSAGE sips:+18005551212@example SIP/2.0") ||
+		!strings.Contains(wire, "Via: SIP/2.0/TLS") ||
+		!strings.Contains(wire, "Content-Length: 4") {
+		t.Fatalf("MESSAGE TLS wire=%q", wire)
 	}
 }
 
@@ -2029,5 +2152,52 @@ func TestWireSIPTransportInviteWaitsForFinalResponseAndWritesAck(t *testing.T) {
 	}
 	if !strings.Contains(seen[1], "ACK sip:callee@example SIP/2.0") || !strings.Contains(seen[1], "Via: SIP/2.0/UDP") {
 		t.Fatalf("ACK wire=%q", seen[1])
+	}
+}
+
+func listenTestSIPTLS(tb testing.TB) net.Listener {
+	tb.Helper()
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", testSIPServerTLSConfig(tb))
+	if err != nil {
+		tb.Fatalf("Listen(tls) error = %v", err)
+	}
+	return ln
+}
+
+func testSIPServerTLSConfig(tb testing.TB) *tls.Config {
+	tb.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		tb.Fatalf("GenerateKey() error = %v", err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "ims.example",
+		},
+		NotBefore:   time.Now().Add(-time.Hour),
+		NotAfter:    time.Now().Add(time.Hour),
+		DNSNames:    []string{"ims.example", "example"},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		tb.Fatalf("CreateCertificate() error = %v", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{der},
+			PrivateKey:  key,
+		}},
+		MinVersion: tls.VersionTLS12,
+	}
+}
+
+func testSIPClientTLSConfig() *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
 	}
 }

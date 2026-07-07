@@ -3,6 +3,7 @@ package voiceclient
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"strings"
@@ -46,6 +47,7 @@ type WireSIPFlow struct {
 	MaxRetransmitInterval time.Duration
 	MaxRetransmits        int
 	FinalResponseDrain    time.Duration
+	TLSConfig             *tls.Config
 
 	mu          sync.Mutex
 	conn        net.Conn
@@ -304,7 +306,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 			}
 			continue
 		}
-		if strings.HasPrefix(network, "tcp") {
+		if isSIPStreamNetwork(network) {
 			resp, err := readFinalSIPFlowResponse(ctx, f.reader, attempt, onProvisional)
 			if err != nil {
 				f.closeConnLocked()
@@ -442,9 +444,9 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 	if f.closed {
 		return nil, "", 0, ErrSIPFlowClosed
 	}
-	network := strings.ToLower(strings.TrimSpace(f.Network))
-	if network == "" {
-		network = "udp"
+	network := sipNetworkForRequest(f.Network, msg.URI)
+	if strings.TrimSpace(f.Network) == "" && f.conn != nil && strings.TrimSpace(f.network) != "" {
+		network = f.network
 	}
 	timeout := f.Timeout
 	if timeout <= 0 {
@@ -465,14 +467,14 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 		return f.conn, network, timeout, nil
 	}
 	_ = f.closeConnLocked()
-	conn, err := dialSIPConn(ctx, network, target, f.LocalAddr, timeout)
+	conn, err := dialSIPConn(ctx, network, target, f.LocalAddr, timeout, f.TLSConfig, sipTLSServerNameForURI(msg.URI))
 	if err != nil {
 		return nil, "", 0, err
 	}
 	f.conn = conn
 	f.network = network
 	f.target = target
-	if strings.HasPrefix(network, "tcp") {
+	if isSIPStreamNetwork(network) {
 		f.reader = bufio.NewReader(conn)
 	} else {
 		f.reader = nil
