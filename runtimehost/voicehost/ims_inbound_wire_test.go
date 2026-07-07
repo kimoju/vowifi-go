@@ -367,6 +367,125 @@ func TestIMSInboundWireServerRoutesPrackAfterReliableProvisional(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerRelaysPrackSDPBody(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+	client, err := net.Dial("udp", pc.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	transport := newReliableProvisionalInboundTransport([]voiceclient.SIPResponse{
+		{
+			StatusCode: 183,
+			Reason:     "Session Progress",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=early-tag"},
+				"Contact": {"<sip:client@127.0.0.1:5070>"},
+				"Require": {"100rel"},
+				"RSeq":    {"43"},
+			},
+			Body: []byte(sampleSDP("127.0.0.1", 4002)),
+		},
+	})
+	server := &IMSInboundWireServer{
+		Agent: &IMSInboundAgent{
+			ClientTransport:  transport,
+			ClientContactURI: "sip:client@127.0.0.1:5070",
+			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+			MediaRelay: &RTPRelayConfig{
+				ClientListenIP:    "127.0.0.1",
+				ClientAdvertiseIP: "127.0.0.1",
+				IMSListenIP:       "127.0.0.1",
+				IMSAdvertiseIP:    "127.0.0.1",
+			},
+		},
+		LocalTag:       "ue-tag",
+		ContactURI:     "sip:vowifi@127.0.0.1:5060",
+		ReadTimeout:    50 * time.Millisecond,
+		TransactionTTL: time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.ServePacket(ctx, pc)
+	}()
+
+	if _, err := client.Write(wireIMSInvite("wire-call-prack-sdp", "INVITE", 1, []byte(sampleSDP("127.0.0.1", 49170)))); err != nil {
+		t.Fatalf("client INVITE Write() error = %v", err)
+	}
+	if trying := readUDPWireResponse(t, client); trying.StatusCode != 100 {
+		t.Fatalf("trying=%+v", trying)
+	}
+	if req := transport.readInvite(t); req.Method != "INVITE" {
+		t.Fatalf("client INVITE=%+v", req)
+	}
+	provisional := readUDPWireResponse(t, client)
+	if provisional.StatusCode != 183 || firstVoiceHeader(provisional.Headers, "RSeq") != "43" {
+		t.Fatalf("provisional=%+v", provisional)
+	}
+
+	prackBody := []byte(sampleSDP("127.0.0.1", 49190))
+	if _, err := client.Write(wireIMSRequest("wire-call-prack-sdp", "PRACK", 2, prackBody, "RAck: 43 1 INVITE\r\n")); err != nil {
+		t.Fatalf("client PRACK Write() error = %v", err)
+	}
+	prack := transport.readRequest(t)
+	if prack.Method != "PRACK" || prack.Headers["Content-Type"] != "application/sdp" {
+		t.Fatalf("client PRACK=%+v", prack)
+	}
+	clientOffer, err := ParseSDP(prack.Body)
+	if err != nil {
+		t.Fatalf("ParseSDP(client PRACK body) error = %v body=%q", err, prack.Body)
+	}
+	if clientOffer.MediaPort <= 0 || clientOffer.MediaPort == 49190 || strings.Contains(string(prack.Body), "m=audio 49190 ") {
+		t.Fatalf("client PRACK offer was not relay-rewritten: %+v body=%q", clientOffer, prack.Body)
+	}
+
+	transport.respondRequest(voiceclient.SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Body:       []byte(sampleSDP("127.0.0.1", 4010)),
+	})
+	prackOK := readUDPWireResponse(t, client)
+	if prackOK.StatusCode != 200 || firstVoiceHeader(prackOK.Headers, "CSeq") != "2 PRACK" ||
+		firstVoiceHeader(prackOK.Headers, "Content-Type") != "application/sdp" {
+		t.Fatalf("PRACK response=%+v", prackOK)
+	}
+	imsAnswer, err := ParseSDP(prackOK.Body)
+	if err != nil {
+		t.Fatalf("ParseSDP(IMS PRACK answer) error = %v body=%q", err, prackOK.Body)
+	}
+	if imsAnswer.MediaPort <= 0 || imsAnswer.MediaPort == 4010 || strings.Contains(string(prackOK.Body), "m=audio 4010 ") {
+		t.Fatalf("IMS PRACK answer was not relay-rewritten: %+v body=%q", imsAnswer, prackOK.Body)
+	}
+
+	transport.respondInvite(voiceclient.SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"To": {"<sip:user@ims.example>;tag=final-tag"}},
+		Body:       []byte(sampleSDP("127.0.0.1", 4004)),
+	})
+	final := readUDPWireResponse(t, client)
+	if final.StatusCode != 200 || firstVoiceHeader(final.Headers, "CSeq") != "1 INVITE" {
+		t.Fatalf("final=%+v", final)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ServePacket() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("ServePacket() did not stop")
+	}
+}
+
 func TestIMSInboundWireServerRetransmitsReliableProvisionalUntilPrack(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

@@ -407,10 +407,13 @@ func (s *IMSInboundWireServer) handlePrack(ctx context.Context, req voiceclient.
 		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
 	}
 	result, err := s.Agent.HandleInboundPrack(ctx, InboundDialogRequest{
-		CallID:  wireCallID(req),
-		CSeq:    wireCSeq(req),
-		Headers: cloneSIPHeaders(req.Headers),
-		RAck:    firstVoiceHeader(req.Headers, "RAck"),
+		CallID:      wireCallID(req),
+		CSeq:        wireCSeq(req),
+		Headers:     cloneSIPHeaders(req.Headers),
+		RAck:        firstVoiceHeader(req.Headers, "RAck"),
+		ContentType: firstVoiceHeader(req.Headers, "Content-Type"),
+		RawSDP:      append([]byte(nil), req.Body...),
+		Body:        append([]byte(nil), req.Body...),
 	})
 	final := wireResponse(inboundStatusCode(result.StatusCode, 500), firstVoiceNonEmpty(result.Reason, "Server Internal Error"))
 	if result.Accepted {
