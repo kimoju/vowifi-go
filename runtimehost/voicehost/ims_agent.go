@@ -126,6 +126,13 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	inviteBody := append([]byte(nil), req.RawSDP...)
 	localSDPBody := dialogLocalSDPBody(req.RawSDP, req.RemoteSDP)
 	var relay *RTPRelaySession
+	var srtpNegotiation *outboundSDESRelayNegotiation
+	closeRelayOnError := true
+	defer func() {
+		if closeRelayOnError && relay != nil {
+			_ = relay.Close()
+		}
+	}()
 	if a.MediaRelay != nil {
 		createdRelay, relayErr := NewRTPRelaySession(ctx, *a.MediaRelay, req.RemoteSDP)
 		if relayErr != nil {
@@ -133,13 +140,15 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		}
 		relay = createdRelay
 		inviteBody = RewriteSDPMediaEndpoint(req.RawSDP, relay.IMSEndpoint())
-	}
-	closeRelayOnError := true
-	defer func() {
-		if closeRelayOnError && relay != nil {
-			_ = relay.Close()
+		if a.MediaRelay.SRTP != nil {
+			negotiation, err := newOutboundSDESRelayNegotiation(req.RawSDP, *a.MediaRelay.SRTP)
+			if err != nil {
+				return OutboundCallResult{Accepted: false, Reason: "RTP relay SRTP negotiation failed"}, err
+			}
+			srtpNegotiation = negotiation
+			inviteBody = srtpNegotiation.RewriteIMSOffer(inviteBody)
 		}
-	}()
+	}
 	var invite voiceclient.SIPRequestMessage
 	var resp voiceclient.SIPResponse
 	var err error
@@ -167,7 +176,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		provisionalSDP = SDPInfo{}
 		provisionalAnswer = nil
 		resp, err = a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
-			if body, info, ok, err := a.provisionalAnswer(provisional, relay); err != nil {
+			if body, info, ok, err := a.provisionalAnswer(provisional, relay, srtpNegotiation); err != nil {
 				return err
 			} else if ok {
 				provisionalAnswer = body
@@ -286,11 +295,19 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 			a.deleteDialog(strings.TrimSpace(req.CallID))
 			return OutboundCallResult{Accepted: false, Reason: "RTP relay remote setup failed"}, err
 		}
-		answerBody = RewriteSDPMediaEndpoint(resp.Body, relay.ClientEndpoint())
-		localSDP, err = ParseSDP(answerBody)
-		if err != nil {
-			a.deleteDialog(strings.TrimSpace(req.CallID))
-			return OutboundCallResult{Accepted: false, Reason: "invalid RTP relay SDP answer"}, err
+		if srtpNegotiation != nil {
+			answerBody, localSDP, err = srtpNegotiation.RewriteClientAnswer(relay, resp.Body, localSDP)
+			if err != nil {
+				a.deleteDialog(strings.TrimSpace(req.CallID))
+				return OutboundCallResult{Accepted: false, Reason: "invalid RTP relay SRTP SDP answer"}, err
+			}
+		} else {
+			answerBody = RewriteSDPMediaEndpoint(resp.Body, relay.ClientEndpoint())
+			localSDP, err = ParseSDP(answerBody)
+			if err != nil {
+				a.deleteDialog(strings.TrimSpace(req.CallID))
+				return OutboundCallResult{Accepted: false, Reason: "invalid RTP relay SDP answer"}, err
+			}
 		}
 	}
 	if localSDP.MediaPort <= 0 || strings.TrimSpace(localSDP.ConnectionIP) == "" {
@@ -1636,7 +1653,7 @@ func (a *IMSOutboundAgent) CancelVoiceCallWithResult(ctx context.Context, info D
 	return result, nil
 }
 
-func (a *IMSOutboundAgent) provisionalAnswer(resp voiceclient.SIPResponse, relay *RTPRelaySession) ([]byte, SDPInfo, bool, error) {
+func (a *IMSOutboundAgent) provisionalAnswer(resp voiceclient.SIPResponse, relay *RTPRelaySession, srtpNegotiation *outboundSDESRelayNegotiation) ([]byte, SDPInfo, bool, error) {
 	if len(resp.Body) == 0 {
 		return nil, SDPInfo{}, false, nil
 	}
@@ -1650,10 +1667,17 @@ func (a *IMSOutboundAgent) provisionalAnswer(resp voiceclient.SIPResponse, relay
 		if err := relay.SetIMSRemote(remoteSDP); err != nil {
 			return nil, SDPInfo{}, false, fmt.Errorf("RTP relay provisional remote setup failed: %w", err)
 		}
-		answerBody = RewriteSDPMediaEndpoint(resp.Body, relay.ClientEndpoint())
-		localSDP, err = ParseSDP(answerBody)
-		if err != nil {
-			return nil, SDPInfo{}, false, fmt.Errorf("invalid RTP relay provisional SDP answer: %w", err)
+		if srtpNegotiation != nil {
+			answerBody, localSDP, err = srtpNegotiation.RewriteClientAnswer(relay, resp.Body, remoteSDP)
+			if err != nil {
+				return nil, SDPInfo{}, false, fmt.Errorf("invalid RTP relay provisional SRTP SDP answer: %w", err)
+			}
+		} else {
+			answerBody = RewriteSDPMediaEndpoint(resp.Body, relay.ClientEndpoint())
+			localSDP, err = ParseSDP(answerBody)
+			if err != nil {
+				return nil, SDPInfo{}, false, fmt.Errorf("invalid RTP relay provisional SDP answer: %w", err)
+			}
 		}
 	}
 	return answerBody, localSDP, true, nil

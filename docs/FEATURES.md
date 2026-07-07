@@ -259,8 +259,9 @@ protocol layers needed by VoHive:
   profiles, independent direction-specific client/IMS key material for
   asymmetric SDES offer/answer keying, replay protection, and authentication
   failure handling, runtime relay transform replacement for post-SDP
-  negotiation SRTP activation, plus SDP `a=crypto` tag, suite, inline key,
-  lifetime, and MKI validation on parse/build boundaries
+  negotiation SRTP activation, outbound IMS SDES offer/answer crypto rewriting
+  with live relay transform installation, plus SDP `a=crypto` tag, suite,
+  inline key, lifetime, and MKI validation on parse/build boundaries
 - RTCP feedback inspection for RTP/SRTP relay paths, including Sender/Receiver
   Reports, PLI/FIR/rapid resynchronization requests, NACK, REMB, transport-wide
   congestion control, SLI, XR, SDES, BYE, application-defined packets,

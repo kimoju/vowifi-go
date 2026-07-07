@@ -32,6 +32,7 @@ type RTPRelayConfig struct {
 	IMSRTPClockRate     int
 	BufferSize          int
 	Transforms          RTPRelayTransforms
+	SRTP                *RTPRelaySRTPConfig
 	RTCPFeedbackHandler RTCPFeedbackHandler
 	RTPDTMFHandler      RTPDTMFHandler
 	RTCPReportSchedule  RTPRelayRTCPReportScheduleConfig

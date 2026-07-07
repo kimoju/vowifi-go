@@ -1,9 +1,11 @@
 package voicehost
 
 import (
+	crand "crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +33,32 @@ type SRTPKeys struct {
 
 func (k SRTPKeys) IsZero() bool {
 	return len(k.MasterKey) == 0 && len(k.MasterSalt) == 0
+}
+
+func GenerateSRTPKeys(profile SRTPProtectionProfile, random io.Reader) (SRTPKeys, error) {
+	srtpProfile, err := srtpProtectionProfile(profile)
+	if err != nil {
+		return SRTPKeys{}, err
+	}
+	keyLen, err := srtpProfile.KeyLen()
+	if err != nil {
+		return SRTPKeys{}, fmt.Errorf("%w: key length: %v", ErrSRTPMediaConfig, err)
+	}
+	saltLen, err := srtpProfile.SaltLen()
+	if err != nil {
+		return SRTPKeys{}, fmt.Errorf("%w: salt length: %v", ErrSRTPMediaConfig, err)
+	}
+	if random == nil {
+		random = crand.Reader
+	}
+	raw := make([]byte, keyLen+saltLen)
+	if _, err := io.ReadFull(random, raw); err != nil {
+		return SRTPKeys{}, fmt.Errorf("%w: random key material: %v", ErrSRTPMediaConfig, err)
+	}
+	return SRTPKeys{
+		MasterKey:  append([]byte(nil), raw[:keyLen]...),
+		MasterSalt: append([]byte(nil), raw[keyLen:]...),
+	}, nil
 }
 
 type SDPCryptoInlineKeyParams struct {
