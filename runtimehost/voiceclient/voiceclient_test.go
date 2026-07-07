@@ -819,6 +819,43 @@ func TestRegisterSessionUsesDigestFromCombinedWWWAuthenticate(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionUsesAKAAppPreference(t *testing.T) {
+	rawNonce := append(bytesFrom(0x22, 16), bytesFrom(0x52, 16)...)
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	aka := &preferenceRegisterAKAProvider{}
+	result, err := RegisterSession{
+		Transport:        transport,
+		AKAProvider:      aka,
+		AKAAppPreference: "isim_strict",
+		Profile:          IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:     "sip:ims.example",
+		ContactURI:       "sip:user@192.0.2.10:5060",
+		CallID:           "call-aka-preference",
+		CNonce:           "cnonce",
+	}.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if !result.Registered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", result, len(transport.requests))
+	}
+	if aka.preference != "isim_strict" || aka.plainCalls != 0 {
+		t.Fatalf("AKA preference=%q plainCalls=%d, want isim_strict via preference API", aka.preference, aka.plainCalls)
+	}
+	if !bytesEqual(aka.rand, bytesFrom(0x22, 16)) || !bytesEqual(aka.autn, bytesFrom(0x52, 16)) {
+		t.Fatalf("AKA rand=%x autn=%x", aka.rand, aka.autn)
+	}
+}
+
 func TestRegisterSessionInstallsSecurityPlanBeforeAuthenticatedRegister(t *testing.T) {
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{
@@ -4039,6 +4076,27 @@ type registerAKAProvider struct {
 }
 
 func (p *registerAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, error) {
+	p.rand = append([]byte(nil), rand16...)
+	p.autn = append([]byte(nil), autn16...)
+	return sim.AKAResult{RES: []byte{0xAA, 0xBB, 0xCC, 0xDD}}, nil
+}
+
+type preferenceRegisterAKAProvider struct {
+	rand       []byte
+	autn       []byte
+	preference string
+	plainCalls int
+}
+
+func (p *preferenceRegisterAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, error) {
+	p.plainCalls++
+	p.rand = append([]byte(nil), rand16...)
+	p.autn = append([]byte(nil), autn16...)
+	return sim.AKAResult{RES: []byte{0x11, 0x22, 0x33, 0x44}}, nil
+}
+
+func (p *preferenceRegisterAKAProvider) CalculateAKAWithPreference(rand16, autn16 []byte, preference string) (sim.AKAResult, error) {
+	p.preference = preference
 	p.rand = append([]byte(nil), rand16...)
 	p.autn = append([]byte(nil), autn16...)
 	return sim.AKAResult{RES: []byte{0xAA, 0xBB, 0xCC, 0xDD}}, nil

@@ -114,6 +114,50 @@ func TestWireIMSRegistrarUsesPreparedIdentity(t *testing.T) {
 	}
 }
 
+func TestWireIMSRegistrarPassesPreparedAKAAppPreference(t *testing.T) {
+	rawNonce := append(runtimeBytesFrom(0x21, 16), runtimeBytesFrom(0x51, 16)...)
+	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`},
+			},
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	sim := &wireIMSRegistrarSIM{}
+	res, err := WireIMSRegistrar{
+		Transport:   transport,
+		ContactHost: "192.0.2.10",
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-aka-pref",
+		TraceID:  "trace-aka-pref",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Prepared: &identity.PreparedSession{
+			IMSIdentity: identity.IMSIdentityResolution{
+				IMPI:             "impi@private.example",
+				IMPU:             "sip:user@ims.example",
+				Domain:           "ims.example",
+				AKAAppPreference: identity.AKAAppPreferenceISIMStrict,
+			},
+		},
+		SIM: sim,
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	if !res.Registered || len(transport.requests) != 2 {
+		t.Fatalf("result=%+v requests=%d", res, len(transport.requests))
+	}
+	if sim.preference != identity.AKAAppPreferenceISIMStrict || sim.plainCalls != 0 {
+		t.Fatalf("SIM AKA preference=%q plainCalls=%d, want prepared preference", sim.preference, sim.plainCalls)
+	}
+	if got := strings.ToUpper(hex.EncodeToString(sim.rand)); got != strings.ToUpper(hex.EncodeToString(runtimeBytesFrom(0x21, 16))) {
+		t.Fatalf("RAND=%s", got)
+	}
+}
+
 func TestWireIMSRegistrarReportsRegistrationRefreshSchedule(t *testing.T) {
 	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{{
 		StatusCode: 200,
@@ -1621,13 +1665,23 @@ func (i *wireIMSRegistrarSecurityInstaller) InstallSecurityPlanRequest(ctx conte
 }
 
 type wireIMSRegistrarSIM struct {
-	rand []byte
-	autn []byte
+	rand       []byte
+	autn       []byte
+	preference string
+	plainCalls int
 }
 
 func (s *wireIMSRegistrarSIM) GetIMSI() (string, error) { return "310280233641503", nil }
 
 func (s *wireIMSRegistrarSIM) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, error) {
+	s.plainCalls++
+	s.rand = append([]byte(nil), rand16...)
+	s.autn = append([]byte(nil), autn16...)
+	return sim.AKAResult{RES: []byte{0x11, 0x22, 0x33, 0x44}, CK: runtimeBytesFrom(0xA0, 16), IK: runtimeBytesFrom(0xB0, 16)}, nil
+}
+
+func (s *wireIMSRegistrarSIM) CalculateAKAWithPreference(rand16, autn16 []byte, preference string) (sim.AKAResult, error) {
+	s.preference = preference
 	s.rand = append([]byte(nil), rand16...)
 	s.autn = append([]byte(nil), autn16...)
 	return sim.AKAResult{RES: []byte{0x11, 0x22, 0x33, 0x44}, CK: runtimeBytesFrom(0xA0, 16), IK: runtimeBytesFrom(0xB0, 16)}, nil

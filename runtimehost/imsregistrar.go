@@ -146,6 +146,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 	registerSession := voiceclient.RegisterSession{
 		Transport:             transport,
 		AKAProvider:           cfg.SIM,
+		AKAAppPreference:      imsAKAAppPreferenceFromConfig(cfg),
 		Profile:               profile,
 		RegistrarURI:          registrarURI,
 		ContactURI:            contactURI,
@@ -973,6 +974,13 @@ func (r WireIMSRegistrar) profileFromConfig(cfg IMSRegistrationConfig) (voicecli
 		LocalIP:   firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP),
 		UserAgent: firstRuntimeNonEmpty(r.UserAgent, "vowifi-go"),
 	}, nil
+}
+
+func imsAKAAppPreferenceFromConfig(cfg IMSRegistrationConfig) string {
+	if cfg.Prepared == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Prepared.IMSIdentity.AKAAppPreference)
 }
 
 func (r WireIMSRegistrar) contactURIForProfile(profile voiceclient.IMSProfile) string {

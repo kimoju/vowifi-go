@@ -405,19 +405,35 @@ func (s *RTPRelaySession) Transforms() RTPRelayTransforms {
 }
 
 func (s *RTPRelaySession) IMSOfferSDP(clientOffer SDPInfo) []byte {
-	info := clientOffer
-	info.ConnectionIP = s.imsAdvertiseIP
-	info.MediaPort = s.imsPort()
-	info.RTCPPort = s.imsRTCPPort()
-	return BuildSDPAnswer(info)
+	return BuildSDPAnswer(relayAdvertisedSDP(clientOffer, s.imsAdvertiseIP, s.imsPort(), s.imsRTCPPort()))
 }
 
 func (s *RTPRelaySession) ClientAnswerSDP(imsAnswer SDPInfo) []byte {
-	info := imsAnswer
-	info.ConnectionIP = s.clientAdvertiseIP
-	info.MediaPort = s.clientPort()
-	info.RTCPPort = s.clientRTCPPort()
-	return BuildSDPAnswer(info)
+	return BuildSDPAnswer(relayAdvertisedSDP(imsAnswer, s.clientAdvertiseIP, s.clientPort(), s.clientRTCPPort()))
+}
+
+func relayAdvertisedSDP(info SDPInfo, advertiseIP string, mediaPort, rtcpPort int) SDPInfo {
+	out := info
+	if out.MediaPort <= 0 {
+		out.MediaPort = 0
+		out.RTCPIP = ""
+		out.RTCPPort = 0
+		out.Direction = "inactive"
+		return out
+	}
+	if sdpConnectionIsUnspecified(out.ConnectionIP) {
+		out.Direction = "inactive"
+		return out
+	}
+	if normalizeSDPDirection(out.Direction) == "inactive" {
+		out.Direction = "inactive"
+		return out
+	}
+	out.ConnectionIP = advertiseIP
+	out.MediaPort = mediaPort
+	out.RTCPIP = advertiseIP
+	out.RTCPPort = rtcpPort
+	return out
 }
 
 func (s *RTPRelaySession) SetIMSRemote(info SDPInfo) error {
@@ -1416,6 +1432,11 @@ func normalizeSDPDirection(direction string) string {
 	default:
 		return "sendrecv"
 	}
+}
+
+func sdpConnectionIsUnspecified(connectionIP string) bool {
+	ip := net.ParseIP(strings.TrimSpace(connectionIP))
+	return ip != nil && ip.IsUnspecified()
 }
 
 func sdpDirectionAllowsSend(direction string) bool {

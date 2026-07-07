@@ -373,6 +373,36 @@ func (a *readerSIMAdapter) CalculateAKA(rand16, autn16 []byte) (swusim.AKAResult
 	return a.provider.CalculateAKA(rand16, autn16)
 }
 
+func (a *readerSIMAdapter) CalculateAKAWithPreference(rand16, autn16 []byte, preference string) (swusim.AKAResult, error) {
+	if a == nil || a.provider == nil {
+		return swusim.AKAResult{}, errors.New("aka provider is nil")
+	}
+	preference = strings.ToLower(strings.TrimSpace(preference))
+	if preference == "" {
+		return a.provider.CalculateAKA(rand16, autn16)
+	}
+	if p, ok := a.provider.(interface {
+		CalculateAKAWithPreference(rand16, autn16 []byte, preference string) (swusim.AKAResult, error)
+	}); ok {
+		return p.CalculateAKAWithPreference(rand16, autn16, preference)
+	}
+	switch preference {
+	case identity.AKAAppPreferenceISIMStrict:
+		isim, ok := a.provider.(swusim.ISIMAKAProvider)
+		if !ok {
+			return swusim.AKAResult{}, errors.New("AKA provider does not support ISIM AKA")
+		}
+		return isim.CalculateISIMAKA(rand16, autn16)
+	case identity.AKAAppPreferenceISIM, identity.AKAAppPreferenceAuto:
+		if isim, ok := a.provider.(swusim.ISIMAKAProvider); ok {
+			if aka, err := isim.CalculateISIMAKA(rand16, autn16); err == nil {
+				return aka, nil
+			}
+		}
+	}
+	return a.provider.CalculateAKA(rand16, autn16)
+}
+
 func (a *readerSIMAdapter) Close() error {
 	if a == nil || a.provider == nil {
 		return nil

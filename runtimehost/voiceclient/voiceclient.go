@@ -123,9 +123,14 @@ type SecurityPlanRequestInstaller interface {
 	InstallSecurityPlanRequest(context.Context, IMSSecurityAssociationInstallRequest) error
 }
 
+type akaPreferenceProvider interface {
+	CalculateAKAWithPreference(rand16, autn16 []byte, preference string) (sim.AKAResult, error)
+}
+
 type RegisterSession struct {
 	Transport             SIPRegisterTransport
 	AKAProvider           sim.AKAProvider
+	AKAAppPreference      string
 	Profile               IMSProfile
 	RegistrarURI          string
 	ContactURI            string
@@ -1414,10 +1419,7 @@ func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registr
 	if !ok {
 		return input, false, IMSSecurityAKAKeys{}, ErrInvalidChallenge
 	}
-	if s.AKAProvider == nil {
-		return input, false, IMSSecurityAKAKeys{}, errors.New("AKA provider required for IMS digest AKA")
-	}
-	aka, err := s.AKAProvider.CalculateAKA(rand16, autn16)
+	aka, err := calculateRegisterAKA(s.AKAProvider, rand16, autn16, s.AKAAppPreference)
 	if errors.Is(err, sim.ErrSyncFailure) {
 		if len(aka.AUTS) == 0 {
 			return input, false, IMSSecurityAKAKeys{}, err
@@ -1442,15 +1444,45 @@ func (s RegisterSession) digestAuthInputForChallenge(ch DigestChallenge, registr
 func (s RegisterSession) digestChallengeInputFunc() DigestChallengeInputFunc {
 	profile := s.Profile
 	akaProvider := s.AKAProvider
+	akaAppPreference := s.AKAAppPreference
 	cnonce := s.CNonce
 	return func(ch DigestChallenge, uri string) (DigestAuthInput, error) {
 		input, _, _, err := (RegisterSession{
-			AKAProvider: akaProvider,
-			Profile:     profile,
-			CNonce:      cnonce,
+			AKAProvider:      akaProvider,
+			AKAAppPreference: akaAppPreference,
+			Profile:          profile,
+			CNonce:           cnonce,
 		}).digestAuthInputForChallenge(ch, uri)
 		return input, err
 	}
+}
+
+func calculateRegisterAKA(provider sim.AKAProvider, rand16, autn16 []byte, preference string) (sim.AKAResult, error) {
+	if provider == nil {
+		return sim.AKAResult{}, errors.New("AKA provider required for IMS digest AKA")
+	}
+	preference = strings.ToLower(strings.TrimSpace(preference))
+	if preference == "" {
+		return provider.CalculateAKA(rand16, autn16)
+	}
+	if p, ok := provider.(akaPreferenceProvider); ok {
+		return p.CalculateAKAWithPreference(rand16, autn16, preference)
+	}
+	switch preference {
+	case "isim_strict":
+		isim, ok := provider.(sim.ISIMAKAProvider)
+		if !ok {
+			return sim.AKAResult{}, errors.New("AKA provider does not support ISIM AKA")
+		}
+		return isim.CalculateISIMAKA(rand16, autn16)
+	case "isim", "auto":
+		if isim, ok := provider.(sim.ISIMAKAProvider); ok {
+			if aka, err := isim.CalculateISIMAKA(rand16, autn16); err == nil {
+				return aka, nil
+			}
+		}
+	}
+	return provider.CalculateAKA(rand16, autn16)
 }
 
 func SelectDigestChallenge(headers map[string][]string, name string) (DigestChallenge, error) {

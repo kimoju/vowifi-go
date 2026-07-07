@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,7 +127,9 @@ func TestRTPRelaySessionAppliesSDPMediaDirection(t *testing.T) {
 		t.Fatalf("SetIMSRemote() error = %v", err)
 	}
 	clientEndpoint := udpAddrFromSDP(t, relay.ClientEndpoint())
+	clientRTCPEndpoint := udpRTCPAddrFromSDP(t, relay.ClientEndpoint())
 	imsEndpoint := udpAddrFromSDP(t, relay.IMSEndpoint())
+	imsRTCPEndpoint := udpRTCPAddrFromSDP(t, relay.IMSEndpoint())
 
 	if _, err := clientPeer.WriteToUDP([]byte{0x10}, clientEndpoint); err != nil {
 		t.Fatalf("client initial WriteToUDP() error = %v", err)
@@ -150,6 +153,21 @@ func TestRTPRelaySessionAppliesSDPMediaDirection(t *testing.T) {
 		t.Fatalf("client recvonly got=%x", got)
 	}
 
+	clientRTCP := testRTCPPacket(0x11111111)
+	if _, err := clientRTCPPeer.WriteToUDP(clientRTCP, clientRTCPEndpoint); err != nil {
+		t.Fatalf("client RTCP during recvonly WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, imsRTCPPeer); !bytes.Equal(got, clientRTCP) {
+		t.Fatalf("IMS RTCP during recvonly got=%x, want %x", got, clientRTCP)
+	}
+	imsRTCP := testRTCPPacket(0x22222222)
+	if _, err := imsRTCPPeer.WriteToUDP(imsRTCP, imsRTCPEndpoint); err != nil {
+		t.Fatalf("ims RTCP during recvonly WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, clientRTCPPeer); !bytes.Equal(got, imsRTCP) {
+		t.Fatalf("client RTCP during recvonly got=%x, want %x", got, imsRTCP)
+	}
+
 	if err := relay.SetIMSRemote(SDPInfo{ConnectionIP: "0.0.0.0", MediaPort: imsAddr.Port}); err != nil {
 		t.Fatalf("SetIMSRemote(0.0.0.0) error = %v", err)
 	}
@@ -166,9 +184,12 @@ func TestRTPRelaySessionAppliesSDPMediaDirection(t *testing.T) {
 	expectNoTestUDP(t, imsPeer)
 
 	stats := waitRelayStats(t, relay, func(stats RTPRelayStats) bool {
-		return stats.ClientToIMSRTPPackets == 1 && stats.ClientToIMSRTPDrops >= 1 && stats.IMSToClientRTPPackets == 1
+		return stats.ClientToIMSRTPPackets == 1 && stats.ClientToIMSRTPDrops >= 1 &&
+			stats.IMSToClientRTPPackets == 1 && stats.ClientToIMSRTCPPackets == 1 &&
+			stats.IMSToClientRTCPPackets == 1
 	})
-	if stats.ClientToIMSRTPPackets != 1 || stats.ClientToIMSRTPDrops < 1 || stats.IMSToClientRTPPackets != 1 {
+	if stats.ClientToIMSRTPPackets != 1 || stats.ClientToIMSRTPDrops < 1 || stats.IMSToClientRTPPackets != 1 ||
+		stats.ClientToIMSRTCPPackets != 1 || stats.IMSToClientRTCPPackets != 1 {
 		t.Fatalf("direction stats=%+v", stats)
 	}
 }
@@ -192,15 +213,101 @@ func TestRTPRelaySessionRewritesSDP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSDP(offer) error = %v", err)
 	}
-	if offer.ConnectionIP != "203.0.113.10" || offer.MediaPort != relay.IMSEndpoint().MediaPort || offer.RTCPPort != relay.IMSEndpoint().RTCPPort {
+	if offer.ConnectionIP != "203.0.113.10" || offer.MediaPort != relay.IMSEndpoint().MediaPort ||
+		offer.RTCPIP != "203.0.113.10" || offer.RTCPPort != relay.IMSEndpoint().RTCPPort {
 		t.Fatalf("offer=%+v relayIMS=%+v", offer, relay.IMSEndpoint())
 	}
 	answer, err := ParseSDP(relay.ClientAnswerSDP(SDPInfo{ConnectionIP: "192.0.2.20", MediaPort: 49170, RTCPPort: 49171, Payloads: []int{0}}))
 	if err != nil {
 		t.Fatalf("ParseSDP(answer) error = %v", err)
 	}
-	if answer.ConnectionIP != "198.51.100.10" || answer.MediaPort != relay.ClientEndpoint().MediaPort || answer.RTCPPort != relay.ClientEndpoint().RTCPPort {
+	if answer.ConnectionIP != "198.51.100.10" || answer.MediaPort != relay.ClientEndpoint().MediaPort ||
+		answer.RTCPIP != "198.51.100.10" || answer.RTCPPort != relay.ClientEndpoint().RTCPPort {
 		t.Fatalf("answer=%+v relayClient=%+v", answer, relay.ClientEndpoint())
+	}
+}
+
+func TestRTPRelaySessionPreservesHeldSDPWhenAdvertising(t *testing.T) {
+	clientPeer := listenTestUDP(t)
+	defer clientPeer.Close()
+	clientAddr := clientPeer.LocalAddr().(*net.UDPAddr)
+	relay, err := NewRTPRelaySession(context.Background(), RTPRelayConfig{
+		ClientListenIP:    "127.0.0.1",
+		ClientAdvertiseIP: "198.51.100.10",
+		IMSListenIP:       "127.0.0.1",
+		IMSAdvertiseIP:    "203.0.113.10",
+	}, SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: clientAddr.Port, RTCPPort: clientAddr.Port + 1, Payloads: []int{0}, Direction: "sendrecv"})
+	if err != nil {
+		t.Fatalf("NewRTPRelaySession() error = %v", err)
+	}
+	defer relay.Close()
+
+	heldPort := 4002
+	for heldPort == relay.IMSEndpoint().MediaPort || heldPort+1 == relay.IMSEndpoint().RTCPPort {
+		heldPort += 2
+	}
+	heldOfferRaw := string(relay.IMSOfferSDP(SDPInfo{
+		ConnectionIP: "0.0.0.0",
+		MediaPort:    heldPort,
+		RTCPPort:     heldPort + 1,
+		Payloads:     []int{0},
+		Direction:    "inactive",
+	}))
+	heldOffer, err := ParseSDP([]byte(heldOfferRaw))
+	if err != nil {
+		t.Fatalf("ParseSDP(held offer) error = %v", err)
+	}
+	if heldOffer.ConnectionIP != "0.0.0.0" || heldOffer.MediaPort != heldPort || heldOffer.Direction != "inactive" {
+		t.Fatalf("held offer=%+v", heldOffer)
+	}
+	if strings.Contains(heldOfferRaw, "203.0.113.10") ||
+		strings.Contains(heldOfferRaw, "m=audio "+strconv.Itoa(relay.IMSEndpoint().MediaPort)+" ") ||
+		strings.Contains(heldOfferRaw, "a=rtcp:"+strconv.Itoa(relay.IMSEndpoint().RTCPPort)) {
+		t.Fatalf("held offer leaked relay IMS endpoint:\n%s", heldOfferRaw)
+	}
+
+	disabledAnswerRaw := string(relay.ClientAnswerSDP(SDPInfo{
+		ConnectionIP: "192.0.2.20",
+		MediaPort:    0,
+		Payloads:     []int{0},
+	}))
+	disabledAnswer, err := ParseSDP([]byte(disabledAnswerRaw))
+	if err != nil {
+		t.Fatalf("ParseSDP(disabled answer) error = %v", err)
+	}
+	if disabledAnswer.ConnectionIP != "192.0.2.20" || disabledAnswer.MediaPort != 0 || disabledAnswer.Direction != "inactive" {
+		t.Fatalf("disabled answer=%+v", disabledAnswer)
+	}
+	if disabledAnswer.RTCPPort != 0 ||
+		strings.Contains(disabledAnswerRaw, "198.51.100.10") ||
+		strings.Contains(disabledAnswerRaw, "m=audio "+strconv.Itoa(relay.ClientEndpoint().MediaPort)+" ") ||
+		strings.Contains(disabledAnswerRaw, "a=rtcp:"+strconv.Itoa(relay.ClientEndpoint().RTCPPort)) {
+		t.Fatalf("disabled answer leaked relay client endpoint:\n%s", disabledAnswerRaw)
+	}
+
+	inactivePort := 49170
+	for inactivePort == relay.ClientEndpoint().MediaPort || inactivePort+1 == relay.ClientEndpoint().RTCPPort {
+		inactivePort += 2
+	}
+	inactiveAnswerRaw := string(relay.ClientAnswerSDP(SDPInfo{
+		ConnectionIP: "192.0.2.30",
+		MediaPort:    inactivePort,
+		RTCPPort:     inactivePort + 1,
+		Payloads:     []int{0},
+		Direction:    "inactive",
+	}))
+	inactiveAnswer, err := ParseSDP([]byte(inactiveAnswerRaw))
+	if err != nil {
+		t.Fatalf("ParseSDP(inactive answer) error = %v", err)
+	}
+	if inactiveAnswer.ConnectionIP != "192.0.2.30" || inactiveAnswer.MediaPort != inactivePort ||
+		inactiveAnswer.RTCPPort != inactivePort+1 || inactiveAnswer.Direction != "inactive" {
+		t.Fatalf("inactive answer=%+v", inactiveAnswer)
+	}
+	if strings.Contains(inactiveAnswerRaw, "198.51.100.10") ||
+		strings.Contains(inactiveAnswerRaw, "m=audio "+strconv.Itoa(relay.ClientEndpoint().MediaPort)+" ") ||
+		strings.Contains(inactiveAnswerRaw, "a=rtcp:"+strconv.Itoa(relay.ClientEndpoint().RTCPPort)) {
+		t.Fatalf("inactive answer leaked relay client endpoint:\n%s", inactiveAnswerRaw)
 	}
 }
 
