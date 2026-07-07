@@ -633,14 +633,55 @@ func TestBuildAndParseUSIMAuth(t *testing.T) {
 		t.Fatalf("AKA with Kc result=%+v", res)
 	}
 
-	res, err = ParseUSIMAuthResponse(append([]byte{0xDC, 0x0E}, bytesFrom(0xAA, 14)...), 0x90, 0x00)
+	syncAUTS := bytesFrom(0xAA, 14)
+	res, err = ParseUSIMAuthResponse(append([]byte{0xDC, 0x0E}, syncAUTS...), 0x90, 0x00)
 	if !errors.Is(err, swusim.ErrSyncFailure) || len(res.AUTS) != AKAAUTSLength {
 		t.Fatalf("sync failure = %+v err=%v, want AUTS and ErrSyncFailure", res, err)
+	}
+	var syncErr *swusim.SyncFailureError
+	if !errors.As(err, &syncErr) {
+		t.Fatalf("sync failure err=%T, want SyncFailureError", err)
+	}
+	if got, want := hex.EncodeToString(syncErr.AUTS()), hex.EncodeToString(syncAUTS); got != want {
+		t.Fatalf("sync failure error AUTS = %s, want %s", got, want)
+	}
+	mutableAUTS := syncErr.AUTS()
+	mutableAUTS[0] = 0x00
+	if got, want := hex.EncodeToString(syncErr.AUTS()), hex.EncodeToString(syncAUTS); got != want {
+		t.Fatalf("sync failure error AUTS was mutable: %s, want %s", got, want)
 	}
 
 	_, err = ParseUSIMAuthResponse([]byte{0xDD, 0x00}, 0x90, 0x00)
 	if !errors.Is(err, swusim.ErrAuthFailure) {
 		t.Fatalf("auth failure err=%v, want ErrAuthFailure", err)
+	}
+}
+
+func TestAKAProviderExposesSyncFailureAUTS(t *testing.T) {
+	rand16 := bytesFrom(0x10, 16)
+	autn16 := bytesFrom(0x30, 16)
+	auts := bytesFrom(0xA0, AKAAUTSLength)
+	resp := append([]byte{0xDC, AKAAUTSLength}, auts...)
+	resp = append(resp, 0x90, 0x00)
+	ft := &fakeTransport{responses: []string{hex.EncodeToString(resp)}}
+	provider := NewAKAProvider(ft)
+
+	res, err := provider.CalculateAKA(rand16, autn16)
+	if !errors.Is(err, swusim.ErrSyncFailure) {
+		t.Fatalf("CalculateAKA(sync failure) err=%v, want ErrSyncFailure", err)
+	}
+	var syncErr *swusim.SyncFailureError
+	if !errors.As(err, &syncErr) {
+		t.Fatalf("CalculateAKA(sync failure) err=%T, want SyncFailureError", err)
+	}
+	if got, want := hex.EncodeToString(syncErr.AUTS()), hex.EncodeToString(auts); got != want {
+		t.Fatalf("SyncFailureError.AUTS() = %s, want %s", got, want)
+	}
+	if got, want := hex.EncodeToString(res.AUTS), hex.EncodeToString(auts); got != want {
+		t.Fatalf("AKAResult.AUTS = %s, want %s", got, want)
+	}
+	if !reflect.DeepEqual(ft.closed, []int{1}) {
+		t.Fatalf("closed channels = %#v, want channel 1 closed", ft.closed)
 	}
 }
 

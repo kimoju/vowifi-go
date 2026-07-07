@@ -343,7 +343,8 @@ func parseUSIMAuthPayload(tag int, data []byte) (AKAResult, error) {
 		if _, err := ParseAUTS(data); err != nil {
 			return AKAResult{}, err
 		}
-		return AKAResult{AUTS: append([]byte(nil), data...)}, swusim.ErrSyncFailure
+		auts := append([]byte(nil), data...)
+		return AKAResult{AUTS: auts}, swusim.NewSyncFailureError(auts)
 	case 0xDD:
 		if len(data) != 0 {
 			return AKAResult{}, fmt.Errorf("AKA MAC failure tag length must be 0 bytes: %d", len(data))

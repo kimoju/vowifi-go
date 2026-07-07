@@ -14,6 +14,29 @@ type AKAResult struct {
 	AUTS []byte
 }
 
+type SyncFailureError struct {
+	auts []byte
+}
+
+func NewSyncFailureError(auts []byte) *SyncFailureError {
+	return &SyncFailureError{auts: append([]byte(nil), auts...)}
+}
+
+func (e *SyncFailureError) Error() string {
+	return ErrSyncFailure.Error()
+}
+
+func (e *SyncFailureError) Unwrap() error {
+	return ErrSyncFailure
+}
+
+func (e *SyncFailureError) AUTS() []byte {
+	if e == nil {
+		return nil
+	}
+	return append([]byte(nil), e.auts...)
+}
+
 type AKAProvider interface {
 	CalculateAKA(rand16, autn16 []byte) (AKAResult, error)
 }
