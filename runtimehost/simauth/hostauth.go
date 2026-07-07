@@ -37,6 +37,25 @@ type AKAHostErrorDecision struct {
 	Fallback bool
 }
 
+type AKAAppFallbackDecision struct {
+	Preference string
+	Primary    swusim.AKAApplication
+	Fallback   swusim.AKAApplication
+	Allow      bool
+	Strict     bool
+}
+
+func (d AKAAppFallbackDecision) Applications() []swusim.AKAApplication {
+	if d.Primary == "" {
+		return nil
+	}
+	apps := []swusim.AKAApplication{d.Primary}
+	if d.Allow && d.Fallback != "" && d.Fallback != d.Primary {
+		apps = append(apps, d.Fallback)
+	}
+	return apps
+}
+
 type AKAHostProvider struct {
 	Primary          swusim.AKAAuthenticator
 	Fallback         swusim.AKAProvider
@@ -169,13 +188,31 @@ func calculateFallbackAKA(provider swusim.AKAProvider, rand16, autn16 []byte, pr
 }
 
 func akaApplicationsForPreference(preference string) []swusim.AKAApplication {
-	switch strings.ToLower(strings.TrimSpace(preference)) {
+	return ClassifyAKAAppFallback(preference).Applications()
+}
+
+func ClassifyAKAAppFallback(preference string) AKAAppFallbackDecision {
+	pref := strings.ToLower(strings.TrimSpace(preference))
+	switch pref {
 	case AKAAppPreferenceAuto, AKAAppPreferenceISIM:
-		return []swusim.AKAApplication{swusim.AKAApplicationISIM, swusim.AKAApplicationUSIM}
+		return AKAAppFallbackDecision{
+			Preference: pref,
+			Primary:    swusim.AKAApplicationISIM,
+			Fallback:   swusim.AKAApplicationUSIM,
+			Allow:      true,
+		}
 	case AKAAppPreferenceISIMStrict:
-		return []swusim.AKAApplication{swusim.AKAApplicationISIM}
+		return AKAAppFallbackDecision{
+			Preference: AKAAppPreferenceISIMStrict,
+			Primary:    swusim.AKAApplicationISIM,
+			Strict:     true,
+		}
 	default:
-		return []swusim.AKAApplication{swusim.AKAApplicationUSIM}
+		return AKAAppFallbackDecision{
+			Preference: AKAAppPreferenceUSIM,
+			Primary:    swusim.AKAApplicationUSIM,
+			Strict:     true,
+		}
 	}
 }
 
@@ -215,11 +252,16 @@ func ClassifyAKAHostError(err error) AKAHostErrorDecision {
 		strings.Contains(text, "unimplemented") ||
 		strings.Contains(text, "no native aka") ||
 		strings.Contains(text, "no sim auth") ||
+		strings.Contains(text, "sim auth failed") ||
 		strings.Contains(text, "sim auth unavailable") ||
+		strings.Contains(text, "authentication failed: no memory") ||
+		strings.Contains(text, "invalid argument") ||
+		strings.Contains(text, "invalid arguments") ||
 		strings.Contains(text, "operation not allowed"):
 		return AKAHostErrorDecision{Fallback: true}
 	case strings.Contains(text, "temporarily unavailable") ||
-		strings.Contains(text, "temporarily not allowed"):
+		strings.Contains(text, "temporarily not allowed") ||
+		strings.Contains(text, "in use"):
 		return AKAHostErrorDecision{
 			Class:    simtransport.RecoveryClassSIMBusy,
 			Recover:  true,

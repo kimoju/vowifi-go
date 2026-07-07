@@ -120,10 +120,19 @@ func entitlementHTTPDigestInput(httpReq *HTTPRequest, req Request, challenge voi
 }
 
 func entitlementHTTPDigestHeaderNames(statusCode int) (challengeHeader, authHeader string) {
-	if statusCode == http.StatusProxyAuthRequired {
-		return "Proxy-Authenticate", "Proxy-Authorization"
+	return entitlementHTTPAuthenticationHeaderNames(statusCode)
+}
+
+func entitlementHTTPDigestChallengeSupported(challenges []HTTPAuthenticationChallenge, challengeHeader string) bool {
+	if strings.TrimSpace(challengeHeader) == "" {
+		return false
 	}
-	return "WWW-Authenticate", "Authorization"
+	challenge, err := voiceclient.SelectDigestChallenge(entitlementHTTPDigestChallengeHeaders(challenges, challengeHeader), challengeHeader)
+	if err != nil {
+		return false
+	}
+	challenge = entitlementHTTPDigestNormalizeChallenge(challenge)
+	return entitlementHTTPDigestUsesAKA(challenge.Algorithm)
 }
 
 func entitlementHTTPDigestChallengeHeaders(challenges []HTTPAuthenticationChallenge, headerName string) map[string][]string {

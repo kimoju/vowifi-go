@@ -10,6 +10,10 @@ import (
 
 var ErrInvalidCreateChild = errors.New("invalid ikev2 create child sa exchange")
 
+func CreateChildSANotifyActionFromError(err error) (NotifyAction, bool) {
+	return NotifyActionFromError(err)
+}
+
 type CreateChildSAConfig struct {
 	Transport InitTransport
 	Init      InitResult

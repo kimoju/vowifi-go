@@ -29,6 +29,77 @@ type RTPStreamStats struct {
 	Delay              uint32
 }
 
+type RTPStreamDiagnosisStatus string
+
+const (
+	RTPStreamDiagnosisStatusUnknown  RTPStreamDiagnosisStatus = "unknown"
+	RTPStreamDiagnosisStatusOK       RTPStreamDiagnosisStatus = "ok"
+	RTPStreamDiagnosisStatusWarning  RTPStreamDiagnosisStatus = "warning"
+	RTPStreamDiagnosisStatusCritical RTPStreamDiagnosisStatus = "critical"
+)
+
+type RTPStreamDiagnosisReason string
+
+const (
+	RTPStreamDiagnosisReasonNoRTP         RTPStreamDiagnosisReason = "no_rtp"
+	RTPStreamDiagnosisReasonPacketLoss    RTPStreamDiagnosisReason = "packet_loss"
+	RTPStreamDiagnosisReasonJitter        RTPStreamDiagnosisReason = "jitter"
+	RTPStreamDiagnosisReasonRTCPKeepalive RTPStreamDiagnosisReason = "rtcp_keepalive"
+)
+
+const (
+	defaultRTPDiagnosisMinExpectedPackets = 20
+	defaultRTPDiagnosisLossWarning        = 13
+	defaultRTPDiagnosisLossCritical       = 26
+	defaultRTPDiagnosisJitterWarning      = 30 * time.Millisecond
+	defaultRTPDiagnosisJitterCritical     = 100 * time.Millisecond
+)
+
+// RTPStreamDiagnosisConfig tunes the conservative thresholds used to classify a
+// received RTP stream. RTCP keepalive classification is enabled only when
+// RTCPKeepaliveInterval is positive or RequireRTCP is true.
+type RTPStreamDiagnosisConfig struct {
+	ClockRate             int
+	MinExpectedPackets    uint64
+	LossWarningFraction   uint8
+	LossCriticalFraction  uint8
+	JitterWarning         time.Duration
+	JitterCritical        time.Duration
+	RTCPKeepaliveInterval time.Duration
+	RTCPKeepaliveGrace    time.Duration
+	RequireRTCP           bool
+}
+
+type RTPStreamDiagnosis struct {
+	SSRC          uint32
+	Status        RTPStreamDiagnosisStatus
+	Reasons       []RTPStreamDiagnosisReason
+	Loss          RTPStreamLossDiagnosis
+	Jitter        RTPStreamJitterDiagnosis
+	RTCPKeepalive RTPStreamRTCPKeepaliveDiagnosis
+}
+
+type RTPStreamLossDiagnosis struct {
+	Status          RTPStreamDiagnosisStatus
+	FractionLost    uint8
+	LostPackets     uint64
+	ExpectedPackets uint64
+}
+
+type RTPStreamJitterDiagnosis struct {
+	Status   RTPStreamDiagnosisStatus
+	Jitter   uint32
+	Duration time.Duration
+}
+
+type RTPStreamRTCPKeepaliveDiagnosis struct {
+	Status           RTPStreamDiagnosisStatus
+	LastSenderReport uint32
+	Delay            time.Duration
+	StaleAfter       time.Duration
+	Missing          bool
+}
+
 // RTPStreamStatsTracker keeps RTP reception statistics split by SSRC.
 type RTPStreamStatsTracker struct {
 	streams       map[uint32]*rtpStreamStatsState
@@ -38,6 +109,41 @@ type RTPStreamStatsTracker struct {
 // NewRTPStreamStatsTracker returns an empty tracker. The zero value is also usable.
 func NewRTPStreamStatsTracker() *RTPStreamStatsTracker {
 	return &RTPStreamStatsTracker{}
+}
+
+// DiagnoseRTPStreamStats classifies RTP stream snapshots without touching the
+// network or requiring a live relay. The output preserves input order.
+func DiagnoseRTPStreamStats(stats []RTPStreamStats, cfg RTPStreamDiagnosisConfig) []RTPStreamDiagnosis {
+	if len(stats) == 0 {
+		return nil
+	}
+	out := make([]RTPStreamDiagnosis, 0, len(stats))
+	for _, stream := range stats {
+		out = append(out, stream.Diagnose(cfg))
+	}
+	return out
+}
+
+// Diagnose classifies packet loss, jitter, and RTCP keepalive freshness for one
+// RTP stream snapshot.
+func (s RTPStreamStats) Diagnose(cfg RTPStreamDiagnosisConfig) RTPStreamDiagnosis {
+	cfg = normalizeRTPStreamDiagnosisConfig(cfg)
+	diagnosis := RTPStreamDiagnosis{
+		SSRC:          s.SSRC,
+		Status:        RTPStreamDiagnosisStatusUnknown,
+		Loss:          diagnoseRTPStreamLoss(s, cfg),
+		Jitter:        diagnoseRTPStreamJitter(s, cfg),
+		RTCPKeepalive: diagnoseRTPStreamRTCPKeepalive(s, cfg),
+	}
+	if s.Packets == 0 {
+		diagnosis.Status = RTPStreamDiagnosisStatusCritical
+		diagnosis.Reasons = append(diagnosis.Reasons, RTPStreamDiagnosisReasonNoRTP)
+		return diagnosis
+	}
+	diagnosis.addMetric(diagnosis.Loss.Status, RTPStreamDiagnosisReasonPacketLoss)
+	diagnosis.addMetric(diagnosis.Jitter.Status, RTPStreamDiagnosisReasonJitter)
+	diagnosis.addMetric(diagnosis.RTCPKeepalive.Status, RTPStreamDiagnosisReasonRTCPKeepalive)
+	return diagnosis
 }
 
 // ObserveRTPPacket parses one RTP packet and updates the matching SSRC stream.
@@ -140,6 +246,139 @@ func (t *RTPStreamStatsTracker) StatsForSSRCAt(ssrc uint32, now time.Time) (RTPS
 		return RTPStreamStats{}, false
 	}
 	return state.snapshotAt(now), true
+}
+
+func diagnoseRTPStreamLoss(s RTPStreamStats, cfg RTPStreamDiagnosisConfig) RTPStreamLossDiagnosis {
+	diagnosis := RTPStreamLossDiagnosis{
+		Status:          RTPStreamDiagnosisStatusUnknown,
+		FractionLost:    s.FractionLost,
+		LostPackets:     s.LostPackets,
+		ExpectedPackets: s.ExpectedPackets,
+	}
+	if s.Packets == 0 || s.ExpectedPackets < cfg.MinExpectedPackets {
+		return diagnosis
+	}
+	switch {
+	case s.FractionLost >= cfg.LossCriticalFraction:
+		diagnosis.Status = RTPStreamDiagnosisStatusCritical
+	case s.FractionLost >= cfg.LossWarningFraction:
+		diagnosis.Status = RTPStreamDiagnosisStatusWarning
+	default:
+		diagnosis.Status = RTPStreamDiagnosisStatusOK
+	}
+	return diagnosis
+}
+
+func diagnoseRTPStreamJitter(s RTPStreamStats, cfg RTPStreamDiagnosisConfig) RTPStreamJitterDiagnosis {
+	diagnosis := RTPStreamJitterDiagnosis{
+		Status: RTPStreamDiagnosisStatusUnknown,
+		Jitter: s.Jitter,
+	}
+	if s.Packets < 2 || cfg.ClockRate <= 0 {
+		return diagnosis
+	}
+	diagnosis.Duration = rtpTimestampUnitsDuration(s.Jitter, cfg.ClockRate)
+	switch {
+	case diagnosis.Duration >= cfg.JitterCritical:
+		diagnosis.Status = RTPStreamDiagnosisStatusCritical
+	case diagnosis.Duration >= cfg.JitterWarning:
+		diagnosis.Status = RTPStreamDiagnosisStatusWarning
+	default:
+		diagnosis.Status = RTPStreamDiagnosisStatusOK
+	}
+	return diagnosis
+}
+
+func diagnoseRTPStreamRTCPKeepalive(s RTPStreamStats, cfg RTPStreamDiagnosisConfig) RTPStreamRTCPKeepaliveDiagnosis {
+	diagnosis := RTPStreamRTCPKeepaliveDiagnosis{
+		Status:           RTPStreamDiagnosisStatusUnknown,
+		LastSenderReport: s.LastSenderReport,
+		Delay:            rtcpCompactDelayDuration(s.Delay),
+	}
+	if cfg.RTCPKeepaliveInterval > 0 {
+		diagnosis.StaleAfter = cfg.RTCPKeepaliveInterval + cfg.RTCPKeepaliveGrace
+	}
+	if s.LastSenderReport == 0 {
+		if cfg.RequireRTCP && s.Packets > 0 && s.ExpectedPackets >= cfg.MinExpectedPackets {
+			diagnosis.Status = RTPStreamDiagnosisStatusWarning
+			diagnosis.Missing = true
+		}
+		return diagnosis
+	}
+	if diagnosis.StaleAfter <= 0 {
+		if cfg.RequireRTCP {
+			diagnosis.Status = RTPStreamDiagnosisStatusOK
+		}
+		return diagnosis
+	}
+	switch {
+	case diagnosis.Delay >= 2*diagnosis.StaleAfter:
+		diagnosis.Status = RTPStreamDiagnosisStatusCritical
+	case diagnosis.Delay > diagnosis.StaleAfter:
+		diagnosis.Status = RTPStreamDiagnosisStatusWarning
+	default:
+		diagnosis.Status = RTPStreamDiagnosisStatusOK
+	}
+	return diagnosis
+}
+
+func normalizeRTPStreamDiagnosisConfig(cfg RTPStreamDiagnosisConfig) RTPStreamDiagnosisConfig {
+	if cfg.MinExpectedPackets == 0 {
+		cfg.MinExpectedPackets = defaultRTPDiagnosisMinExpectedPackets
+	}
+	if cfg.LossWarningFraction == 0 {
+		cfg.LossWarningFraction = defaultRTPDiagnosisLossWarning
+	}
+	if cfg.LossCriticalFraction == 0 {
+		cfg.LossCriticalFraction = defaultRTPDiagnosisLossCritical
+	}
+	if cfg.LossCriticalFraction < cfg.LossWarningFraction {
+		cfg.LossCriticalFraction = cfg.LossWarningFraction
+	}
+	if cfg.JitterWarning <= 0 {
+		cfg.JitterWarning = defaultRTPDiagnosisJitterWarning
+	}
+	if cfg.JitterCritical <= 0 {
+		cfg.JitterCritical = defaultRTPDiagnosisJitterCritical
+	}
+	if cfg.JitterCritical < cfg.JitterWarning {
+		cfg.JitterCritical = cfg.JitterWarning
+	}
+	if cfg.RTCPKeepaliveInterval > 0 && cfg.RTCPKeepaliveGrace <= 0 {
+		cfg.RTCPKeepaliveGrace = cfg.RTCPKeepaliveInterval
+	}
+	return cfg
+}
+
+func (d *RTPStreamDiagnosis) addMetric(status RTPStreamDiagnosisStatus, reason RTPStreamDiagnosisReason) {
+	if rtpStreamDiagnosisStatusRank(status) > rtpStreamDiagnosisStatusRank(d.Status) {
+		d.Status = status
+	}
+	if rtpStreamDiagnosisStatusRank(status) >= rtpStreamDiagnosisStatusRank(RTPStreamDiagnosisStatusWarning) {
+		d.Reasons = append(d.Reasons, reason)
+	}
+}
+
+func rtpStreamDiagnosisStatusRank(status RTPStreamDiagnosisStatus) int {
+	switch status {
+	case RTPStreamDiagnosisStatusOK:
+		return 1
+	case RTPStreamDiagnosisStatusWarning:
+		return 2
+	case RTPStreamDiagnosisStatusCritical:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func rtpTimestampUnitsDuration(units uint32, clockRate int) time.Duration {
+	if clockRate <= 0 {
+		return 0
+	}
+	seconds := uint64(units) / uint64(clockRate)
+	remainder := uint64(units) % uint64(clockRate)
+	return time.Duration(seconds)*time.Second + time.Duration(remainder)*time.Second/time.Duration(clockRate)
 }
 
 type rtpStreamStatsState struct {

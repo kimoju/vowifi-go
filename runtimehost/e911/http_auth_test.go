@@ -161,6 +161,13 @@ func TestClassifyEntitlementHTTPStatusRetryAfterScopeAndMalformed(t *testing.T) 
 	if authStatus.Class != EntitlementHTTPStatusAuthenticationNeeded || authStatus.RetryAfter != 3*time.Second {
 		t.Fatalf("auth status=%+v", authStatus)
 	}
+	proxyStatus := ClassifyEntitlementHTTPStatus(&HTTPResponse{
+		StatusCode: http.StatusProxyAuthRequired,
+		Headers:    []HeaderPair{{Key: "Retry-After", Value: "4"}},
+	}, now)
+	if proxyStatus.Class != EntitlementHTTPStatusAuthenticationNeeded || proxyStatus.RetryAfter != 4*time.Second {
+		t.Fatalf("proxy status=%+v", proxyStatus)
+	}
 
 	forbidden := ClassifyEntitlementHTTPStatus(&HTTPResponse{
 		StatusCode: http.StatusForbidden,
@@ -174,8 +181,143 @@ func TestClassifyEntitlementHTTPStatusRetryAfterScopeAndMalformed(t *testing.T) 
 		StatusCode: http.StatusInternalServerError,
 		Headers:    []HeaderPair{{Key: "Retry-After", Value: "9"}},
 	}, now)
-	if serverError.Class != EntitlementHTTPStatusRetryableFailure || !serverError.Retryable || serverError.RetryAfter != 0 {
+	if serverError.Class != EntitlementHTTPStatusRetryableFailure || !serverError.Retryable || serverError.RetryAfter != 9*time.Second {
 		t.Fatalf("server error=%+v", serverError)
+	}
+}
+
+func TestClassifyEntitlementHTTPRecoverySelectsDigestAuthentication(t *testing.T) {
+	origin := ClassifyEntitlementHTTPRecovery(&HTTPResponse{
+		StatusCode: http.StatusUnauthorized,
+		Headers: []HeaderPair{{
+			Key:   "WWW-Authenticate",
+			Value: `Basic realm="legacy", Digest realm="e911", nonce="nonce-one", algorithm=AKAv1-MD5, qop="auth"`,
+		}},
+	}, time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC))
+	if origin.Action != EntitlementHTTPRecoveryActionAuthenticate ||
+		origin.ChallengeHeader != "WWW-Authenticate" ||
+		origin.AuthorizationHeader != "Authorization" ||
+		origin.SelectedAuthenticationScheme != "Digest" {
+		t.Fatalf("origin decision=%+v", origin)
+	}
+	if len(origin.AuthenticationSchemes) != 2 || origin.AuthenticationSchemes[0] != "Basic" || origin.AuthenticationSchemes[1] != "Digest" {
+		t.Fatalf("origin schemes=%+v", origin.AuthenticationSchemes)
+	}
+
+	proxy := ClassifyEntitlementHTTPRecovery(&HTTPResponse{
+		StatusCode: http.StatusProxyAuthRequired,
+		Headers: []HeaderPair{
+			{Key: "WWW-Authenticate", Value: `Digest realm="origin", nonce="ignored", algorithm=AKAv1-MD5`},
+			{Key: "Proxy-Authenticate", Value: `Digest realm="proxy", nonce="nonce-two", algorithm=AKAv2-MD5, qop=auth-int,auth`},
+		},
+	}, time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC))
+	if proxy.Action != EntitlementHTTPRecoveryActionAuthenticate ||
+		proxy.ChallengeHeader != "Proxy-Authenticate" ||
+		proxy.AuthorizationHeader != "Proxy-Authorization" ||
+		proxy.SelectedAuthenticationScheme != "Digest" ||
+		len(proxy.Challenges) != 1 ||
+		proxy.Challenges[0].Params["realm"] != "proxy" {
+		t.Fatalf("proxy decision=%+v", proxy)
+	}
+}
+
+func TestClassifyEntitlementHTTPRecoveryDefersDigestAuthenticationForRetryAfter(t *testing.T) {
+	now := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name              string
+		statusCode        int
+		challengeHeader   string
+		authorizationName string
+	}{
+		{
+			name:              "origin",
+			statusCode:        http.StatusUnauthorized,
+			challengeHeader:   "WWW-Authenticate",
+			authorizationName: "Authorization",
+		},
+		{
+			name:              "proxy",
+			statusCode:        http.StatusProxyAuthRequired,
+			challengeHeader:   "Proxy-Authenticate",
+			authorizationName: "Proxy-Authorization",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision := ClassifyEntitlementHTTPRecovery(&HTTPResponse{
+				StatusCode: tt.statusCode,
+				Headers: []HeaderPair{
+					{Key: "Retry-After", Value: "7"},
+					{Key: tt.challengeHeader, Value: `Digest realm="e911", nonce="nonce-one", algorithm=AKAv1-MD5, qop="auth"`},
+				},
+			}, now)
+
+			if decision.Action != EntitlementHTTPRecoveryActionBackoff ||
+				decision.Status.RetryAfter != 7*time.Second ||
+				decision.SelectedAuthenticationScheme != "Digest" ||
+				!decision.AuthenticationDeferredByRetryAfter {
+				t.Fatalf("decision=%+v", decision)
+			}
+			if decision.ChallengeHeader != tt.challengeHeader || decision.AuthorizationHeader != tt.authorizationName {
+				t.Fatalf("headers=%q/%q", decision.ChallengeHeader, decision.AuthorizationHeader)
+			}
+			if len(decision.Challenges) != 1 || decision.Challenges[0].Params["nonce"] != "nonce-one" {
+				t.Fatalf("challenges=%+v", decision.Challenges)
+			}
+		})
+	}
+
+	unsupported := ClassifyEntitlementHTTPRecovery(&HTTPResponse{
+		StatusCode: http.StatusUnauthorized,
+		Headers: []HeaderPair{
+			{Key: "Retry-After", Value: "5"},
+			{Key: "WWW-Authenticate", Value: `Digest realm="legacy", nonce="nonce-two", algorithm=MD5, qop="auth"`},
+		},
+	}, now)
+	if unsupported.Action != EntitlementHTTPRecoveryActionBackoff ||
+		unsupported.SelectedAuthenticationScheme != "" ||
+		unsupported.AuthenticationDeferredByRetryAfter {
+		t.Fatalf("unsupported decision=%+v", unsupported)
+	}
+}
+
+func TestClassifyEntitlementHTTPRecoveryBackoffRetryAndFail(t *testing.T) {
+	now := time.Date(2026, 7, 7, 9, 0, 0, 0, time.UTC)
+	forbidden := ClassifyEntitlementHTTPRecovery(&HTTPResponse{
+		StatusCode: http.StatusForbidden,
+		Headers:    []HeaderPair{{Key: "Retry-After", Value: "11"}},
+	}, now)
+	if forbidden.Action != EntitlementHTTPRecoveryActionBackoff || forbidden.Status.RetryAfter != 11*time.Second {
+		t.Fatalf("forbidden decision=%+v", forbidden)
+	}
+
+	serverError := ClassifyEntitlementHTTPRecovery(&HTTPResponse{
+		StatusCode: http.StatusBadGateway,
+	}, now)
+	if serverError.Action != EntitlementHTTPRecoveryActionRetry {
+		t.Fatalf("server error decision=%+v", serverError)
+	}
+
+	unsupportedChallenge := ClassifyEntitlementHTTPRecovery(&HTTPResponse{
+		StatusCode: http.StatusUnauthorized,
+		Headers:    []HeaderPair{{Key: "WWW-Authenticate", Value: `Basic realm="legacy"`}},
+	}, now)
+	if unsupportedChallenge.Action != EntitlementHTTPRecoveryActionFail ||
+		unsupportedChallenge.SelectedAuthenticationScheme != "" ||
+		len(unsupportedChallenge.AuthenticationSchemes) != 1 ||
+		unsupportedChallenge.AuthenticationSchemes[0] != "Basic" {
+		t.Fatalf("unsupported challenge decision=%+v", unsupportedChallenge)
+	}
+
+	passwordDigest := ClassifyEntitlementHTTPRecovery(&HTTPResponse{
+		StatusCode: http.StatusUnauthorized,
+		Headers:    []HeaderPair{{Key: "WWW-Authenticate", Value: `Digest realm="legacy", nonce="nonce-three", algorithm=MD5, qop="auth"`}},
+	}, now)
+	if passwordDigest.Action != EntitlementHTTPRecoveryActionFail ||
+		passwordDigest.SelectedAuthenticationScheme != "" ||
+		len(passwordDigest.AuthenticationSchemes) != 1 ||
+		passwordDigest.AuthenticationSchemes[0] != "Digest" {
+		t.Fatalf("password digest decision=%+v", passwordDigest)
 	}
 }
 

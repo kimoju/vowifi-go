@@ -697,6 +697,43 @@ func TestBuildReauthenticationResponse(t *testing.T) {
 	}
 }
 
+func TestParseReauthenticationResponseAccepted(t *testing.T) {
+	identity := "reauth-identity@example"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	request := signedReauthenticationRequestWithOptions(t, TypeAKA, keys, 12, nonceS, nil, []Attribute{ResultIndAttribute()})
+	response, _, err := BuildReauthenticationResponse(identity, request, keys, bytes.Repeat([]byte{0x66}, 16))
+	if err != nil {
+		t.Fatalf("BuildReauthenticationResponse() error = %v", err)
+	}
+	parsed, err := ParseReauthenticationResponse(response, keys, nonceS)
+	if err != nil {
+		t.Fatalf("ParseReauthenticationResponse() error = %v", err)
+	}
+	if parsed.Counter != 12 || parsed.CounterTooSmall || !parsed.ResultInd {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+	if len(parsed.EncryptedAttributes) != 1 {
+		t.Fatalf("encrypted attrs=%+v", parsed.EncryptedAttributes)
+	}
+	parsed.EncryptedAttributes[0].Data[1] = 99
+	again, err := ParseReauthenticationResponse(response, keys, nonceS)
+	if err != nil {
+		t.Fatalf("ParseReauthenticationResponse(again) error = %v", err)
+	}
+	if again.Counter != 12 {
+		t.Fatalf("parsed result was not cloned: counter=%d", again.Counter)
+	}
+}
+
 func TestBuildReauthenticationResponseWithCounterCheckAcceptsFreshCounter(t *testing.T) {
 	identity := "reauth-identity@example"
 	aka := sim.AKAResult{
@@ -783,6 +820,35 @@ func TestBuildReauthenticationResponseWithCounterCheckRejectsStaleCounter(t *tes
 	}
 	if counter != 12 {
 		t.Fatalf("encrypted counter=%d", counter)
+	}
+}
+
+func TestParseReauthenticationResponseCounterTooSmall(t *testing.T) {
+	identity := "reauth-identity@example"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	request := signedReauthenticationRequest(t, keys, 2, nonceS, nil)
+	response, err := BuildReauthenticationCounterTooSmallResponse(request, keys, bytes.Repeat([]byte{0x88}, 16))
+	if err != nil {
+		t.Fatalf("BuildReauthenticationCounterTooSmallResponse() error = %v", err)
+	}
+	parsed, err := ParseReauthenticationResponse(response, keys, nonceS)
+	if err != nil {
+		t.Fatalf("ParseReauthenticationResponse() error = %v", err)
+	}
+	if parsed.Counter != 2 || !parsed.CounterTooSmall || parsed.ResultInd {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+	if len(parsed.EncryptedAttributes) != 2 {
+		t.Fatalf("encrypted attrs=%+v", parsed.EncryptedAttributes)
 	}
 }
 

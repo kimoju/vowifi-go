@@ -215,6 +215,110 @@ func TestIMSRegistrationMaintenanceReportsUpdatedRefreshSchedule(t *testing.T) {
 	}
 }
 
+func TestClassifyIMSRegisterResponse(t *testing.T) {
+	tests := []struct {
+		name                string
+		statusCode          int
+		retryAfter          time.Duration
+		wantAction          string
+		wantRecoverable     bool
+		wantRetry           bool
+		wantReauthenticate  bool
+		wantRefreshIdentity bool
+		wantBackoff         bool
+		wantRetryAfter      time.Duration
+	}{
+		{
+			name:               "401 reauthenticates",
+			statusCode:         401,
+			wantAction:         IMSRegisterResponseActionReauthenticate,
+			wantRecoverable:    true,
+			wantRetry:          true,
+			wantReauthenticate: true,
+		},
+		{
+			name:               "407 reauthenticates",
+			statusCode:         407,
+			wantAction:         IMSRegisterResponseActionReauthenticate,
+			wantRecoverable:    true,
+			wantRetry:          true,
+			wantReauthenticate: true,
+		},
+		{
+			name:                "403 refreshes identity without retrying stale credentials",
+			statusCode:          403,
+			wantAction:          IMSRegisterResponseActionRefreshIdentity,
+			wantRefreshIdentity: true,
+		},
+		{
+			name:            "423 retries with Min-Expires",
+			statusCode:      423,
+			wantAction:      IMSRegisterResponseActionRetryWithMinExpires,
+			wantRecoverable: true,
+			wantRetry:       true,
+		},
+		{
+			name:            "503 backs off with Retry-After",
+			statusCode:      503,
+			retryAfter:      7 * time.Second,
+			wantAction:      IMSRegisterResponseActionBackoffRetry,
+			wantRecoverable: true,
+			wantRetry:       true,
+			wantBackoff:     true,
+			wantRetryAfter:  7 * time.Second,
+		},
+		{
+			name:            "580 backs off without Retry-After",
+			statusCode:      580,
+			wantAction:      IMSRegisterResponseActionBackoffRetry,
+			wantRecoverable: true,
+			wantRetry:       true,
+			wantBackoff:     true,
+		},
+		{
+			name:       "486 has no registration recovery action",
+			statusCode: 486,
+			wantAction: IMSRegisterResponseActionNone,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ClassifyIMSRegisterResponse(tc.statusCode, tc.retryAfter)
+			if got.StatusCode != tc.statusCode ||
+				got.Action != tc.wantAction ||
+				got.Recoverable != tc.wantRecoverable ||
+				got.Retry != tc.wantRetry ||
+				got.Reauthenticate != tc.wantReauthenticate ||
+				got.RefreshIdentity != tc.wantRefreshIdentity ||
+				got.Backoff != tc.wantBackoff ||
+				got.RetryAfter != tc.wantRetryAfter {
+				t.Fatalf("ClassifyIMSRegisterResponse()=%+v", got)
+			}
+		})
+	}
+}
+
+func TestIMSRegistrationMaintenanceShouldRecoverFromClassifiedResponses(t *testing.T) {
+	m := &imsRegistrationMaintenance{}
+	tests := []struct {
+		statusCode int
+		want       bool
+	}{
+		{statusCode: 401, want: true},
+		{statusCode: 407, want: true},
+		{statusCode: 403, want: false},
+		{statusCode: 423, want: true},
+		{statusCode: 503, want: true},
+		{statusCode: 486, want: false},
+	}
+	for _, tc := range tests {
+		got := m.shouldRecoverRegistration(voiceclient.RefreshResult{StatusCode: tc.statusCode}, voiceclient.ErrRegistrationRejected)
+		if got != tc.want {
+			t.Fatalf("shouldRecoverRegistration(%d)=%t, want %t", tc.statusCode, got, tc.want)
+		}
+	}
+}
+
 func TestWireIMSRegistrarHandlesAKADigestChallenge(t *testing.T) {
 	rawNonce := append(runtimeBytesFrom(0x10, 16), runtimeBytesFrom(0x40, 16)...)
 	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{

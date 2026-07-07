@@ -156,11 +156,43 @@ type ReauthenticationRequest struct {
 	EncryptedAttributes []Attribute
 }
 
+type ReauthenticationResponse struct {
+	Counter             uint16
+	CounterTooSmall     bool
+	ResultInd           bool
+	IdentityState       EncryptedIdentityState
+	EncryptedAttributes []Attribute
+}
+
 type NotificationInfo struct {
 	Value                uint16
 	Code                 uint16
 	Success              bool
 	BeforeAuthentication bool
+}
+
+type AKARecoveryAction uint8
+
+const (
+	AKARecoveryNone AKARecoveryAction = iota
+	AKARecoveryRetry
+	AKARecoveryResync
+	AKARecoveryFail
+)
+
+type SynchronizationFailureInfo struct {
+	AUTS       []byte
+	AUTSFields AUTSFields
+	KDFValues  []uint16
+}
+
+type AKARecoveryDecision struct {
+	Action          AKARecoveryAction
+	SyncFailure     bool
+	AuthFailure     bool
+	ClientError     bool
+	ClientErrorCode uint16
+	SyncInfo        SynchronizationFailureInfo
 }
 
 func (p Packet) MarshalBinary() ([]byte, error) {
@@ -511,6 +543,92 @@ func ParseClientErrorResponse(response Packet) (uint16, error) {
 		return 0, fmt.Errorf("%w: missing AT_CLIENT_ERROR_CODE", ErrInvalidAttribute)
 	}
 	return code, nil
+}
+
+func ParseSynchronizationFailureResponse(response Packet) (SynchronizationFailureInfo, error) {
+	if response.Code != CodeResponse || response.Subtype != SubtypeSynchronizationFailure {
+		return SynchronizationFailureInfo{}, fmt.Errorf("%w: not an EAP-AKA synchronization-failure response", ErrInvalidPacket)
+	}
+	if !isAKAType(response.Type) {
+		return SynchronizationFailureInfo{}, fmt.Errorf("%w: EAP type %d", ErrInvalidPacket, response.Type)
+	}
+	attr, ok, err := FindSingleAttribute(response.Attributes, AttributeAUTS)
+	if err != nil {
+		return SynchronizationFailureInfo{}, err
+	}
+	if !ok {
+		return SynchronizationFailureInfo{}, fmt.Errorf("%w: missing AT_AUTS", ErrInvalidAttribute)
+	}
+	auts, err := attr.AUTSValue()
+	if err != nil {
+		return SynchronizationFailureInfo{}, err
+	}
+	fields, err := ParseAUTS(auts)
+	if err != nil {
+		return SynchronizationFailureInfo{}, err
+	}
+	kdfs, err := kdfValues(response.Attributes)
+	if err != nil {
+		return SynchronizationFailureInfo{}, err
+	}
+	if response.Type == TypeAKAPrime && len(kdfs) == 0 {
+		return SynchronizationFailureInfo{}, fmt.Errorf("%w: missing AT_KDF", ErrInvalidAttribute)
+	}
+	return SynchronizationFailureInfo{
+		AUTS:       auts,
+		AUTSFields: fields,
+		KDFValues:  append([]uint16(nil), kdfs...),
+	}, nil
+}
+
+func ClassifyAKARecoveryPacket(packet Packet) (AKARecoveryDecision, bool, error) {
+	if packet.Code == CodeFailure {
+		return AKARecoveryDecision{Action: AKARecoveryFail}, true, nil
+	}
+	if packet.Code != CodeResponse {
+		return AKARecoveryDecision{}, false, nil
+	}
+	switch packet.Subtype {
+	case SubtypeSynchronizationFailure:
+		info, err := ParseSynchronizationFailureResponse(packet)
+		if err != nil {
+			return AKARecoveryDecision{}, true, err
+		}
+		return AKARecoveryDecision{
+			Action:      AKARecoveryResync,
+			SyncFailure: true,
+			SyncInfo:    info,
+		}, true, nil
+	case SubtypeAuthenticationReject:
+		if !isAKAType(packet.Type) {
+			return AKARecoveryDecision{}, true, fmt.Errorf("%w: EAP type %d", ErrInvalidPacket, packet.Type)
+		}
+		return AKARecoveryDecision{
+			Action:      AKARecoveryFail,
+			AuthFailure: true,
+		}, true, nil
+	case SubtypeClientError:
+		code, err := ParseClientErrorResponse(packet)
+		if err != nil {
+			return AKARecoveryDecision{}, true, err
+		}
+		return AKARecoveryDecision{
+			Action:          clientErrorRecoveryAction(code),
+			ClientError:     true,
+			ClientErrorCode: code,
+		}, true, nil
+	default:
+		return AKARecoveryDecision{}, false, nil
+	}
+}
+
+func clientErrorRecoveryAction(code uint16) AKARecoveryAction {
+	switch code {
+	case ClientErrorInsufficientChallenges, ClientErrorRANDNotFresh:
+		return AKARecoveryRetry
+	default:
+		return AKARecoveryFail
+	}
 }
 
 func CounterFromAttributes(attrs []Attribute) (uint16, bool, error) {

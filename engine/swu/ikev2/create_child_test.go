@@ -188,6 +188,41 @@ func TestRunCREATECHILDSAExposesInvalidKEAlternativeGroup(t *testing.T) {
 	}
 }
 
+func TestCreateChildSANotifyActionFromError(t *testing.T) {
+	init := fakeInitResult(t)
+	transport := &createChildTransport{
+		t:         t,
+		init:      init,
+		messageID: 12,
+		localSPI:  []byte{0xca, 0xfe, 0xba, 0xbe},
+		responseNotify: &Notify{
+			NotifyType:       NotifyInvalidKEPayload,
+			NotificationData: []byte{0, byte(DHGroup384BitECP)},
+		},
+	}
+	_, err := RunCREATE_CHILD_SA(context.Background(), CreateChildSAConfig{
+		Transport: transport,
+		Init:      init,
+		ChildSPI:  transport.localSPI,
+		Nonce:     bytes.Repeat([]byte{0x49}, 32),
+		MessageID: 12,
+		IV:        bytes.Repeat([]byte{0x98}, init.Keys.Profile.EncryptionBlockSize),
+	})
+	if !errors.Is(err, ErrInvalidCreateChild) {
+		t.Fatalf("RunCREATE_CHILD_SA() err=%v, want ErrInvalidCreateChild", err)
+	}
+	action, ok := CreateChildSANotifyActionFromError(err)
+	if !ok || action.Kind != NotifyActionRetryWithSuggestedDH ||
+		!action.Retry || action.SuggestedDHGroup != DHGroup384BitECP ||
+		action.Notify.NotifyType != NotifyInvalidKEPayload {
+		t.Fatalf("CreateChildSANotifyActionFromError() action=%+v ok=%t", action, ok)
+	}
+	action.Notify.NotificationData[1] = 0
+	if transport.responseNotify.NotificationData[1] != byte(DHGroup384BitECP) {
+		t.Fatalf("action notify data aliases response notify")
+	}
+}
+
 func TestRunCREATECHILDSARejectsUnsupportedSelectedSA(t *testing.T) {
 	init := fakeInitResult(t)
 	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}

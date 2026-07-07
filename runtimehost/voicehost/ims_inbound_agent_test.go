@@ -668,6 +668,110 @@ func TestIMSInboundAgentHandlesPrackAndUpdate(t *testing.T) {
 	}
 }
 
+func TestIMSInboundAgentRejectsDialogOfferWhilePendingAndReleases(t *testing.T) {
+	setupTransport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers: map[string][]string{
+			"To":      {"<sip:user@ims.example>;tag=client-tag"},
+			"Contact": {"<sip:client@192.0.2.50:5060>"},
+		},
+		Body: []byte(sampleSDP("192.0.2.50", 4002)),
+	}}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  setupTransport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+	}
+	if result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-pending-offer",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RawSDP:    []byte(sampleSDP("203.0.113.10", 49170)),
+	}); err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+
+	pendingTransport := newCancelAwareInboundTransport()
+	agent.ClientTransport = pendingTransport
+	type inboundResult struct {
+		result InboundCallResult
+		err    error
+	}
+	updateCh := make(chan inboundResult, 1)
+	go func() {
+		result, err := agent.HandleInboundUpdate(context.Background(), InboundDialogRequest{
+			CallID: "in-call-pending-offer",
+			CSeq:   2,
+			RawSDP: []byte(sampleSDP("203.0.113.11", 49172)),
+		})
+		updateCh <- inboundResult{result: result, err: err}
+	}()
+	updateReq := pendingTransport.readInvite(t)
+	if updateReq.Method != "UPDATE" || updateReq.Headers["CSeq"] != "2 UPDATE" {
+		t.Fatalf("client UPDATE=%+v", updateReq)
+	}
+
+	conflictCtx, cancelConflict := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelConflict()
+	conflict, err := agent.HandleInboundInvite(conflictCtx, InboundCallRequest{
+		CallID: "in-call-pending-offer",
+		CSeq:   3,
+		RawSDP: []byte(sampleSDP("203.0.113.20", 49174)),
+	})
+	if err != nil || conflict.Accepted || conflict.StatusCode != 491 || conflict.Reason != "Request Pending" {
+		t.Fatalf("conflicting re-INVITE result=%+v err=%v", conflict, err)
+	}
+	select {
+	case req := <-pendingTransport.invites:
+		t.Fatalf("conflicting offer reached client: %+v", req)
+	default:
+	}
+
+	pendingTransport.respondInvite(voiceclient.SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"Contact": {"<sip:client@192.0.2.60:5060>"}},
+		Body:       []byte(sampleSDP("192.0.2.60", 5000)),
+	})
+	select {
+	case got := <-updateCh:
+		if got.err != nil || !got.result.Accepted || got.result.LocalSDP.MediaPort != 5000 {
+			t.Fatalf("HandleInboundUpdate() result=%+v err=%v", got.result, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HandleInboundUpdate() did not return")
+	}
+
+	reinviteCh := make(chan inboundResult, 1)
+	go func() {
+		result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+			CallID: "in-call-pending-offer",
+			CSeq:   4,
+			RawSDP: []byte(sampleSDP("203.0.113.20", 49174)),
+		})
+		reinviteCh <- inboundResult{result: result, err: err}
+	}()
+	reinviteReq := pendingTransport.readInvite(t)
+	if reinviteReq.Method != "INVITE" || reinviteReq.Headers["CSeq"] != "4 INVITE" {
+		t.Fatalf("client re-INVITE=%+v", reinviteReq)
+	}
+	pendingTransport.respondInvite(voiceclient.SIPResponse{
+		StatusCode: 200,
+		Reason:     "OK",
+		Headers:    map[string][]string{"Contact": {"<sip:client@192.0.2.70:5060>"}},
+		Body:       []byte(sampleSDP("192.0.2.70", 5002)),
+	})
+	select {
+	case got := <-reinviteCh:
+		if got.err != nil || !got.result.Accepted || got.result.LocalSDP.MediaPort != 5002 {
+			t.Fatalf("HandleInboundInvite(re-INVITE) result=%+v err=%v", got.result, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HandleInboundInvite(re-INVITE) did not return")
+	}
+}
+
 func TestIMSInboundAgentFollowsClientPrackRedirectContact(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{

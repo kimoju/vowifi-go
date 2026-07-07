@@ -110,6 +110,53 @@ type DialogFailureInfo struct {
 	DialogReasons []DialogReason
 }
 
+type DialogRecoveryAction string
+
+const (
+	DialogRecoveryActionNone                 DialogRecoveryAction = "none"
+	DialogRecoveryActionWaitFinalResponse    DialogRecoveryAction = "wait-final-response"
+	DialogRecoveryActionConfirmDialog        DialogRecoveryAction = "confirm-dialog"
+	DialogRecoveryActionKeepDialog           DialogRecoveryAction = "keep-dialog"
+	DialogRecoveryActionTerminateDialog      DialogRecoveryAction = "terminate-dialog"
+	DialogRecoveryActionRetryAuthentication  DialogRecoveryAction = "retry-authentication"
+	DialogRecoveryActionRetrySessionInterval DialogRecoveryAction = "retry-session-interval"
+	DialogRecoveryActionRetryRequestPending  DialogRecoveryAction = "retry-request-pending"
+	DialogRecoveryActionRetryAfter           DialogRecoveryAction = "retry-after"
+	DialogRecoveryActionRetryRequest         DialogRecoveryAction = "retry-request"
+)
+
+// DialogRecoveryPlan describes the next dialog action suggested by a final or
+// provisional SIP response.
+type DialogRecoveryPlan struct {
+	Method            string
+	StatusCode        int
+	CurrentState      DialogSessionState
+	NextState         DialogSessionState
+	Action            DialogRecoveryAction
+	Recoverable       bool
+	RequiresAck       bool
+	RetryAfter        time.Duration
+	RetryAfterPresent bool
+	MinDelay          time.Duration
+	MaxDelay          time.Duration
+	RequestPending    DialogRequestPendingRetryInfo
+	SessionTimer      DialogSessionTimerInfo
+}
+
+// DialogRequestPendingRetryInfo describes how to retry a 491 Request Pending
+// response for an overlapping in-dialog offer request.
+type DialogRequestPendingRetryInfo struct {
+	Method            string
+	StatusCode        int
+	RequestPending    bool
+	Retry             bool
+	LocalCallIDOwner  bool
+	RetryAfter        time.Duration
+	RetryAfterPresent bool
+	MinDelay          time.Duration
+	MaxDelay          time.Duration
+}
+
 type DialogReason struct {
 	Raw        string
 	Protocol   string
@@ -424,6 +471,130 @@ func DialogResponseIsRequestPending(resp SIPResponse) bool {
 	return resp.StatusCode == 491
 }
 
+// DialogResponseRecoveryPlan classifies common INVITE/UPDATE/BYE/CANCEL
+// responses into conservative dialog recovery actions.
+func DialogResponseRecoveryPlan(method string, state DialogSessionState, resp SIPResponse, localCallIDOwner bool) (DialogRecoveryPlan, error) {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if state == "" {
+		state = DialogSessionStateIdle
+	}
+	plan := DialogRecoveryPlan{
+		Method:       method,
+		StatusCode:   resp.StatusCode,
+		CurrentState: state,
+		NextState:    AdvanceDialogSessionState(state, method, resp),
+		RequiresAck:  DialogResponseRequiresAck(method, resp),
+	}
+	if retryAfter, ok := sipResponseRetryAfterDelay(resp); ok {
+		plan.RetryAfter = retryAfter
+		plan.RetryAfterPresent = true
+	}
+	if resp.StatusCode == 0 {
+		return plan, nil
+	}
+	if isSIPProvisionalResponse(resp.StatusCode) {
+		plan.Action = DialogRecoveryActionWaitFinalResponse
+		return plan, nil
+	}
+	if isSIPSuccess(resp.StatusCode) {
+		switch method {
+		case "INVITE":
+			plan.Action = DialogRecoveryActionConfirmDialog
+		case "BYE":
+			plan.Action = DialogRecoveryActionTerminateDialog
+		case "CANCEL":
+			plan.Action = DialogRecoveryActionWaitFinalResponse
+		default:
+			plan.Action = DialogRecoveryActionKeepDialog
+		}
+		return plan, nil
+	}
+
+	switch resp.StatusCode {
+	case 401, 407:
+		if dialogRecoveryAuthenticationRetryableMethod(method) {
+			plan.Action = DialogRecoveryActionRetryAuthentication
+			plan.Recoverable = true
+			return plan, nil
+		}
+	case 422:
+		if method == "INVITE" || method == "UPDATE" {
+			timer, err := ParseDialogSessionTimerInfo(resp)
+			if err != nil {
+				return plan, err
+			}
+			if timer.MinSE <= 0 {
+				return plan, fmt.Errorf("%w: 422 response missing Min-SE", ErrInvalidSIPMessage)
+			}
+			plan.Action = DialogRecoveryActionRetrySessionInterval
+			plan.Recoverable = true
+			plan.SessionTimer = timer
+			return plan, nil
+		}
+	case 481:
+		plan.Action = DialogRecoveryActionTerminateDialog
+		return plan, nil
+	case 491:
+		pending := DialogRequestPendingRetry(method, resp, localCallIDOwner)
+		plan.RequestPending = pending
+		if pending.Retry {
+			plan.Action = DialogRecoveryActionRetryRequestPending
+			plan.Recoverable = true
+			applyDialogRecoveryRequestPendingDelay(&plan, pending)
+			return plan, nil
+		}
+	}
+
+	if plan.RetryAfterPresent && dialogRecoveryRetryAfterMethod(method) {
+		plan.Action = DialogRecoveryActionRetryAfter
+		plan.Recoverable = true
+		plan.MinDelay = plan.RetryAfter
+		plan.MaxDelay = plan.RetryAfter
+		return plan, nil
+	}
+	if dialogRecoveryTransientStatus(resp.StatusCode) && dialogRecoveryRetryableMethod(method) {
+		plan.Action = DialogRecoveryActionRetryRequest
+		plan.Recoverable = true
+		return plan, nil
+	}
+	if plan.NextState == DialogSessionStateTerminated {
+		plan.Action = DialogRecoveryActionTerminateDialog
+		return plan, nil
+	}
+	plan.Action = DialogRecoveryActionKeepDialog
+	return plan, nil
+}
+
+// DialogRequestPendingRetry classifies 491 Request Pending retry timing for
+// overlapping in-dialog INVITE or UPDATE requests.
+func DialogRequestPendingRetry(method string, resp SIPResponse, localCallIDOwner bool) DialogRequestPendingRetryInfo {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	info := DialogRequestPendingRetryInfo{
+		Method:           method,
+		StatusCode:       resp.StatusCode,
+		RequestPending:   DialogResponseIsRequestPending(resp),
+		LocalCallIDOwner: localCallIDOwner,
+	}
+	if !info.RequestPending || !dialogRequestPendingRetryableMethod(method) {
+		return info
+	}
+	info.Retry = true
+	if retryAfter, ok := sipResponseRetryAfterDelay(resp); ok {
+		info.RetryAfter = retryAfter
+		info.RetryAfterPresent = true
+		info.MinDelay = retryAfter
+		info.MaxDelay = retryAfter
+		return info
+	}
+	if localCallIDOwner {
+		info.MinDelay = 2100 * time.Millisecond
+		info.MaxDelay = 4 * time.Second
+		return info
+	}
+	info.MaxDelay = 2 * time.Second
+	return info
+}
+
 func FormatDialogReasonHeader(protocol string, cause int, text string) (string, error) {
 	protocol = strings.TrimSpace(protocol)
 	if protocol == "" {
@@ -538,6 +709,58 @@ func parseDialogReasonParamValue(value string) (string, error) {
 		return "", fmt.Errorf("%w: malformed Reason parameter", ErrInvalidSIPMessage)
 	}
 	return value, nil
+}
+
+func dialogRequestPendingRetryableMethod(method string) bool {
+	switch method {
+	case "INVITE", "UPDATE":
+		return true
+	default:
+		return false
+	}
+}
+
+func dialogRecoveryAuthenticationRetryableMethod(method string) bool {
+	switch method {
+	case "INVITE", "UPDATE", "BYE":
+		return true
+	default:
+		return false
+	}
+}
+
+func dialogRecoveryRetryAfterMethod(method string) bool {
+	switch method {
+	case "INVITE", "UPDATE", "BYE":
+		return true
+	default:
+		return false
+	}
+}
+
+func dialogRecoveryRetryableMethod(method string) bool {
+	switch method {
+	case "INVITE", "UPDATE", "BYE":
+		return true
+	default:
+		return false
+	}
+}
+
+func dialogRecoveryTransientStatus(code int) bool {
+	switch code {
+	case 408, 500, 502, 503, 504, 580:
+		return true
+	default:
+		return false
+	}
+}
+
+func applyDialogRecoveryRequestPendingDelay(plan *DialogRecoveryPlan, pending DialogRequestPendingRetryInfo) {
+	plan.RetryAfter = pending.RetryAfter
+	plan.RetryAfterPresent = pending.RetryAfterPresent
+	plan.MinDelay = pending.MinDelay
+	plan.MaxDelay = pending.MaxDelay
 }
 
 func BuildInfoRequest(cfg DialogRequestConfig, contentType string, body []byte) (SIPRequestMessage, error) {

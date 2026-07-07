@@ -32,6 +32,33 @@ type SMSRPDU struct {
 	TPDU             []byte
 }
 
+type SMSRPCauseClass string
+
+const (
+	SMSRPCauseClassUnknown          SMSRPCauseClass = ""
+	SMSRPCauseClassAddressing       SMSRPCauseClass = "addressing"
+	SMSRPCauseClassBarring          SMSRPCauseClass = "barring"
+	SMSRPCauseClassSubscriber       SMSRPCauseClass = "subscriber"
+	SMSRPCauseClassTemporaryNetwork SMSRPCauseClass = "temporary-network"
+	SMSRPCauseClassFacility         SMSRPCauseClass = "facility"
+	SMSRPCauseClassProtocol         SMSRPCauseClass = "protocol"
+	SMSRPCauseClassInterworking     SMSRPCauseClass = "interworking"
+)
+
+// SMSRPCauseDisposition describes retry and finality metadata for RP-ERROR causes.
+type SMSRPCauseDisposition struct {
+	Cause                   int
+	Class                   SMSRPCauseClass
+	Text                    string
+	Temporary               bool
+	Permanent               bool
+	Retryable               bool
+	Terminal                bool
+	RegistrationRecoverable bool
+	SubscriberActionNeeded  bool
+	ProtocolError           bool
+}
+
 type SMSConcatInfo struct {
 	IsConcat bool
 	Ref      int
@@ -560,6 +587,55 @@ func BuildSMSRPErrorWithDiagnostics(rpMR byte, cause byte, diagnostics []byte, t
 	out = append(out, byte(len(tpdu)))
 	out = append(out, tpdu...)
 	return out, nil
+}
+
+func ClassifySMSRPCause(cause int) SMSRPCauseDisposition {
+	disposition := SMSRPCauseDisposition{
+		Cause: cause,
+		Text:  RPCauseText(cause),
+	}
+	switch cause {
+	case 1, 27:
+		disposition.Class = SMSRPCauseClassAddressing
+		disposition.Permanent = true
+		disposition.Terminal = true
+	case 8, 10:
+		disposition.Class = SMSRPCauseClassBarring
+		disposition.Permanent = true
+		disposition.Terminal = true
+		disposition.SubscriberActionNeeded = true
+	case 22, 28, 30:
+		disposition.Class = SMSRPCauseClassSubscriber
+		disposition.Permanent = true
+		disposition.Terminal = true
+		disposition.SubscriberActionNeeded = cause == 22
+	case 38, int(SMSRPCauseTemporaryFailure), 42, 47:
+		disposition.Class = SMSRPCauseClassTemporaryNetwork
+		disposition.Temporary = true
+		disposition.Retryable = true
+		disposition.RegistrationRecoverable = true
+	case 21, 29, 50, 69:
+		disposition.Class = SMSRPCauseClassFacility
+		disposition.Permanent = cause == 50 || cause == 69
+		disposition.Temporary = cause == 21 || cause == 29
+		disposition.Retryable = disposition.Temporary
+		disposition.Terminal = true
+		disposition.SubscriberActionNeeded = cause == 50
+	case 81, 95, 96, 97, 98, 99, 111:
+		disposition.Class = SMSRPCauseClassProtocol
+		disposition.Permanent = true
+		disposition.Terminal = true
+		disposition.ProtocolError = true
+	case 127:
+		disposition.Class = SMSRPCauseClassInterworking
+		disposition.Temporary = true
+		disposition.Retryable = true
+		disposition.RegistrationRecoverable = true
+	default:
+		disposition.Permanent = true
+		disposition.Terminal = true
+	}
+	return disposition
 }
 
 func smsRPCauseText(code int) string {

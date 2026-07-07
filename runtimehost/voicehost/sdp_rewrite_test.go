@@ -371,6 +371,75 @@ func TestSelectSDPAnswerCodecsRejectsIncompatibleAMROctetAlign(t *testing.T) {
 	}
 }
 
+func TestClassifySDPAMRFMTPCompatibility(t *testing.T) {
+	tests := []struct {
+		name         string
+		offered      string
+		want         string
+		compatible   bool
+		status       SDPAMRFMTPCompatibilityStatus
+		parameter    string
+		answerFMTP   string
+		selectedFMTP string
+		selectedOK   bool
+	}{
+		{
+			name:         "compatible answer",
+			offered:      "octet-align=1;crc=0;mode-set=0,2,4,7;x-offer=keep",
+			want:         "octet-align=1;mode-set=2,7;mode-change-period=2;x-local=answer",
+			compatible:   true,
+			status:       SDPAMRFMTPCompatible,
+			answerFMTP:   "octet-align=1;crc=0;mode-set=2,7;mode-change-period=2;x-local=answer;x-offer=keep",
+			selectedFMTP: "octet-align=1;crc=0;mode-set=2,7;mode-change-period=2;x-local=answer;x-offer=keep",
+			selectedOK:   true,
+		},
+		{
+			name:         "local default bandwidth efficient",
+			offered:      "octet-align=1;mode-set=0,2",
+			want:         "",
+			compatible:   true,
+			status:       SDPAMRFMTPCompatible,
+			answerFMTP:   "octet-align=1;mode-set=0,2",
+			selectedFMTP: "octet-align=1;mode-set=0,2",
+			selectedOK:   true,
+		},
+		{
+			name:       "binary parameter mismatch",
+			offered:    "octet-align=0",
+			want:       "octet-align=1",
+			status:     SDPAMRFMTPIncompatibleParameter,
+			parameter:  "octet-align",
+			selectedOK: false,
+		},
+		{
+			name:       "missing required binary parameter",
+			offered:    "",
+			want:       "crc=1",
+			status:     SDPAMRFMTPIncompatibleParameter,
+			parameter:  "crc",
+			selectedOK: false,
+		},
+		{
+			name:       "disjoint mode set",
+			offered:    "mode-set=0,1",
+			want:       "mode-set=2,3",
+			status:     SDPAMRFMTPIncompatibleModeSet,
+			parameter:  "mode-set",
+			selectedOK: false,
+		},
+	}
+	for _, tt := range tests {
+		got := ClassifySDPAMRFMTPCompatibility(tt.offered, tt.want)
+		if got.Compatible != tt.compatible || got.Status != tt.status || got.Parameter != tt.parameter || got.AnswerFMTP != tt.answerFMTP {
+			t.Fatalf("%s: compatibility=%+v", tt.name, got)
+		}
+		selectedFMTP, ok := selectSDPAMRAnswerFMTP(tt.offered, tt.want)
+		if ok != tt.selectedOK || selectedFMTP != tt.selectedFMTP {
+			t.Fatalf("%s: selectSDPAMRAnswerFMTP()=(%q,%v), want (%q,%v)", tt.name, selectedFMTP, ok, tt.selectedFMTP, tt.selectedOK)
+		}
+	}
+}
+
 func TestSDPFmtpParametersRoundTrip(t *testing.T) {
 	params := ParseSDPFmtpParameters("mode-set=7,2; octet-align=1; mode-change-period=2")
 	if params["octet-align"] != "1" || params["mode-set"] != "7,2" || params["mode-change-period"] != "2" {

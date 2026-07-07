@@ -21,6 +21,35 @@ type IMSSMSTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, 
 type IMSUSSDTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, voiceclient.RegistrationBinding, voiceclient.SIPRequestTransport) messaging.USSDTransport
 type imsRegistrationWaitFunc func(context.Context, time.Duration) bool
 
+const (
+	// IMSRegisterResponseActionNone means the status does not imply local registration recovery.
+	IMSRegisterResponseActionNone = "none"
+
+	// IMSRegisterResponseActionReauthenticate means the UE should obtain a fresh digest challenge.
+	IMSRegisterResponseActionReauthenticate = "reauthenticate"
+
+	// IMSRegisterResponseActionRefreshIdentity means local IMS identity material should be refreshed before retrying.
+	IMSRegisterResponseActionRefreshIdentity = "refresh_identity"
+
+	// IMSRegisterResponseActionRetryWithMinExpires means the UE should honor Min-Expires and retry.
+	IMSRegisterResponseActionRetryWithMinExpires = "retry_with_min_expires"
+
+	// IMSRegisterResponseActionBackoffRetry means the UE should retry registration conservatively after delay/backoff.
+	IMSRegisterResponseActionBackoffRetry = "backoff_retry"
+)
+
+// IMSRegisterResponseDecision is a local recovery hint for a SIP REGISTER response.
+type IMSRegisterResponseDecision struct {
+	StatusCode      int
+	Action          string
+	Recoverable     bool
+	Retry           bool
+	Reauthenticate  bool
+	RefreshIdentity bool
+	Backoff         bool
+	RetryAfter      time.Duration
+}
+
 type WireIMSRegistrar struct {
 	Transport              voiceclient.SIPRegisterTransport
 	TransportFactory       IMSRegisterTransportFactory
@@ -55,6 +84,37 @@ type WireIMSRegistrar struct {
 	MaxRetransmitInterval  time.Duration
 	MaxRetransmits         int
 	SecurityPlanInstaller  voiceclient.SecurityPlanInstaller
+}
+
+// ClassifyIMSRegisterResponse maps SIP REGISTER status codes to conservative local recovery hints.
+func ClassifyIMSRegisterResponse(statusCode int, retryAfter time.Duration) IMSRegisterResponseDecision {
+	decision := IMSRegisterResponseDecision{
+		StatusCode: statusCode,
+		Action:     IMSRegisterResponseActionNone,
+	}
+	switch {
+	case statusCode == 401 || statusCode == 407:
+		decision.Action = IMSRegisterResponseActionReauthenticate
+		decision.Recoverable = true
+		decision.Retry = true
+		decision.Reauthenticate = true
+	case statusCode == 403:
+		decision.Action = IMSRegisterResponseActionRefreshIdentity
+		decision.RefreshIdentity = true
+	case statusCode == 423:
+		decision.Action = IMSRegisterResponseActionRetryWithMinExpires
+		decision.Recoverable = true
+		decision.Retry = true
+	case isBackoffIMSRegisterStatus(statusCode):
+		decision.Action = IMSRegisterResponseActionBackoffRetry
+		decision.Recoverable = true
+		decision.Retry = true
+		decision.Backoff = true
+		if retryAfter > 0 {
+			decision.RetryAfter = retryAfter
+		}
+	}
+	return decision
 }
 
 func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationConfig) (IMSRegistrationResult, error) {
@@ -739,12 +799,16 @@ func (m *imsRegistrationMaintenance) shouldRecoverRegistration(result voiceclien
 		return false
 	}
 	if errors.Is(err, voiceclient.ErrRegistrationRejected) {
-		return isRecoverableIMSRegistrationStatus(result.StatusCode)
+		return ClassifyIMSRegisterResponse(result.StatusCode, result.RetryAfter).Recoverable
 	}
 	return true
 }
 
 func isRecoverableIMSRegistrationStatus(code int) bool {
+	return ClassifyIMSRegisterResponse(code, 0).Recoverable
+}
+
+func isBackoffIMSRegisterStatus(code int) bool {
 	switch code {
 	case 408, 430, 480, 481, 500, 502, 503, 504, 580:
 		return true

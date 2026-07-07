@@ -95,7 +95,8 @@ func TestInformationalContentClassifiesNotifyAndDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseInformationalResponseContent() error = %v", err)
 	}
-	if len(content.Payloads) != 3 || len(content.Notifies) != 2 || len(content.Deletes) != 1 {
+	if len(content.Payloads) != 3 || len(content.Notifies) != 2 ||
+		len(content.NotifyActions) != 2 || len(content.Deletes) != 1 {
 		t.Fatalf("content=%+v", content)
 	}
 	if !errors.Is(content.NotifyError, ErrIKEv2NotifyError) ||
@@ -113,6 +114,11 @@ func TestInformationalContentClassifiesNotifyAndDelete(t *testing.T) {
 	if content.Notifies[0].NotifyType != NotifyMOBIKESupported ||
 		content.Notifies[1].NotifyType != NotifyUnacceptableAddresses {
 		t.Fatalf("notifies=%+v", content.Notifies)
+	}
+	if content.NotifyActions[0].Kind != NotifyActionMOBIKESupported ||
+		content.NotifyActions[1].Kind != NotifyActionMOBIKEAddressRecovery ||
+		!content.NotifyActions[1].Retry {
+		t.Fatalf("notify actions=%+v", content.NotifyActions)
 	}
 	if content.Deletes[0].ProtocolID != ProtocolESP || len(content.Deletes[0].SPIs) != 1 ||
 		hex.EncodeToString(content.Deletes[0].SPIs[0]) != "01020304" {

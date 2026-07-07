@@ -23,6 +23,18 @@ const (
 	EntitlementHTTPStatusFailure              EntitlementHTTPStatusClass = "failure"
 )
 
+// EntitlementHTTPRecoveryAction identifies the next protocol action suggested
+// by an entitlement HTTP response.
+type EntitlementHTTPRecoveryAction string
+
+const (
+	EntitlementHTTPRecoveryActionNone         EntitlementHTTPRecoveryAction = "none"
+	EntitlementHTTPRecoveryActionAuthenticate EntitlementHTTPRecoveryAction = "authenticate"
+	EntitlementHTTPRecoveryActionBackoff      EntitlementHTTPRecoveryAction = "backoff"
+	EntitlementHTTPRecoveryActionRetry        EntitlementHTTPRecoveryAction = "retry"
+	EntitlementHTTPRecoveryActionFail         EntitlementHTTPRecoveryAction = "fail"
+)
+
 // EntitlementHTTPStatus describes retry-relevant metadata for an entitlement
 // HTTP response.
 type EntitlementHTTPStatus struct {
@@ -43,8 +55,23 @@ type HTTPAuthenticationChallenge struct {
 	Raw    string
 }
 
+// EntitlementHTTPRecoveryDecision describes challenge and retry handling for an
+// entitlement HTTP response. SelectedAuthenticationScheme is set when the
+// response carries a supported Digest challenge, even if Retry-After makes the
+// conservative recovery action a backoff.
+type EntitlementHTTPRecoveryDecision struct {
+	Status                             EntitlementHTTPStatus
+	Action                             EntitlementHTTPRecoveryAction
+	Challenges                         []HTTPAuthenticationChallenge
+	ChallengeHeader                    string
+	AuthorizationHeader                string
+	AuthenticationSchemes              []string
+	SelectedAuthenticationScheme       string
+	AuthenticationDeferredByRetryAfter bool
+}
+
 // ClassifyEntitlementHTTPStatus returns a typed entitlement HTTP status view.
-// Retry-After is honored for 401, 403, 429, and 503 responses.
+// Retry-After is honored for 401, 403, 407, 429, and 5xx responses.
 func ClassifyEntitlementHTTPStatus(resp *HTTPResponse, now time.Time) EntitlementHTTPStatus {
 	status := EntitlementHTTPStatus{
 		Class: EntitlementHTTPStatusFailure,
@@ -60,6 +87,47 @@ func ClassifyEntitlementHTTPStatus(resp *HTTPResponse, now time.Time) Entitlemen
 		status.RetryAfter, status.RetryAfterAt, status.RetryAfterRaw, _ = entitlementHTTPRetryAfter(resp.Headers, now)
 	}
 	return status
+}
+
+// ClassifyEntitlementHTTPRecovery returns a typed challenge/retry decision for
+// entitlement HTTP responses, covering 401, 403, 407, 429, and 5xx recovery
+// flows without requiring callers to re-parse authentication headers.
+func ClassifyEntitlementHTTPRecovery(resp *HTTPResponse, now time.Time) EntitlementHTTPRecoveryDecision {
+	decision := EntitlementHTTPRecoveryDecision{
+		Status: ClassifyEntitlementHTTPStatus(resp, now),
+		Action: EntitlementHTTPRecoveryActionFail,
+	}
+	if resp == nil {
+		return decision
+	}
+	if decision.Status.Success {
+		decision.Action = EntitlementHTTPRecoveryActionNone
+		return decision
+	}
+	supportedAuthenticationChallenge := false
+	if httpStatusCanCarryAuthenticationChallenge(resp.StatusCode) {
+		decision.ChallengeHeader, decision.AuthorizationHeader = entitlementHTTPAuthenticationHeaderNames(resp.StatusCode)
+		decision.Challenges = httpAuthenticationChallenges(resp.StatusCode, resp.Headers)
+		decision.AuthenticationSchemes = httpAuthenticationChallengeSchemes(decision.Challenges)
+		if entitlementHTTPDigestChallengeSupported(decision.Challenges, decision.ChallengeHeader) {
+			decision.SelectedAuthenticationScheme = "Digest"
+			supportedAuthenticationChallenge = true
+		}
+	}
+	if decision.Status.RetryAfterRaw != "" {
+		decision.AuthenticationDeferredByRetryAfter = supportedAuthenticationChallenge
+		decision.Action = EntitlementHTTPRecoveryActionBackoff
+		return decision
+	}
+	if supportedAuthenticationChallenge {
+		decision.Action = EntitlementHTTPRecoveryActionAuthenticate
+		return decision
+	}
+	if decision.Status.Retryable {
+		decision.Action = EntitlementHTTPRecoveryActionRetry
+		return decision
+	}
+	return decision
 }
 
 // ParseHTTPRetryAfter parses a Retry-After field value as either delta-seconds
@@ -124,6 +192,13 @@ func httpStatusCanCarryAuthenticationChallenge(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusProxyAuthRequired
 }
 
+func entitlementHTTPAuthenticationHeaderNames(statusCode int) (challengeHeader, authHeader string) {
+	if statusCode == http.StatusProxyAuthRequired {
+		return "Proxy-Authenticate", "Proxy-Authorization"
+	}
+	return "WWW-Authenticate", "Authorization"
+}
+
 func entitlementHTTPStatusClass(statusCode int) EntitlementHTTPStatusClass {
 	switch statusCode {
 	case http.StatusUnauthorized, http.StatusProxyAuthRequired:
@@ -156,10 +231,10 @@ func entitlementHTTPStatusRetryable(statusCode int) bool {
 
 func entitlementHTTPStatusCanCarryRetryAfter(statusCode int) bool {
 	switch statusCode {
-	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable:
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusProxyAuthRequired, http.StatusTooManyRequests:
 		return true
 	default:
-		return false
+		return statusCode >= 500
 	}
 }
 

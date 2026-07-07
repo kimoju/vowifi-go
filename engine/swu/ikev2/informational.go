@@ -29,10 +29,11 @@ type InformationalResult struct {
 }
 
 type InformationalContent struct {
-	Payloads    []Payload
-	Notifies    []Notify
-	Deletes     []Delete
-	NotifyError error
+	Payloads      []Payload
+	Notifies      []Notify
+	NotifyActions []NotifyAction
+	Deletes       []Delete
+	NotifyError   error
 }
 
 func RunInformationalExchange(ctx context.Context, cfg InformationalConfig) (InformationalResult, error) {
@@ -168,6 +169,9 @@ func ParseInformationalContent(payloads []Payload) (InformationalContent, error)
 				return InformationalContent{}, fmt.Errorf("%w: %w", ErrInvalidInformational, err)
 			}
 			content.Notifies = append(content.Notifies, cloneNotify(notify))
+			if action := ClassifyNotifyAction(notify); action.Kind != NotifyActionNone {
+				content.NotifyActions = append(content.NotifyActions, action)
+			}
 			if content.NotifyError == nil {
 				content.NotifyError = NotifyErrorFor(notify)
 			}
@@ -229,10 +233,11 @@ func informationalIV(random io.Reader, profile KeyMaterialProfile, override []by
 
 func cloneInformationalContent(in InformationalContent) InformationalContent {
 	return InformationalContent{
-		Payloads:    clonePayloads(in.Payloads),
-		Notifies:    cloneNotifies(in.Notifies),
-		Deletes:     cloneDeletes(in.Deletes),
-		NotifyError: cloneNotifyError(in.NotifyError),
+		Payloads:      clonePayloads(in.Payloads),
+		Notifies:      cloneNotifies(in.Notifies),
+		NotifyActions: cloneNotifyActions(in.NotifyActions),
+		Deletes:       cloneDeletes(in.Deletes),
+		NotifyError:   cloneNotifyError(in.NotifyError),
 	}
 }
 
@@ -242,6 +247,19 @@ func cloneNotifies(in []Notify) []Notify {
 		out[i] = cloneNotify(notify)
 	}
 	return out
+}
+
+func cloneNotifyActions(in []NotifyAction) []NotifyAction {
+	out := make([]NotifyAction, len(in))
+	for i, action := range in {
+		out[i] = cloneNotifyAction(action)
+	}
+	return out
+}
+
+func cloneNotifyAction(in NotifyAction) NotifyAction {
+	in.Notify = cloneNotify(in.Notify)
+	return in
 }
 
 func cloneDeletes(in []Delete) []Delete {

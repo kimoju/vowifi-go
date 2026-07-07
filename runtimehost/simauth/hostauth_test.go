@@ -177,6 +177,81 @@ func TestAKAHostProviderStrictISIMFallbackUsesISIMProvider(t *testing.T) {
 	}
 }
 
+func TestClassifyAKAAppFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		pref string
+		want AKAAppFallbackDecision
+		apps []swusim.AKAApplication
+	}{
+		{
+			name: "empty defaults to strict USIM",
+			want: AKAAppFallbackDecision{
+				Preference: AKAAppPreferenceUSIM,
+				Primary:    swusim.AKAApplicationUSIM,
+				Strict:     true,
+			},
+			apps: []swusim.AKAApplication{swusim.AKAApplicationUSIM},
+		},
+		{
+			name: "auto tries ISIM then USIM",
+			pref: " AUTO ",
+			want: AKAAppFallbackDecision{
+				Preference: AKAAppPreferenceAuto,
+				Primary:    swusim.AKAApplicationISIM,
+				Fallback:   swusim.AKAApplicationUSIM,
+				Allow:      true,
+			},
+			apps: []swusim.AKAApplication{swusim.AKAApplicationISIM, swusim.AKAApplicationUSIM},
+		},
+		{
+			name: "isim permits USIM fallback",
+			pref: AKAAppPreferenceISIM,
+			want: AKAAppFallbackDecision{
+				Preference: AKAAppPreferenceISIM,
+				Primary:    swusim.AKAApplicationISIM,
+				Fallback:   swusim.AKAApplicationUSIM,
+				Allow:      true,
+			},
+			apps: []swusim.AKAApplication{swusim.AKAApplicationISIM, swusim.AKAApplicationUSIM},
+		},
+		{
+			name: "strict ISIM stays on ISIM",
+			pref: AKAAppPreferenceISIMStrict,
+			want: AKAAppFallbackDecision{
+				Preference: AKAAppPreferenceISIMStrict,
+				Primary:    swusim.AKAApplicationISIM,
+				Strict:     true,
+			},
+			apps: []swusim.AKAApplication{swusim.AKAApplicationISIM},
+		},
+		{
+			name: "unknown preference normalizes to strict USIM",
+			pref: "native",
+			want: AKAAppFallbackDecision{
+				Preference: AKAAppPreferenceUSIM,
+				Primary:    swusim.AKAApplicationUSIM,
+				Strict:     true,
+			},
+			apps: []swusim.AKAApplication{swusim.AKAApplicationUSIM},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClassifyAKAAppFallback(tt.pref)
+			if got != tt.want {
+				t.Fatalf("ClassifyAKAAppFallback() = %+v, want %+v", got, tt.want)
+			}
+			if apps := got.Applications(); !reflect.DeepEqual(apps, tt.apps) {
+				t.Fatalf("Applications() = %+v, want %+v", apps, tt.apps)
+			}
+			if apps := akaApplicationsForPreference(tt.pref); !reflect.DeepEqual(apps, tt.apps) {
+				t.Fatalf("akaApplicationsForPreference() = %+v, want %+v", apps, tt.apps)
+			}
+		})
+	}
+}
+
 func TestClassifyAKAHostErrorDecisions(t *testing.T) {
 	tests := []struct {
 		name string
@@ -207,6 +282,21 @@ func TestClassifyAKAHostErrorDecisions(t *testing.T) {
 			name: "deadline",
 			err:  errors.New("context deadline exceeded"),
 			want: AKAHostErrorDecision{Class: simtransport.RecoveryClassControlPortHung, Recover: true, Fallback: true},
+		},
+		{
+			name: "qmi no memory",
+			err:  errors.New("QMI UIM authenticate failed: authentication failed: no memory"),
+			want: AKAHostErrorDecision{Fallback: true},
+		},
+		{
+			name: "qmi invalid arguments",
+			err:  errors.New("QMI UIM authenticate failed: invalid arguments"),
+			want: AKAHostErrorDecision{Fallback: true},
+		},
+		{
+			name: "native modem busy",
+			err:  errors.New("native SIM auth already in use"),
+			want: AKAHostErrorDecision{Class: simtransport.RecoveryClassSIMBusy, Recover: true, Fallback: true},
 		},
 	}
 	for _, tt := range tests {

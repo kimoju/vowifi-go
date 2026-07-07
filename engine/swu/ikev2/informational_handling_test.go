@@ -60,6 +60,43 @@ func TestHandleInformationalContentTreatsEmptyAsLiveness(t *testing.T) {
 	}
 }
 
+func TestHandleInformationalContentClassifiesNotifyActions(t *testing.T) {
+	cookiePayload, err := Cookie2Notify([]byte("cookie-3"))
+	if err != nil {
+		t.Fatalf("Cookie2Notify() error = %v", err)
+	}
+	selectorPayload, err := NotifyPayload(Notify{
+		ProtocolID:       ProtocolESP,
+		NotifyType:       NotifyInvalidSelectors,
+		SPI:              []byte{0xca, 0xfe, 0xba, 0xbe},
+		NotificationData: []byte{0x45, 0x00, 0x00, 0x54},
+	})
+	if err != nil {
+		t.Fatalf("NotifyPayload() error = %v", err)
+	}
+	handling, err := HandleInformationalPayloads([]Payload{
+		UpdateSAAddressesNotify(),
+		cookiePayload,
+		selectorPayload,
+	})
+	if err != nil {
+		t.Fatalf("HandleInformationalPayloads() error = %v", err)
+	}
+	if len(handling.NotifyActions) != 3 {
+		t.Fatalf("NotifyActions=%+v, want three actions", handling.NotifyActions)
+	}
+	if handling.NotifyActions[0].Kind != NotifyActionMOBIKEUpdateAddresses ||
+		handling.NotifyActions[1].Kind != NotifyActionMOBIKEEchoCookie2 {
+		t.Fatalf("NotifyActions=%+v", handling.NotifyActions)
+	}
+	recovery := handling.NotifyActions[2]
+	if recovery.Kind != NotifyActionNarrowTrafficSelectors ||
+		!recovery.Retry || !recovery.RecreateChild ||
+		recovery.Notify.NotifyType != NotifyInvalidSelectors {
+		t.Fatalf("recovery action=%+v", recovery)
+	}
+}
+
 func TestPlanInformationalResponseEchoesCookie2(t *testing.T) {
 	cookiePayload, err := Cookie2Notify([]byte("cookie-2"))
 	if err != nil {

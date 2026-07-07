@@ -1,9 +1,42 @@
 package ikev2
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 )
+
+type NotifyActionKind uint8
+
+const (
+	NotifyActionNone NotifyActionKind = iota
+	NotifyActionMOBIKESupported
+	NotifyActionMOBIKEUpdateAddresses
+	NotifyActionMOBIKEAdditionalAddress
+	NotifyActionMOBIKENoAdditionalAddresses
+	NotifyActionMOBIKEEchoCookie2
+	NotifyActionRekeyChildSA
+	NotifyActionRetryWithSuggestedDH
+	NotifyActionRetryWithDifferentProposal
+	NotifyActionNarrowTrafficSelectors
+	NotifyActionRecreateChildSA
+	NotifyActionRecreateIKESA
+	NotifyActionMOBIKEAddressRecovery
+	NotifyActionWaitAndRetry
+	NotifyActionReauthenticate
+	NotifyActionAbort
+)
+
+type NotifyAction struct {
+	Notify           Notify
+	Kind             NotifyActionKind
+	Retry            bool
+	RetryLater       bool
+	RecreateIKE      bool
+	RecreateChild    bool
+	SuggestedDHGroup uint16
+}
 
 type InformationalHandling struct {
 	Empty                 bool
@@ -18,6 +51,7 @@ type InformationalHandling struct {
 	InvalidSelectors      []InvalidSelectorReport
 	NotifyError           error
 	Notifies              []Notify
+	NotifyActions         []NotifyAction
 	Deletes               []Delete
 }
 
@@ -55,6 +89,9 @@ func HandleInformationalContent(content InformationalContent) (InformationalHand
 	for _, notify := range content.Notifies {
 		if err := handleInformationalNotify(&handling, notify); err != nil {
 			return InformationalHandling{}, err
+		}
+		if action := ClassifyNotifyAction(notify); action.Kind != NotifyActionNone {
+			handling.NotifyActions = append(handling.NotifyActions, action)
 		}
 	}
 	return handling, nil
@@ -105,4 +142,74 @@ func handleInformationalNotify(handling *InformationalHandling, notify Notify) e
 		handling.InvalidSelectors = append(handling.InvalidSelectors, report)
 	}
 	return nil
+}
+
+func ClassifyNotifyAction(notify Notify) NotifyAction {
+	action := NotifyAction{Notify: cloneNotify(notify)}
+	switch notify.NotifyType {
+	case NotifyMOBIKESupported:
+		action.Kind = NotifyActionMOBIKESupported
+	case NotifyUpdateSAAddresses:
+		action.Kind = NotifyActionMOBIKEUpdateAddresses
+	case NotifyAdditionalIPv4Address, NotifyAdditionalIPv6Address:
+		action.Kind = NotifyActionMOBIKEAdditionalAddress
+	case NotifyNoAdditionalAddresses:
+		action.Kind = NotifyActionMOBIKENoAdditionalAddresses
+	case NotifyCookie2:
+		action.Kind = NotifyActionMOBIKEEchoCookie2
+	case NotifyRekeySA:
+		action.Kind = NotifyActionRekeyChildSA
+	case NotifyInvalidKEPayload:
+		if len(notify.NotificationData) == 2 {
+			action.Kind = NotifyActionRetryWithSuggestedDH
+			action.Retry = true
+			action.SuggestedDHGroup = binary.BigEndian.Uint16(notify.NotificationData)
+		} else {
+			action.Kind = NotifyActionAbort
+		}
+	case NotifyNoProposalChosen:
+		action.Kind = NotifyActionRetryWithDifferentProposal
+		action.Retry = true
+	case NotifySinglePairRequired, NotifyTSUnacceptable, NotifyInvalidSelectors:
+		action.Kind = NotifyActionNarrowTrafficSelectors
+		action.Retry = true
+		action.RecreateChild = true
+	case NotifyInvalidSPI:
+		action.Kind = NotifyActionRecreateChildSA
+		action.Retry = true
+		action.RecreateChild = true
+	case NotifyNoAdditionalSAs:
+		action.Kind = NotifyActionWaitAndRetry
+		action.Retry = true
+		action.RetryLater = true
+	case NotifyInvalidIKESPI, NotifyInternalAddressFailure, NotifyFailedCPRequired:
+		action.Kind = NotifyActionRecreateIKESA
+		action.Retry = true
+		action.RecreateIKE = true
+	case NotifyUnacceptableAddresses, NotifyUnexpectedNATDetected, NotifyNoNATsAllowed:
+		action.Kind = NotifyActionMOBIKEAddressRecovery
+		action.Retry = true
+	case NotifyAuthenticationFailed:
+		action.Kind = NotifyActionReauthenticate
+		action.RecreateIKE = true
+	case NotifyUnsupportedCriticalPayload, NotifyInvalidMajorVersion, NotifyInvalidSyntax, NotifyInvalidMessageID:
+		action.Kind = NotifyActionAbort
+	default:
+		if notify.NotifyType < 16384 {
+			action.Kind = NotifyActionAbort
+		}
+	}
+	return action
+}
+
+func NotifyActionFromError(err error) (NotifyAction, bool) {
+	if err == nil {
+		return NotifyAction{}, false
+	}
+	var notifyErr *NotifyError
+	if !errors.As(err, &notifyErr) {
+		return NotifyAction{}, false
+	}
+	action := ClassifyNotifyAction(notifyErr.Notify)
+	return action, action.Kind != NotifyActionNone
 }

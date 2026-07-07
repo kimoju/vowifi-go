@@ -267,6 +267,170 @@ func TestTypedControlPacketParsing(t *testing.T) {
 	}
 }
 
+func TestSynchronizationFailureParsingAndRecoveryClassification(t *testing.T) {
+	auts := mustHex(t, "010203040506a1a2a3a4a5a6a7a8")
+	response := Packet{
+		Code:       CodeResponse,
+		Identifier: 8,
+		Type:       TypeAKAPrime,
+		Subtype:    SubtypeSynchronizationFailure,
+		Attributes: []Attribute{AUTSAttribute(auts), KDFAttribute(AKAPrimeKDFDefault)},
+	}
+
+	info, err := ParseSynchronizationFailureResponse(response)
+	if err != nil {
+		t.Fatalf("ParseSynchronizationFailureResponse() error = %v", err)
+	}
+	if hex.EncodeToString(info.AUTS) != "010203040506a1a2a3a4a5a6a7a8" {
+		t.Fatalf("AUTS=%x", info.AUTS)
+	}
+	if hex.EncodeToString(info.AUTSFields.SQNMSXorAK) != "010203040506" || hex.EncodeToString(info.AUTSFields.MACS) != "a1a2a3a4a5a6a7a8" {
+		t.Fatalf("AUTS fields=%+v", info.AUTSFields)
+	}
+	if len(info.KDFValues) != 1 || info.KDFValues[0] != AKAPrimeKDFDefault {
+		t.Fatalf("KDF values=%v", info.KDFValues)
+	}
+
+	info.AUTS[0] = 0xff
+	decision, ok, err := ClassifyAKARecoveryPacket(response)
+	if err != nil {
+		t.Fatalf("ClassifyAKARecoveryPacket() error = %v", err)
+	}
+	if !ok || decision.Action != AKARecoveryResync || !decision.SyncFailure || decision.AuthFailure || decision.ClientError {
+		t.Fatalf("decision ok=%t value=%+v", ok, decision)
+	}
+	if hex.EncodeToString(decision.SyncInfo.AUTS) != "010203040506a1a2a3a4a5a6a7a8" {
+		t.Fatalf("classified AUTS was not cloned: %x", decision.SyncInfo.AUTS)
+	}
+}
+
+func TestClassifyAKARecoveryPacketActions(t *testing.T) {
+	tests := []struct {
+		name       string
+		packet     Packet
+		ok         bool
+		action     AKARecoveryAction
+		auth       bool
+		client     bool
+		clientCode uint16
+	}{
+		{
+			name:   "terminal failure",
+			packet: Packet{Code: CodeFailure},
+			ok:     true,
+			action: AKARecoveryFail,
+		},
+		{
+			name: "authentication reject",
+			packet: Packet{
+				Code:    CodeResponse,
+				Type:    TypeAKA,
+				Subtype: SubtypeAuthenticationReject,
+			},
+			ok:     true,
+			action: AKARecoveryFail,
+			auth:   true,
+		},
+		{
+			name: "rand not fresh retries",
+			packet: Packet{
+				Code:       CodeResponse,
+				Type:       TypeAKA,
+				Subtype:    SubtypeClientError,
+				Attributes: []Attribute{ClientErrorCodeAttribute(ClientErrorRANDNotFresh)},
+			},
+			ok:         true,
+			action:     AKARecoveryRetry,
+			client:     true,
+			clientCode: ClientErrorRANDNotFresh,
+		},
+		{
+			name: "insufficient challenges retries",
+			packet: Packet{
+				Code:       CodeResponse,
+				Type:       TypeAKA,
+				Subtype:    SubtypeClientError,
+				Attributes: []Attribute{ClientErrorCodeAttribute(ClientErrorInsufficientChallenges)},
+			},
+			ok:         true,
+			action:     AKARecoveryRetry,
+			client:     true,
+			clientCode: ClientErrorInsufficientChallenges,
+		},
+		{
+			name: "unsupported version fails",
+			packet: Packet{
+				Code:       CodeResponse,
+				Type:       TypeAKA,
+				Subtype:    SubtypeClientError,
+				Attributes: []Attribute{ClientErrorCodeAttribute(ClientErrorUnsupportedVersion)},
+			},
+			ok:         true,
+			action:     AKARecoveryFail,
+			client:     true,
+			clientCode: ClientErrorUnsupportedVersion,
+		},
+		{
+			name: "unrelated response",
+			packet: Packet{
+				Code:    CodeResponse,
+				Type:    TypeAKA,
+				Subtype: SubtypeChallenge,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok, err := ClassifyAKARecoveryPacket(tt.packet)
+			if err != nil {
+				t.Fatalf("ClassifyAKARecoveryPacket() error = %v", err)
+			}
+			if ok != tt.ok {
+				t.Fatalf("ok=%t, want %t", ok, tt.ok)
+			}
+			if !tt.ok {
+				return
+			}
+			if got.Action != tt.action || got.AuthFailure != tt.auth || got.ClientError != tt.client || got.ClientErrorCode != tt.clientCode {
+				t.Fatalf("decision=%+v", got)
+			}
+		})
+	}
+}
+
+func TestParseSynchronizationFailureResponseRejectsInvalidAttributes(t *testing.T) {
+	response := Packet{
+		Code:    CodeResponse,
+		Type:    TypeAKA,
+		Subtype: SubtypeSynchronizationFailure,
+	}
+	if _, err := ParseSynchronizationFailureResponse(response); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ParseSynchronizationFailureResponse(missing AUTS) err=%v, want ErrInvalidAttribute", err)
+	}
+
+	auts := mustHex(t, "010203040506a1a2a3a4a5a6a7a8")
+	response.Attributes = []Attribute{AUTSAttribute(auts), AUTSAttribute(auts)}
+	if _, err := ParseSynchronizationFailureResponse(response); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ParseSynchronizationFailureResponse(duplicate AUTS) err=%v, want ErrInvalidAttribute", err)
+	}
+
+	response.Attributes = []Attribute{AUTSAttribute(auts[:13])}
+	if _, err := ParseSynchronizationFailureResponse(response); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ParseSynchronizationFailureResponse(short AUTS) err=%v, want ErrInvalidAttribute", err)
+	}
+
+	response.Type = TypeAKAPrime
+	response.Attributes = []Attribute{AUTSAttribute(auts)}
+	if _, err := ParseSynchronizationFailureResponse(response); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("ParseSynchronizationFailureResponse(missing AKA' KDF) err=%v, want ErrInvalidAttribute", err)
+	}
+
+	response.Type = 99
+	if _, _, err := ClassifyAKARecoveryPacket(response); !errors.Is(err, ErrInvalidPacket) {
+		t.Fatalf("ClassifyAKARecoveryPacket(bad type) err=%v, want ErrInvalidPacket", err)
+	}
+}
+
 func TestTypedControlExtractionRejectsInvalidAttributes(t *testing.T) {
 	if _, _, err := NotificationFromAttributes([]Attribute{
 		NotificationAttribute(NotificationSuccess),

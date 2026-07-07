@@ -430,6 +430,151 @@ func TestClassifyControlPortRecoveryClonesPlans(t *testing.T) {
 	}
 }
 
+func TestClassifyIMEIReadRecovery(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		attempt     int
+		portType    string
+		wantClass   RecoveryClass
+		wantAction  RecoveryAction
+		wantMode    ControlPortRecoveryMode
+		wantIdent   bool
+		wantReconf  bool
+		wantControl []ATRecoveryStep
+	}{
+		{
+			name:        "AT parse failure uses control recovery",
+			err:         errors.New("AT+CGSN: parse IMEI from OK"),
+			portType:    ControlPortTypeAT,
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionATControlRecovery,
+			wantMode:    ControlPortRecoveryModeCFUNCycle,
+			wantIdent:   true,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 0),
+		},
+		{
+			name:        "QMI unavailable suggests composition recovery",
+			err:         errors.New("QMI device unavailable while reading IMEI"),
+			portType:    ControlPortTypeQMI,
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionReconfigurePort,
+			wantMode:    ControlPortRecoveryModeQCFGReconfigure,
+			wantIdent:   true,
+			wantReconf:  true,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 0),
+		},
+		{
+			name:      "permanent profile error stays terminal",
+			err:       errors.New("permanent profile error"),
+			portType:  ControlPortTypeQMI,
+			wantClass: RecoveryClassNone,
+			wantIdent: false,
+		},
+		{
+			name:        "later AT hang can escalate to vendor reset plan",
+			err:         context.DeadlineExceeded,
+			attempt:     2,
+			portType:    ControlPortTypeAT,
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionATControlRecovery,
+			wantMode:    ControlPortRecoveryModeVendorReset,
+			wantIdent:   true,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 2),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClassifyIMEIReadRecovery(tt.err, tt.attempt, tt.portType)
+			if got.Class != tt.wantClass ||
+				got.Action != tt.wantAction ||
+				got.Mode != tt.wantMode ||
+				got.IdentityReadFailure != tt.wantIdent ||
+				got.ReconfigureControlPort != tt.wantReconf {
+				t.Fatalf("decision = %+v", got)
+			}
+			if !reflect.DeepEqual(got.ATControlPlan, tt.wantControl) {
+				t.Fatalf("ATControlPlan = %#v, want %#v", got.ATControlPlan, tt.wantControl)
+			}
+		})
+	}
+}
+
+func TestClassifyIMSIAndISIMReadRecovery(t *testing.T) {
+	tests := []struct {
+		name        string
+		classify    func(error, int, string) ControlPortRecoveryDecision
+		err         error
+		attempt     int
+		portType    string
+		wantClass   RecoveryClass
+		wantAction  RecoveryAction
+		wantMode    ControlPortRecoveryMode
+		wantIdent   bool
+		wantReconf  bool
+		wantControl []ATRecoveryStep
+	}{
+		{
+			name:        "IMSI AT parse failure uses control recovery",
+			classify:    ClassifyIMSIReadRecovery,
+			err:         errors.New("AT+CIMI: parse IMSI from OK"),
+			portType:    ControlPortTypeAT,
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionATControlRecovery,
+			wantMode:    ControlPortRecoveryModeCFUNCycle,
+			wantIdent:   true,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 0),
+		},
+		{
+			name:        "IMSI QMI unavailable suggests composition recovery",
+			classify:    ClassifyIMSIReadRecovery,
+			err:         errors.New("QMI UIM service unavailable while reading IMSI"),
+			portType:    ControlPortTypeQMI,
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionReconfigurePort,
+			wantMode:    ControlPortRecoveryModeQCFGReconfigure,
+			wantIdent:   true,
+			wantReconf:  true,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 0),
+		},
+		{
+			name:        "ISIM logical channel parse failure uses control recovery",
+			classify:    ClassifyISIMReadRecovery,
+			err:         errors.New("open ISIM logical channel: parse CCHO channel from OK"),
+			portType:    ControlPortTypeAT,
+			wantClass:   RecoveryClassControlPortHung,
+			wantAction:  RecoveryActionATControlRecovery,
+			wantMode:    ControlPortRecoveryModeCFUNCycle,
+			wantIdent:   true,
+			wantControl: PlanATControlRecovery(RecoveryClassControlPortHung, 0),
+		},
+		{
+			name:      "ISIM permanent profile error stays terminal",
+			classify:  ClassifyISIMReadRecovery,
+			err:       errors.New("permanent profile error"),
+			portType:  ControlPortTypeQMI,
+			wantClass: RecoveryClassNone,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.classify(tt.err, tt.attempt, tt.portType)
+			if got.Class != tt.wantClass ||
+				got.Action != tt.wantAction ||
+				got.Mode != tt.wantMode ||
+				got.IdentityReadFailure != tt.wantIdent ||
+				got.ReconfigureControlPort != tt.wantReconf {
+				t.Fatalf("decision = %+v", got)
+			}
+			if !reflect.DeepEqual(got.ATControlPlan, tt.wantControl) {
+				t.Fatalf("ATControlPlan = %#v, want %#v", got.ATControlPlan, tt.wantControl)
+			}
+		})
+	}
+}
+
 func TestRunATRecoveryPlanSkipsVendorSpecificByDefault(t *testing.T) {
 	plan := PlanATControlRecovery(RecoveryClassControlPortHung, 2)
 	executor := &recordingATRecoveryExecutor{}

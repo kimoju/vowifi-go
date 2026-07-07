@@ -2,6 +2,7 @@ package voicehost
 
 import (
 	"encoding/binary"
+	"reflect"
 	"testing"
 	"time"
 
@@ -184,6 +185,110 @@ func TestRTPStreamStatsTimestampRollover(t *testing.T) {
 	}
 	if stats.Jitter != 0 {
 		t.Fatalf("Jitter=%d, want 0", stats.Jitter)
+	}
+}
+
+func TestRTPStreamStatsDiagnosisClassifiesLossJitterAndRTCPKeepalive(t *testing.T) {
+	stats := RTPStreamStats{
+		SSRC:             0x12344321,
+		Packets:          90,
+		ExpectedPackets:  100,
+		LostPackets:      10,
+		FractionLost:     25,
+		Jitter:           1200,
+		LastSenderReport: 0x01020304,
+		Delay:            rtcpCompactDelay(25 * time.Second),
+	}
+	diagnoses := DiagnoseRTPStreamStats([]RTPStreamStats{stats}, RTPStreamDiagnosisConfig{
+		ClockRate:             8000,
+		MinExpectedPackets:    10,
+		RTCPKeepaliveInterval: 5 * time.Second,
+		RTCPKeepaliveGrace:    5 * time.Second,
+	})
+
+	if len(diagnoses) != 1 {
+		t.Fatalf("diagnoses=%+v, want one", diagnoses)
+	}
+	diagnosis := diagnoses[0]
+	if diagnosis.Status != RTPStreamDiagnosisStatusCritical {
+		t.Fatalf("diagnosis status=%q, want critical: %+v", diagnosis.Status, diagnosis)
+	}
+	if diagnosis.Loss.Status != RTPStreamDiagnosisStatusWarning {
+		t.Fatalf("loss diagnosis=%+v, want warning", diagnosis.Loss)
+	}
+	if diagnosis.Jitter.Status != RTPStreamDiagnosisStatusCritical || diagnosis.Jitter.Duration != 150*time.Millisecond {
+		t.Fatalf("jitter diagnosis=%+v, want critical 150ms", diagnosis.Jitter)
+	}
+	if diagnosis.RTCPKeepalive.Status != RTPStreamDiagnosisStatusCritical ||
+		diagnosis.RTCPKeepalive.Delay != 25*time.Second ||
+		diagnosis.RTCPKeepalive.StaleAfter != 10*time.Second ||
+		diagnosis.RTCPKeepalive.Missing {
+		t.Fatalf("RTCP keepalive diagnosis=%+v, want stale critical", diagnosis.RTCPKeepalive)
+	}
+	wantReasons := []RTPStreamDiagnosisReason{
+		RTPStreamDiagnosisReasonPacketLoss,
+		RTPStreamDiagnosisReasonJitter,
+		RTPStreamDiagnosisReasonRTCPKeepalive,
+	}
+	if !reflect.DeepEqual(diagnosis.Reasons, wantReasons) {
+		t.Fatalf("diagnosis reasons=%+v, want %+v", diagnosis.Reasons, wantReasons)
+	}
+}
+
+func TestRTPStreamStatsDiagnosisIsConservativeDuringStartup(t *testing.T) {
+	diagnosis := RTPStreamStats{
+		SSRC:            0x23455432,
+		Packets:         2,
+		ExpectedPackets: 3,
+		LostPackets:     1,
+		FractionLost:    85,
+	}.Diagnose(RTPStreamDiagnosisConfig{ClockRate: 8000})
+
+	if diagnosis.Status != RTPStreamDiagnosisStatusOK {
+		t.Fatalf("diagnosis status=%q, want ok: %+v", diagnosis.Status, diagnosis)
+	}
+	if diagnosis.Loss.Status != RTPStreamDiagnosisStatusUnknown {
+		t.Fatalf("loss diagnosis=%+v, want unknown before enough packets", diagnosis.Loss)
+	}
+	if len(diagnosis.Reasons) != 0 {
+		t.Fatalf("diagnosis reasons=%+v, want none", diagnosis.Reasons)
+	}
+}
+
+func TestRTPStreamStatsDiagnosisCanRequireRTCPKeepalive(t *testing.T) {
+	diagnosis := RTPStreamStats{
+		SSRC:            0x34566543,
+		Packets:         25,
+		ExpectedPackets: 25,
+	}.Diagnose(RTPStreamDiagnosisConfig{
+		ClockRate:             8000,
+		RTCPKeepaliveInterval: 5 * time.Second,
+		RequireRTCP:           true,
+	})
+
+	if diagnosis.Status != RTPStreamDiagnosisStatusWarning {
+		t.Fatalf("diagnosis status=%q, want warning: %+v", diagnosis.Status, diagnosis)
+	}
+	if diagnosis.RTCPKeepalive.Status != RTPStreamDiagnosisStatusWarning ||
+		!diagnosis.RTCPKeepalive.Missing ||
+		diagnosis.RTCPKeepalive.StaleAfter != 10*time.Second {
+		t.Fatalf("RTCP keepalive diagnosis=%+v, want missing warning", diagnosis.RTCPKeepalive)
+	}
+	if !reflect.DeepEqual(diagnosis.Reasons, []RTPStreamDiagnosisReason{RTPStreamDiagnosisReasonRTCPKeepalive}) {
+		t.Fatalf("diagnosis reasons=%+v, want RTCP keepalive", diagnosis.Reasons)
+	}
+
+	diagnosis = RTPStreamStats{
+		SSRC:             0x34566543,
+		Packets:          25,
+		ExpectedPackets:  25,
+		LastSenderReport: 0x01020304,
+	}.Diagnose(RTPStreamDiagnosisConfig{
+		ClockRate:   8000,
+		RequireRTCP: true,
+	})
+	if diagnosis.RTCPKeepalive.Status != RTPStreamDiagnosisStatusOK {
+		t.Fatalf("RTCP keepalive diagnosis=%+v, want ok when RTCP is present", diagnosis.RTCPKeepalive)
 	}
 }
 

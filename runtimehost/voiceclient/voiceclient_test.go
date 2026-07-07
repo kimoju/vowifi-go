@@ -3122,6 +3122,172 @@ func TestBuildAckRequestForInviteResponse(t *testing.T) {
 	}
 }
 
+func TestDialogRequestPendingRetryClassifiesTimingWindows(t *testing.T) {
+	remoteOwner := DialogRequestPendingRetry("INVITE", SIPResponse{StatusCode: 491}, false)
+	if !remoteOwner.RequestPending || !remoteOwner.Retry || remoteOwner.Method != "INVITE" ||
+		remoteOwner.LocalCallIDOwner || remoteOwner.RetryAfterPresent ||
+		remoteOwner.MinDelay != 0 || remoteOwner.MaxDelay != 2*time.Second {
+		t.Fatalf("remote-owner retry=%+v", remoteOwner)
+	}
+
+	localOwner := DialogRequestPendingRetry("update", SIPResponse{StatusCode: 491}, true)
+	if !localOwner.Retry || !localOwner.LocalCallIDOwner ||
+		localOwner.MinDelay != 2100*time.Millisecond || localOwner.MaxDelay != 4*time.Second {
+		t.Fatalf("local-owner retry=%+v", localOwner)
+	}
+
+	retryAfter := DialogRequestPendingRetry("INVITE", SIPResponse{
+		StatusCode: 491,
+		Headers:    map[string][]string{"Retry-After": {"3"}},
+	}, true)
+	if !retryAfter.Retry || !retryAfter.RetryAfterPresent || retryAfter.RetryAfter != 3*time.Second ||
+		retryAfter.MinDelay != 3*time.Second || retryAfter.MaxDelay != 3*time.Second {
+		t.Fatalf("Retry-After retry=%+v", retryAfter)
+	}
+
+	zeroRetryAfter := DialogRequestPendingRetry("UPDATE", SIPResponse{
+		StatusCode: 491,
+		Headers:    map[string][]string{"Retry-After": {"0"}},
+	}, false)
+	if !zeroRetryAfter.RetryAfterPresent || zeroRetryAfter.MinDelay != 0 || zeroRetryAfter.MaxDelay != 0 {
+		t.Fatalf("zero Retry-After retry=%+v", zeroRetryAfter)
+	}
+
+	nonPending := DialogRequestPendingRetry("INVITE", SIPResponse{StatusCode: 500}, false)
+	if nonPending.RequestPending || nonPending.Retry || nonPending.MaxDelay != 0 {
+		t.Fatalf("non-pending retry=%+v", nonPending)
+	}
+	nonOffer := DialogRequestPendingRetry("BYE", SIPResponse{StatusCode: 491}, false)
+	if !nonOffer.RequestPending || nonOffer.Retry || nonOffer.MaxDelay != 0 {
+		t.Fatalf("non-offer retry=%+v", nonOffer)
+	}
+}
+
+func TestDialogResponseRecoveryPlanClassifiesCommonActions(t *testing.T) {
+	tests := []struct {
+		name            string
+		method          string
+		state           DialogSessionState
+		resp            SIPResponse
+		wantAction      DialogRecoveryAction
+		wantNext        DialogSessionState
+		wantRecoverable bool
+		wantAck         bool
+		wantRetry       time.Duration
+		wantRetrySeen   bool
+		wantMinDelay    time.Duration
+		wantMaxDelay    time.Duration
+	}{
+		{
+			name:       "invite provisional waits",
+			method:     "INVITE",
+			state:      DialogSessionStateIdle,
+			resp:       SIPResponse{StatusCode: 183},
+			wantAction: DialogRecoveryActionWaitFinalResponse,
+			wantNext:   DialogSessionStateEarly,
+		},
+		{
+			name:       "invite success confirms",
+			method:     "INVITE",
+			state:      DialogSessionStateEarly,
+			resp:       SIPResponse{StatusCode: 200},
+			wantAction: DialogRecoveryActionConfirmDialog,
+			wantNext:   DialogSessionStateConfirmed,
+			wantAck:    true,
+		},
+		{
+			name:            "update auth challenge retries",
+			method:          "UPDATE",
+			state:           DialogSessionStateConfirmed,
+			resp:            SIPResponse{StatusCode: 407},
+			wantAction:      DialogRecoveryActionRetryAuthentication,
+			wantNext:        DialogSessionStateConfirmed,
+			wantRecoverable: true,
+		},
+		{
+			name:            "reinvite service unavailable waits retry after",
+			method:          "INVITE",
+			state:           DialogSessionStateConfirmed,
+			resp:            SIPResponse{StatusCode: 503, Headers: map[string][]string{"Retry-After": {"5"}}},
+			wantAction:      DialogRecoveryActionRetryAfter,
+			wantNext:        DialogSessionStateConfirmed,
+			wantRecoverable: true,
+			wantAck:         true,
+			wantRetry:       5 * time.Second,
+			wantRetrySeen:   true,
+			wantMinDelay:    5 * time.Second,
+			wantMaxDelay:    5 * time.Second,
+		},
+		{
+			name:       "update missing dialog terminates",
+			method:     "UPDATE",
+			state:      DialogSessionStateConfirmed,
+			resp:       SIPResponse{StatusCode: 481},
+			wantAction: DialogRecoveryActionTerminateDialog,
+			wantNext:   DialogSessionStateTerminated,
+		},
+		{
+			name:       "bye success terminates",
+			method:     "BYE",
+			state:      DialogSessionStateConfirmed,
+			resp:       SIPResponse{StatusCode: 200},
+			wantAction: DialogRecoveryActionTerminateDialog,
+			wantNext:   DialogSessionStateTerminated,
+		},
+		{
+			name:       "cancel success waits for invite final",
+			method:     "CANCEL",
+			state:      DialogSessionStateEarly,
+			resp:       SIPResponse{StatusCode: 200},
+			wantAction: DialogRecoveryActionWaitFinalResponse,
+			wantNext:   DialogSessionStateTerminating,
+		},
+	}
+	for _, tc := range tests {
+		got, err := DialogResponseRecoveryPlan(tc.method, tc.state, tc.resp, false)
+		if err != nil {
+			t.Fatalf("%s DialogResponseRecoveryPlan() error = %v", tc.name, err)
+		}
+		if got.Action != tc.wantAction || got.NextState != tc.wantNext ||
+			got.Recoverable != tc.wantRecoverable || got.RequiresAck != tc.wantAck ||
+			got.RetryAfter != tc.wantRetry || got.RetryAfterPresent != tc.wantRetrySeen ||
+			got.MinDelay != tc.wantMinDelay || got.MaxDelay != tc.wantMaxDelay {
+			t.Fatalf("%s recovery plan=%+v", tc.name, got)
+		}
+	}
+}
+
+func TestDialogResponseRecoveryPlanIncludesRetryDetails(t *testing.T) {
+	pending, err := DialogResponseRecoveryPlan("invite", DialogSessionStateConfirmed, SIPResponse{StatusCode: 491}, true)
+	if err != nil {
+		t.Fatalf("DialogResponseRecoveryPlan(491) error = %v", err)
+	}
+	if pending.Method != "INVITE" || pending.Action != DialogRecoveryActionRetryRequestPending ||
+		!pending.Recoverable || !pending.RequiresAck || pending.NextState != DialogSessionStateConfirmed ||
+		!pending.RequestPending.Retry || !pending.RequestPending.LocalCallIDOwner ||
+		pending.MinDelay != 2100*time.Millisecond || pending.MaxDelay != 4*time.Second {
+		t.Fatalf("491 recovery plan=%+v", pending)
+	}
+
+	interval, err := DialogResponseRecoveryPlan("UPDATE", DialogSessionStateConfirmed, SIPResponse{
+		StatusCode: 422,
+		Headers:    map[string][]string{"Min-SE": {"600"}},
+	}, false)
+	if err != nil {
+		t.Fatalf("DialogResponseRecoveryPlan(422) error = %v", err)
+	}
+	if interval.Action != DialogRecoveryActionRetrySessionInterval || !interval.Recoverable ||
+		interval.SessionTimer.MinSE != 600 || !interval.SessionTimer.RetryRequired ||
+		interval.NextState != DialogSessionStateConfirmed {
+		t.Fatalf("422 recovery plan=%+v", interval)
+	}
+
+	_, err = DialogResponseRecoveryPlan("UPDATE", DialogSessionStateConfirmed, SIPResponse{StatusCode: 422}, false)
+	if !errors.Is(err, ErrInvalidSIPMessage) {
+		t.Fatalf("DialogResponseRecoveryPlan(422 missing Min-SE) error=%v, want ErrInvalidSIPMessage", err)
+	}
+}
+
 func TestAdvanceDialogSessionStateInviteCancelBye(t *testing.T) {
 	state := AdvanceDialogSessionState("", "INVITE", SIPResponse{StatusCode: 100})
 	if state != DialogSessionStateCalling {

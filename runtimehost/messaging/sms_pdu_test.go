@@ -477,6 +477,97 @@ func TestBuildSMSRPErrorWithDiagnosticsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestClassifySMSRPCause(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+		want SMSRPCauseDisposition
+		text string
+	}{
+		{
+			name: "addressing",
+			code: 1,
+			want: SMSRPCauseDisposition{
+				Cause:     1,
+				Class:     SMSRPCauseClassAddressing,
+				Permanent: true,
+				Terminal:  true,
+			},
+			text: "unassigned number",
+		},
+		{
+			name: "temporary network",
+			code: int(SMSRPCauseTemporaryFailure),
+			want: SMSRPCauseDisposition{
+				Cause:                   int(SMSRPCauseTemporaryFailure),
+				Class:                   SMSRPCauseClassTemporaryNetwork,
+				Temporary:               true,
+				Retryable:               true,
+				RegistrationRecoverable: true,
+			},
+			text: "temporary failure",
+		},
+		{
+			name: "facility subscription",
+			code: 50,
+			want: SMSRPCauseDisposition{
+				Cause:                  50,
+				Class:                  SMSRPCauseClassFacility,
+				Permanent:              true,
+				Terminal:               true,
+				SubscriberActionNeeded: true,
+			},
+			text: "not subscribed",
+		},
+		{
+			name: "protocol",
+			code: 96,
+			want: SMSRPCauseDisposition{
+				Cause:         96,
+				Class:         SMSRPCauseClassProtocol,
+				Permanent:     true,
+				Terminal:      true,
+				ProtocolError: true,
+			},
+			text: "invalid mandatory information",
+		},
+		{
+			name: "interworking",
+			code: 127,
+			want: SMSRPCauseDisposition{
+				Cause:                   127,
+				Class:                   SMSRPCauseClassInterworking,
+				Temporary:               true,
+				Retryable:               true,
+				RegistrationRecoverable: true,
+			},
+			text: "interworking unspecified",
+		},
+		{
+			name: "unknown",
+			code: 123,
+			want: SMSRPCauseDisposition{
+				Cause:     123,
+				Permanent: true,
+				Terminal:  true,
+			},
+			text: "RP cause 123",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClassifySMSRPCause(tt.code)
+			tt.want.Text = got.Text
+			if got != tt.want {
+				t.Fatalf("ClassifySMSRPCause(%d)=%+v want %+v", tt.code, got, tt.want)
+			}
+			if !strings.Contains(got.Text, tt.text) {
+				t.Fatalf("ClassifySMSRPCause(%d).Text=%q, want %q", tt.code, got.Text, tt.text)
+			}
+		})
+	}
+}
+
 func TestParseSMSDeliverTPDUGSM7(t *testing.T) {
 	tpdu := mustHex(t, "0005810180F600006270502143650005E8329BFD06")
 	deliver, err := ParseSMSDeliverTPDU(tpdu)

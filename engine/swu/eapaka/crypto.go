@@ -567,6 +567,61 @@ func ParseReauthenticationRequest(request Packet, keys Keys) (ReauthenticationRe
 	}, nil
 }
 
+func ParseReauthenticationResponse(response Packet, keys Keys, nonceS []byte) (ReauthenticationResponse, error) {
+	if response.Code != CodeResponse || response.Subtype != SubtypeReauthentication {
+		return ReauthenticationResponse{}, fmt.Errorf("%w: not an AKA reauthentication response", ErrInvalidReauth)
+	}
+	if !isAKAType(response.Type) {
+		return ReauthenticationResponse{}, fmt.Errorf("%w: EAP type %d", ErrInvalidReauth, response.Type)
+	}
+	if len(nonceS) != RANDLength {
+		return ReauthenticationResponse{}, fmt.Errorf("%w: NONCE_S length %d", ErrInvalidReauth, len(nonceS))
+	}
+	if err := validateReauthenticationMethod(response.Type, keys); err != nil {
+		return ReauthenticationResponse{}, err
+	}
+	raw, err := response.MarshalBinary()
+	if err != nil {
+		return ReauthenticationResponse{}, err
+	}
+	if err := verifyPacketMAC(response.Type, keys.KAut, raw, nonceS); err != nil {
+		return ReauthenticationResponse{}, err
+	}
+	attrs, ok, err := DecryptPacketEncryptedAttributes(response, keys)
+	if err != nil {
+		return ReauthenticationResponse{}, err
+	}
+	if !ok {
+		return ReauthenticationResponse{}, fmt.Errorf("%w: missing AT_IV/AT_ENCR_DATA", ErrInvalidReauth)
+	}
+	counter, ok, err := CounterFromAttributes(attrs)
+	if err != nil {
+		return ReauthenticationResponse{}, err
+	}
+	if !ok {
+		return ReauthenticationResponse{}, fmt.Errorf("%w: missing AT_COUNTER", ErrInvalidReauth)
+	}
+	counterTooSmall, err := CounterTooSmallFromAttributes(attrs)
+	if err != nil {
+		return ReauthenticationResponse{}, err
+	}
+	resultInd, err := ResultIndFromAttributes(response.Attributes)
+	if err != nil {
+		return ReauthenticationResponse{}, err
+	}
+	state, err := IdentityStateFromAttributes(attrs)
+	if err != nil {
+		return ReauthenticationResponse{}, err
+	}
+	return ReauthenticationResponse{
+		Counter:             counter,
+		CounterTooSmall:     counterTooSmall,
+		ResultInd:           resultInd,
+		IdentityState:       state,
+		EncryptedAttributes: cloneAttributes(attrs),
+	}, nil
+}
+
 func DeriveReauthenticationKeys(identity string, previous Keys, counter uint16, nonceS []byte) (Keys, error) {
 	if identity == "" {
 		return Keys{}, fmt.Errorf("%w: identity is empty", ErrInvalidKeyMaterial)

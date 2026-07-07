@@ -75,6 +75,14 @@ type ControlPortRecoveryInput struct {
 	IdentityRead bool
 }
 
+// IdentityReadRecoveryInput describes a failed modem identity read.
+type IdentityReadRecoveryInput struct {
+	Err      error
+	Attempt  int
+	PortType string
+	Identity string
+}
+
 // ControlPortRecoveryDecision describes a non-executing modem recovery decision.
 type ControlPortRecoveryDecision struct {
 	Class                  RecoveryClass
@@ -233,6 +241,55 @@ func ClassifyControlPortRecovery(input ControlPortRecoveryInput) ControlPortReco
 	decision.VendorSpecific = planHasVendorSpecific(decision.ATControlPlan) ||
 		planHasVendorSpecific(decision.ATReconfigurePlan)
 	return decision
+}
+
+// ClassifyIdentityReadRecovery specializes control-port recovery for identity
+// reads such as IMEI, IMSI, or ISIM identity probing.
+func ClassifyIdentityReadRecovery(input IdentityReadRecoveryInput) ControlPortRecoveryDecision {
+	identity := strings.ToLower(strings.TrimSpace(input.Identity))
+	if identity == "" {
+		identity = "identity"
+	}
+	return ClassifyControlPortRecovery(ControlPortRecoveryInput{
+		Err:          input.Err,
+		Attempt:      input.Attempt,
+		PortType:     input.PortType,
+		Operation:    "read_" + identity,
+		IdentityRead: true,
+	})
+}
+
+// ClassifyIMEIReadRecovery returns a non-executing recovery decision for IMEI
+// reads that fail because the modem control path may be stuck or unavailable.
+func ClassifyIMEIReadRecovery(err error, attempt int, portType string) ControlPortRecoveryDecision {
+	return ClassifyIdentityReadRecovery(IdentityReadRecoveryInput{
+		Err:      err,
+		Attempt:  attempt,
+		PortType: portType,
+		Identity: "imei",
+	})
+}
+
+// ClassifyIMSIReadRecovery returns a non-executing recovery decision for IMSI
+// reads that fail because the modem control path may be stuck or unavailable.
+func ClassifyIMSIReadRecovery(err error, attempt int, portType string) ControlPortRecoveryDecision {
+	return ClassifyIdentityReadRecovery(IdentityReadRecoveryInput{
+		Err:      err,
+		Attempt:  attempt,
+		PortType: portType,
+		Identity: "imsi",
+	})
+}
+
+// ClassifyISIMReadRecovery returns a non-executing recovery decision for ISIM
+// identity reads that fail because the modem control path may be stuck or unavailable.
+func ClassifyISIMReadRecovery(err error, attempt int, portType string) ControlPortRecoveryDecision {
+	return ClassifyIdentityReadRecovery(IdentityReadRecoveryInput{
+		Err:      err,
+		Attempt:  attempt,
+		PortType: portType,
+		Identity: "isim",
+	})
 }
 
 // PlanATControlRecovery returns a non-executing recovery sequence for a stuck AT control path.
@@ -684,6 +741,7 @@ func hasIdentityFailureSignal(text string) bool {
 		strings.Contains(s, "failed") ||
 		strings.Contains(s, "failure") ||
 		strings.Contains(s, "no response") ||
+		strings.Contains(s, "deadline exceeded") ||
 		strings.Contains(s, "timeout") ||
 		strings.Contains(s, "timed out")
 }

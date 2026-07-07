@@ -54,6 +54,23 @@ type SDPMediaRewriteOptions struct {
 	RTCPMux bool
 }
 
+type SDPAMRFMTPCompatibilityStatus string
+
+const (
+	SDPAMRFMTPCompatible            SDPAMRFMTPCompatibilityStatus = "compatible"
+	SDPAMRFMTPIncompatibleParameter SDPAMRFMTPCompatibilityStatus = "incompatible_parameter"
+	SDPAMRFMTPIncompatibleModeSet   SDPAMRFMTPCompatibilityStatus = "incompatible_mode_set"
+)
+
+// SDPAMRFMTPCompatibility describes whether offered AMR/AMR-WB fmtp parameters
+// can satisfy a local codec preference and, when compatible, the fmtp to answer.
+type SDPAMRFMTPCompatibility struct {
+	Compatible bool
+	Status     SDPAMRFMTPCompatibilityStatus
+	Parameter  string
+	AnswerFMTP string
+}
+
 func NewSDPPCMUCodec() SDPCodec {
 	return SDPCodec{
 		Payload:      SDPPCMUPayloadType,
@@ -326,6 +343,67 @@ func SelectSDPAnswerPacketizationTime(offer, local SDPInfo) (int, int) {
 		ptime = limit
 	}
 	return ptime, maxptime
+}
+
+// ClassifySDPAMRFMTPCompatibility checks whether offered AMR/AMR-WB fmtp
+// parameters can satisfy a local codec preference.
+func ClassifySDPAMRFMTPCompatibility(offered, want string) SDPAMRFMTPCompatibility {
+	offered = strings.TrimSpace(offered)
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return SDPAMRFMTPCompatibility{
+			Compatible: true,
+			Status:     SDPAMRFMTPCompatible,
+			AnswerFMTP: offered,
+		}
+	}
+	offeredParams := ParseSDPFmtpParameters(offered)
+	wantParams := ParseSDPFmtpParameters(want)
+	out := make(map[string]string, len(offeredParams)+len(wantParams))
+	for key, value := range offeredParams {
+		out[key] = value
+	}
+	for _, key := range []string{"octet-align", "crc", "robust-sorting", "interleaving"} {
+		value, ok := selectSDPAMRBinaryFMTPParam(offeredParams, wantParams, key)
+		if !ok {
+			return SDPAMRFMTPCompatibility{
+				Status:    SDPAMRFMTPIncompatibleParameter,
+				Parameter: key,
+			}
+		}
+		if strings.TrimSpace(value) != "" {
+			out[key] = value
+		}
+	}
+	if wantModeSet, ok := wantParams["mode-set"]; ok {
+		if offeredModeSet, hasOffered := offeredParams["mode-set"]; hasOffered {
+			intersection, ok := intersectSDPAMRModeSet(offeredModeSet, wantModeSet)
+			if !ok {
+				return SDPAMRFMTPCompatibility{
+					Status:    SDPAMRFMTPIncompatibleModeSet,
+					Parameter: "mode-set",
+				}
+			}
+			out["mode-set"] = intersection
+		} else {
+			out["mode-set"] = strings.TrimSpace(wantModeSet)
+		}
+	}
+	for key, value := range wantParams {
+		switch key {
+		case "octet-align", "crc", "robust-sorting", "interleaving", "mode-set":
+			continue
+		default:
+			if strings.TrimSpace(value) != "" {
+				out[key] = value
+			}
+		}
+	}
+	return SDPAMRFMTPCompatibility{
+		Compatible: true,
+		Status:     SDPAMRFMTPCompatible,
+		AnswerFMTP: BuildSDPFmtpParameters(out),
+	}
 }
 
 func SDPInfoWithCodecs(info SDPInfo, codecs []SDPCodec) SDPInfo {
@@ -884,48 +962,8 @@ func sdpCodecIsAMR(codec SDPCodec) bool {
 }
 
 func selectSDPAMRAnswerFMTP(offered, want string) (string, bool) {
-	offered = strings.TrimSpace(offered)
-	want = strings.TrimSpace(want)
-	if want == "" {
-		return offered, true
-	}
-	offeredParams := ParseSDPFmtpParameters(offered)
-	wantParams := ParseSDPFmtpParameters(want)
-	out := make(map[string]string, len(offeredParams)+len(wantParams))
-	for key, value := range offeredParams {
-		out[key] = value
-	}
-	for _, key := range []string{"octet-align", "crc", "robust-sorting", "interleaving"} {
-		value, ok := selectSDPAMRBinaryFMTPParam(offeredParams, wantParams, key)
-		if !ok {
-			return "", false
-		}
-		if strings.TrimSpace(value) != "" {
-			out[key] = value
-		}
-	}
-	if wantModeSet, ok := wantParams["mode-set"]; ok {
-		if offeredModeSet, hasOffered := offeredParams["mode-set"]; hasOffered {
-			intersection, ok := intersectSDPAMRModeSet(offeredModeSet, wantModeSet)
-			if !ok {
-				return "", false
-			}
-			out["mode-set"] = intersection
-		} else {
-			out["mode-set"] = strings.TrimSpace(wantModeSet)
-		}
-	}
-	for key, value := range wantParams {
-		switch key {
-		case "octet-align", "crc", "robust-sorting", "interleaving", "mode-set":
-			continue
-		default:
-			if strings.TrimSpace(value) != "" {
-				out[key] = value
-			}
-		}
-	}
-	return BuildSDPFmtpParameters(out), true
+	compatibility := ClassifySDPAMRFMTPCompatibility(offered, want)
+	return compatibility.AnswerFMTP, compatibility.Compatible
 }
 
 func selectSDPAMRBinaryFMTPParam(offered, want map[string]string, key string) (string, bool) {

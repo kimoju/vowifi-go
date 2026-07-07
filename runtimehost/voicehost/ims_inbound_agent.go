@@ -24,8 +24,9 @@ type IMSInboundAgent struct {
 	UserAgent        string
 	MediaRelay       *RTPRelayConfig
 
-	mu      sync.Mutex
-	dialogs map[string]imsInboundDialogState
+	mu                     sync.Mutex
+	dialogs                map[string]imsInboundDialogState
+	nextPendingOfferSerial uint64
 }
 
 type InboundCallRequest struct {
@@ -78,6 +79,20 @@ type imsInboundDialogState struct {
 	srtpNegotiation *inboundSDESRelayNegotiation
 	early           bool
 	canceled        bool
+	pendingOffer    imsInboundPendingOffer
+}
+
+type imsInboundPendingOffer struct {
+	active bool
+	serial uint64
+	method string
+	cseq   int
+}
+
+type imsInboundDialogConcurrencyDecision struct {
+	trackPendingOffer bool
+	statusCode        int
+	reason            string
 }
 
 func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCallRequest) (InboundCallResult, error) {
@@ -91,8 +106,8 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 	if callID == "" {
 		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
 	}
-	if state, ok := a.inboundDialog(callID); ok {
-		return a.handleInboundReinvite(ctx, req, state)
+	if _, ok := a.inboundDialog(callID); ok {
+		return a.handleInboundReinvite(ctx, req)
 	}
 	callerURI := strings.TrimSpace(req.CallerURI)
 	if callerURI == "" {
@@ -279,9 +294,20 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 	}, nil
 }
 
-func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req InboundCallRequest, state imsInboundDialogState) (InboundCallResult, error) {
+func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req InboundCallRequest) (InboundCallResult, error) {
 	callID := strings.TrimSpace(req.CallID)
 	reinviteCSeq := inboundCSeq(req.CSeq)
+	state, decision, ok := a.beginInboundDialogOffer(callID, "INVITE", reinviteCSeq, inboundCallRequestHasOffer(req))
+	if !ok {
+		return InboundCallResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
+	}
+	if decision.statusCode > 0 {
+		return InboundCallResult{Accepted: false, StatusCode: decision.statusCode, Reason: decision.reason}, nil
+	}
+	if decision.trackPendingOffer {
+		serial := state.pendingOffer.serial
+		defer a.releaseInboundPendingOffer(callID, serial)
+	}
 	cfg := state.clientCfg
 	cfg.CSeq = reinviteCSeq
 	applyInboundSessionIntervalHeaders(&cfg, req.Headers)
@@ -630,12 +656,19 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 	if callID == "" {
 		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
 	}
-	state, ok := a.inboundDialog(callID)
+	updateCSeq := inboundCSeq(req.CSeq)
+	state, decision, ok := a.beginInboundDialogOffer(callID, "UPDATE", updateCSeq, inboundDialogRequestHasOffer(req))
 	if !ok {
 		return InboundCallResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
+	if decision.statusCode > 0 {
+		return InboundCallResult{Accepted: false, StatusCode: decision.statusCode, Reason: decision.reason}, nil
+	}
+	if decision.trackPendingOffer {
+		serial := state.pendingOffer.serial
+		defer a.releaseInboundPendingOffer(callID, serial)
+	}
 	cfg := state.clientCfg
-	updateCSeq := inboundCSeq(req.CSeq)
 	cfg.CSeq = updateCSeq
 	applyInboundSessionIntervalHeaders(&cfg, req.Headers)
 	body := append([]byte(nil), req.RawSDP...)
@@ -1242,6 +1275,7 @@ func (a *IMSInboundAgent) CancelInboundCallWithResult(ctx context.Context, info 
 		return result, fmt.Errorf("client CANCEL rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
 	state.canceled = true
+	state.pendingOffer = imsInboundPendingOffer{}
 	a.storeInboundDialog(callID, state)
 	return result, nil
 }
@@ -1360,6 +1394,18 @@ func inboundDialogBody(req InboundDialogRequest) []byte {
 	return append([]byte(nil), req.Body...)
 }
 
+func inboundCallRequestHasOffer(req InboundCallRequest) bool {
+	return len(req.RawSDP) > 0 || inboundSDPInfoPresent(req.RemoteSDP)
+}
+
+func inboundDialogRequestHasOffer(req InboundDialogRequest) bool {
+	return len(req.RawSDP) > 0 || inboundSDPInfoPresent(req.RemoteSDP)
+}
+
+func inboundSDPInfoPresent(info SDPInfo) bool {
+	return strings.TrimSpace(info.ConnectionIP) != "" || info.MediaPort > 0
+}
+
 func inboundCSeq(cseq int) int {
 	if cseq <= 0 {
 		return 1
@@ -1386,6 +1432,58 @@ func inboundStatusCode(code, fallback int) int {
 		return code
 	}
 	return fallback
+}
+
+func (a *IMSInboundAgent) beginInboundDialogOffer(callID, method string, cseq int, hasOffer bool) (imsInboundDialogState, imsInboundDialogConcurrencyDecision, bool) {
+	if a == nil {
+		return imsInboundDialogState{}, imsInboundDialogConcurrencyDecision{}, false
+	}
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return imsInboundDialogState{}, imsInboundDialogConcurrencyDecision{}, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		return imsInboundDialogState{}, imsInboundDialogConcurrencyDecision{}, false
+	}
+	if !hasOffer {
+		return state, imsInboundDialogConcurrencyDecision{}, true
+	}
+	if state.pendingOffer.active {
+		return state, imsInboundDialogConcurrencyDecision{statusCode: 491, reason: "Request Pending"}, true
+	}
+	a.nextPendingOfferSerial++
+	if a.nextPendingOfferSerial == 0 {
+		a.nextPendingOfferSerial++
+	}
+	state.pendingOffer = imsInboundPendingOffer{
+		active: true,
+		serial: a.nextPendingOfferSerial,
+		method: strings.ToUpper(strings.TrimSpace(method)),
+		cseq:   cseq,
+	}
+	a.dialogs[callID] = state
+	return state, imsInboundDialogConcurrencyDecision{trackPendingOffer: true}, true
+}
+
+func (a *IMSInboundAgent) releaseInboundPendingOffer(callID string, serial uint64) {
+	if a == nil || serial == 0 {
+		return
+	}
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state, ok := a.dialogs[callID]
+	if !ok || !state.pendingOffer.active || state.pendingOffer.serial != serial {
+		return
+	}
+	state.pendingOffer = imsInboundPendingOffer{}
+	a.dialogs[callID] = state
 }
 
 func (a *IMSInboundAgent) storeInboundDialog(callID string, state imsInboundDialogState) {
