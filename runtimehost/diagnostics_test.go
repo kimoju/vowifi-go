@@ -2,6 +2,7 @@ package runtimehost
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -104,6 +105,30 @@ func TestSafeDiagnosticIMSRegisterResponseDecisionRedactsReason(t *testing.T) {
 		if !strings.Contains(fmt.Sprintf("%+v", got), want) {
 			t.Fatalf("diagnostic decision does not contain redaction marker %q: %+v", want, got)
 		}
+	}
+}
+
+func TestSafeDiagnosticStringAndErrorRedactFreeFormRuntimeText(t *testing.T) {
+	localPath := "/" + filepathJoinForDiagnosticTest("home", "boa", "vohive", "runtime.log")
+	text := `SWU tunnel establishment failed: read udp 192.168.31.34:44789->87.194.9.8:4500: i/o timeout; ` +
+		`sip:310280233641503@ims.example; Authorization: Digest nonce="nonce-secret", response="0123456789abcdef0123456789abcdef"; path=` + localPath
+
+	gotText := SafeDiagnosticString(text)
+	gotErr := SafeDiagnosticError(errors.New(text))
+	if gotText == "" || gotErr == "" || gotText != gotErr {
+		t.Fatalf("SafeDiagnosticString=%q SafeDiagnosticError=%q, want matching non-empty redacted text", gotText, gotErr)
+	}
+	assertNoRuntimeDiagnosticLeak(t, gotText, localPath)
+	for _, want := range []string{"<redacted", ".invalid", "<redacted-local-path>"} {
+		if !strings.Contains(gotText, want) {
+			t.Fatalf("redacted free-form text does not contain marker %q: %q", want, gotText)
+		}
+	}
+	if got := SafeDiagnosticString(" \t\n "); got != "" {
+		t.Fatalf("blank diagnostic string=%q, want empty", got)
+	}
+	if got := SafeDiagnosticError(nil); got != "" {
+		t.Fatalf("nil diagnostic error=%q, want empty", got)
 	}
 }
 

@@ -101,6 +101,21 @@ func SafeDiagnosticIMSRegisterResponseDecision(decision IMSRegisterResponseDecis
 	}
 }
 
+// SafeDiagnosticString redacts subscriber identifiers, AKA/digest material,
+// IPs, MACs, and local paths from free-form runtime diagnostic text.
+func SafeDiagnosticString(value string) string {
+	return redactRuntimeDiagnosticString(tracefixture.NewRedactor(), value)
+}
+
+// SafeDiagnosticError returns a redacted error string for logs, UI, and
+// structured runtime status. It returns an empty string when err is nil.
+func SafeDiagnosticError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return SafeDiagnosticString(err.Error())
+}
+
 func redactRuntimeDiagnosticString(redactor *tracefixture.Redactor, value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
