@@ -71,12 +71,13 @@ type InboundDialogRequest struct {
 }
 
 type imsInboundDialogState struct {
-	clientCfg  voiceclient.DialogRequestConfig
-	invite     voiceclient.SIPRequestMessage
-	inviteCSeq int
-	relay      *RTPRelaySession
-	early      bool
-	canceled   bool
+	clientCfg       voiceclient.DialogRequestConfig
+	invite          voiceclient.SIPRequestMessage
+	inviteCSeq      int
+	relay           *RTPRelaySession
+	srtpNegotiation *inboundSDESRelayNegotiation
+	early           bool
+	canceled        bool
 }
 
 func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCallRequest) (InboundCallResult, error) {
@@ -110,6 +111,14 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid IMS SDP offer"}, err
 	}
 	var relay *RTPRelaySession
+	var srtpNegotiation *inboundSDESRelayNegotiation
+	imsOfferBody := append([]byte(nil), offerBody...)
+	closeRelayOnError := true
+	defer func() {
+		if closeRelayOnError && relay != nil {
+			_ = relay.Close()
+		}
+	}()
 	if a.MediaRelay != nil {
 		createdRelay, relayErr := NewRTPRelaySessionForIMSRemote(ctx, *a.MediaRelay, remoteSDP)
 		if relayErr != nil {
@@ -117,13 +126,15 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		}
 		relay = createdRelay
 		offerBody = RewriteSDPMediaEndpoint(offerBody, relay.ClientEndpoint())
-	}
-	closeRelayOnError := true
-	defer func() {
-		if closeRelayOnError && relay != nil {
-			_ = relay.Close()
+		if a.MediaRelay.SRTP != nil {
+			negotiation, err := newInboundSDESRelayNegotiation(imsOfferBody, *a.MediaRelay.SRTP)
+			if err != nil {
+				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "RTP relay SRTP negotiation failed"}, err
+			}
+			srtpNegotiation = negotiation
+			offerBody = srtpNegotiation.RewriteClientOffer(offerBody)
 		}
-	}()
+	}
 	cfg := voiceclient.DialogRequestConfig{
 		Profile:         a.Profile,
 		Registration:    voiceclient.RegistrationBinding{},
@@ -148,9 +159,9 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client INVITE failed"}, err
 		}
 		ensureInboundClientInviteVia(&invite, cfg)
-		a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay, early: true})
+		a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay, srtpNegotiation: srtpNegotiation, early: true})
 		provisionalAnswer = InboundCallResult{}
-		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, relay, func(result InboundCallResult) error {
+		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, relay, srtpNegotiation, func(result InboundCallResult) error {
 			if len(result.RawSDP) > 0 {
 				provisionalAnswer = cloneInboundCallResult(result)
 			}
@@ -231,11 +242,19 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 			a.deleteInboundDialog(callID)
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client setup failed"}, err
 		}
-		answerBody = RewriteSDPMediaEndpoint(resp.Body, relay.IMSEndpoint())
-		localSDP, err = ParseSDP(answerBody)
-		if err != nil {
-			a.deleteInboundDialog(callID)
-			return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SDP answer"}, err
+		if srtpNegotiation != nil {
+			answerBody, localSDP, err = srtpNegotiation.RewriteIMSAnswer(relay, resp.Body, localSDP)
+			if err != nil {
+				a.deleteInboundDialog(callID)
+				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP SDP answer"}, err
+			}
+		} else {
+			answerBody = RewriteSDPMediaEndpoint(resp.Body, relay.IMSEndpoint())
+			localSDP, err = ParseSDP(answerBody)
+			if err != nil {
+				a.deleteInboundDialog(callID)
+				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SDP answer"}, err
+			}
 		}
 	}
 	cfg.RemoteTag = sipHeaderTag(firstVoiceHeader(resp.Headers, "To"))
@@ -246,7 +265,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		cfg.RouteSet = routeSet
 	}
 	applyInboundNegotiatedSessionInterval(&cfg, resp.Headers)
-	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay})
+	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay, srtpNegotiation: srtpNegotiation})
 	closeRelayOnError = false
 	return InboundCallResult{
 		Accepted:   true,
@@ -267,6 +286,7 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 	cfg.CSeq = reinviteCSeq
 	applyInboundSessionIntervalHeaders(&cfg, req.Headers)
 	body := append([]byte(nil), req.RawSDP...)
+	var srtpNegotiation *inboundSDESRelayNegotiation
 	if len(body) > 0 && state.relay != nil {
 		remoteSDP, offerBody, err := inboundOfferSDP(req)
 		if err != nil {
@@ -275,7 +295,14 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 		if err := state.relay.SetIMSRemote(remoteSDP); err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS re-INVITE failed"}, err
 		}
+		imsOfferBody := append([]byte(nil), offerBody...)
 		body = RewriteSDPMediaEndpoint(offerBody, state.relay.ClientEndpoint())
+		if negotiation, err := a.newInboundSDESRelayNegotiation(imsOfferBody, state); err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "RTP relay SRTP re-INVITE negotiation failed"}, err
+		} else if negotiation != nil {
+			srtpNegotiation = negotiation
+			body = srtpNegotiation.RewriteClientOffer(body)
+		}
 	}
 	var invite voiceclient.SIPRequestMessage
 	var resp voiceclient.SIPResponse
@@ -290,9 +317,12 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 		}
 		ensureInboundClientInviteVia(&invite, cfg)
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		if srtpNegotiation != nil {
+			state.srtpNegotiation = srtpNegotiation
+		}
 		a.storeInboundDialog(callID, state)
 		provisionalAnswer = InboundCallResult{}
-		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, state.relay, func(result InboundCallResult) error {
+		resp, err = a.roundTripClientInvite(ctx, invite, a.inboundProvisionalHandler(callID, state.relay, srtpNegotiation, func(result InboundCallResult) error {
 			if len(result.RawSDP) > 0 {
 				provisionalAnswer = cloneInboundCallResult(result)
 			}
@@ -344,10 +374,17 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 			if err := state.relay.SetClientRemote(localSDP); err != nil {
 				return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client re-INVITE failed"}, err
 			}
-			result.RawSDP = RewriteSDPMediaEndpoint(resp.Body, state.relay.IMSEndpoint())
-			localSDP, err = ParseSDP(result.RawSDP)
-			if err != nil {
-				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay re-INVITE SDP answer"}, err
+			if srtpNegotiation != nil {
+				result.RawSDP, localSDP, err = srtpNegotiation.RewriteIMSAnswer(state.relay, resp.Body, localSDP)
+				if err != nil {
+					return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP re-INVITE SDP answer"}, err
+				}
+			} else {
+				result.RawSDP = RewriteSDPMediaEndpoint(resp.Body, state.relay.IMSEndpoint())
+				localSDP, err = ParseSDP(result.RawSDP)
+				if err != nil {
+					return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay re-INVITE SDP answer"}, err
+				}
 			}
 		}
 		result.LocalSDP = localSDP
@@ -363,6 +400,9 @@ func (a *IMSInboundAgent) handleInboundReinvite(ctx context.Context, req Inbound
 	cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 	state.clientCfg = cfg
 	state.inviteCSeq = cfg.CSeq
+	if srtpNegotiation != nil {
+		state.srtpNegotiation = srtpNegotiation
+	}
 	a.storeInboundDialog(callID, state)
 	return result, nil
 }
@@ -472,7 +512,25 @@ func cloneInboundCallResult(result InboundCallResult) InboundCallResult {
 	return out
 }
 
-func (a *IMSInboundAgent) inboundProvisionalHandler(callID string, relay *RTPRelaySession, onProvisional func(InboundCallResult) error) func(voiceclient.SIPResponse) error {
+func (a *IMSInboundAgent) newInboundSDESRelayNegotiation(body []byte, state imsInboundDialogState) (*inboundSDESRelayNegotiation, error) {
+	cfg, ok := a.inboundSDESRelayConfig(state)
+	if !ok {
+		return nil, nil
+	}
+	return newInboundSDESRelayNegotiation(body, cfg)
+}
+
+func (a *IMSInboundAgent) inboundSDESRelayConfig(state imsInboundDialogState) (RTPRelaySRTPConfig, bool) {
+	if a != nil && a.MediaRelay != nil && a.MediaRelay.SRTP != nil {
+		return *a.MediaRelay.SRTP, true
+	}
+	if state.srtpNegotiation != nil {
+		return state.srtpNegotiation.cfg, true
+	}
+	return RTPRelaySRTPConfig{}, false
+}
+
+func (a *IMSInboundAgent) inboundProvisionalHandler(callID string, relay *RTPRelaySession, srtpNegotiation *inboundSDESRelayNegotiation, onProvisional func(InboundCallResult) error) func(voiceclient.SIPResponse) error {
 	return func(resp voiceclient.SIPResponse) error {
 		if resp.StatusCode <= 100 || resp.StatusCode >= 200 {
 			return nil
@@ -493,10 +551,17 @@ func (a *IMSInboundAgent) inboundProvisionalHandler(callID string, relay *RTPRel
 				if err := relay.SetClientRemote(localSDP); err != nil {
 					return fmt.Errorf("RTP relay client provisional setup failed: %w", err)
 				}
-				result.RawSDP = RewriteSDPMediaEndpoint(resp.Body, relay.IMSEndpoint())
-				localSDP, err = ParseSDP(result.RawSDP)
-				if err != nil {
-					return fmt.Errorf("invalid RTP relay provisional SDP answer: %w", err)
+				if srtpNegotiation != nil {
+					result.RawSDP, localSDP, err = srtpNegotiation.RewriteIMSAnswer(relay, resp.Body, localSDP)
+					if err != nil {
+						return fmt.Errorf("invalid RTP relay SRTP provisional SDP answer: %w", err)
+					}
+				} else {
+					result.RawSDP = RewriteSDPMediaEndpoint(resp.Body, relay.IMSEndpoint())
+					localSDP, err = ParseSDP(result.RawSDP)
+					if err != nil {
+						return fmt.Errorf("invalid RTP relay provisional SDP answer: %w", err)
+					}
 				}
 			}
 			result.LocalSDP = localSDP
@@ -574,6 +639,7 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 	cfg.CSeq = updateCSeq
 	applyInboundSessionIntervalHeaders(&cfg, req.Headers)
 	body := append([]byte(nil), req.RawSDP...)
+	var srtpNegotiation *inboundSDESRelayNegotiation
 	if len(body) > 0 && state.relay != nil {
 		remoteSDP, offerBody, err := inboundDialogSDP(req)
 		if err != nil {
@@ -582,7 +648,14 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 		if err := state.relay.SetIMSRemote(remoteSDP); err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS update failed"}, err
 		}
+		imsOfferBody := append([]byte(nil), offerBody...)
 		body = RewriteSDPMediaEndpoint(offerBody, state.relay.ClientEndpoint())
+		if negotiation, err := a.newInboundSDESRelayNegotiation(imsOfferBody, state); err != nil {
+			return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "RTP relay SRTP UPDATE negotiation failed"}, err
+		} else if negotiation != nil {
+			srtpNegotiation = negotiation
+			body = srtpNegotiation.RewriteClientOffer(body)
+		}
 	}
 	var update voiceclient.SIPRequestMessage
 	var resp voiceclient.SIPResponse
@@ -595,6 +668,9 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 			return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "build client UPDATE failed"}, err
 		}
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
+		if srtpNegotiation != nil {
+			state.srtpNegotiation = srtpNegotiation
+		}
 		a.storeInboundDialog(callID, state)
 		resp, err = a.ClientTransport.RoundTripRequest(ctx, update)
 		if err != nil {
@@ -629,10 +705,17 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 			if err := state.relay.SetClientRemote(localSDP); err != nil {
 				return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client update failed"}, err
 			}
-			result.RawSDP = RewriteSDPMediaEndpoint(resp.Body, state.relay.IMSEndpoint())
-			localSDP, err = ParseSDP(result.RawSDP)
-			if err != nil {
-				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay UPDATE SDP answer"}, err
+			if srtpNegotiation != nil {
+				result.RawSDP, localSDP, err = srtpNegotiation.RewriteIMSAnswer(state.relay, resp.Body, localSDP)
+				if err != nil {
+					return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP UPDATE SDP answer"}, err
+				}
+			} else {
+				result.RawSDP = RewriteSDPMediaEndpoint(resp.Body, state.relay.IMSEndpoint())
+				localSDP, err = ParseSDP(result.RawSDP)
+				if err != nil {
+					return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay UPDATE SDP answer"}, err
+				}
 			}
 		}
 		result.LocalSDP = localSDP
@@ -643,6 +726,9 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 	applyInboundNegotiatedSessionInterval(&cfg, resp.Headers)
 	cfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 	state.clientCfg = cfg
+	if srtpNegotiation != nil {
+		state.srtpNegotiation = srtpNegotiation
+	}
 	a.storeInboundDialog(callID, state)
 	return result, nil
 }

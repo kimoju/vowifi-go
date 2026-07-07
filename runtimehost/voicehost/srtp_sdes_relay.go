@@ -26,6 +26,18 @@ type outboundSDESRelayNegotiation struct {
 	clientCrypto      SDPCryptoAttribute
 }
 
+type inboundSDESRelayNegotiation struct {
+	cfg               RTPRelaySRTPConfig
+	imsSDP            SDPInfo
+	imsSecurity       SDPSecurityInfo
+	profile           SRTPProtectionProfile
+	imsSendKeys       SRTPKeys
+	relayToIMSKeys    SRTPKeys
+	relayToClientKeys SRTPKeys
+	clientOfferCrypto SDPCryptoAttribute
+	imsAnswerCrypto   SDPCryptoAttribute
+}
+
 func newOutboundSDESRelayNegotiation(clientOffer []byte, cfg RTPRelaySRTPConfig) (*outboundSDESRelayNegotiation, error) {
 	clientSDP, clientSecurity, err := ParseSDPWithSecurity(clientOffer)
 	if err != nil {
@@ -68,6 +80,48 @@ func newOutboundSDESRelayNegotiation(clientOffer []byte, cfg RTPRelaySRTPConfig)
 	}, nil
 }
 
+func newInboundSDESRelayNegotiation(imsOffer []byte, cfg RTPRelaySRTPConfig) (*inboundSDESRelayNegotiation, error) {
+	imsSDP, imsSecurity, err := ParseSDPWithSecurity(imsOffer)
+	if err != nil {
+		return nil, err
+	}
+	_, profile, imsParams, ok, err := SelectSDPCryptoAttribute(imsSecurity.Crypto, srtpRelayPreferredProfiles(cfg.Profiles))
+	if err != nil {
+		return nil, fmt.Errorf("%w: IMS offer crypto: %v", ErrSDPSecurityNegotiation, err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: missing compatible IMS SDES crypto", ErrSDPSecurityNegotiation)
+	}
+	relayToIMSKeys, err := GenerateSRTPKeys(profile, cfg.Random)
+	if err != nil {
+		return nil, err
+	}
+	relayToClientKeys, err := GenerateSRTPKeys(profile, cfg.Random)
+	if err != nil {
+		return nil, err
+	}
+	tag := firstVoiceNonEmpty(cfg.CryptoTag, "1")
+	clientOfferCrypto, err := buildSDESCryptoForKeys(tag, profile, relayToClientKeys, cfg.SessionParams)
+	if err != nil {
+		return nil, err
+	}
+	imsAnswerCrypto, err := buildSDESCryptoForKeys(tag, profile, relayToIMSKeys, cfg.SessionParams)
+	if err != nil {
+		return nil, err
+	}
+	return &inboundSDESRelayNegotiation{
+		cfg:               cfg,
+		imsSDP:            imsSDP,
+		imsSecurity:       imsSecurity,
+		profile:           profile,
+		imsSendKeys:       srtpKeysFromSDPCryptoParams(imsParams),
+		relayToIMSKeys:    relayToIMSKeys,
+		relayToClientKeys: relayToClientKeys,
+		clientOfferCrypto: clientOfferCrypto,
+		imsAnswerCrypto:   imsAnswerCrypto,
+	}, nil
+}
+
 func (n *outboundSDESRelayNegotiation) RewriteIMSOffer(body []byte) []byte {
 	if n == nil {
 		return append([]byte(nil), body...)
@@ -76,6 +130,17 @@ func (n *outboundSDESRelayNegotiation) RewriteIMSOffer(body []byte) []byte {
 		RTPProfile: secureSDPRTPProfile(n.clientSecurity.RTPProfile),
 		Crypto:     []SDPCryptoAttribute{n.imsOfferCrypto},
 	}, n.clientSecurity)
+	return applySDPSecurity(body, security)
+}
+
+func (n *inboundSDESRelayNegotiation) RewriteClientOffer(body []byte) []byte {
+	if n == nil {
+		return append([]byte(nil), body...)
+	}
+	security := withSDPTransportAttributes(SDPSecurityInfo{
+		RTPProfile: secureSDPRTPProfile(n.imsSecurity.RTPProfile),
+		Crypto:     []SDPCryptoAttribute{n.clientOfferCrypto},
+	}, n.imsSecurity)
 	return applySDPSecurity(body, security)
 }
 
@@ -123,6 +188,58 @@ func (n *outboundSDESRelayNegotiation) RewriteClientAnswer(relay *RTPRelaySessio
 		RTPProfile: secureSDPRTPProfile(firstVoiceNonEmpty(imsSecurity.RTPProfile, n.clientSecurity.RTPProfile)),
 		Crypto:     []SDPCryptoAttribute{n.clientCrypto},
 	}, imsSecurity)
+	body = applySDPSecurity(body, security)
+	info, err := ParseSDP(body)
+	if err != nil {
+		return nil, SDPInfo{}, err
+	}
+	return body, info, nil
+}
+
+func (n *inboundSDESRelayNegotiation) RewriteIMSAnswer(relay *RTPRelaySession, clientAnswer []byte, clientSDP SDPInfo) ([]byte, SDPInfo, error) {
+	if n == nil {
+		body := append([]byte(nil), clientAnswer...)
+		info, err := ParseSDP(body)
+		return body, info, err
+	}
+	if relay == nil {
+		return nil, SDPInfo{}, fmt.Errorf("%w: RTP relay unavailable", ErrSDPSecurityNegotiation)
+	}
+	_, clientSecurity, err := ParseSDPWithSecurity(clientAnswer)
+	if err != nil {
+		return nil, SDPInfo{}, err
+	}
+	_, _, clientParams, ok, err := SelectSDPCryptoAttribute(clientSecurity.Crypto, []SRTPProtectionProfile{n.profile})
+	if err != nil {
+		return nil, SDPInfo{}, fmt.Errorf("%w: client answer crypto: %v", ErrSDPSecurityNegotiation, err)
+	}
+	if !ok {
+		return nil, SDPInfo{}, fmt.Errorf("%w: missing compatible client SDES crypto", ErrSDPSecurityNegotiation)
+	}
+	media, err := NewSRTPMediaSession(SRTPMediaConfig{
+		Profile:               n.profile,
+		ClientProtectKeys:     n.relayToClientKeys,
+		ClientUnprotectKeys:   srtpKeysFromSDPCryptoParams(clientParams),
+		IMSProtectKeys:        n.relayToIMSKeys,
+		IMSUnprotectKeys:      n.imsSendKeys,
+		ReplayWindowSize:      n.cfg.ReplayWindowSize,
+		RTCPFeedbackHandler:   relay.rtcpFeedbackHandler,
+		RTPDTMFHandler:        relay.rtpDTMFHandler,
+		RTPPlaintextHandler:   relay.RTPPlaintextHandler(),
+		ClientRTPDTMFPayloads: rtpDTMFPayloadTypesFromSDP(clientSDP),
+		IMSRTPDTMFPayloads:    rtpDTMFPayloadTypesFromSDP(n.imsSDP),
+	})
+	if err != nil {
+		return nil, SDPInfo{}, err
+	}
+	if err := relay.SetTransforms(media.RelayTransforms()); err != nil {
+		return nil, SDPInfo{}, err
+	}
+	body := RewriteSDPMediaEndpoint(clientAnswer, relay.IMSEndpoint())
+	security := withSDPTransportAttributes(SDPSecurityInfo{
+		RTPProfile: secureSDPRTPProfile(firstVoiceNonEmpty(clientSecurity.RTPProfile, n.imsSecurity.RTPProfile)),
+		Crypto:     []SDPCryptoAttribute{n.imsAnswerCrypto},
+	}, clientSecurity)
 	body = applySDPSecurity(body, security)
 	info, err := ParseSDP(body)
 	if err != nil {

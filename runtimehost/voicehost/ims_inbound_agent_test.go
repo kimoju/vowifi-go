@@ -1,7 +1,10 @@
 package voicehost
 
 import (
+	"bytes"
 	"context"
+	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2117,6 +2120,126 @@ func TestIMSInboundAgentUsesRTPRelay(t *testing.T) {
 		t.Fatalf("IMS answer body=%q", answer)
 	}
 	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-relay"}); err != nil {
+		t.Fatalf("EndInboundCall() error = %v", err)
+	}
+}
+
+func TestIMSInboundAgentNegotiatesInboundSDESRelay(t *testing.T) {
+	imsPeer := listenTestUDP(t)
+	defer imsPeer.Close()
+	clientPeer := listenTestUDP(t)
+	defer clientPeer.Close()
+	profile := SRTPProfileAes128CmHmacSha1_80
+	imsKeys := testSRTPKeys(0x31, 0x41)
+	clientKeys := testSRTPKeys(0x11, 0x21)
+	imsOffer := sampleSDPWithCrypto(t, "127.0.0.1", imsPeer.LocalAddr().(*net.UDPAddr).Port, profile, imsKeys)
+	clientAnswer := sampleSDPWithCrypto(t, "127.0.0.1", clientPeer.LocalAddr().(*net.UDPAddr).Port, profile, clientKeys)
+	remoteSDP, err := ParseSDP([]byte(imsOffer))
+	if err != nil {
+		t.Fatalf("ParseSDP(imsOffer) error = %v", err)
+	}
+	relayRandom := append(bytes.Repeat([]byte{0x55}, 30), bytes.Repeat([]byte{0x66}, 30)...)
+	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
+		{
+			StatusCode: 200,
+			Reason:     "OK",
+			Headers: map[string][]string{
+				"To":      {"<sip:user@ims.example>;tag=client-tag"},
+				"Contact": {"<sip:client@127.0.0.1:5060>"},
+			},
+			Body: []byte(clientAnswer),
+		},
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	agent := &IMSInboundAgent{
+		ClientTransport:  transport,
+		ClientContactURI: "sip:client@127.0.0.1:5070",
+		LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
+		MediaRelay: &RTPRelayConfig{
+			ClientListenIP:    "127.0.0.1",
+			ClientAdvertiseIP: "127.0.0.1",
+			IMSListenIP:       "127.0.0.1",
+			IMSAdvertiseIP:    "127.0.0.1",
+			SRTP: &RTPRelaySRTPConfig{
+				Random: bytes.NewReader(relayRandom),
+			},
+		},
+	}
+	result, err := agent.HandleInboundInvite(context.Background(), InboundCallRequest{
+		CallID:    "in-call-relay-sdes",
+		CallerURI: "sip:+18005551212@ims.example",
+		CalleeURI: "sip:user@ims.example",
+		RemoteSDP: remoteSDP,
+		RawSDP:    []byte(imsOffer),
+	})
+	if err != nil || !result.Accepted {
+		t.Fatalf("HandleInboundInvite() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 1 || transport.requests[0].Method != "INVITE" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if body := string(transport.requests[0].Body); !strings.Contains(body, "RTP/SAVP") || !strings.Contains(body, "a=crypto:") ||
+		strings.Contains(body, "m=audio "+strconv.Itoa(remoteSDP.MediaPort)+" ") {
+		t.Fatalf("client offer body=%q", body)
+	}
+	if body := string(result.RawSDP); !strings.Contains(body, "RTP/SAVP") || !strings.Contains(body, "a=crypto:") ||
+		strings.Contains(body, "m=audio "+strconv.Itoa(clientPeer.LocalAddr().(*net.UDPAddr).Port)+" ") {
+		t.Fatalf("IMS answer body=%q", body)
+	}
+	clientOffer, err := ParseSDP(transport.requests[0].Body)
+	if err != nil {
+		t.Fatalf("ParseSDP(client offer) error = %v", err)
+	}
+	relayToClientKeys := firstSDPCryptoKeys(t, transport.requests[0].Body)
+	relayToIMSKeys := firstSDPCryptoKeys(t, result.RawSDP)
+	if bytes.Equal(relayToClientKeys.MasterKey, imsKeys.MasterKey) || bytes.Equal(relayToIMSKeys.MasterKey, clientKeys.MasterKey) ||
+		bytes.Equal(relayToClientKeys.MasterKey, relayToIMSKeys.MasterKey) {
+		t.Fatalf("unexpected relay keys client=%x ims=%x", relayToClientKeys.MasterKey, relayToIMSKeys.MasterKey)
+	}
+	state, ok := agent.inboundDialog("in-call-relay-sdes")
+	if !ok || state.relay == nil || state.relay.Transforms().IMSToClientRTP == nil {
+		t.Fatalf("dialog state=%+v ok=%v", state, ok)
+	}
+
+	imsSender := newTestSRTPMediaSession(t, SRTPMediaConfig{Profile: profile, ClientKeys: relayToClientKeys, IMSKeys: imsKeys})
+	clientReceiver := newTestSRTPMediaSession(t, SRTPMediaConfig{Profile: profile, ClientKeys: relayToClientKeys, IMSKeys: relayToIMSKeys})
+	imsPlain := testRTPPacket(91, 0x22222222, []byte{0x91})
+	imsProtected, err := imsSender.ProtectIMSRTP(imsPlain)
+	if err != nil {
+		t.Fatalf("ProtectIMSRTP() error = %v", err)
+	}
+	if _, err := imsPeer.WriteToUDP(imsProtected, udpAddrFromSDP(t, result.LocalSDP)); err != nil {
+		t.Fatalf("IMS WriteToUDP() error = %v", err)
+	}
+	got, _ := readTestUDP(t, clientPeer)
+	gotPlain, err := clientReceiver.UnprotectClientRTP(got)
+	if err != nil {
+		t.Fatalf("client UnprotectClientRTP() error = %v", err)
+	}
+	if !bytes.Equal(gotPlain, imsPlain) {
+		t.Fatalf("client plain=%x, want %x", gotPlain, imsPlain)
+	}
+
+	clientSender := newTestSRTPMediaSession(t, SRTPMediaConfig{Profile: profile, ClientKeys: clientKeys, IMSKeys: relayToIMSKeys})
+	imsReceiver := newTestSRTPMediaSession(t, SRTPMediaConfig{Profile: profile, ClientKeys: relayToClientKeys, IMSKeys: relayToIMSKeys})
+	clientPlain := testRTPPacket(92, 0x11111111, []byte{0x92})
+	clientProtected, err := clientSender.ProtectClientRTP(clientPlain)
+	if err != nil {
+		t.Fatalf("ProtectClientRTP() error = %v", err)
+	}
+	if _, err := clientPeer.WriteToUDP(clientProtected, udpAddrFromSDP(t, clientOffer)); err != nil {
+		t.Fatalf("client WriteToUDP() error = %v", err)
+	}
+	got, _ = readTestUDP(t, imsPeer)
+	gotPlain, err = imsReceiver.UnprotectIMSRTP(got)
+	if err != nil {
+		t.Fatalf("IMS UnprotectIMSRTP() error = %v", err)
+	}
+	if !bytes.Equal(gotPlain, clientPlain) {
+		t.Fatalf("IMS plain=%x, want %x", gotPlain, clientPlain)
+	}
+
+	if err := agent.EndInboundCall(context.Background(), DialogInfo{CallID: "in-call-relay-sdes"}); err != nil {
 		t.Fatalf("EndInboundCall() error = %v", err)
 	}
 }
