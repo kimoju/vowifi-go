@@ -45,8 +45,9 @@ protocol layers needed by VoHive:
   success, warning, procedure, and checking-error responses,
   reusable ISIM identity, USIM EF_IMSI decoding/encoding, and EF_AD MNC-length
   decoders, ISIM EF identity string TLV encoding and linear-fixed record
-  padding helpers, short-APDU UPDATE BINARY/UPDATE RECORD EF write helpers, and
-  USIM/ISIM AKA AUTHENTICATE primitives
+  padding helpers, short-APDU UPDATE BINARY/UPDATE RECORD EF write helpers,
+  whitespace-tolerant APDU response hex parsing shared by logical-channel
+  transmits, and USIM/ISIM AKA AUTHENTICATE primitives
 - carrier presets and JSON carrier overrides, including AT&T TS.43/E911
   configuration for native `310/280` and `310/410` profiles, plus normalized
   multi-candidate P-CSCF profile overrides for registrar failover
@@ -65,8 +66,9 @@ protocol layers needed by VoHive:
   entitlement challenges and HTTP `WWW-Authenticate`/`Proxy-Authenticate`
   challenge parsing/classification without leaking nonce material in errors,
   including HTTP Digest AKAv1-MD5/AKAv2-MD5 entitlement retry generation with
-  mixed-case challenge normalization, proxy digest handling, `Authentication-Info`
-  nextnonce parsing helpers, and AUTS synchronization-failure retry handling
+  mixed-case challenge normalization, unquoted `qop` token-list recovery,
+  proxy digest handling, `Authentication-Info` nextnonce parsing helpers, and
+  AUTS synchronization-failure retry handling
 - IMS SIP client primitives for REGISTER headers, `WWW-Authenticate` parsing,
   AKA nonce extraction, Digest MD5/MD5-sess/SHA-256/SHA-512-256 plus
   AKAv1-MD5 and AKAv2-MD5 authorization material,
@@ -124,7 +126,8 @@ protocol layers needed by VoHive:
   `Expires: 0`, Contact `expires=0`, Security-Verify, and Digest/AKA retry on
   401/407 challenges
 - SMS segmentation, IMS SIP `MESSAGE` transport hooks, inbound SMS, delivery
-  report matching, CPIM and IMS `Content-Transfer-Encoding` decoding for
+  report matching, CPIM content-type parameter recovery for lenient carrier
+  headers, and CPIM and IMS `Content-Transfer-Encoding` decoding for
   base64/quoted-printable SMS payloads, nested multipart MESSAGE leaf
   selection for CPIM/3GPP SMS/IMDN payloads, strict UCS2/8-bit user-data
   length validation, optional outbound CPIM wrapping for 3GPP SMS with IMDN
@@ -154,11 +157,12 @@ protocol layers needed by VoHive:
   security parsing/building for RTP/SAVP/SAVPF, SDES crypto, DTLS fingerprint/
   setup attributes, IMS INVITE/ACK/BYE/CANCEL request construction with MMTel
   service identification headers,
-  IMS audio SDP media parsing/validation for AMR, AMR-WB, telephone-event,
-  RTCP, and RTCP mux attributes,
+  IMS audio SDP media parsing/validation for static PCMU/PCMA, AMR, AMR-WB,
+  telephone-event, RTCP, and RTCP mux attributes,
   route-set application, UDP/TCP SIP request transport, outbound IMS voice
   agent, ACK/BYE/CANCEL dialog handling with release Reason/body forwarding,
-  IMS BYE/CANCEL response status/body/header capture and local softphone
+  IMS BYE/CANCEL response status/body/header capture, dialog failure diagnostic
+  extraction for Retry-After/Warning/Reason headers, and local softphone
   response propagation,
   RTP/RTCP media relay endpoint allocation, SDP media/RTCP rewriting,
   SDP `rtcp-fb`, `rtcp-mux`, `rtcp-rsize`, multi-crypto, fingerprint, and
@@ -208,7 +212,8 @@ protocol layers needed by VoHive:
   pseudonym, and reauthentication identity selection, `AT_BIDDING` downgrade protection,
   AT_MAC verification/generation, AT_RAND/AT_AUTN challenge extraction with
   AUTN field parsing, multi-vector challenge decoding, encrypted identity-state
-  extraction, SIM AKA RES response, AUTS synchronization-failure response, AUTN MAC-failure
+  extraction, duplicate reauthentication control-attribute rejection,
+  SIM AKA RES response, AUTS synchronization-failure response, AUTN MAC-failure
   Authentication-Reject response, EAP-AKA Notification ACK, and Client-Error
   handling over encrypted IKE_AUTH
 - final IKE_AUTH CHILD_SA result parsing with responder ESP SPI,

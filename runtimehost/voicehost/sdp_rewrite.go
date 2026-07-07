@@ -21,9 +21,16 @@ type SDPCodec struct {
 }
 
 const (
+	SDPCodecPCMU           = "PCMU"
+	SDPCodecPCMA           = "PCMA"
 	SDPCodecAMR            = "AMR"
 	SDPCodecAMRWB          = "AMR-WB"
 	SDPCodecTelephoneEvent = "telephone-event"
+)
+
+const (
+	SDPPCMUPayloadType = 0
+	SDPPCMAPayloadType = 8
 )
 
 type SDPMediaDescription struct {
@@ -45,6 +52,24 @@ type SDPAnswerOptions struct {
 
 type SDPMediaRewriteOptions struct {
 	RTCPMux bool
+}
+
+func NewSDPPCMUCodec() SDPCodec {
+	return SDPCodec{
+		Payload:      SDPPCMUPayloadType,
+		EncodingName: SDPCodecPCMU,
+		ClockRate:    8000,
+		Channels:     1,
+	}
+}
+
+func NewSDPPCMACodec() SDPCodec {
+	return SDPCodec{
+		Payload:      SDPPCMAPayloadType,
+		EncodingName: SDPCodecPCMA,
+		ClockRate:    8000,
+		Channels:     1,
+	}
 }
 
 func NewSDPAMRCodec(payload int, fmtp string) SDPCodec {
@@ -914,10 +939,10 @@ func parseSDPAMRModeSet(value string) []string {
 
 func staticSDPCodec(payload int) (SDPCodec, bool) {
 	switch payload {
-	case 0:
-		return SDPCodec{Payload: payload, EncodingName: "PCMU", ClockRate: 8000, Channels: 1}, true
-	case 8:
-		return SDPCodec{Payload: payload, EncodingName: "PCMA", ClockRate: 8000, Channels: 1}, true
+	case SDPPCMUPayloadType:
+		return NewSDPPCMUCodec(), true
+	case SDPPCMAPayloadType:
+		return NewSDPPCMACodec(), true
 	default:
 		return SDPCodec{Payload: payload}, false
 	}

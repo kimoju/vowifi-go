@@ -84,6 +84,37 @@ func (r Response) StatusString() string {
 	return fmt.Sprintf("%02X%02X", r.SW1, r.SW2)
 }
 
+// ParseAPDUResponseHex parses response bytes followed by SW1/SW2 from a hex string.
+func ParseAPDUResponseHex(hexResponse string) (Response, error) {
+	raw, err := hex.DecodeString(compactHex(hexResponse))
+	if err != nil {
+		return Response{}, fmt.Errorf("decode APDU response: %w", err)
+	}
+	if len(raw) < 2 {
+		return Response{}, fmt.Errorf("APDU response too short: %d", len(raw))
+	}
+	return Response{
+		Body: append([]byte(nil), raw[:len(raw)-2]...),
+		SW1:  raw[len(raw)-2],
+		SW2:  raw[len(raw)-1],
+	}, nil
+}
+
+func compactHex(in string) string {
+	in = strings.TrimSpace(in)
+	var b strings.Builder
+	b.Grow(len(in))
+	for _, r := range in {
+		switch r {
+		case ' ', '\t', '\n', '\r', '\f', '\v':
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func ResolveAID(t LogicalChannelTransport, app, fallbackAID, expectedPrefix string) (string, string, error) {
 	fallback := strings.ToUpper(strings.TrimSpace(fallbackAID))
 	want := strings.ToUpper(strings.TrimSpace(expectedPrefix))
@@ -307,18 +338,7 @@ func transmitOnce(t LogicalChannelTransport, channel int, cmd []byte) (Response,
 	if err != nil {
 		return Response{}, err
 	}
-	raw, err := hex.DecodeString(strings.TrimSpace(out))
-	if err != nil {
-		return Response{}, fmt.Errorf("decode APDU response: %w", err)
-	}
-	if len(raw) < 2 {
-		return Response{}, fmt.Errorf("APDU response too short: %d", len(raw))
-	}
-	return Response{
-		Body: append([]byte(nil), raw[:len(raw)-2]...),
-		SW1:  raw[len(raw)-2],
-		SW2:  raw[len(raw)-1],
-	}, nil
+	return ParseAPDUResponseHex(out)
 }
 
 func SelectFile(t LogicalChannelTransport, channel int, fid uint16) (Response, error) {

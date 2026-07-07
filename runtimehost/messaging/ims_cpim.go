@@ -516,10 +516,63 @@ func parseIMSMessageContentType(contentType string) (string, map[string]string) 
 	if err == nil {
 		return strings.ToLower(strings.TrimSpace(mediaType)), cloneIMSContentTypeParams(params)
 	}
-	if semi := strings.IndexByte(contentType, ';'); semi >= 0 {
-		contentType = contentType[:semi]
+	mediaType, params = parseLenientIMSMessageContentType(contentType)
+	return strings.ToLower(strings.TrimSpace(mediaType)), params
+}
+
+func parseLenientIMSMessageContentType(contentType string) (string, map[string]string) {
+	parts := splitIMSContentTypeParameters(contentType)
+	if len(parts) == 0 {
+		return "", nil
 	}
-	return strings.ToLower(strings.TrimSpace(contentType)), nil
+	params := make(map[string]string)
+	for _, part := range parts[1:] {
+		name, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		params[name] = trimIMSContentTypeParamValue(value)
+	}
+	if len(params) == 0 {
+		params = nil
+	}
+	return strings.TrimSpace(parts[0]), params
+}
+
+func splitIMSContentTypeParameters(value string) []string {
+	var parts []string
+	start := 0
+	inQuote := false
+	escaped := false
+	for i, r := range value {
+		switch {
+		case escaped:
+			escaped = false
+		case inQuote && r == '\\':
+			escaped = true
+		case r == '"':
+			inQuote = !inQuote
+		case r == ';' && !inQuote:
+			parts = append(parts, value[start:i])
+			start = i + 1
+		}
+	}
+	return append(parts, value[start:])
+}
+
+func trimIMSContentTypeParamValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			return unquoted
+		}
+		return value[1 : len(value)-1]
+	}
+	return strings.Trim(value, `"`)
 }
 
 func cloneIMSContentTypeParams(params map[string]string) map[string]string {

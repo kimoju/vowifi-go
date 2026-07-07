@@ -31,6 +31,44 @@ func (f *fakeTransport) TransmitAPDU(channel int, hexAPDU string) (string, error
 	return resp, nil
 }
 
+func TestParseAPDUResponseHex(t *testing.T) {
+	resp, err := ParseAPDUResponseHex("aa bb\n90 00")
+	if err != nil {
+		t.Fatalf("ParseAPDUResponseHex() error = %v", err)
+	}
+	if !reflect.DeepEqual(resp.Body, []byte{0xAA, 0xBB}) || resp.Status() != 0x9000 || !resp.Success() {
+		t.Fatalf("response = body % X status %s success %v, want AA BB 9000 true", resp.Body, resp.StatusString(), resp.Success())
+	}
+
+	resp, err = ParseAPDUResponseHex("62 82")
+	if err != nil {
+		t.Fatalf("ParseAPDUResponseHex(status only) error = %v", err)
+	}
+	if len(resp.Body) != 0 || resp.StatusString() != "6282" {
+		t.Fatalf("status-only response = body % X status %s, want empty 6282", resp.Body, resp.StatusString())
+	}
+
+	tests := []string{"90", "900", "90 ZZ"}
+	for _, tt := range tests {
+		t.Run(tt, func(t *testing.T) {
+			if got, err := ParseAPDUResponseHex(tt); err == nil {
+				t.Fatalf("ParseAPDUResponseHex(%q) = %+v nil error, want error", tt, got)
+			}
+		})
+	}
+}
+
+func TestTransmitParsesWhitespaceAPDUResponse(t *testing.T) {
+	ft := &fakeTransport{responses: []string{"AA BB 90 00"}}
+	resp, err := Transmit(ft, 1, []byte{0x00, 0xB0, 0x00, 0x00, 0x02})
+	if err != nil {
+		t.Fatalf("Transmit(whitespace response) error = %v", err)
+	}
+	if !reflect.DeepEqual(resp.Body, []byte{0xAA, 0xBB}) || resp.StatusString() != "9000" {
+		t.Fatalf("response = body % X status %s, want AA BB 9000", resp.Body, resp.StatusString())
+	}
+}
+
 func TestParseTLVListAndFCP(t *testing.T) {
 	fcp := []byte{0x62, 0x0B, 0x80, 0x02, 0x00, 0x20, 0x82, 0x05, 0x21, 0x00, 0x00, 0x10, 0x02}
 	if got := FileSizeFromFCP(fcp); got != 32 {

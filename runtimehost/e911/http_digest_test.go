@@ -144,6 +144,50 @@ func TestStartEmergencyAddressUpdateHTTPDigestAKAResyncThenFreshNonce(t *testing
 	}
 }
 
+func TestStartEmergencyAddressUpdateHTTPDigestNormalizesUnquotedQOPList(t *testing.T) {
+	rawNonce := append(bytesFrom(0x14, 16), bytesFrom(0x44, 16)...)
+	challenge := `Digest realm="e911.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop=auth-int,auth`
+	client := &fakeHTTPClient{responses: []*HTTPResponse{
+		{
+			StatusCode: 401,
+			Headers:    []HeaderPair{{Key: "WWW-Authenticate", Value: challenge}},
+		},
+		{
+			StatusCode: 200,
+			Body:       []byte(`{"status":1000,"websheet-url":"https://example.test/address?ok=qop"}`),
+		},
+	}}
+	aka := &fakeAKAProvider{}
+
+	ws, err := StartEmergencyAddressUpdate(context.Background(), Request{
+		Carrier: carrier.EffectiveCarrierConfig{
+			E911: carrier.E911Config{
+				Provider:            "att-ts43",
+				Websheet:            "https://example.test/websheet",
+				EntitlementEndpoint: "https://example.test/entitlement",
+			},
+		},
+		Identity:    Identity{IMSI: "310280233641503", IMEI: "356306952701762", MCC: "310", MNC: "280"},
+		AKAProvider: aka,
+		Client:      client,
+		Random:      bytes.NewReader(bytes.Repeat([]byte{0x99}, 16)),
+	})
+	if err != nil {
+		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
+	}
+	if ws.URL != "https://example.test/address?ok=qop" {
+		t.Fatalf("URL=%q", ws.URL)
+	}
+	auth := headerValue(client.requests[1].Headers, "Authorization")
+	parsed, err := voiceclient.ParseDigestAuthorization(auth)
+	if err != nil {
+		t.Fatalf("ParseDigestAuthorization() error = %v", err)
+	}
+	if parsed.QOP != "auth" || parsed.CNonce != strings.Repeat("99", 16) {
+		t.Fatalf("Authorization=%+v", parsed)
+	}
+}
+
 func TestStartEmergencyAddressUpdateAnswersProxyDigestAKAChallengeVariants(t *testing.T) {
 	rawNonce := append(bytesFrom(0x12, 16), bytesFrom(0x42, 16)...)
 	challenge := `dIgEsT realm="e911,proxy", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=akav2-md5, qop="AUTH-INT", qop=AUTH, opaque="opq,one", stale=TRUE`

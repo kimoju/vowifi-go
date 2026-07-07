@@ -476,6 +476,41 @@ func TestParseReauthenticationRequestRejectsMethodMismatch(t *testing.T) {
 	}
 }
 
+func TestParseReauthenticationRequestRejectsDuplicateControlAttributes(t *testing.T) {
+	identity := "reauth-identity@example"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	keys, err := DeriveKeys(identity, aka)
+	if err != nil {
+		t.Fatalf("DeriveKeys() error = %v", err)
+	}
+	nonceS := []byte("0123456789abcdef")
+	for _, tc := range []struct {
+		name  string
+		extra []Attribute
+	}{
+		{
+			name:  "counter",
+			extra: []Attribute{CounterAttribute(13)},
+		},
+		{
+			name:  "nonce_s",
+			extra: []Attribute{NonceSAttribute([]byte("fedcba9876543210"))},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := signedReauthenticationRequest(t, keys, 12, nonceS, tc.extra)
+			_, err := ParseReauthenticationRequest(request, keys)
+			if !errors.Is(err, ErrInvalidAttribute) {
+				t.Fatalf("ParseReauthenticationRequest() err=%v, want ErrInvalidAttribute", err)
+			}
+		})
+	}
+}
+
 func TestDeriveReauthenticationKeys(t *testing.T) {
 	identity := "reauth-identity@example"
 	aka := sim.AKAResult{

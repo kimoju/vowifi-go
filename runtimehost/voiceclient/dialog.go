@@ -100,6 +100,14 @@ type DialogSessionTimerInfo struct {
 	RetryRequired bool
 }
 
+type DialogFailureInfo struct {
+	StatusCode   int
+	ReasonPhrase string
+	RetryAfter   time.Duration
+	Warnings     []string
+	Reasons      []string
+}
+
 func BuildInviteRequest(cfg DialogRequestConfig, sdp []byte) (SIPRequestMessage, error) {
 	msg, err := buildDialogRequest("INVITE", cfg, sdp)
 	if err != nil {
@@ -331,6 +339,16 @@ func DialogSessionTimerRetryConfig(cfg DialogRequestConfig, resp SIPResponse) (D
 		next.SessionExpires = next.MinSE
 	}
 	return next, true, nil
+}
+
+func ParseDialogFailureInfo(resp SIPResponse) DialogFailureInfo {
+	return DialogFailureInfo{
+		StatusCode:   resp.StatusCode,
+		ReasonPhrase: strings.TrimSpace(resp.Reason),
+		RetryAfter:   SIPResponseRetryAfter(resp),
+		Warnings:     trimHeaderValues(headerListValues(resp.Headers, "Warning")),
+		Reasons:      trimHeaderValues(headerListValues(resp.Headers, "Reason")),
+	}
 }
 
 func AdvanceDialogSessionState(state DialogSessionState, method string, resp SIPResponse) DialogSessionState {

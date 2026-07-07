@@ -513,12 +513,36 @@ func ParseClientErrorResponse(response Packet) (uint16, error) {
 	return code, nil
 }
 
+func CounterFromAttributes(attrs []Attribute) (uint16, bool, error) {
+	attr, ok, err := FindSingleAttribute(attrs, AttributeCounter)
+	if err != nil || !ok {
+		return 0, ok, err
+	}
+	counter, err := attr.CounterValue()
+	if err != nil {
+		return 0, true, err
+	}
+	return counter, true, nil
+}
+
 func CounterTooSmallFromAttributes(attrs []Attribute) (bool, error) {
 	attr, ok, err := FindSingleAttribute(attrs, AttributeCounterTooSmall)
 	if err != nil || !ok {
 		return ok, err
 	}
 	return true, attr.CounterTooSmallValue()
+}
+
+func NonceSFromAttributes(attrs []Attribute) ([]byte, bool, error) {
+	attr, ok, err := FindSingleAttribute(attrs, AttributeNonceS)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	nonceS, err := attr.NonceSValue()
+	if err != nil {
+		return nil, true, err
+	}
+	return nonceS, true, nil
 }
 
 func CheckcodeFromAttributes(attrs []Attribute) ([]byte, bool, error) {

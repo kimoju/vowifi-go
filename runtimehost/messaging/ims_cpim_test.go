@@ -109,6 +109,40 @@ func TestParseIMSCPIMMessageContentTypeParameters(t *testing.T) {
 	}
 }
 
+func TestParseIMSCPIMMessageLenientContentTypeParameters(t *testing.T) {
+	rawContentType := `Application/Vnd.3Gpp.Sms; Charset=UTF-8; profile=sms/imdn; carrier-note=delivery report`
+	body := []byte(strings.Join([]string{
+		"From: <tel:+15550101000>",
+		"To: <tel:+15550101001>",
+		"",
+		"Content-Type: " + rawContentType,
+		"Content-Length: 5",
+		"",
+		"hello",
+	}, "\r\n"))
+
+	parsed, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	if parsed.ContentType != IMS3GPPSMSContentType {
+		t.Fatalf("ContentType=%q want %q", parsed.ContentType, IMS3GPPSMSContentType)
+	}
+	wantParams := map[string]string{
+		"charset":      "UTF-8",
+		"profile":      "sms/imdn",
+		"carrier-note": "delivery report",
+	}
+	for key, want := range wantParams {
+		if got := parsed.ContentTypeParams[key]; got != want {
+			t.Fatalf("ContentTypeParams[%q]=%q want %q in %+v", key, got, want, parsed.ContentTypeParams)
+		}
+	}
+	if got := textproto.MIMEHeader(parsed.ContentHeaders).Get("Content-Type"); got != rawContentType {
+		t.Fatalf("raw Content-Type=%q want %q", got, rawContentType)
+	}
+}
+
 func TestBuildIMSCPIMMessageWithHeadersDeduplicatesContentLength(t *testing.T) {
 	body := []byte("hello")
 	encoded, err := BuildIMSCPIMMessageWithHeaders(map[string][]string{

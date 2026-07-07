@@ -89,6 +89,24 @@ func TestHTTPAuthenticateChallengeParserMergesDuplicateParams(t *testing.T) {
 	}
 }
 
+func TestHTTPAuthenticateChallengeParserMergesUnquotedQOPList(t *testing.T) {
+	header := `Digest realm="e911", nonce="abc,def", algorithm=AKAv1-MD5, qop=auth-int,auth, Basic realm="legacy"`
+	chunks := splitHTTPAuthenticateChallenges(header)
+	if len(chunks) != 2 {
+		t.Fatalf("chunks=%q", chunks)
+	}
+	challenges := httpAuthenticationChallenges(http.StatusUnauthorized, []HeaderPair{{Key: "WWW-Authenticate", Value: header}})
+	if len(challenges) != 2 {
+		t.Fatalf("challenges=%+v", challenges)
+	}
+	if challenges[0].Scheme != "Digest" || challenges[0].Params["qop"] != "auth-int,auth" {
+		t.Fatalf("digest challenge=%+v", challenges[0])
+	}
+	if challenges[1].Scheme != "Basic" || challenges[1].Params["realm"] != "legacy" {
+		t.Fatalf("basic challenge=%+v", challenges[1])
+	}
+}
+
 func TestHTTPAuthenticateChallengeParserClassifiesProxyHeader(t *testing.T) {
 	challenges := httpAuthenticationChallenges(http.StatusProxyAuthRequired, []HeaderPair{
 		{Key: "www-authenticate", Value: `Digest realm="origin", nonce="ignored"`},

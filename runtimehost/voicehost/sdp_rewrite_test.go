@@ -231,6 +231,58 @@ func TestSelectSDPAnswerCodecsAndBuildMuxedAnswer(t *testing.T) {
 	}
 }
 
+func TestSelectSDPAnswerCodecsBuildsStaticPCMUAndPCMAAnswer(t *testing.T) {
+	pcmu := NewSDPPCMUCodec()
+	pcma := NewSDPPCMACodec()
+	if pcmu.Payload != SDPPCMUPayloadType || pcmu.EncodingName != SDPCodecPCMU || pcmu.ClockRate != 8000 || pcmu.Channels != 1 || pcmu.FMTP != "" {
+		t.Fatalf("PCMU codec=%+v", pcmu)
+	}
+	if pcma.Payload != SDPPCMAPayloadType || pcma.EncodingName != SDPCodecPCMA || pcma.ClockRate != 8000 || pcma.Channels != 1 || pcma.FMTP != "" {
+		t.Fatalf("PCMA codec=%+v", pcma)
+	}
+	offer, err := ParseSDPMediaDescription([]byte("v=0\r\n" +
+		"c=IN IP4 203.0.113.8\r\n" +
+		"m=audio 49170 RTP/AVP 0 8 101\r\n" +
+		"a=rtpmap:101 telephone-event/8000\r\n"))
+	if err != nil {
+		t.Fatalf("ParseSDPMediaDescription() error = %v", err)
+	}
+	codecs := SelectSDPAnswerCodecs(offer.Codecs, []SDPCodec{
+		NewSDPPCMACodec(),
+		NewSDPPCMUCodec(),
+		NewSDPTelephoneEventCodec(0, 8000),
+	})
+	if len(codecs) != 3 || codecs[0].Payload != SDPPCMAPayloadType || codecs[1].Payload != SDPPCMUPayloadType || codecs[2].Payload != 101 {
+		t.Fatalf("selected codecs=%+v", codecs)
+	}
+	answer := string(BuildSDPAnswerWithOptions(SDPInfo{
+		ConnectionIP: "192.0.2.2",
+		MediaPort:    6000,
+		RTCPPort:     6001,
+		Direction:    "sendrecv",
+	}, SDPAnswerOptions{
+		RTPProfile: offer.RTPProfile,
+		Codecs:     codecs,
+	}))
+	for _, want := range []string{
+		"m=audio 6000 RTP/AVP 8 0 101\r\n",
+		"a=rtcp:6001 IN IP4 192.0.2.2\r\n",
+		"a=rtpmap:8 PCMA/8000\r\n",
+		"a=rtpmap:0 PCMU/8000\r\n",
+		"a=rtpmap:101 telephone-event/8000\r\n",
+		"a=fmtp:101 0-16\r\n",
+	} {
+		if !strings.Contains(answer, want) {
+			t.Fatalf("answer missing %q:\n%s", want, answer)
+		}
+	}
+	for _, unwanted := range []string{"a=fmtp:8 ", "a=fmtp:0 "} {
+		if strings.Contains(answer, unwanted) {
+			t.Fatalf("answer included static codec fmtp %q:\n%s", unwanted, answer)
+		}
+	}
+}
+
 func TestSelectSDPAnswerCodecsNegotiatesAMRAndAMRWB(t *testing.T) {
 	offer, err := ParseSDPMediaDescription([]byte("v=0\r\n" +
 		"c=IN IP4 203.0.113.8\r\n" +

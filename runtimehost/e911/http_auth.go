@@ -111,16 +111,24 @@ func parseHTTPAuthenticationChallenge(headerName, raw string) (HTTPAuthenticatio
 
 func parseHTTPAuthParams(s string) map[string]string {
 	params := make(map[string]string)
+	lastKey := ""
 	for _, part := range splitHTTPAuthParams(s) {
 		key, value, ok := strings.Cut(part, "=")
 		if !ok {
+			if lastKey == "qop" && isHTTPAuthTokenList(part) {
+				setHTTPAuthParam(params, lastKey, part)
+				continue
+			}
+			lastKey = ""
 			continue
 		}
 		key = strings.ToLower(strings.TrimSpace(key))
 		if key == "" {
+			lastKey = ""
 			continue
 		}
 		setHTTPAuthParam(params, key, unquoteHTTPAuthValue(value))
+		lastKey = key
 	}
 	if len(params) == 0 {
 		return nil
@@ -258,6 +266,25 @@ func httpAuthChallengeStarts(s string) bool {
 	}
 	rest := strings.TrimLeft(s[end:], " \t")
 	return rest != "" && rest[0] != '='
+}
+
+func isHTTPAuthTokenList(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, part := range strings.Split(value, ",") {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			return false
+		}
+		for i := 0; i < len(token); i++ {
+			if !isHTTPAuthTokenChar(token[i]) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func isHTTPAuthTokenChar(c byte) bool {

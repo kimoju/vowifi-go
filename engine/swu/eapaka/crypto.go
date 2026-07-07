@@ -535,21 +535,19 @@ func ParseReauthenticationRequest(request Packet, keys Keys) (ReauthenticationRe
 	if !ok {
 		return ReauthenticationRequest{}, fmt.Errorf("%w: missing AT_IV/AT_ENCR_DATA", ErrInvalidReauth)
 	}
-	counterAttr, ok := FindAttribute(attrs, AttributeCounter)
+	counter, ok, err := CounterFromAttributes(attrs)
+	if err != nil {
+		return ReauthenticationRequest{}, err
+	}
 	if !ok {
 		return ReauthenticationRequest{}, fmt.Errorf("%w: missing AT_COUNTER", ErrInvalidReauth)
 	}
-	counter, err := counterAttr.CounterValue()
+	nonceS, ok, err := NonceSFromAttributes(attrs)
 	if err != nil {
 		return ReauthenticationRequest{}, err
 	}
-	nonceAttr, ok := FindAttribute(attrs, AttributeNonceS)
 	if !ok {
 		return ReauthenticationRequest{}, fmt.Errorf("%w: missing AT_NONCE_S", ErrInvalidReauth)
-	}
-	nonceS, err := nonceAttr.NonceSValue()
-	if err != nil {
-		return ReauthenticationRequest{}, err
 	}
 	state, err := IdentityStateFromAttributes(attrs)
 	if err != nil {

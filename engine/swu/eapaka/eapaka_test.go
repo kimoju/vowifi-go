@@ -458,6 +458,50 @@ func TestReauthenticationAttributes(t *testing.T) {
 	}
 }
 
+func TestReauthenticationAttributeExtraction(t *testing.T) {
+	attrs := []Attribute{
+		CounterAttribute(9),
+		NonceSAttribute([]byte("fedcba9876543210")),
+	}
+	counter, ok, err := CounterFromAttributes(attrs)
+	if err != nil {
+		t.Fatalf("CounterFromAttributes() error = %v", err)
+	}
+	if !ok || counter != 9 {
+		t.Fatalf("counter ok=%t value=%d", ok, counter)
+	}
+	nonceS, ok, err := NonceSFromAttributes(attrs)
+	if err != nil {
+		t.Fatalf("NonceSFromAttributes() error = %v", err)
+	}
+	if !ok || string(nonceS) != "fedcba9876543210" {
+		t.Fatalf("nonce_s ok=%t value=%q", ok, string(nonceS))
+	}
+	nonceS[0] = 'x'
+	again, ok, err := NonceSFromAttributes(attrs)
+	if err != nil {
+		t.Fatalf("NonceSFromAttributes(again) error = %v", err)
+	}
+	if !ok || string(again) != "fedcba9876543210" {
+		t.Fatalf("nonce_s was not cloned: ok=%t value=%q", ok, string(again))
+	}
+	if _, ok, err := CounterFromAttributes(nil); err != nil || ok {
+		t.Fatalf("CounterFromAttributes(nil) ok=%t err=%v, want missing nil error", ok, err)
+	}
+	if _, _, err := CounterFromAttributes([]Attribute{CounterAttribute(1), CounterAttribute(2)}); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("CounterFromAttributes(duplicate) err=%v, want ErrInvalidAttribute", err)
+	}
+	if _, _, err := NonceSFromAttributes([]Attribute{NonceSAttribute([]byte("short"))}); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("NonceSFromAttributes(short) err=%v, want ErrInvalidAttribute", err)
+	}
+	if _, _, err := NonceSFromAttributes([]Attribute{
+		NonceSAttribute([]byte("fedcba9876543210")),
+		NonceSAttribute([]byte("0123456789abcdef")),
+	}); !errors.Is(err, ErrInvalidAttribute) {
+		t.Fatalf("NonceSFromAttributes(duplicate) err=%v, want ErrInvalidAttribute", err)
+	}
+}
+
 func TestAKAChallengeAttributes(t *testing.T) {
 	raw, err := (Packet{
 		Code:       CodeRequest,

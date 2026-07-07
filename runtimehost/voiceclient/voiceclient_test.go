@@ -2656,6 +2656,66 @@ func TestDialogSessionTimerRetryConfigAppliesMinSE(t *testing.T) {
 	}
 }
 
+func TestParseDialogFailureInfoCapturesDiagnosticHeaders(t *testing.T) {
+	resp := SIPResponse{
+		StatusCode: 486,
+		Reason:     " Busy Here ",
+		Headers: map[string][]string{
+			"Retry-After": {"12"},
+			"Warning": {
+				`399 pcscf.example "media path unavailable", 370 pcscf.example "insufficient bandwidth"`,
+				`399 pcscf2.example "alternate route rejected"`,
+			},
+			"reason": {`SIP;cause=486;text="Busy Here", Q.850;cause=17;text="user busy"`},
+		},
+	}
+	info := ParseDialogFailureInfo(resp)
+	if info.StatusCode != 486 || info.ReasonPhrase != "Busy Here" || info.RetryAfter != 12*time.Second {
+		t.Fatalf("failure info=%+v", info)
+	}
+	wantWarnings := []string{
+		`399 pcscf.example "media path unavailable"`,
+		`370 pcscf.example "insufficient bandwidth"`,
+		`399 pcscf2.example "alternate route rejected"`,
+	}
+	if len(info.Warnings) != len(wantWarnings) {
+		t.Fatalf("warnings=%q, want %q", info.Warnings, wantWarnings)
+	}
+	for i := range wantWarnings {
+		if info.Warnings[i] != wantWarnings[i] {
+			t.Fatalf("warning[%d]=%q, want %q", i, info.Warnings[i], wantWarnings[i])
+		}
+	}
+	wantReasons := []string{
+		`SIP;cause=486;text="Busy Here"`,
+		`Q.850;cause=17;text="user busy"`,
+	}
+	if len(info.Reasons) != len(wantReasons) {
+		t.Fatalf("reasons=%q, want %q", info.Reasons, wantReasons)
+	}
+	for i := range wantReasons {
+		if info.Reasons[i] != wantReasons[i] {
+			t.Fatalf("reason[%d]=%q, want %q", i, info.Reasons[i], wantReasons[i])
+		}
+	}
+	resp.Headers["Warning"][0] = `399 changed "mutated"`
+	if info.Warnings[0] != wantWarnings[0] {
+		t.Fatalf("failure info kept header backing slice: warnings=%q", info.Warnings)
+	}
+}
+
+func TestParseDialogFailureInfoUsesParsedRetryAfter(t *testing.T) {
+	info := ParseDialogFailureInfo(SIPResponse{
+		StatusCode: 503,
+		Reason:     "Service Unavailable",
+		Headers:    map[string][]string{"Retry-After": {"1"}},
+		RetryAfter: 5 * time.Second,
+	})
+	if info.RetryAfter != 5*time.Second {
+		t.Fatalf("RetryAfter=%v, want parsed response value", info.RetryAfter)
+	}
+}
+
 func TestParseProvisionalResponseInfoReliableEarlyMedia(t *testing.T) {
 	body := []byte("v=0\r\nm=audio 40000 RTP/AVP 0\r\n")
 	resp := SIPResponse{
