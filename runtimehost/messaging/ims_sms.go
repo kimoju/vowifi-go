@@ -20,6 +20,8 @@ type IMSSMSTransport struct {
 	UserAgent            string
 	ContentType          string
 	SMSC                 string
+	UseCPIM              bool
+	IMDNNotifications    []string
 	DisableStatusReports bool
 }
 
@@ -45,7 +47,7 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 	if cseq <= 0 {
 		cseq = 1
 	}
-	contentType, body, err := t.messagePayload(req, byte(cseq))
+	contentType, body, err := t.messagePayload(req, byte(cseq), localURI, remoteURI, callID)
 	if err != nil {
 		return SMSSendResult{CallID: callID, RPMR: cseq, State: "failed", ErrorText: err.Error()}, err
 	}
@@ -110,7 +112,7 @@ func IMSRegistrationRecoveryNeededStatus(code int) bool {
 	}
 }
 
-func (t IMSSMSTransport) messagePayload(req SMSSendRequest, rpMR byte) (string, []byte, error) {
+func (t IMSSMSTransport) messagePayload(req SMSSendRequest, rpMR byte, localURI, remoteURI, messageID string) (string, []byte, error) {
 	contentType := firstNonEmpty(t.ContentType, IMS3GPPSMSContentType)
 	if strings.HasPrefix(strings.ToLower(contentType), "text/plain") {
 		return contentType, []byte(req.Part.Text), nil
@@ -127,7 +129,25 @@ func (t IMSSMSTransport) messagePayload(req SMSSendRequest, rpMR byte) (string, 
 	if err != nil {
 		return "", nil, err
 	}
+	if t.UseCPIM {
+		messageHeaders := BuildIMSCPIMIMDNMessageHeaders(localURI, remoteURI, messageID, t.imdnNotifications())
+		cpim, err := BuildIMSCPIMMessageWithHeaders(messageHeaders, map[string][]string{"Content-Type": {contentType}}, rpData)
+		if err != nil {
+			return "", nil, err
+		}
+		return IMSCPIMContentType, cpim, nil
+	}
 	return contentType, rpData, nil
+}
+
+func (t IMSSMSTransport) imdnNotifications() []string {
+	if len(t.IMDNNotifications) > 0 {
+		return NormalizeIMSIMDNDispositionNotifications(t.IMDNNotifications...)
+	}
+	if t.DisableStatusReports {
+		return nil
+	}
+	return []string{IMSIMDNDispositionPositiveDelivery, IMSIMDNDispositionNegativeDelivery}
 }
 
 func (t IMSSMSTransport) remoteURI(peer string) string {

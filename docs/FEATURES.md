@@ -127,7 +127,8 @@ protocol layers needed by VoHive:
   report matching, CPIM and IMS `Content-Transfer-Encoding` decoding for
   base64/quoted-printable SMS payloads, nested multipart MESSAGE leaf
   selection for CPIM/3GPP SMS/IMDN payloads, strict UCS2/8-bit user-data
-  length validation, and USSD session transport hooks, including 3xx Contact
+  length validation, optional outbound CPIM wrapping for 3GPP SMS with IMDN
+  disposition request headers, and USSD session transport hooks, including 3xx Contact
   redirect retries, TP-SRR delivery-status requests, SMS RP-ERROR/
   STATUS-REPORT cause mapping, RP-ACK user-data STATUS-REPORT handling,
   RP-ERROR diagnostics/user-data preservation, SMS-DELIVER TP-PID/TP-DCS and

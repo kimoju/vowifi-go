@@ -23,12 +23,33 @@ const imsContentTransferEncodingHeader = "Content-Transfer-Encoding"
 const imsCPIMIMDNNamespace = "urn:ietf:params:imdn"
 const imsIMDNContentType = "message/imdn+xml"
 
+const (
+	IMSIMDNDispositionPositiveDelivery = "positive-delivery"
+	IMSIMDNDispositionNegativeDelivery = "negative-delivery"
+	IMSIMDNDispositionDisplay          = "display"
+	IMSIMDNDispositionProcessing       = "processing"
+)
+
 type IMSCPIMMessage struct {
 	Headers           map[string][]string
 	ContentHeaders    map[string][]string
 	ContentType       string
 	ContentTypeParams map[string]string
 	Body              []byte
+}
+
+type IMSCPIMIMDNDispositionRequest struct {
+	MessageID        string
+	Notifications    []string
+	PositiveDelivery bool
+	NegativeDelivery bool
+	Display          bool
+	Processing       bool
+	Required         bool
+}
+
+func (r IMSCPIMIMDNDispositionRequest) Requested() bool {
+	return r.PositiveDelivery || r.NegativeDelivery || r.Display || r.Processing || len(r.Notifications) > 0
 }
 
 func ParseIMSCPIMMessage(body []byte) (IMSCPIMMessage, error) {
@@ -368,6 +389,29 @@ func BuildIMSCPIMMessage(from, to, contentType string, body []byte) ([]byte, err
 	return BuildIMSCPIMMessageWithHeaders(messageHeaders, map[string][]string{"Content-Type": {contentType}}, body)
 }
 
+func BuildIMSCPIMIMDNMessageHeaders(from, to, messageID string, notifications []string) map[string][]string {
+	headers := make(map[string][]string, 5)
+	if from = strings.TrimSpace(from); from != "" {
+		headers["From"] = []string{from}
+	}
+	if to = strings.TrimSpace(to); to != "" {
+		headers["To"] = []string{to}
+	}
+	normalized := NormalizeIMSIMDNDispositionNotifications(notifications...)
+	messageID = strings.TrimSpace(messageID)
+	if messageID != "" || len(normalized) > 0 {
+		headers["NS"] = []string{"imdn <" + imsCPIMIMDNNamespace + ">"}
+	}
+	if messageID != "" {
+		headers["imdn.Message-ID"] = []string{messageID}
+	}
+	if len(normalized) > 0 {
+		headers["Require"] = []string{"imdn.Disposition-Notification"}
+		headers["imdn.Disposition-Notification"] = []string{strings.Join(normalized, ", ")}
+	}
+	return headers
+}
+
 func BuildIMSCPIMMessageWithHeaders(messageHeaders, contentHeaders map[string][]string, body []byte) ([]byte, error) {
 	contentType := firstCPIMHeaderValue(contentHeaders, "Content-Type")
 	if strings.TrimSpace(contentType) == "" {
@@ -386,6 +430,49 @@ func BuildIMSCPIMMessageWithHeaders(messageHeaders, contentHeaders map[string][]
 	out.WriteString("\r\n")
 	out.Write(body)
 	return out.Bytes(), nil
+}
+
+func ParseIMSCPIMIMDNDispositionRequest(cpim IMSCPIMMessage) IMSCPIMIMDNDispositionRequest {
+	return IMSCPIMIMDNDispositionRequestFromHeaders(cpim.Headers)
+}
+
+func IMSCPIMIMDNDispositionRequestFromHeaders(headers map[string][]string) IMSCPIMIMDNDispositionRequest {
+	headers = cloneCPIMHeaders(headers)
+	normalizeCPIMIMDNHeaders(headers)
+	req := IMSCPIMIMDNDispositionRequest{
+		MessageID: strings.TrimSpace(firstCPIMHeaderValue(headers, "imdn.Message-ID")),
+		Required:  cpimHeaderTokenRequested(headers, "Require", "imdn.Disposition-Notification"),
+	}
+	req.Notifications = NormalizeIMSIMDNDispositionNotifications(cpimHeaderValues(headers, "imdn.Disposition-Notification")...)
+	for _, notification := range req.Notifications {
+		switch notification {
+		case IMSIMDNDispositionPositiveDelivery:
+			req.PositiveDelivery = true
+		case IMSIMDNDispositionNegativeDelivery:
+			req.NegativeDelivery = true
+		case IMSIMDNDispositionDisplay:
+			req.Display = true
+		case IMSIMDNDispositionProcessing:
+			req.Processing = true
+		}
+	}
+	return req
+}
+
+func NormalizeIMSIMDNDispositionNotifications(values ...string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, value := range values {
+		for _, token := range strings.Split(value, ",") {
+			notification := normalizeIMSIMDNDispositionNotification(token)
+			if notification == "" || seen[notification] {
+				continue
+			}
+			seen[notification] = true
+			out = append(out, notification)
+		}
+	}
+	return out
 }
 
 func splitCPIMHeaderBlock(data []byte) (block []byte, rest []byte, ok bool) {
@@ -586,6 +673,21 @@ func cpimHeaderValues(headers map[string][]string, key string) []string {
 	return out
 }
 
+func cpimHeaderTokenRequested(headers map[string][]string, key, token string) bool {
+	token = strings.ToLower(strings.TrimSpace(token))
+	if token == "" {
+		return false
+	}
+	for _, value := range cpimHeaderValues(headers, key) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func parseCPIMNamespaceHeader(value string) (prefix, uri string, ok bool) {
 	value = strings.TrimSpace(value)
 	start := strings.IndexByte(value, '<')
@@ -626,6 +728,21 @@ func canonicalCPIMIMDNHeaderSuffix(suffix string) string {
 		return "DateTime"
 	default:
 		return strings.TrimSpace(suffix)
+	}
+}
+
+func normalizeIMSIMDNDispositionNotification(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case IMSIMDNDispositionPositiveDelivery, "positive":
+		return IMSIMDNDispositionPositiveDelivery
+	case IMSIMDNDispositionNegativeDelivery, "negative":
+		return IMSIMDNDispositionNegativeDelivery
+	case IMSIMDNDispositionDisplay, "display-notification":
+		return IMSIMDNDispositionDisplay
+	case IMSIMDNDispositionProcessing, "processing-notification":
+		return IMSIMDNDispositionProcessing
+	default:
+		return ""
 	}
 }
 

@@ -272,6 +272,57 @@ func TestParseIMSCPIMMessageMergesCanonicalAndAliasedIMDNHeaders(t *testing.T) {
 	}
 }
 
+func TestIMSCPIMIMDNDispositionRequestRoundTrip(t *testing.T) {
+	headers := BuildIMSCPIMIMDNMessageHeaders(
+		"<sip:alice@example.com>",
+		"<sip:bob@example.com>",
+		"msg-123-1@vowifi-go",
+		[]string{"positive", IMSIMDNDispositionNegativeDelivery, "DISPLAY", "unknown", "display"},
+	)
+	body, err := BuildIMSCPIMMessageWithHeaders(headers, map[string][]string{"Content-Type": {"text/plain"}}, []byte("hello"))
+	if err != nil {
+		t.Fatalf("BuildIMSCPIMMessageWithHeaders() error = %v", err)
+	}
+	cpim, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	req := ParseIMSCPIMIMDNDispositionRequest(cpim)
+	if !req.Requested() || !req.Required || req.MessageID != "msg-123-1@vowifi-go" ||
+		!req.PositiveDelivery || !req.NegativeDelivery || !req.Display || req.Processing {
+		t.Fatalf("IMDN disposition request=%+v", req)
+	}
+	want := []string{IMSIMDNDispositionPositiveDelivery, IMSIMDNDispositionNegativeDelivery, IMSIMDNDispositionDisplay}
+	if strings.Join(req.Notifications, ",") != strings.Join(want, ",") {
+		t.Fatalf("notifications=%+v want %+v", req.Notifications, want)
+	}
+}
+
+func TestParseIMSCPIMIMDNDispositionRequestWithFoldedAlias(t *testing.T) {
+	body := []byte(strings.Join([]string{
+		"From: <sip:alice@example.com>",
+		"NS: delivery <urn:ietf:params:imdn>",
+		"Require: imdn.Disposition-Notification, other-feature",
+		"delivery.Message-ID: folded-msg",
+		"delivery.Disposition-Notification: positive-delivery,",
+		" negative-delivery, PROCESSING",
+		"",
+		"Content-Type: text/plain",
+		"Content-Length: 5",
+		"",
+		"hello",
+	}, "\r\n"))
+	cpim, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	req := ParseIMSCPIMIMDNDispositionRequest(cpim)
+	if !req.Requested() || !req.Required || req.MessageID != "folded-msg" ||
+		!req.PositiveDelivery || !req.NegativeDelivery || !req.Processing || req.Display {
+		t.Fatalf("folded IMDN disposition request=%+v headers=%+v", req, cpim.Headers)
+	}
+}
+
 func TestParseIMSCPIMIMDNReportDeliveryFailure(t *testing.T) {
 	payload := strings.Join([]string{
 		`<?xml version="1.0" encoding="UTF-8"?>`,

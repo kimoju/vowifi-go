@@ -87,6 +87,89 @@ func TestIMSSMSTransportCanDisableStatusReports(t *testing.T) {
 	}
 }
 
+func TestIMSSMSTransportCanWrap3GPPSMSInCPIMWithIMDN(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
+	sms := IMSSMSTransport{
+		Transport: transport,
+		UseCPIM:   true,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+
+	result, err := sms.SendSMSPart(context.Background(), SMSSendRequest{
+		Peer:      "+18005551212",
+		MessageID: "cpim sms",
+		Part:      SMSPart{PartNo: 1, TotalParts: 1, Text: "hello"},
+	})
+	if err != nil || result.State != "accepted" {
+		t.Fatalf("SendSMSPart() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	req := transport.requests[0]
+	if req.Headers["Content-Type"] != IMSCPIMContentType {
+		t.Fatalf("MESSAGE Content-Type=%q want %q", req.Headers["Content-Type"], IMSCPIMContentType)
+	}
+	cpim, err := ParseIMSCPIMMessage(req.Body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v body=%s", err, req.Body)
+	}
+	if cpim.ContentType != IMS3GPPSMSContentType {
+		t.Fatalf("CPIM content type=%q want %q", cpim.ContentType, IMS3GPPSMSContentType)
+	}
+	imdn := ParseIMSCPIMIMDNDispositionRequest(cpim)
+	if imdn.MessageID != "cpim-sms-1@vowifi-go" || !imdn.Required || !imdn.PositiveDelivery || !imdn.NegativeDelivery || imdn.Display {
+		t.Fatalf("IMDN request=%+v headers=%+v", imdn, cpim.Headers)
+	}
+	if got := imsHeaderValue(cpim.Headers, "From"); got != "sip:user@ims.example" {
+		t.Fatalf("CPIM From=%q", got)
+	}
+	if got := imsHeaderValue(cpim.Headers, "To"); got != "sip:+18005551212@ims.example" {
+		t.Fatalf("CPIM To=%q", got)
+	}
+	rpMR, tpdu, err := ParseSMSRPData(cpim.Body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPData(CPIM body) error = %v body=%x", err, cpim.Body)
+	}
+	if rpMR != 1 || len(tpdu) == 0 || tpdu[0] != 0x21 {
+		t.Fatalf("CPIM RP-DATA rpMR=%d tpdu=%x", rpMR, tpdu)
+	}
+}
+
+func TestIMSSMSTransportCPIMHonorsCustomIMDNNotifications(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
+	sms := IMSSMSTransport{
+		Transport:            transport,
+		UseCPIM:              true,
+		IMDNNotifications:    []string{IMSIMDNDispositionDisplay},
+		DisableStatusReports: true,
+		Profile:              voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration:         voiceclient.RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060", PublicIdentity: "sip:user@ims.example"},
+	}
+	if _, err := sms.SendSMSPart(context.Background(), SMSSendRequest{Peer: "+18005551212", Part: SMSPart{PartNo: 1, Text: "hello"}}); err != nil {
+		t.Fatalf("SendSMSPart() error = %v", err)
+	}
+	cpim, err := ParseIMSCPIMMessage(transport.requests[0].Body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	imdn := ParseIMSCPIMIMDNDispositionRequest(cpim)
+	if !imdn.Display || imdn.PositiveDelivery || imdn.NegativeDelivery {
+		t.Fatalf("custom IMDN request=%+v", imdn)
+	}
+	_, tpdu, err := ParseSMSRPData(cpim.Body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPData() error = %v", err)
+	}
+	if len(tpdu) == 0 || tpdu[0] != 0x01 {
+		t.Fatalf("TPDU first octet=0x%02x want 0x01 with status reports disabled", tpdu[0])
+	}
+}
+
 func TestIMSSMSTransportFollowsRedirectContact(t *testing.T) {
 	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{
 		{
