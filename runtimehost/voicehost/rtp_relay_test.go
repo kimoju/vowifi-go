@@ -3,6 +3,7 @@ package voicehost
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"strconv"
 	"testing"
@@ -281,6 +282,156 @@ func TestRTPRelaySessionAppliesSRTPTransforms(t *testing.T) {
 	})
 	if stats.ClientToIMSRTPDrops != 0 || stats.IMSToClientRTPDrops != 0 || stats.ClientToIMSRTPPackets != 1 || stats.IMSToClientRTPPackets != 1 {
 		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+func TestRTPRelaySessionUpdatesTransformsAtRuntime(t *testing.T) {
+	clientPeer := listenTestUDP(t)
+	defer clientPeer.Close()
+	clientRTCPPeer := listenTestUDP(t)
+	defer clientRTCPPeer.Close()
+	imsPeer := listenTestUDP(t)
+	defer imsPeer.Close()
+	imsRTCPPeer := listenTestUDP(t)
+	defer imsRTCPPeer.Close()
+
+	clientAddr := clientPeer.LocalAddr().(*net.UDPAddr)
+	clientRTCPAddr := clientRTCPPeer.LocalAddr().(*net.UDPAddr)
+	imsAddr := imsPeer.LocalAddr().(*net.UDPAddr)
+	imsRTCPAddr := imsRTCPPeer.LocalAddr().(*net.UDPAddr)
+	relay, err := NewRTPRelaySession(context.Background(), RTPRelayConfig{
+		ClientListenIP:    "127.0.0.1",
+		ClientAdvertiseIP: "127.0.0.1",
+		IMSListenIP:       "127.0.0.1",
+		IMSAdvertiseIP:    "127.0.0.1",
+	}, SDPInfo{
+		ConnectionIP:           "127.0.0.1",
+		MediaPort:              clientAddr.Port,
+		RTCPPort:               clientRTCPAddr.Port,
+		TelephoneEventPayloads: map[uint8]int{101: 8000},
+	})
+	if err != nil {
+		t.Fatalf("NewRTPRelaySession() error = %v", err)
+	}
+	defer relay.Close()
+	if err := relay.SetIMSRemote(SDPInfo{
+		ConnectionIP:           "127.0.0.1",
+		MediaPort:              imsAddr.Port,
+		RTCPPort:               imsRTCPAddr.Port,
+		TelephoneEventPayloads: map[uint8]int{101: 8000},
+	}); err != nil {
+		t.Fatalf("SetIMSRemote() error = %v", err)
+	}
+	clientEndpoint := udpAddrFromSDP(t, relay.ClientEndpoint())
+	imsEndpoint := udpAddrFromSDP(t, relay.IMSEndpoint())
+
+	initialPlain := testRTPPacket(41, 0x11111111, []byte{0x41})
+	if _, err := clientPeer.WriteToUDP(initialPlain, clientEndpoint); err != nil {
+		t.Fatalf("client initial WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, imsPeer); !bytes.Equal(got, initialPlain) {
+		t.Fatalf("IMS initial RTP=%x, want %x", got, initialPlain)
+	}
+
+	media, err := NewSRTPMediaSession(testSRTPMediaConfig())
+	if err != nil {
+		t.Fatalf("NewSRTPMediaSession() error = %v", err)
+	}
+	if err := relay.SetTransforms(media.RelayTransforms()); err != nil {
+		t.Fatalf("SetTransforms() error = %v", err)
+	}
+	if relay.Transforms().ClientToIMSRTP == nil || relay.Transforms().GeneratedToClientRTCP == nil {
+		t.Fatalf("Transforms() did not expose installed transforms")
+	}
+
+	clientPlain := testRTPPacket(42, 0x11111111, []byte{0x42})
+	clientProtected, err := media.ProtectClientRTP(clientPlain)
+	if err != nil {
+		t.Fatalf("ProtectClientRTP() error = %v", err)
+	}
+	if _, err := clientPeer.WriteToUDP(clientProtected, clientEndpoint); err != nil {
+		t.Fatalf("client protected WriteToUDP() error = %v", err)
+	}
+	got, _ := readTestUDP(t, imsPeer)
+	if bytes.Equal(got, clientPlain) || bytes.Equal(got, clientProtected) {
+		t.Fatalf("IMS got untransformed RTP=%x", got)
+	}
+	gotPlain, err := media.UnprotectIMSRTP(got)
+	if err != nil {
+		t.Fatalf("UnprotectIMSRTP() error = %v", err)
+	}
+	if !bytes.Equal(gotPlain, clientPlain) {
+		t.Fatalf("IMS RTP plain=%x, want %x", gotPlain, clientPlain)
+	}
+
+	dtmf, err := relay.SendRTPDTMFToIMS(context.Background(), RTPRelayDTMFRequest{
+		Signal:         "9",
+		DurationMS:     10,
+		StepMS:         10,
+		EndPacketCount: 1,
+		PayloadType:    101,
+		ClockRate:      8000,
+		SequenceNumber: 90,
+		Timestamp:      0x09090909,
+		SSRC:           0x09090909,
+	})
+	if err != nil {
+		t.Fatalf("SendRTPDTMFToIMS() error = %v", err)
+	}
+	if dtmf.Packets != 2 {
+		t.Fatalf("DTMF result=%+v", dtmf)
+	}
+	for i := 0; i < dtmf.Packets; i++ {
+		got, _ := readTestUDP(t, imsPeer)
+		plain, err := media.UnprotectIMSRTP(got)
+		if err != nil {
+			t.Fatalf("UnprotectIMSRTP(DTMF %d) error = %v", i, err)
+		}
+		event, ok, err := ParseRTPDTMFEvent(RTPDTMFClientToIMS, plain, map[uint8]int{101: 8000})
+		if err != nil || !ok || event.Signal != "9" {
+			t.Fatalf("DTMF event[%d]=%+v ok=%v err=%v", i, event, ok, err)
+		}
+	}
+
+	rtcpResult, err := relay.SendRTCPToClient(context.Background(), &rtcp.ReceiverReport{SSRC: 0x51525354})
+	if err != nil {
+		t.Fatalf("SendRTCPToClient() error = %v", err)
+	}
+	if rtcpResult.Datagrams != 1 {
+		t.Fatalf("RTCP result=%+v", rtcpResult)
+	}
+	got, _ = readTestUDP(t, clientRTCPPeer)
+	plainRTCP, err := media.UnprotectClientRTCP(got)
+	if err != nil {
+		t.Fatalf("UnprotectClientRTCP() error = %v", err)
+	}
+	packets, err := rtcp.Unmarshal(plainRTCP)
+	if err != nil {
+		t.Fatalf("rtcp.Unmarshal() error = %v", err)
+	}
+	if rr, ok := packets[0].(*rtcp.ReceiverReport); !ok || rr.SSRC != 0x51525354 {
+		t.Fatalf("RTCP packets=%+v", packets)
+	}
+
+	if err := relay.SetTransforms(RTPRelayTransforms{}); err != nil {
+		t.Fatalf("SetTransforms(clear) error = %v", err)
+	}
+	if relay.Transforms().ClientToIMSRTP != nil {
+		t.Fatalf("Transforms() still has ClientToIMSRTP after clear")
+	}
+	finalPlain := testRTPPacket(43, 0x22222222, []byte{0x43})
+	if _, err := imsPeer.WriteToUDP(finalPlain, imsEndpoint); err != nil {
+		t.Fatalf("IMS final WriteToUDP() error = %v", err)
+	}
+	if got, _ := readTestUDP(t, clientPeer); !bytes.Equal(got, finalPlain) {
+		t.Fatalf("client final RTP=%x, want %x", got, finalPlain)
+	}
+
+	if err := relay.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := relay.SetTransforms(media.RelayTransforms()); !errors.Is(err, ErrRTPRelayConfig) {
+		t.Fatalf("SetTransforms(closed) err=%v, want ErrRTPRelayConfig", err)
 	}
 }
 

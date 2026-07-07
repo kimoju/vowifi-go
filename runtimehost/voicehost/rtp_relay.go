@@ -50,6 +50,8 @@ type RTPRelayTransforms struct {
 	GeneratedToClientRTCP RTPRelayTransform
 }
 
+type rtpRelayTransformSelector func(RTPRelayTransforms) RTPRelayTransform
+
 type RTPRelayDTMFRequest struct {
 	Direction      RTPDTMFDirection
 	Signal         string
@@ -366,15 +368,37 @@ func newRTPRelaySession(ctx context.Context, cfg RTPRelayConfig) (*RTPRelaySessi
 		s.bufferSize = 2048
 	}
 	s.wg.Add(4)
-	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, s.allowClientToIMSRTP, &s.clientToIMSRTPPackets, &s.clientToIMSRTPBytes, &s.clientToIMSRTPDrops, s.transforms.ClientToIMSRTP, "", RTPDTMFClientToIMS, s.currentClientRTPDTMFPayloads, s.currentIMSRTPDTMFPayloads, RTPDTMFClientToIMS, s.clientRTPClockRate)
-	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, s.allowIMSToClientRTP, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes, &s.imsToClientRTPDrops, s.transforms.IMSToClientRTP, "", RTPDTMFIMSToClient, s.currentIMSRTPDTMFPayloads, s.currentClientRTPDTMFPayloads, RTPDTMFIMSToClient, s.imsRTPClockRate)
-	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, nil, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes, &s.clientToIMSRTCPDrops, s.transforms.ClientToIMSRTCP, RTCPFeedbackClientToIMS, "", nil, nil, "", 0)
-	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, nil, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes, &s.imsToClientRTCPDrops, s.transforms.IMSToClientRTCP, RTCPFeedbackIMSToClient, "", nil, nil, "", 0)
+	go s.forwardLoop(childCtx, s.clientConn, s.imsConn, s.currentIMSTarget, s.allowClientToIMSRTP, &s.clientToIMSRTPPackets, &s.clientToIMSRTPBytes, &s.clientToIMSRTPDrops, selectClientToIMSRTPTransform, "", RTPDTMFClientToIMS, s.currentClientRTPDTMFPayloads, s.currentIMSRTPDTMFPayloads, RTPDTMFClientToIMS, s.clientRTPClockRate)
+	go s.forwardLoop(childCtx, s.imsConn, s.clientConn, s.currentClientTarget, s.allowIMSToClientRTP, &s.imsToClientRTPPackets, &s.imsToClientRTPBytes, &s.imsToClientRTPDrops, selectIMSToClientRTPTransform, "", RTPDTMFIMSToClient, s.currentIMSRTPDTMFPayloads, s.currentClientRTPDTMFPayloads, RTPDTMFIMSToClient, s.imsRTPClockRate)
+	go s.forwardLoop(childCtx, s.clientRTCPConn, s.imsRTCPConn, s.currentIMSRTCPTarget, nil, &s.clientToIMSRTCPPackets, &s.clientToIMSRTCPBytes, &s.clientToIMSRTCPDrops, selectClientToIMSRTCPTransform, RTCPFeedbackClientToIMS, "", nil, nil, "", 0)
+	go s.forwardLoop(childCtx, s.imsRTCPConn, s.clientRTCPConn, s.currentClientRTCPTarget, nil, &s.imsToClientRTCPPackets, &s.imsToClientRTCPBytes, &s.imsToClientRTCPDrops, selectIMSToClientRTCPTransform, RTCPFeedbackIMSToClient, "", nil, nil, "", 0)
 	if err := s.StartRTCPReportSchedule(childCtx, cfg.RTCPReportSchedule); err != nil {
 		_ = s.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+func (s *RTPRelaySession) SetTransforms(transforms RTPRelayTransforms) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("%w: relay is closed", ErrRTPRelayConfig)
+	}
+	s.transforms = transforms
+	return nil
+}
+
+func (s *RTPRelaySession) Transforms() RTPRelayTransforms {
+	if s == nil {
+		return RTPRelayTransforms{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.transforms
 }
 
 func (s *RTPRelaySession) IMSOfferSDP(clientOffer SDPInfo) []byte {
@@ -736,8 +760,8 @@ func (s *RTPRelaySession) SendRTPDTMF(ctx context.Context, req RTPRelayDTMFReque
 		}
 		s.recordRTPDTMFSummary(direction, summary)
 		out := packet
-		if route.transform != nil {
-			transformed, err := route.transform(packet)
+		if transform := route.transform(); transform != nil {
+			transformed, err := transform(packet)
 			if err != nil {
 				route.drops.Add(1)
 				return result, err
@@ -806,8 +830,8 @@ func (s *RTPRelaySession) SendRTCP(ctx context.Context, req RTPRelayRTCPRequest)
 	}
 	s.recordRTCPFeedbackSummary(summary)
 	out := packet
-	if route.transform != nil {
-		transformed, err := route.transform(packet)
+	if transform := route.transform(); transform != nil {
+		transformed, err := transform(packet)
 		if err != nil {
 			route.drops.Add(1)
 			return RTPRelayRTCPResult{Feedback: summary}, err
@@ -889,7 +913,7 @@ func (s *RTPRelaySession) SendSenderReport(ctx context.Context, req RTPRelaySend
 	})
 }
 
-func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, allow func() bool, packets, bytes, drops *atomic.Uint64, transform RTPRelayTransform, rtcpDirection RTCPFeedbackDirection, dtmfDirection RTPDTMFDirection, dtmfPayloads, dtmfTargetPayloads func() map[uint8]int, rtpStatsDirection RTPDTMFDirection, rtpClockRate int) {
+func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, allow func() bool, packets, bytes, drops *atomic.Uint64, transformSelector rtpRelayTransformSelector, rtcpDirection RTCPFeedbackDirection, dtmfDirection RTPDTMFDirection, dtmfPayloads, dtmfTargetPayloads func() map[uint8]int, rtpStatsDirection RTPDTMFDirection, rtpClockRate int) {
 	defer s.wg.Done()
 	buf := make([]byte, s.bufferSize)
 	for {
@@ -911,6 +935,7 @@ func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn
 			continue
 		}
 		packet := append([]byte(nil), buf[:n]...)
+		transform := s.currentTransform(transformSelector)
 		if transform == nil && rtpStatsDirection != "" {
 			s.observeRTPStream(rtpStatsDirection, packet, time.Now(), rtpClockRate)
 		}
@@ -1028,7 +1053,7 @@ type rtpDTMFSendRoute struct {
 	target    *net.UDPAddr
 	allow     func() bool
 	payloads  map[uint8]int
-	transform RTPRelayTransform
+	transform func() RTPRelayTransform
 	packets   *atomic.Uint64
 	bytes     *atomic.Uint64
 	drops     *atomic.Uint64
@@ -1038,7 +1063,7 @@ type rtcpSendRoute struct {
 	label     string
 	conn      *net.UDPConn
 	target    *net.UDPAddr
-	transform RTPRelayTransform
+	transform func() RTPRelayTransform
 	packets   *atomic.Uint64
 	bytes     *atomic.Uint64
 	drops     *atomic.Uint64
@@ -1056,7 +1081,7 @@ func (s *RTPRelaySession) rtpDTMFSendRoute(direction RTPDTMFDirection) (rtpDTMFS
 			target:    s.currentIMSTarget(),
 			allow:     s.allowClientToIMSRTP,
 			payloads:  s.currentIMSRTPDTMFPayloads(),
-			transform: s.transforms.GeneratedToIMSRTP,
+			transform: func() RTPRelayTransform { return s.currentTransform(selectGeneratedToIMSRTPTransform) },
 			packets:   &s.clientToIMSRTPPackets,
 			bytes:     &s.clientToIMSRTPBytes,
 			drops:     &s.clientToIMSRTPDrops,
@@ -1068,7 +1093,7 @@ func (s *RTPRelaySession) rtpDTMFSendRoute(direction RTPDTMFDirection) (rtpDTMFS
 			target:    s.currentClientTarget(),
 			allow:     s.allowIMSToClientRTP,
 			payloads:  s.currentClientRTPDTMFPayloads(),
-			transform: s.transforms.GeneratedToClientRTP,
+			transform: func() RTPRelayTransform { return s.currentTransform(selectGeneratedToClientRTPTransform) },
 			packets:   &s.imsToClientRTPPackets,
 			bytes:     &s.imsToClientRTPBytes,
 			drops:     &s.imsToClientRTPDrops,
@@ -1088,7 +1113,7 @@ func (s *RTPRelaySession) rtcpSendRoute(direction RTCPFeedbackDirection) (rtcpSe
 			label:     "IMS",
 			conn:      s.imsRTCPConn,
 			target:    s.currentIMSRTCPTarget(),
-			transform: s.transforms.GeneratedToIMSRTCP,
+			transform: func() RTPRelayTransform { return s.currentTransform(selectGeneratedToIMSRTCPTransform) },
 			packets:   &s.clientToIMSRTCPPackets,
 			bytes:     &s.clientToIMSRTCPBytes,
 			drops:     &s.clientToIMSRTCPDrops,
@@ -1098,7 +1123,7 @@ func (s *RTPRelaySession) rtcpSendRoute(direction RTCPFeedbackDirection) (rtcpSe
 			label:     "client",
 			conn:      s.clientRTCPConn,
 			target:    s.currentClientRTCPTarget(),
-			transform: s.transforms.GeneratedToClientRTCP,
+			transform: func() RTPRelayTransform { return s.currentTransform(selectGeneratedToClientRTCPTransform) },
 			packets:   &s.imsToClientRTCPPackets,
 			bytes:     &s.imsToClientRTCPBytes,
 			drops:     &s.imsToClientRTCPDrops,
@@ -1157,6 +1182,48 @@ func (s *RTPRelaySession) buildGeneratedRTPDTMFSequence(direction RTPDTMFDirecti
 	state.nextTimestamp = cfg.Timestamp + uint32(durationSamples)
 	state.ssrc = cfg.SSRC
 	return packets, cfg, nil
+}
+
+func (s *RTPRelaySession) currentTransform(selector rtpRelayTransformSelector) RTPRelayTransform {
+	if s == nil || selector == nil {
+		return nil
+	}
+	s.mu.RLock()
+	transforms := s.transforms
+	s.mu.RUnlock()
+	return selector(transforms)
+}
+
+func selectClientToIMSRTPTransform(transforms RTPRelayTransforms) RTPRelayTransform {
+	return transforms.ClientToIMSRTP
+}
+
+func selectIMSToClientRTPTransform(transforms RTPRelayTransforms) RTPRelayTransform {
+	return transforms.IMSToClientRTP
+}
+
+func selectClientToIMSRTCPTransform(transforms RTPRelayTransforms) RTPRelayTransform {
+	return transforms.ClientToIMSRTCP
+}
+
+func selectIMSToClientRTCPTransform(transforms RTPRelayTransforms) RTPRelayTransform {
+	return transforms.IMSToClientRTCP
+}
+
+func selectGeneratedToIMSRTPTransform(transforms RTPRelayTransforms) RTPRelayTransform {
+	return transforms.GeneratedToIMSRTP
+}
+
+func selectGeneratedToClientRTPTransform(transforms RTPRelayTransforms) RTPRelayTransform {
+	return transforms.GeneratedToClientRTP
+}
+
+func selectGeneratedToIMSRTCPTransform(transforms RTPRelayTransforms) RTPRelayTransform {
+	return transforms.GeneratedToIMSRTCP
+}
+
+func selectGeneratedToClientRTCPTransform(transforms RTPRelayTransforms) RTPRelayTransform {
+	return transforms.GeneratedToClientRTCP
 }
 
 func normalizeRTCPFeedbackDirection(direction RTCPFeedbackDirection) (RTCPFeedbackDirection, error) {
