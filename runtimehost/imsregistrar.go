@@ -37,6 +37,9 @@ const (
 
 	// IMSRegisterResponseActionBackoffRetry means the UE should retry registration conservatively after delay/backoff.
 	IMSRegisterResponseActionBackoffRetry = "backoff_retry"
+
+	// IMSRegisterResponseActionRefreshSecurity means the UE should rebuild Security-Agree state before retrying.
+	IMSRegisterResponseActionRefreshSecurity = "refresh_security"
 )
 
 // IMSRegisterResponseDecision is a local recovery hint for a SIP REGISTER response.
@@ -47,6 +50,7 @@ type IMSRegisterResponseDecision struct {
 	Retry           bool
 	Reauthenticate  bool
 	RefreshIdentity bool
+	RefreshSecurity bool
 	Backoff         bool
 	RetryAfter      time.Duration
 }
@@ -106,6 +110,11 @@ func ClassifyIMSRegisterResponse(statusCode int, retryAfter time.Duration) IMSRe
 		decision.Action = IMSRegisterResponseActionRetryWithMinExpires
 		decision.Recoverable = true
 		decision.Retry = true
+	case statusCode == 494:
+		decision.Action = IMSRegisterResponseActionRefreshSecurity
+		decision.Recoverable = true
+		decision.Retry = true
+		decision.RefreshSecurity = true
 	case isBackoffIMSRegisterStatus(statusCode):
 		decision.Action = IMSRegisterResponseActionBackoffRetry
 		decision.Recoverable = true

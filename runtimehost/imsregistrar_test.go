@@ -398,6 +398,7 @@ func TestClassifyIMSRegisterResponse(t *testing.T) {
 		wantRetry           bool
 		wantReauthenticate  bool
 		wantRefreshIdentity bool
+		wantRefreshSecurity bool
 		wantBackoff         bool
 		wantRetryAfter      time.Duration
 	}{
@@ -429,6 +430,14 @@ func TestClassifyIMSRegisterResponse(t *testing.T) {
 			wantAction:      IMSRegisterResponseActionRetryWithMinExpires,
 			wantRecoverable: true,
 			wantRetry:       true,
+		},
+		{
+			name:                "494 refreshes security agreement",
+			statusCode:          494,
+			wantAction:          IMSRegisterResponseActionRefreshSecurity,
+			wantRecoverable:     true,
+			wantRetry:           true,
+			wantRefreshSecurity: true,
 		},
 		{
 			name:            "503 backs off with Retry-After",
@@ -463,6 +472,7 @@ func TestClassifyIMSRegisterResponse(t *testing.T) {
 				got.Retry != tc.wantRetry ||
 				got.Reauthenticate != tc.wantReauthenticate ||
 				got.RefreshIdentity != tc.wantRefreshIdentity ||
+				got.RefreshSecurity != tc.wantRefreshSecurity ||
 				got.Backoff != tc.wantBackoff ||
 				got.RetryAfter != tc.wantRetryAfter {
 				t.Fatalf("ClassifyIMSRegisterResponse()=%+v", got)
@@ -481,6 +491,7 @@ func TestIMSRegistrationMaintenanceShouldRecoverFromClassifiedResponses(t *testi
 		{statusCode: 407, want: true},
 		{statusCode: 403, want: false},
 		{statusCode: 423, want: true},
+		{statusCode: 494, want: true},
 		{statusCode: 503, want: true},
 		{statusCode: 486, want: false},
 	}

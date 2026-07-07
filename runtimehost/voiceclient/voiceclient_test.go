@@ -1486,6 +1486,130 @@ func TestRegisterSessionFailureInfoCapturesDiagnosticHeaders(t *testing.T) {
 	}
 }
 
+func TestPlanRegistrationRecoveryAuthenticatesWithSecurityMetadata(t *testing.T) {
+	rawNonce := append(bytesFrom(0x22, 16), bytesFrom(0x52, 16)...)
+	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth-int"`
+	resp := RegisterResponse{
+		StatusCode: 407,
+		Reason:     "Proxy Authentication Required",
+		Headers: map[string][]string{
+			"Proxy-Authenticate": {challenge},
+			"Security-Server": {
+				`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063;q=0.7`,
+			},
+			"Warning": {`399 pcscf.example "security association required"`},
+		},
+	}
+
+	plan := PlanRegistrationRecovery(resp, 600, time.Time{})
+	if plan.Action != RegistrationRecoveryActionAuthenticate ||
+		!plan.Recoverable ||
+		!plan.Retry ||
+		plan.Terminal ||
+		!plan.AuthenticationRefreshNeeded ||
+		!plan.SecurityAssociationNeeded ||
+		plan.ChallengeHeaderName != "Proxy-Authenticate" ||
+		plan.AuthorizationHeaderName != "Proxy-Authorization" ||
+		plan.ChallengeHeader != challenge ||
+		!plan.ChallengeValid ||
+		plan.Challenge.Algorithm != "AKAv2-MD5" ||
+		plan.Challenge.QOP != "auth-int" ||
+		plan.SecurityVerify == "" ||
+		len(plan.SecurityServer) != 1 {
+		t.Fatalf("auth recovery plan=%+v", plan)
+	}
+	assertRegistrationFailureInfo(t, plan.FailureInfo, 407, "Proxy Authentication Required", 0,
+		[]string{`399 pcscf.example "security association required"`}, nil)
+}
+
+func TestPlanRegistrationRecoveryClassifiesRegisterFailures(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		resp       RegisterResponse
+		expires    int
+		wantAction RegistrationRecoveryAction
+		check      func(t *testing.T, plan RegistrationRecoveryPlan)
+	}{
+		{
+			name: "min expires retry",
+			resp: RegisterResponse{
+				StatusCode: 423,
+				Reason:     "Interval Too Brief",
+				Headers:    map[string][]string{"Min-Expires": {"1200"}},
+			},
+			expires:    600,
+			wantAction: RegistrationRecoveryActionRetryMinExpires,
+			check: func(t *testing.T, plan RegistrationRecoveryPlan) {
+				if !plan.Recoverable || !plan.Retry || plan.Terminal || plan.MinExpires != 1200 || plan.NextExpires != 1200 {
+					t.Fatalf("423 plan=%+v", plan)
+				}
+			},
+		},
+		{
+			name: "server backoff retry after zero",
+			resp: RegisterResponse{
+				StatusCode: 503,
+				Reason:     "Service Unavailable",
+				Headers:    map[string][]string{"Retry-After": {"0"}},
+			},
+			expires:    600,
+			wantAction: RegistrationRecoveryActionBackoffRetry,
+			check: func(t *testing.T, plan RegistrationRecoveryPlan) {
+				if !plan.Recoverable || !plan.Retry || plan.Terminal ||
+					!plan.RegistrationRecoveryNeeded ||
+					!plan.RetryAfterPresent ||
+					plan.RetryAfter != 0 ||
+					!plan.NextAttemptAt.Equal(now) {
+					t.Fatalf("503 plan=%+v", plan)
+				}
+			},
+		},
+		{
+			name: "security agreement retry",
+			resp: RegisterResponse{
+				StatusCode: 494,
+				Reason:     "Security Agreement Required",
+				Headers: map[string][]string{
+					"Security-Server": {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=333;spi-s=444;port-c=5062;port-s=5063`},
+				},
+			},
+			expires:    600,
+			wantAction: RegistrationRecoveryActionRefreshSecurity,
+			check: func(t *testing.T, plan RegistrationRecoveryPlan) {
+				if !plan.SecurityAssociationNeeded || !plan.Recoverable || !plan.Retry || plan.Terminal ||
+					plan.SecurityVerify == "" || len(plan.SecurityServer) != 1 {
+					t.Fatalf("494 plan=%+v", plan)
+				}
+			},
+		},
+		{
+			name: "forbidden identity refresh",
+			resp: RegisterResponse{
+				StatusCode: 403,
+				Reason:     "Forbidden",
+			},
+			expires:    600,
+			wantAction: RegistrationRecoveryActionRefreshIdentity,
+			check: func(t *testing.T, plan RegistrationRecoveryPlan) {
+				if !plan.IdentityRefreshNeeded || plan.Retry || !plan.Terminal || plan.Recoverable {
+					t.Fatalf("403 plan=%+v", plan)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := PlanRegistrationRecovery(tt.resp, tt.expires, now)
+			if plan.Action != tt.wantAction || plan.StatusCode != tt.resp.StatusCode || plan.RequestedExpires != tt.expires {
+				t.Fatalf("PlanRegistrationRecovery()=%+v", plan)
+			}
+			tt.check(t, plan)
+		})
+	}
+}
+
 func TestRegisterSessionFallsBackToSupportedDigestChallenge(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{

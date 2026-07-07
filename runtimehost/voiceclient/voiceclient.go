@@ -214,6 +214,47 @@ type RegistrationFailureInfo struct {
 	Reasons      []string
 }
 
+type RegistrationRecoveryAction string
+
+const (
+	RegistrationRecoveryActionNone            RegistrationRecoveryAction = "none"
+	RegistrationRecoveryActionAuthenticate    RegistrationRecoveryAction = "authenticate"
+	RegistrationRecoveryActionRetryMinExpires RegistrationRecoveryAction = "retry_min_expires"
+	RegistrationRecoveryActionRefreshIdentity RegistrationRecoveryAction = "refresh_identity"
+	RegistrationRecoveryActionBackoffRetry    RegistrationRecoveryAction = "backoff_retry"
+	RegistrationRecoveryActionRefreshSecurity RegistrationRecoveryAction = "refresh_security"
+)
+
+// RegistrationRecoveryPlan is a pure-data recovery decision for a SIP REGISTER
+// response. It is safe to persist or hand to a supervising runtime before the
+// next REGISTER attempt is built.
+type RegistrationRecoveryPlan struct {
+	StatusCode                  int
+	Action                      RegistrationRecoveryAction
+	Recoverable                 bool
+	Retry                       bool
+	Terminal                    bool
+	AuthenticationRefreshNeeded bool
+	IdentityRefreshNeeded       bool
+	RegistrationRecoveryNeeded  bool
+	SecurityAssociationNeeded   bool
+	ChallengeHeaderName         string
+	AuthorizationHeaderName     string
+	ChallengeHeader             string
+	Challenge                   DigestChallenge
+	ChallengeValid              bool
+	SecurityVerify              string
+	SecurityServer              []string
+	RequestedExpires            int
+	MinExpires                  int
+	NextExpires                 int
+	RetryAfter                  time.Duration
+	RetryAfterPresent           bool
+	NextAttemptAt               time.Time
+	FailureInfo                 RegistrationFailureInfo
+	Reason                      string
+}
+
 func ParseWWWAuthenticate(header string) (DigestChallenge, error) {
 	var firstErr error
 	for _, header := range digestChallengeHeaderValues(header) {
@@ -897,6 +938,77 @@ func ParseRegistrationFailureInfo(resp RegisterResponse) RegistrationFailureInfo
 	}
 }
 
+// PlanRegistrationRecovery classifies a final SIP REGISTER response into the
+// next recovery step a runtime should prepare. currentExpires is the Expires
+// value used for the failed REGISTER; it is used to decide whether a 423
+// Min-Expires response can be retried.
+func PlanRegistrationRecovery(resp RegisterResponse, currentExpires int, now time.Time) RegistrationRecoveryPlan {
+	retryAfter, retryAfterPresent := registerResponseRetryAfter(resp)
+	plan := RegistrationRecoveryPlan{
+		StatusCode:        resp.StatusCode,
+		Action:            RegistrationRecoveryActionNone,
+		Terminal:          true,
+		RequestedExpires:  currentExpires,
+		RetryAfter:        retryAfter,
+		RetryAfterPresent: retryAfterPresent,
+		FailureInfo:       ParseRegistrationFailureInfo(resp),
+		Reason:            strings.TrimSpace(resp.Reason),
+		SecurityServer:    securityServerHeaderValues(resp.Headers),
+		SecurityVerify:    securityVerifyFromChallenge(resp.Headers),
+	}
+	if plan.Reason == "" && resp.StatusCode > 0 {
+		plan.Reason = strconv.Itoa(resp.StatusCode)
+	}
+	switch {
+	case isSIPSuccess(resp.StatusCode):
+		return plan
+	case resp.StatusCode == 401 || resp.StatusCode == 407:
+		plan.Action = RegistrationRecoveryActionAuthenticate
+		plan.AuthenticationRefreshNeeded = true
+		plan.SecurityAssociationNeeded = len(plan.SecurityServer) > 0
+		plan.ChallengeHeaderName, plan.AuthorizationHeaderName = registerAuthenticationHeaderNames(resp)
+		plan.ChallengeHeader = firstHeader(resp.Headers, plan.ChallengeHeaderName)
+		challenge, err := SelectDigestChallenge(resp.Headers, plan.ChallengeHeaderName)
+		if err != nil {
+			plan.Reason = firstNonEmpty(strings.TrimSpace(err.Error()), plan.Reason)
+			return plan
+		}
+		plan.Challenge = challenge
+		plan.ChallengeValid = true
+		plan.Recoverable = true
+		plan.Retry = true
+		plan.Terminal = false
+	case resp.StatusCode == 423:
+		plan.MinExpires = minExpiresHeader(resp.Headers)
+		plan.NextExpires = plan.MinExpires
+		if plan.MinExpires > 0 && (currentExpires <= 0 || plan.MinExpires > currentExpires) {
+			plan.Action = RegistrationRecoveryActionRetryMinExpires
+			plan.Recoverable = true
+			plan.Retry = true
+			plan.Terminal = false
+		}
+	case resp.StatusCode == 403:
+		plan.Action = RegistrationRecoveryActionRefreshIdentity
+		plan.IdentityRefreshNeeded = true
+	case resp.StatusCode == 494:
+		plan.Action = RegistrationRecoveryActionRefreshSecurity
+		plan.SecurityAssociationNeeded = true
+		plan.Retry = len(plan.SecurityServer) > 0
+		plan.Recoverable = plan.Retry
+		plan.Terminal = !plan.Retry
+	case registerResponseNeedsBackoffRecovery(resp.StatusCode):
+		plan.Action = RegistrationRecoveryActionBackoffRetry
+		plan.Recoverable = true
+		plan.Retry = true
+		plan.Terminal = false
+		plan.RegistrationRecoveryNeeded = true
+	}
+	if plan.Retry && retryAfterPresent && !now.IsZero() {
+		plan.NextAttemptAt = now.Add(retryAfter)
+	}
+	return plan
+}
+
 func deregisterFailureResult(resp RegisterResponse, attempts int) DeregisterResult {
 	return DeregisterResult{
 		StatusCode:  resp.StatusCode,
@@ -1303,6 +1415,68 @@ func registerDigestChallenge(headers map[string][]string) (DigestChallenge, stri
 	}
 	ch, err := SelectDigestChallenge(headers, challengeHeader)
 	return ch, authHeaderName, err
+}
+
+func registerAuthenticationHeaderNames(resp RegisterResponse) (challengeHeader, authHeader string) {
+	if resp.StatusCode == 407 || firstHeader(resp.Headers, "WWW-Authenticate") == "" {
+		return "Proxy-Authenticate", "Proxy-Authorization"
+	}
+	return "WWW-Authenticate", "Authorization"
+}
+
+func registerResponseRetryAfter(resp RegisterResponse) (time.Duration, bool) {
+	retryAfter := SIPResponseRetryAfter(resp)
+	if retryAfter > 0 || resp.RetryAfter > 0 {
+		return retryAfter, true
+	}
+	for _, value := range rawHeaderValues(resp.Headers, "Retry-After") {
+		if registerRetryAfterValuePresent(value) {
+			return retryAfter, true
+		}
+	}
+	return 0, false
+}
+
+func registerRetryAfterValuePresent(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	end := 0
+	for end < len(value) {
+		switch value[end] {
+		case ' ', '\t', ';', '(', ',':
+			goto parse
+		default:
+			end++
+		}
+	}
+parse:
+	if token := strings.TrimSpace(value[:end]); token != "" {
+		seconds, err := strconv.Atoi(token)
+		if err == nil && seconds >= 0 {
+			return true
+		}
+	}
+	dateValue := strings.TrimSpace(value)
+	if semi := strings.IndexByte(dateValue, ';'); semi >= 0 {
+		dateValue = strings.TrimSpace(dateValue[:semi])
+	}
+	for _, layout := range []string{time.RFC1123, time.RFC1123Z, time.RFC850, time.ANSIC} {
+		if _, err := time.Parse(layout, dateValue); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func registerResponseNeedsBackoffRecovery(statusCode int) bool {
+	switch statusCode {
+	case 408, 430, 480, 500, 502, 503, 504, 580:
+		return true
+	default:
+		return statusCode >= 500 && statusCode < 600
+	}
 }
 
 func updateDigestAuthStateFromInfo(state DigestAuthState, headers map[string][]string, authHeaderName string, body []byte) (DigestAuthState, error) {
