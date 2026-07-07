@@ -268,6 +268,136 @@ func TestPacketSessionAdvanceChildSARekeyTriggersWhenDue(t *testing.T) {
 	}
 }
 
+func TestPacketSessionRunChildSARekeyDueUpdatesNextDue(t *testing.T) {
+	start := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	newChild := packetRekeyChildSA(true)
+	rekeyCalls := 0
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: &captureESPPacketTransport{},
+		Result: TunnelResult{
+			Ready:             true,
+			Mode:              DataplaneModeUserspace,
+			IKEEstablished:    true,
+			IPsecEstablished:  true,
+			ChildSAIdentifier: "11111111/22222222",
+			EstablishedAt:     start,
+		},
+		RekeyHandler: func(context.Context) (ikev2.ChildSAResult, error) {
+			rekeyCalls++
+			return newChild, nil
+		},
+		RekeyPolicy: ChildSARekeyPolicy{
+			Lifetime: time.Minute,
+			LeadTime: 10 * time.Second,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	dueAt := start.Add(50 * time.Second)
+	nextDue, ok := session.NextChildSARekeyDue()
+	if !ok || !nextDue.Equal(dueAt) {
+		t.Fatalf("NextChildSARekeyDue()=%v,%t want %v,true", nextDue, ok, dueAt)
+	}
+
+	decision, err := session.RunChildSARekeyDue(context.Background(), dueAt)
+	if err != nil {
+		t.Fatalf("RunChildSARekeyDue() error = %v", err)
+	}
+	if decision.Action != ChildSARekeyDue || rekeyCalls != 1 {
+		t.Fatalf("decision=%+v rekeyCalls=%d", decision, rekeyCalls)
+	}
+	wantNext := dueAt.Add(50 * time.Second)
+	if !decision.DueAt.Equal(dueAt) || !decision.NextDue.Equal(wantNext) {
+		t.Fatalf("decision schedule=%+v want due=%v next=%v", decision, dueAt, wantNext)
+	}
+	nextDue, ok = session.NextChildSARekeyDue()
+	if !ok || !nextDue.Equal(wantNext) {
+		t.Fatalf("NextChildSARekeyDue(after)=%v,%t want %v,true", nextDue, ok, wantNext)
+	}
+}
+
+func TestPacketSessionRunChildSARekeyDueDisabledNoops(t *testing.T) {
+	start := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	rekeyCalls := 0
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: &captureESPPacketTransport{},
+		Result: TunnelResult{
+			Ready:            true,
+			IKEEstablished:   true,
+			IPsecEstablished: true,
+			EstablishedAt:    start,
+		},
+		RekeyHandler: func(context.Context) (ikev2.ChildSAResult, error) {
+			rekeyCalls++
+			return packetRekeyChildSA(true), nil
+		},
+		RekeyPolicy: ChildSARekeyPolicy{Disabled: true},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	nextDue, ok := session.NextChildSARekeyDue()
+	if ok || !nextDue.IsZero() {
+		t.Fatalf("NextChildSARekeyDue()=%v,%t want zero,false", nextDue, ok)
+	}
+	decision, err := session.RunChildSARekeyDue(context.Background(), start.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RunChildSARekeyDue(disabled) error = %v", err)
+	}
+	if decision.Action != ChildSARekeyNoAction || decision.Reason != "rekey disabled" || rekeyCalls != 0 {
+		t.Fatalf("decision=%+v rekeyCalls=%d", decision, rekeyCalls)
+	}
+}
+
+func TestPacketSessionRunChildSARekeyDueErrorKeepsScheduleAndResult(t *testing.T) {
+	start := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+	wantErr := errors.New("rekey failed")
+	rekeyCalls := 0
+	session, err := NewPacketSession(PacketSessionConfig{
+		ChildSA:   packetChildSA(true),
+		Transport: &captureESPPacketTransport{},
+		Result: TunnelResult{
+			Ready:             true,
+			Mode:              DataplaneModeUserspace,
+			IKEEstablished:    true,
+			IPsecEstablished:  true,
+			ChildSAIdentifier: "11111111/22222222",
+			Reason:            "packet tunnel ready",
+			EstablishedAt:     start,
+		},
+		RekeyHandler: func(context.Context) (ikev2.ChildSAResult, error) {
+			rekeyCalls++
+			return ikev2.ChildSAResult{}, wantErr
+		},
+		RekeyPolicy: ChildSARekeyPolicy{
+			Lifetime: time.Minute,
+			LeadTime: 10 * time.Second,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketSession() error = %v", err)
+	}
+	dueAt := start.Add(50 * time.Second)
+	decision, err := session.RunChildSARekeyDue(context.Background(), dueAt)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("RunChildSARekeyDue() err=%v, want rekey failed", err)
+	}
+	if decision.Action != ChildSARekeyDue || rekeyCalls != 1 {
+		t.Fatalf("decision=%+v rekeyCalls=%d", decision, rekeyCalls)
+	}
+	nextDue, ok := session.NextChildSARekeyDue()
+	if !ok || !nextDue.Equal(dueAt) {
+		t.Fatalf("NextChildSARekeyDue(after error)=%v,%t want %v,true", nextDue, ok, dueAt)
+	}
+	result := session.Result()
+	if result.ChildSAIdentifier != "11111111/22222222" || result.Reason != "packet tunnel ready" || !result.IsReady() {
+		t.Fatalf("result changed after failed due rekey: %+v", result)
+	}
+}
+
 func TestPacketSessionReadInnerPacketUsesReadableTransport(t *testing.T) {
 	wire := &captureESPPacketTransport{}
 	a, err := NewPacketSession(PacketSessionConfig{ChildSA: packetChildSA(true), Transport: wire})

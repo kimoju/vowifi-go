@@ -44,6 +44,13 @@ func (f ESPPacketTransportFunc) SendESPPacket(ctx context.Context, packet []byte
 
 type ChildSARekeyHandler func(context.Context) (ikev2.ChildSAResult, error)
 
+type ChildSARekeyScheduler interface {
+	RekeyChildSA(context.Context) (TunnelResult, error)
+	NextChildSARekeyDue() (time.Time, bool)
+	RunChildSARekeyDue(context.Context, time.Time) (ChildSARekeyDecision, error)
+	ChildSARekeySnapshot() ChildSARekeySnapshot
+}
+
 type ChildSARekeyAction uint8
 
 const (
@@ -148,6 +155,13 @@ func (s *ChildSARekeyState) Snapshot() ChildSARekeySnapshot {
 		Lifetime:      s.policy.Lifetime,
 		LeadTime:      s.policy.LeadTime,
 	}
+}
+
+func (s *ChildSARekeyState) NextDue() (time.Time, bool) {
+	if s == nil || !s.enabled {
+		return time.Time{}, false
+	}
+	return s.dueAt(), true
 }
 
 func (s *ChildSARekeyState) decision(now time.Time, action ChildSARekeyAction, reason string) ChildSARekeyDecision {
@@ -273,6 +287,7 @@ var (
 	_ MOBIKENATObserver       = (*PacketSession)(nil)
 	_ IKELivenessController   = (*PacketSession)(nil)
 	_ ChildSARekeyController  = (*PacketSession)(nil)
+	_ ChildSARekeyScheduler   = (*PacketSession)(nil)
 )
 
 func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
@@ -426,6 +441,29 @@ func (s *PacketSession) AdvanceChildSARekey(ctx context.Context, now time.Time) 
 	}
 	_, err := s.rekeyChildSA(ctx, now)
 	return decision, err
+}
+
+func (s *PacketSession) RunChildSARekeyDue(ctx context.Context, now time.Time) (ChildSARekeyDecision, error) {
+	decision, err := s.AdvanceChildSARekey(ctx, now)
+	if err != nil || decision.Action != ChildSARekeyDue {
+		return decision, err
+	}
+	if nextDue, ok := s.NextChildSARekeyDue(); ok {
+		decision.NextDue = nextDue
+	}
+	return decision, nil
+}
+
+func (s *PacketSession) NextChildSARekeyDue() (time.Time, bool) {
+	if s == nil {
+		return time.Time{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.rekeyState == nil {
+		return time.Time{}, false
+	}
+	return s.rekeyState.NextDue()
 }
 
 func (s *PacketSession) ChildSARekeySnapshot() ChildSARekeySnapshot {
