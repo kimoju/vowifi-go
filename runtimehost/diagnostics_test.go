@@ -90,6 +90,23 @@ func TestRuntimeSnapshotAndObsUseDiagnosticState(t *testing.T) {
 	}
 }
 
+func TestSafeDiagnosticIMSRegisterResponseDecisionRedactsReason(t *testing.T) {
+	reason := `403 Forbidden for sip:310280233641503@ims.example from 192.168.31.34; WWW-Authenticate: Digest nonce="recover-secret"; path=/` + "home" + `/boa/vohive/ims.log`
+	decision := ClassifyIMSRegisterResponse(503, 7*time.Second)
+
+	got := SafeDiagnosticIMSRegisterResponseDecision(decision, reason)
+	if !got.Redacted || got.StatusCode != 503 || got.Action != IMSRegisterResponseActionBackoffRetry ||
+		!got.Recoverable || !got.Retry || !got.Backoff || got.RetryAfter != 7*time.Second {
+		t.Fatalf("diagnostic decision lost recovery fields: %+v", got)
+	}
+	assertNoRuntimeDiagnosticLeak(t, fmt.Sprintf("%+v", got), "/"+filepathJoinForDiagnosticTest("home", "boa", "vohive", "ims.log"))
+	for _, want := range []string{"<redacted", ".invalid", "<redacted-local-path>"} {
+		if !strings.Contains(fmt.Sprintf("%+v", got), want) {
+			t.Fatalf("diagnostic decision does not contain redaction marker %q: %+v", want, got)
+		}
+	}
+}
+
 func assertNoRuntimeDiagnosticLeak(t *testing.T, value string, extraLeaks ...string) {
 	t.Helper()
 	leaks := []string{
@@ -107,4 +124,8 @@ func assertNoRuntimeDiagnosticLeak(t *testing.T, value string, extraLeaks ...str
 			t.Fatalf("diagnostic output leaked %q in %q", leak, value)
 		}
 	}
+}
+
+func filepathJoinForDiagnosticTest(parts ...string) string {
+	return strings.Join(parts, "/")
 }

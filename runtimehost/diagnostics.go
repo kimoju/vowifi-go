@@ -36,6 +36,24 @@ type DiagnosticState struct {
 	Redacted                 bool
 }
 
+// DiagnosticIMSRegisterResponseDecision is a redacted view of an IMS REGISTER
+// recovery decision. It is suitable for logs/UI because it carries the
+// operational recovery action without exposing SIP identities or auth material
+// from the response reason.
+type DiagnosticIMSRegisterResponseDecision struct {
+	StatusCode      int
+	Action          string
+	Recoverable     bool
+	Retry           bool
+	Reauthenticate  bool
+	RefreshIdentity bool
+	RefreshSecurity bool
+	Backoff         bool
+	RetryAfter      time.Duration
+	Reason          string
+	Redacted        bool
+}
+
 // SafeDiagnosticState returns a diagnostic view of state with sensitive text
 // fields redacted. It does not mutate the input State.
 func SafeDiagnosticState(state State) DiagnosticState {
@@ -61,6 +79,25 @@ func SafeDiagnosticState(state State) DiagnosticState {
 		IMSRecoveryReason:        redactRuntimeDiagnosticString(redactor, state.IMSRecoveryReason),
 		UpdatedAt:                state.UpdatedAt,
 		Redacted:                 true,
+	}
+}
+
+// SafeDiagnosticIMSRegisterResponseDecision returns a diagnostic view of an IMS
+// REGISTER recovery decision with optional response reason text redacted.
+func SafeDiagnosticIMSRegisterResponseDecision(decision IMSRegisterResponseDecision, reason string) DiagnosticIMSRegisterResponseDecision {
+	redactor := tracefixture.NewRedactor()
+	return DiagnosticIMSRegisterResponseDecision{
+		StatusCode:      decision.StatusCode,
+		Action:          redactRuntimeDiagnosticString(redactor, decision.Action),
+		Recoverable:     decision.Recoverable,
+		Retry:           decision.Retry,
+		Reauthenticate:  decision.Reauthenticate,
+		RefreshIdentity: decision.RefreshIdentity,
+		RefreshSecurity: decision.RefreshSecurity,
+		Backoff:         decision.Backoff,
+		RetryAfter:      decision.RetryAfter,
+		Reason:          redactRuntimeDiagnosticString(redactor, reason),
+		Redacted:        true,
 	}
 }
 

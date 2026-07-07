@@ -9,9 +9,10 @@ be treated as usable inside VoHive beyond compile-time compatibility tests.
 The repository currently has local CI, GitHub Actions CI, module-path hygiene
 checks, and a compatibility script that can rewrite an older VoHive consumer in
 a temporary checkout and run a focused test set against this module.
-The VoHive-facing runtime state also has a redacted diagnostic view for logs,
-UI state, and event snapshots so common subscriber identifiers, AKA/digest
-material, IPs, MACs, and local paths are not exposed by default.
+The VoHive-facing runtime state also has redacted diagnostic views for logs,
+UI state, event snapshots, and IMS REGISTER recovery decisions so common
+subscriber identifiers, AKA/digest material, IPs, MACs, and local paths are not
+exposed by default.
 
 That proves an important baseline: VoHive can resolve and compile against this
 module in the covered package set, and the loopback/unit tests exercise many
@@ -220,7 +221,8 @@ Done means:
 
 - Runtime state exposes registration, tunnel, modem, messaging, E911, and voice
   health snapshots.
-- Recovery decisions include reason codes, retry timing, and next actions.
+- Recovery decisions include reason codes, retry timing, and next actions; IMS
+  REGISTER response decisions now have a redacted diagnostic shape.
 - VoHive can present concise user-facing failures for modem control, SIM auth,
   ePDG, IMS registration, messaging, E911, and voice media.
 
@@ -256,7 +258,8 @@ following evidence exists:
 
 1. Keep the VoHive compatibility package matrix synchronized with VoHive
    consumers on every release candidate.
-2. Wire registration recovery plans into VoHive-facing runtime state and logs.
+2. Wire registration recovery plans and redacted IMS REGISTER decisions into
+   VoHive-facing runtime state and logs.
 3. Run and document a real modem/SIM identity and AKA validation pass.
 4. Prove SWu/ePDG tunnel setup and cleanup in a controlled environment.
 5. Prove IMS registration with Security-Agree and refresh maintenance.
