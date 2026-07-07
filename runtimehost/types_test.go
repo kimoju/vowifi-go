@@ -1123,6 +1123,46 @@ func TestRuntimeIMSRecoveryHonorsRetryAfterContext(t *testing.T) {
 	if recoveries != 0 {
 		t.Fatalf("recoveries=%d, want 0 before Retry-After elapses", recoveries)
 	}
+	st := inst.State()
+	if !st.IMSReady || !st.IMSRecoveryPending || st.IMSRecoveryRetryAfter != time.Second ||
+		st.IMSRecoveryNextAttemptAt.IsZero() ||
+		st.IMSRecoveryReason != "Service Unavailable" ||
+		st.LastReason != "IMS registration recovery delayed: Service Unavailable" {
+		t.Fatalf("state after Retry-After cancellation=%+v", st)
+	}
+}
+
+func TestRuntimeIMSRecoveryClearsRetryAfterPendingStateOnSuccess(t *testing.T) {
+	profile := voiceclient.IMSProfile{IMPI: "user@ims.example", IMPU: "sip:user@ims.example", Domain: "ims.example"}
+	binding := voiceclient.RegistrationBinding{ContactURI: "sip:user@192.0.2.10:5060", PublicIdentity: "sip:user@ims.example"}
+	recoveries := 0
+	inst := &Instance{
+		state: State{DeviceID: "dev-retry-after-success", Phase: PhaseReady, IMSReady: true},
+		imsRecover: func(ctx context.Context) (IMSRegistrationResult, error) {
+			recoveries++
+			return IMSRegistrationResult{
+				Registered: true,
+				StatusCode: 200,
+				Reason:     "ims recovered",
+				Profile:    profile,
+				Binding:    binding,
+			}, nil
+		},
+	}
+
+	result, recovered, err := inst.recoverIMSRegistration(context.Background(), "Service Unavailable", false, time.Millisecond)
+	if err != nil || !recovered || !result.Registered {
+		t.Fatalf("recoverIMSRegistration() result=%+v recovered=%v err=%v", result, recovered, err)
+	}
+	if recoveries != 1 {
+		t.Fatalf("recoveries=%d, want 1", recoveries)
+	}
+	st := inst.State()
+	if !st.IMSReady || st.IMSRecoveryPending || st.IMSRecoveryRetryAfter != 0 ||
+		!st.IMSRecoveryNextAttemptAt.IsZero() || st.IMSRecoveryReason != "" ||
+		st.LastReason != "ims recovered" {
+		t.Fatalf("state after recovery success=%+v", st)
+	}
 }
 
 func TestRuntimeIMSRecoveryAfterByeCancelRecoverableResults(t *testing.T) {

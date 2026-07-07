@@ -71,21 +71,25 @@ type LogNotify struct {
 }
 
 type RuntimeStateSnapshot struct {
-	DevID          string
-	Phase          string
-	DataplaneMode  string
-	SIMReady       bool
-	AccessReady    bool
-	TunnelReady    bool
-	IMSReady       bool
-	SMSReady       bool
-	RegStatus      int
-	RegStatusText  string
-	NetworkMode    string
-	LastErrorClass string
-	LastError      string
-	LastReason     string
-	Time           time.Time
+	DevID                    string
+	Phase                    string
+	DataplaneMode            string
+	SIMReady                 bool
+	AccessReady              bool
+	TunnelReady              bool
+	IMSReady                 bool
+	SMSReady                 bool
+	RegStatus                int
+	RegStatusText            string
+	NetworkMode              string
+	LastErrorClass           string
+	LastError                string
+	LastReason               string
+	IMSRecoveryPending       bool
+	IMSRecoveryRetryAfter    time.Duration
+	IMSRecoveryNextAttemptAt time.Time
+	IMSRecoveryReason        string
+	Time                     time.Time
 }
 
 type ControlPortHint struct {
@@ -167,6 +171,7 @@ func NormalizeRuntimeStateSnapshot(snapshot RuntimeStateSnapshot) (RuntimeStateS
 	snapshot.LastErrorClass = strings.TrimSpace(snapshot.LastErrorClass)
 	snapshot.LastError = strings.TrimSpace(snapshot.LastError)
 	snapshot.LastReason = strings.TrimSpace(snapshot.LastReason)
+	snapshot.IMSRecoveryReason = strings.TrimSpace(snapshot.IMSRecoveryReason)
 	if snapshot.DevID == "" {
 		return RuntimeStateSnapshot{}, errors.New("runtime state snapshot device id is empty")
 	}

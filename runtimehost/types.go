@@ -54,21 +54,25 @@ const (
 )
 
 type State struct {
-	DeviceID       string
-	Phase          Phase
-	DataplaneMode  string
-	SIMReady       bool
-	AccessReady    bool
-	TunnelReady    bool
-	IMSReady       bool
-	SMSReady       bool
-	RegStatus      int
-	RegStatusText  string
-	NetworkMode    string
-	LastErrorClass string
-	LastError      string
-	LastReason     string
-	UpdatedAt      time.Time
+	DeviceID                 string
+	Phase                    Phase
+	DataplaneMode            string
+	SIMReady                 bool
+	AccessReady              bool
+	TunnelReady              bool
+	IMSReady                 bool
+	SMSReady                 bool
+	RegStatus                int
+	RegStatusText            string
+	NetworkMode              string
+	LastErrorClass           string
+	LastError                string
+	LastReason               string
+	IMSRecoveryPending       bool
+	IMSRecoveryRetryAfter    time.Duration
+	IMSRecoveryNextAttemptAt time.Time
+	IMSRecoveryReason        string
+	UpdatedAt                time.Time
 }
 
 type Event struct {
@@ -1127,6 +1131,7 @@ func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, up
 		return IMSRegistrationResult{}, false, nil
 	}
 	if retryAfter > 0 {
+		i.recordIMSRecoveryPending(ctx, reason, retryAfter)
 		timer := time.NewTimer(retryAfter)
 		select {
 		case <-ctx.Done():
@@ -1149,6 +1154,28 @@ func (i *Instance) recoverIMSRegistration(ctx context.Context, reason string, up
 	return result, true, nil
 }
 
+func (i *Instance) recordIMSRecoveryPending(ctx context.Context, reason string, retryAfter time.Duration) {
+	if i == nil || retryAfter <= 0 {
+		return
+	}
+	now := time.Now()
+	reason = firstRuntimeNonEmpty(reason, "IMS registration recovery")
+	i.mu.Lock()
+	if i.stopped {
+		i.mu.Unlock()
+		return
+	}
+	i.state.IMSRecoveryPending = true
+	i.state.IMSRecoveryRetryAfter = retryAfter
+	i.state.IMSRecoveryNextAttemptAt = now.Add(retryAfter)
+	i.state.IMSRecoveryReason = reason
+	i.state.LastReason = "IMS registration recovery delayed: " + reason
+	i.state.UpdatedAt = now
+	i.mu.Unlock()
+	i.notify(ctx)
+	i.dispatchRuntimeState(ctx)
+}
+
 func (i *Instance) recordIMSRecoveryFailure(ctx context.Context, err error) {
 	if i == nil || err == nil {
 		return
@@ -1159,6 +1186,10 @@ func (i *Instance) recordIMSRecoveryFailure(ctx context.Context, err error) {
 		return
 	}
 	i.state.IMSReady = false
+	i.state.IMSRecoveryPending = false
+	i.state.IMSRecoveryRetryAfter = 0
+	i.state.IMSRecoveryNextAttemptAt = time.Time{}
+	i.state.IMSRecoveryReason = ""
 	i.state.LastReason = "IMS registration recovery failed: " + err.Error()
 	i.state.UpdatedAt = time.Now()
 	i.mu.Unlock()
@@ -1195,6 +1226,10 @@ func (i *Instance) applyIMSRegistrationResult(ctx context.Context, result IMSReg
 		}
 	}
 	i.state.IMSReady = result.Registered
+	i.state.IMSRecoveryPending = false
+	i.state.IMSRecoveryRetryAfter = 0
+	i.state.IMSRecoveryNextAttemptAt = time.Time{}
+	i.state.IMSRecoveryReason = ""
 	i.state.LastReason = firstRuntimeNonEmpty(reason, result.Server, "IMS registration recovered")
 	i.state.UpdatedAt = time.Now()
 	svc := i.service
@@ -1815,11 +1850,15 @@ func (i *Instance) Obs() map[string]interface{} {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return map[string]interface{}{
-		"device_id": i.state.DeviceID,
-		"phase":     string(i.state.Phase),
-		"sms_ready": i.state.SMSReady,
-		"ims_ready": i.state.IMSReady,
-		"updated":   i.state.UpdatedAt,
+		"device_id":                    i.state.DeviceID,
+		"phase":                        string(i.state.Phase),
+		"sms_ready":                    i.state.SMSReady,
+		"ims_ready":                    i.state.IMSReady,
+		"ims_recovery_pending":         i.state.IMSRecoveryPending,
+		"ims_recovery_retry_after":     i.state.IMSRecoveryRetryAfter,
+		"ims_recovery_next_attempt_at": i.state.IMSRecoveryNextAttemptAt,
+		"ims_recovery_reason":          i.state.IMSRecoveryReason,
+		"updated":                      i.state.UpdatedAt,
 	}
 }
 
@@ -1836,21 +1875,25 @@ func (i *Instance) dispatchRuntimeState(ctx context.Context) {
 
 func runtimeStateSnapshot(state State) eventhost.RuntimeStateSnapshot {
 	return eventhost.RuntimeStateSnapshot{
-		DevID:          state.DeviceID,
-		Phase:          string(state.Phase),
-		DataplaneMode:  state.DataplaneMode,
-		SIMReady:       state.SIMReady,
-		AccessReady:    state.AccessReady,
-		TunnelReady:    state.TunnelReady,
-		IMSReady:       state.IMSReady,
-		SMSReady:       state.SMSReady,
-		RegStatus:      state.RegStatus,
-		RegStatusText:  state.RegStatusText,
-		NetworkMode:    state.NetworkMode,
-		LastErrorClass: state.LastErrorClass,
-		LastError:      state.LastError,
-		LastReason:     state.LastReason,
-		Time:           state.UpdatedAt,
+		DevID:                    state.DeviceID,
+		Phase:                    string(state.Phase),
+		DataplaneMode:            state.DataplaneMode,
+		SIMReady:                 state.SIMReady,
+		AccessReady:              state.AccessReady,
+		TunnelReady:              state.TunnelReady,
+		IMSReady:                 state.IMSReady,
+		SMSReady:                 state.SMSReady,
+		RegStatus:                state.RegStatus,
+		RegStatusText:            state.RegStatusText,
+		NetworkMode:              state.NetworkMode,
+		LastErrorClass:           state.LastErrorClass,
+		LastError:                state.LastError,
+		LastReason:               state.LastReason,
+		IMSRecoveryPending:       state.IMSRecoveryPending,
+		IMSRecoveryRetryAfter:    state.IMSRecoveryRetryAfter,
+		IMSRecoveryNextAttemptAt: state.IMSRecoveryNextAttemptAt,
+		IMSRecoveryReason:        state.IMSRecoveryReason,
+		Time:                     state.UpdatedAt,
 	}
 }
 

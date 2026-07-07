@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
 )
@@ -84,14 +85,18 @@ func TestDispatchRuntimeStateSnapshotNormalizesAndValidates(t *testing.T) {
 
 	dispatcher := &captureDispatcher{}
 	ok, err := DispatchRuntimeStateSnapshot(context.Background(), dispatcher, RuntimeStateSnapshot{
-		DevID:         " dev-1 ",
-		Phase:         " READY ",
-		DataplaneMode: " userspace ",
-		RegStatusText: " registered ",
-		NetworkMode:   " LTE ",
-		LastReason:    " started ",
-		IMSReady:      true,
-		SMSReady:      true,
+		DevID:                    " dev-1 ",
+		Phase:                    " READY ",
+		DataplaneMode:            " userspace ",
+		RegStatusText:            " registered ",
+		NetworkMode:              " LTE ",
+		LastReason:               " started ",
+		IMSRecoveryPending:       true,
+		IMSRecoveryRetryAfter:    3 * time.Second,
+		IMSRecoveryNextAttemptAt: time.Now(),
+		IMSRecoveryReason:        " retry-after ",
+		IMSReady:                 true,
+		SMSReady:                 true,
 	})
 	if err != nil || !ok {
 		t.Fatalf("DispatchRuntimeStateSnapshot() = %t, %v; want true, nil", ok, err)
@@ -103,7 +108,9 @@ func TestDispatchRuntimeStateSnapshotNormalizesAndValidates(t *testing.T) {
 	if got.DevID != "dev-1" || got.Phase != RuntimePhaseReady ||
 		got.DataplaneMode != "userspace" || got.RegStatusText != "registered" ||
 		got.NetworkMode != "LTE" || got.LastReason != "started" ||
-		!got.IMSReady || !got.SMSReady || got.Time.IsZero() {
+		!got.IMSReady || !got.SMSReady || !got.IMSRecoveryPending ||
+		got.IMSRecoveryRetryAfter != 3*time.Second || got.IMSRecoveryNextAttemptAt.IsZero() ||
+		got.IMSRecoveryReason != "retry-after" || got.Time.IsZero() {
 		t.Fatalf("snapshot=%+v, want normalized ready snapshot", got)
 	}
 
