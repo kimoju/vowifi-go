@@ -152,6 +152,28 @@ func TestAKAHostProviderDoesNotFallbackForSIMAuthOutcome(t *testing.T) {
 	}
 }
 
+func TestAKAHostProviderReturnsAUTSFromSyncFailureError(t *testing.T) {
+	rand16 := bytesFrom(0x10, 16)
+	autn16 := bytesFrom(0x30, 16)
+	auts := bytesFrom(0xB0, AKAAUTSLength)
+	host := &fakeHostAKAAuthenticator{results: []fakeHostAKAResult{
+		{err: swusim.NewSyncFailureError(auts)},
+	}}
+	fallback := &fakeFallbackAKAProvider{result: AKAResult{RES: []byte{0xFF}}}
+	provider := NewAKAHostProvider(host, fallback)
+
+	got, err := provider.CalculateAKA(rand16, autn16)
+	if !errors.Is(err, swusim.ErrSyncFailure) {
+		t.Fatalf("CalculateAKA() err=%v, want sync failure", err)
+	}
+	if !bytes.Equal(got.AUTS, auts) {
+		t.Fatalf("CalculateAKA() AUTS = % X, want % X", got.AUTS, auts)
+	}
+	if len(fallback.calls) != 0 {
+		t.Fatalf("fallback calls = %#v, want none", fallback.calls)
+	}
+}
+
 func TestAKAHostProviderStrictISIMFallbackUsesISIMProvider(t *testing.T) {
 	rand16 := bytesFrom(0x10, 16)
 	autn16 := bytesFrom(0x30, 16)

@@ -100,6 +100,7 @@ func (p *AKAHostProvider) CalculateAKAWithPreference(rand16, autn16 []byte, pref
 		if err == nil {
 			return res, nil
 		}
+		res = akaResultWithSyncFailureAUTS(res, err)
 		if len(primaryErrs) > 0 {
 			errs := append(primaryErrs, fmt.Errorf("fallback AKA: %w", err))
 			return res, errors.Join(errs...)
@@ -125,7 +126,7 @@ func (p *AKAHostProvider) calculateHostAKA(application swusim.AKAApplication, ra
 		}
 		decision := p.classifyHostError(err)
 		if p.Recovery == nil || !decision.Recover || attempt >= attempts {
-			return res, err
+			return akaResultWithSyncFailureAUTS(res, err), err
 		}
 		recoveryReq := AKAHostRecoveryRequest{
 			Application: req.Application,
@@ -134,7 +135,7 @@ func (p *AKAHostProvider) calculateHostAKA(application swusim.AKAApplication, ra
 			Err:         err,
 		}
 		if recoveryErr := p.Recovery.RecoverAKAHost(recoveryReq); recoveryErr != nil {
-			return res, errors.Join(err, fmt.Errorf("AKA host recovery: %w", recoveryErr))
+			return akaResultWithSyncFailureAUTS(res, err), errors.Join(err, fmt.Errorf("AKA host recovery: %w", recoveryErr))
 		}
 	}
 }
@@ -154,6 +155,21 @@ func (p *AKAHostProvider) classifyHostError(err error) AKAHostErrorDecision {
 		return p.ClassifyError(err)
 	}
 	return ClassifyAKAHostError(err)
+}
+
+type syncFailureAUTSCarrier interface {
+	AUTS() []byte
+}
+
+func akaResultWithSyncFailureAUTS(result AKAResult, err error) AKAResult {
+	if len(result.AUTS) > 0 || !errors.Is(err, swusim.ErrSyncFailure) {
+		return result
+	}
+	var carrier syncFailureAUTSCarrier
+	if errors.As(err, &carrier) {
+		result.AUTS = append([]byte(nil), carrier.AUTS()...)
+	}
+	return result
 }
 
 type akaPreferenceProvider interface {

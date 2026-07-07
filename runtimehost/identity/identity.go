@@ -103,7 +103,7 @@ type PrepareStartInput struct {
 func NormalizeProfile(p Profile) Profile {
 	p.IMSI = strings.TrimSpace(p.IMSI)
 	p.MCC = normalizeMCC(p.MCC)
-	p.MNC = normalizeMNC(p.MNC)
+	p.MNC = normalizeProfileMNC(p.MNC)
 	p.IMEI = strings.TrimSpace(p.IMEI)
 	p.SMSC = strings.TrimSpace(p.SMSC)
 	imsiMCC, imsiMNC := plmnFromIMSI(p.IMSI)
@@ -129,7 +129,7 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 	if effectiveCfg.MCC != "" {
 		profile.MCC = effectiveCfg.MCC
 	}
-	if effectiveCfg.MNC != "" {
+	if effectiveCfg.MNC != "" && len(profile.MNC) != 2 {
 		profile.MNC = effectiveCfg.MNC
 	}
 	imeiSource := IMEISourceProfile
@@ -325,7 +325,7 @@ func prepareProfile(p Profile) (Profile, []FallbackMetadata, error) {
 		fallbacks = append(fallbacks, profilePLMNFallbackMetadata(IdentityFieldMCC, profile.MCC))
 		profile.MCC = imsiMCC
 	}
-	if mnc := normalizeMNC(profile.MNC); mnc != "" {
+	if mnc := normalizeProfileMNC(profile.MNC); mnc != "" {
 		profile.MNC = mnc
 	} else {
 		fallbacks = append(fallbacks, profilePLMNFallbackMetadata(IdentityFieldMNC, profile.MNC))
@@ -368,6 +368,14 @@ func normalizeMNC(mnc string) string {
 		return "0" + mnc
 	}
 	if len(mnc) != 3 {
+		return ""
+	}
+	return mnc
+}
+
+func normalizeProfileMNC(mnc string) string {
+	mnc = strings.TrimSpace(mnc)
+	if !isDecimalString(mnc) || (len(mnc) != 2 && len(mnc) != 3) {
 		return ""
 	}
 	return mnc

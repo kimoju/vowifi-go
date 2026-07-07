@@ -1796,6 +1796,45 @@ func TestStartBuildsTunnelManagerForExplicitUserspaceDataplane(t *testing.T) {
 	}
 }
 
+func TestStartBuildsTunnelManagerForExplicitKernelDataplane(t *testing.T) {
+	manager := &runtimeTunnelManager{session: &runtimeTunnelSession{result: swu.TunnelResult{
+		Ready:            true,
+		Mode:             swu.DataplaneModeKernel,
+		EPDGAddress:      "epdg.example",
+		LocalInnerIP:     "10.0.0.2",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+		Reason:           "kernel tunnel ready",
+	}}}
+	var factoryCalled bool
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID: "dev-1",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane: DataplanePolicy{
+			Mode: swu.DataplaneModeKernel,
+		},
+		TunnelManagerFactory: func(req StartRequest) (swu.TunnelManager, error) {
+			factoryCalled = true
+			if req.DeviceID != "dev-1" || req.Dataplane.Mode != swu.DataplaneModeKernel {
+				t.Fatalf("factory request=%+v", req)
+			}
+			return manager, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if !factoryCalled {
+		t.Fatalf("TunnelManagerFactory was not called")
+	}
+	if manager.config.Mode != swu.DataplaneModeKernel {
+		t.Fatalf("tunnel config mode=%q, want %q", manager.config.Mode, swu.DataplaneModeKernel)
+	}
+	if !inst.State().TunnelReady || inst.State().LastReason != "kernel tunnel ready" {
+		t.Fatalf("state=%+v", inst.State())
+	}
+}
+
 func TestStartDoesNotAutoBuildTunnelForImplicitDataplane(t *testing.T) {
 	var factoryCalled bool
 	inst, err := Start(context.Background(), StartRequest{
@@ -1814,6 +1853,43 @@ func TestStartDoesNotAutoBuildTunnelForImplicitDataplane(t *testing.T) {
 	}
 	if inst.State().TunnelReady {
 		t.Fatalf("state=%+v, want tunnel not ready", inst.State())
+	}
+}
+
+func TestDefaultTunnelManagerForStartBuildsKernelIKEManager(t *testing.T) {
+	reauthState := swu.EAPReauthenticationState{
+		Identity:  "reauth-kernel",
+		Counter:   5,
+		CounterOK: true,
+		Keys: eapaka.Keys{
+			KEncr: []byte("0123456789abcdef"),
+			KAut:  []byte("fedcba9876543210"),
+		},
+	}
+	var callbackState swu.EAPReauthenticationState
+	manager, err := defaultTunnelManagerForStart(StartRequest{
+		DeviceID:                   "dev-1",
+		SIM:                        &runtimeSIMAdapter{},
+		EAPReauthentication:        reauthState,
+		OnEAPReauthenticationState: func(state swu.EAPReauthenticationState) { callbackState = state },
+		Dataplane: DataplanePolicy{
+			Mode: swu.DataplaneModeKernel,
+		},
+	})
+	if err != nil {
+		t.Fatalf("defaultTunnelManagerForStart() error = %v", err)
+	}
+	ikeManager, ok := manager.(*swu.IKEPacketTunnelManager)
+	if !ok {
+		t.Fatalf("manager=%T, want *swu.IKEPacketTunnelManager", manager)
+	}
+	if ikeManager.Config.SIM == nil || ikeManager.Config.Reauthentication.Identity != "reauth-kernel" ||
+		ikeManager.Config.Reauthentication.Counter != 5 || ikeManager.Config.OnReauthenticationState == nil {
+		t.Fatalf("ike manager config=%+v", ikeManager.Config)
+	}
+	ikeManager.Config.OnReauthenticationState(swu.EAPReauthenticationState{Identity: "reauth-kernel-next"})
+	if callbackState.Identity != "reauth-kernel-next" {
+		t.Fatalf("callback state=%+v", callbackState)
 	}
 }
 

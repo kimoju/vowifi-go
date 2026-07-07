@@ -10,6 +10,33 @@ import (
 	"time"
 )
 
+func TestNormalizeEmergencyServiceURNHandlesCarrierForms(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		service string
+		want    string
+	}{
+		{name: "dial string 112", service: "112", want: DefaultEmergencyServiceURN},
+		{name: "emergency alias", service: "emergency", want: DefaultEmergencyServiceURN},
+		{name: "service prefix", service: "service:fire", want: "urn:service:sos.fire"},
+		{name: "medical alias", service: "medical", want: "urn:service:sos.ambulance"},
+		{name: "slash urn", service: "urn/service/sos/ambulance", want: "urn:service:sos.ambulance"},
+		{name: "sip urn wrapper", service: "sip:urn:service:sos.fire@ecscf.example;transport=tcp", want: "urn:service:sos.fire"},
+		{name: "sips display wrapper", service: `"Alt" <sips:urn:service:sos.police@ecscf.example;lr>`, want: "urn:service:sos.police"},
+		{name: "sip dial string wrapper", service: "sip:911@example.test;user=phone", want: DefaultEmergencyServiceURN},
+		{name: "tel dial string wrapper", service: "tel:112;phone-context=+1", want: DefaultEmergencyServiceURN},
+		{name: "non emergency tel wrapper", service: "tel:+15551212"},
+		{name: "false sos prefix", service: "urn:service:sosatellite"},
+		{name: "legacy private token", service: "private-carrier-service", want: "urn:service:sos.private-carrier-service"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NormalizeEmergencyServiceURN(tc.service); got != tc.want {
+				t.Fatalf("NormalizeEmergencyServiceURN(%q)=%q, want %q", tc.service, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBuildEmergencyPIDFLOWithUsageRules(t *testing.T) {
 	allowed := true
 	timestamp := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
@@ -220,6 +247,65 @@ func TestBuildEmergencyInviteRequestEmbedsPIDFLOMultipartBody(t *testing.T) {
 		part.Header.Get("Content-ID") != "<location-inline>" ||
 		!strings.Contains(string(secondBody), "<gml:pos>47.6205 -122.3493</gml:pos>") {
 		t.Fatalf("second INVITE part headers=%+v body=%q", part.Header, secondBody)
+	}
+}
+
+func TestBuildEmergencyInviteRequestPreservesDialogAccessAndGeolocation(t *testing.T) {
+	pidfLO, err := BuildEmergencyPIDFLO(EmergencyPIDFLOConfig{
+		Entity: "pres:device@example.test",
+		Address: EmergencyAddress{
+			Latitude:  "47.6205",
+			Longitude: "-122.3493",
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildEmergencyPIDFLO() error = %v", err)
+	}
+	info := EmergencySIPRequestInfo{
+		RequestURI:      "service:fire",
+		PIDFLOContentID: "location-inline",
+		PIDFLOBody:      pidfLO,
+	}
+	msg, err := BuildEmergencyInviteRequest(DialogRequestConfig{
+		Profile: IMSProfile{
+			IMPU:      "sip:user@example.test",
+			UserAgent: "vowifi-go-test",
+		},
+		Registration: RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@example.test",
+		},
+		RemoteURI:         "sip:911@ims.example",
+		CallID:            "emergency-call-carrier-location",
+		LocalTag:          "local",
+		AccessNetworkInfo: "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100abcde",
+		CarrierHeaders: map[string]string{
+			"Geolocation":         "<https://lis.example.test/location/abc>;inserted-by=network",
+			"Geolocation-Routing": GeolocationRoutingYes,
+		},
+	}, info, []byte("v=0\r\n"))
+	if err != nil {
+		t.Fatalf("BuildEmergencyInviteRequest() error = %v", err)
+	}
+	if msg.URI != "urn:service:sos.fire" {
+		t.Fatalf("Request-URI=%q", msg.URI)
+	}
+	if msg.Headers["P-Access-Network-Info"] != "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100abcde" {
+		t.Fatalf("P-Access-Network-Info=%q", msg.Headers["P-Access-Network-Info"])
+	}
+	if msg.Headers["Geolocation"] != "<https://lis.example.test/location/abc>;inserted-by=network" ||
+		msg.Headers["Geolocation-Routing"] != GeolocationRoutingYes {
+		t.Fatalf("location headers=%+v", msg.Headers)
+	}
+	if msg.Headers["Accept-Contact"] != IMSEmergencyAcceptContact ||
+		msg.Headers["P-Preferred-Service"] != IMSMMTelServiceIdentifier {
+		t.Fatalf("emergency IMS headers=%+v", msg.Headers)
+	}
+	if msg.Headers["Contact"] != "<sip:user@192.0.2.10:5060;sos>" {
+		t.Fatalf("Contact=%q", msg.Headers["Contact"])
+	}
+	if mediaType, _, err := mime.ParseMediaType(msg.Headers["Content-Type"]); err != nil || mediaType != EmergencyMultipartRelatedContentType {
+		t.Fatalf("Content-Type=%q mediaType=%q err=%v", msg.Headers["Content-Type"], mediaType, err)
 	}
 }
 

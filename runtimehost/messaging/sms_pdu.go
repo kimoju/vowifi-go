@@ -1393,11 +1393,18 @@ func decodeSMSUserDataWithHeader(data []byte, udl int, dcs byte, hasUDH bool) (s
 			septets -= headerSeptets
 		}
 		if septets < 0 {
-			septets = 0
+			return "", SMSUserDataHeaderInfo{}, fmt.Errorf("SMS user data length %d is shorter than UDH septets %d", udl, headerSeptets)
 		}
 		fillBits := 0
 		if hasUDH {
 			fillBits = (7 - ((len(udh) * 8) % 7)) % 7
+		}
+		payloadOctets := smsPackedSeptetOctets(septets, fillBits)
+		if payloadOctets > len(payload) {
+			return "", SMSUserDataHeaderInfo{}, fmt.Errorf("SMS user data truncated: need %d octets, have %d", payloadOctets, len(payload))
+		}
+		if payloadOctets < len(payload) {
+			return "", SMSUserDataHeaderInfo{}, fmt.Errorf("SMS user data has trailing data: %d octets", len(payload)-payloadOctets)
 		}
 		return decodeGSM7WithLanguage(unpackSeptets(payload, septets, fillBits), headerInfo.LockingShiftLang, headerInfo.SingleShiftLang), headerInfo, nil
 	}
@@ -1414,7 +1421,17 @@ func smsOctetUserDataLength(udl int, udh []byte, payload []byte) (int, error) {
 	if payloadOctets > len(payload) {
 		return 0, fmt.Errorf("SMS user data truncated: need %d octets, have %d", payloadOctets, len(payload))
 	}
+	if payloadOctets < len(payload) {
+		return 0, fmt.Errorf("SMS user data has trailing data: %d octets", len(payload)-payloadOctets)
+	}
 	return payloadOctets, nil
+}
+
+func smsPackedSeptetOctets(septets, bitOffset int) int {
+	if septets <= 0 {
+		return 0
+	}
+	return (bitOffset + septets*7 + 7) / 8
 }
 
 func splitSMSUDH(data []byte, hasUDH bool) (udh []byte, payload []byte, headerSeptets int, headerInfo SMSUserDataHeaderInfo, err error) {

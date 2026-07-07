@@ -199,6 +199,73 @@ func TestPrepareStartDerivesProfileIMSIdentityWith3GPPRealm(t *testing.T) {
 	}
 }
 
+func TestNormalizeProfilePreservesNativeMNCWidth(t *testing.T) {
+	tests := []struct {
+		name string
+		mnc  string
+		want string
+	}{
+		{name: "two digit", mnc: " 24 ", want: "24"},
+		{name: "three digit", mnc: " 240 ", want: "240"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profile := NormalizeProfile(Profile{
+				IMSI: "310240123456789",
+				MCC:  " 310 ",
+				MNC:  tt.mnc,
+			})
+			if profile.MCC != "310" || profile.MNC != tt.want {
+				t.Fatalf("NormalizeProfile() PLMN=(%q,%q), want 310/%s", profile.MCC, profile.MNC, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrepareStartPreservesTwoDigitProfileMNCAndPadsIMSIdentifiers(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		Profile: Profile{IMSI: "310240123456789", MCC: "310", MNC: "24"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.Profile.MCC != "310" || prepared.Profile.MNC != "24" {
+		t.Fatalf("profile PLMN=(%q,%q), want 310/24", prepared.Profile.MCC, prepared.Profile.MNC)
+	}
+	if prepared.EffectiveCarrier.MCC != "310" || prepared.EffectiveCarrier.MNC != "024" ||
+		prepared.EffectiveCarrier.PresetID != "310024" {
+		t.Fatalf("EffectiveCarrier=%+v, want padded carrier PLMN", prepared.EffectiveCarrier)
+	}
+	if prepared.IMSIdentity.IMPI != "310240123456789@ims.mnc024.mcc310.3gppnetwork.org" ||
+		prepared.IMSIdentity.IMPU != "sip:310240123456789@ims.mnc024.mcc310.3gppnetwork.org" ||
+		prepared.IMSIdentity.Domain != "ims.mnc024.mcc310.3gppnetwork.org" {
+		t.Fatalf("profile IMS identity=%+v, want padded MNC realm", prepared.IMSIdentity)
+	}
+	if prepared.EPDGAddr != "epdg.epc.mnc024.mcc310.pub.3gppnetwork.org" {
+		t.Fatalf("EPDGAddr=%q, want padded MNC FQDN", prepared.EPDGAddr)
+	}
+}
+
+func TestPrepareStartKeepsThreeDigitProfileMNC(t *testing.T) {
+	prepared, err := PrepareStart(PrepareStartInput{
+		Profile: Profile{IMSI: "310240123456789", MCC: "310", MNC: "240"},
+	})
+	if err != nil {
+		t.Fatalf("PrepareStart() error = %v", err)
+	}
+	if prepared.Profile.MCC != "310" || prepared.Profile.MNC != "240" {
+		t.Fatalf("profile PLMN=(%q,%q), want 310/240", prepared.Profile.MCC, prepared.Profile.MNC)
+	}
+	if prepared.EffectiveCarrier.MCC != "310" || prepared.EffectiveCarrier.MNC != "240" ||
+		prepared.EffectiveCarrier.PresetID != "310240" {
+		t.Fatalf("EffectiveCarrier=%+v, want three-digit carrier PLMN", prepared.EffectiveCarrier)
+	}
+	if prepared.IMSIdentity.Domain != "ims.mnc240.mcc310.3gppnetwork.org" {
+		t.Fatalf("IMSIdentity.Domain=%q, want three-digit MNC realm", prepared.IMSIdentity.Domain)
+	}
+}
+
 func TestPrepareStartNormalizesInvalidProfilePLMNFromIMSI(t *testing.T) {
 	prepared, err := PrepareStart(PrepareStartInput{
 		Profile: Profile{

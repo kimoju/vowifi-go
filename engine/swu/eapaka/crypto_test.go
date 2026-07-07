@@ -1360,6 +1360,41 @@ func TestBuildChallengeResponseFromProviderSyncFailure(t *testing.T) {
 	}
 }
 
+func TestBuildChallengeResponseFromProviderSyncFailureUsesAUTSFromError(t *testing.T) {
+	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
+	aka := sim.AKAResult{
+		RES: []byte{0x11, 0x22, 0x33, 0x44},
+		CK:  bytes.Repeat([]byte{0xc1}, 16),
+		IK:  bytes.Repeat([]byte{0xd2}, 16),
+	}
+	req := signedChallengeRequest(t, identity, aka)
+	wantAUTS := bytes.Repeat([]byte{0xef}, AUTSLength)
+
+	result, err := BuildChallengeResponseFromProvider(identity, req, challengeAKAProviderFunc(func(rand16, autn16 []byte) (sim.AKAResult, error) {
+		return sim.AKAResult{}, sim.NewSyncFailureError(wantAUTS)
+	}), nil)
+	if err != nil {
+		t.Fatalf("BuildChallengeResponseFromProvider(sync error AUTS) error = %v", err)
+	}
+	if !result.SyncFailure || result.Response.Subtype != SubtypeSynchronizationFailure {
+		t.Fatalf("sync result=%+v", result)
+	}
+	if !bytes.Equal(result.AKA.AUTS, wantAUTS) {
+		t.Fatalf("result AUTS=%x, want %x", result.AKA.AUTS, wantAUTS)
+	}
+	attr, ok := FindAttribute(result.Response.Attributes, AttributeAUTS)
+	if !ok {
+		t.Fatal("missing AT_AUTS")
+	}
+	auts, err := attr.AUTSValue()
+	if err != nil {
+		t.Fatalf("AUTSValue() error = %v", err)
+	}
+	if !bytes.Equal(auts, wantAUTS) {
+		t.Fatalf("response AUTS=%x, want %x", auts, wantAUTS)
+	}
+}
+
 func TestBuildChallengeResponseFromProviderAuthFailure(t *testing.T) {
 	identity := "310280233641503@nai.epc.mnc280.mcc310.3gppnetwork.org"
 	aka := sim.AKAResult{

@@ -300,6 +300,42 @@ func TestInspectRTCPFeedbackReportsPLIAndFIRAndXR(t *testing.T) {
 	}
 }
 
+func TestInspectRTCPFeedbackReportsGoodbyeSourcesAndReason(t *testing.T) {
+	raw, err := rtcp.Marshal([]rtcp.Packet{
+		BuildGoodbye([]uint32{0x11111111, 0x22222222}, "call cleared"),
+	})
+	if err != nil {
+		t.Fatalf("rtcp.Marshal() error = %v", err)
+	}
+
+	var events []RTCPFeedbackEvent
+	summary, err := InspectRTCPFeedback(RTCPFeedbackIMSToClient, raw, func(event RTCPFeedbackEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("InspectRTCPFeedback() error = %v", err)
+	}
+	if summary.Packets != 1 || summary.Goodbyes != 1 {
+		t.Fatalf("summary=%+v", summary)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events=%d, want 1", len(events))
+	}
+	event := events[0]
+	if event.Direction != RTCPFeedbackIMSToClient || event.Kind != RTCPFeedbackGoodbye || event.PacketType != "203" {
+		t.Fatalf("event=%+v", event)
+	}
+	if event.SSRC != 0x11111111 || event.GoodbyeReason != "call cleared" ||
+		!uint32SlicesEqual(event.GoodbyeSSRCs, []uint32{0x11111111, 0x22222222}) ||
+		!uint32SlicesEqual(event.DestinationSSRCs, []uint32{0x11111111, 0x22222222}) {
+		t.Fatalf("goodbye event=%+v", event)
+	}
+	event.GoodbyeSSRCs[0] = 0
+	if reparsed, err := rtcp.Unmarshal(raw); err != nil || reparsed[0].(*rtcp.Goodbye).Sources[0] != 0x11111111 {
+		t.Fatalf("GoodbyeSSRCs were not isolated from packet sources, packets=%+v err=%v", reparsed, err)
+	}
+}
+
 func uint32SliceContains(values []uint32, want uint32) bool {
 	for _, value := range values {
 		if value == want {
@@ -307,4 +343,16 @@ func uint32SliceContains(values []uint32, want uint32) bool {
 		}
 	}
 	return false
+}
+
+func uint32SlicesEqual(got, want []uint32) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

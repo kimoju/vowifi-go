@@ -1961,7 +1961,7 @@ func tunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 	if req.Dataplane.TunnelManager != nil {
 		return req.Dataplane.TunnelManager, nil
 	}
-	if !explicitUserspaceDataplane(req.Dataplane.Mode) {
+	if !explicitSWUDataplane(req.Dataplane.Mode) {
 		return nil, nil
 	}
 	factory := req.TunnelManagerFactory
@@ -1981,20 +1981,29 @@ func tunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 	return manager, nil
 }
 
-func explicitUserspaceDataplane(mode string) bool {
-	return strings.TrimSpace(mode) == swu.DataplaneModeUserspace
+func explicitSWUDataplane(mode string) bool {
+	switch strings.TrimSpace(mode) {
+	case swu.DataplaneModeUserspace, swu.DataplaneModeKernel:
+		return true
+	default:
+		return false
+	}
 }
 
 func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 	if req.SIM == nil {
 		return nil, errors.New("SWU tunnel manager requires SIM AKA provider")
 	}
+	ikeCfg := swu.IKEPacketTunnelManagerConfig{
+		SIM:                     req.SIM,
+		Reauthentication:        req.EAPReauthentication,
+		OnReauthenticationState: req.OnEAPReauthenticationState,
+	}
+	if strings.TrimSpace(req.Dataplane.Mode) == swu.DataplaneModeKernel {
+		return swu.NewIKEPacketTunnelManager(ikeCfg), nil
+	}
 	return swu.NewTUNIKETunnelManager(
-		swu.IKEPacketTunnelManagerConfig{
-			SIM:                     req.SIM,
-			Reauthentication:        req.EAPReauthentication,
-			OnReauthenticationState: req.OnEAPReauthenticationState,
-		},
+		ikeCfg,
 		swu.TUNTunnelManagerConfig{
 			TUN:                 swu.TUNDeviceConfig{Name: strings.TrimSpace(req.Dataplane.TUNName)},
 			DisableRouting:      req.Dataplane.DisableTUNRouting,

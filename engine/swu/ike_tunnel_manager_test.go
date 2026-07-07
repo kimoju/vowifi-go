@@ -136,6 +136,138 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	}
 }
 
+func TestIKEPacketTunnelManagerEstablishesKernelSession(t *testing.T) {
+	init := ikeControlInit(t)
+	child := xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128)
+	child.LocalSPI = []byte{0xca, 0xfe, 0xba, 0xbe}
+	control := &ikeCloseTransport{
+		t:         t,
+		init:      init,
+		keys:      init.Keys,
+		child:     child,
+		messageID: 8,
+	}
+	xfrmManager := &fakeKernelXFRMManager{
+		applyState: KernelXFRMState{undo: []ipCommand{{args: []string{"xfrm", "state", "delete"}}}},
+	}
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
+		SIM:               ikeTunnelAKAProvider{},
+		Random:            bytes.NewReader(bytes.Repeat([]byte{0x55}, 64)),
+		ChildSPI:          child.LocalSPI,
+		Transport:         control,
+		KernelXFRMManager: xfrmManager,
+		ESPTransportFactory: func(cfg TunnelConfig, transport ESPTransportConfig) (ESPPacketTransport, error) {
+			t.Fatal("ESP transport factory must not be used for kernel dataplane")
+			return nil, nil
+		},
+		InitRunner: func(ctx context.Context, cfg ikev2.InitConfig) (ikev2.InitResult, error) {
+			return init, nil
+		},
+		AuthRunner: func(ctx context.Context, cfg ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
+			if !bytes.Equal(cfg.ChildSPI, child.LocalSPI) {
+				t.Fatalf("auth child SPI=%x, want %x", cfg.ChildSPI, child.LocalSPI)
+			}
+			return ikev2.FullAuthResult{ChildSA: &child, NextMessageID: 8}, nil
+		},
+	})
+
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:      "dev-1",
+		Mode:          DataplaneModeKernel,
+		EPDGAddress:   "198.51.100.7",
+		OuterLocalIP:  "192.0.2.10",
+		InnerLocalIP:  "10.10.0.2",
+		RemoteInnerIP: "0.0.0.0/0",
+		IMSI:          "310280233641503",
+		MCC:           "310",
+		MNC:           "280",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	if _, ok := session.(PacketTunnelSession); ok {
+		t.Fatalf("kernel session type %T unexpectedly implements PacketTunnelSession", session)
+	}
+	result := session.Result()
+	if !result.IsReady() || result.Mode != DataplaneModeKernel || result.LocalInnerIP != "10.10.0.2" ||
+		result.ChildSAIdentifier != "cafebabe/deadbeef" {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(xfrmManager.applyConfigs) != 1 {
+		t.Fatalf("xfrm apply count=%d, want 1", len(xfrmManager.applyConfigs))
+	}
+	xfrmCfg := xfrmManager.applyConfigs[0]
+	if xfrmCfg.OuterLocalIP != "192.0.2.10" || xfrmCfg.OuterRemoteIP != "198.51.100.7" ||
+		xfrmCfg.InnerLocalPrefix != "10.10.0.2/32" || xfrmCfg.InnerRemotePrefix != "0.0.0.0/0" ||
+		!bytes.Equal(xfrmCfg.ChildSA.LocalSPI, child.LocalSPI) {
+		t.Fatalf("xfrm config=%+v", xfrmCfg)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if control.requests != 1 || !control.sawChildDelete || !control.sawIKEDelete {
+		t.Fatalf("control requests=%d child=%t ike=%t", control.requests, control.sawChildDelete, control.sawIKEDelete)
+	}
+	if len(xfrmManager.cleanupStates) != 1 {
+		t.Fatalf("xfrm cleanup count=%d, want 1", len(xfrmManager.cleanupStates))
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatalf("Close(second) error = %v", err)
+	}
+	if control.requests != 1 || len(xfrmManager.cleanupStates) != 1 {
+		t.Fatalf("second close repeated work: control=%d cleanup=%d", control.requests, len(xfrmManager.cleanupStates))
+	}
+}
+
+func TestIKEPacketTunnelManagerKernelXFRMApplyFailureClosesIKE(t *testing.T) {
+	init := ikeControlInit(t)
+	child := xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128)
+	child.LocalSPI = []byte{0xca, 0xfe, 0xba, 0xbe}
+	control := &ikeCloseTransport{
+		t:         t,
+		init:      init,
+		keys:      init.Keys,
+		child:     child,
+		messageID: 9,
+	}
+	wantErr := errors.New("xfrm apply failed")
+	xfrmManager := &fakeKernelXFRMManager{applyErr: wantErr}
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
+		SIM:               ikeTunnelAKAProvider{},
+		Random:            bytes.NewReader(bytes.Repeat([]byte{0x66}, 64)),
+		ChildSPI:          child.LocalSPI,
+		Transport:         control,
+		KernelXFRMManager: xfrmManager,
+		InitRunner: func(ctx context.Context, cfg ikev2.InitConfig) (ikev2.InitResult, error) {
+			return init, nil
+		},
+		AuthRunner: func(ctx context.Context, cfg ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
+			return ikev2.FullAuthResult{ChildSA: &child, NextMessageID: 9}, nil
+		},
+	})
+
+	_, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:      "dev-1",
+		Mode:          DataplaneModeKernel,
+		EPDGAddress:   "198.51.100.7",
+		OuterLocalIP:  "192.0.2.10",
+		InnerLocalIP:  "10.10.0.2",
+		RemoteInnerIP: "0.0.0.0/0",
+		IMSI:          "310280233641503",
+		MCC:           "310",
+		MNC:           "280",
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("EstablishTunnel() err=%v, want xfrm apply failure", err)
+	}
+	if control.requests != 1 || !control.sawChildDelete || !control.sawIKEDelete {
+		t.Fatalf("control requests=%d child=%t ike=%t", control.requests, control.sawChildDelete, control.sawIKEDelete)
+	}
+	if len(xfrmManager.cleanupStates) != 0 {
+		t.Fatalf("xfrm cleanup count=%d, want 0", len(xfrmManager.cleanupStates))
+	}
+}
+
 func TestIKEPacketTunnelManagerWiresLivenessDPDHandler(t *testing.T) {
 	init := ikeControlInit(t)
 	init.MOBIKESupported = true
@@ -706,4 +838,22 @@ func (ikeTunnelAKAProvider) CalculateAKA(rand16, autn16 []byte) (sim.AKAResult, 
 		CK:  bytes.Repeat([]byte{0x10}, 16),
 		IK:  bytes.Repeat([]byte{0x20}, 16),
 	}, nil
+}
+
+type fakeKernelXFRMManager struct {
+	applyConfigs  []KernelXFRMConfig
+	applyState    KernelXFRMState
+	applyErr      error
+	cleanupStates []KernelXFRMState
+	cleanupErr    error
+}
+
+func (m *fakeKernelXFRMManager) Apply(ctx context.Context, cfg KernelXFRMConfig) (KernelXFRMState, error) {
+	m.applyConfigs = append(m.applyConfigs, cfg)
+	return m.applyState, m.applyErr
+}
+
+func (m *fakeKernelXFRMManager) Cleanup(ctx context.Context, state KernelXFRMState) error {
+	m.cleanupStates = append(m.cleanupStates, state)
+	return m.cleanupErr
 }

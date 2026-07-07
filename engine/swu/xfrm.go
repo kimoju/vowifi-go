@@ -73,6 +73,11 @@ type KernelXFRMState struct {
 	undo []ipCommand
 }
 
+type KernelXFRMManager interface {
+	Apply(context.Context, KernelXFRMConfig) (KernelXFRMState, error)
+	Cleanup(context.Context, KernelXFRMState) error
+}
+
 type LinuxXFRMManager struct {
 	Runner IPCommandRunner
 }

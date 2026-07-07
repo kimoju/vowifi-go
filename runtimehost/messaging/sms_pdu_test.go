@@ -644,6 +644,43 @@ func TestParseSMSDeliverTPDURejectsTruncatedOctetEncodedUserData(t *testing.T) {
 	}
 }
 
+func TestDecodeSMSUserDataRejectsMalformedGSM7Lengths(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		udl  int
+		want string
+	}{
+		{
+			name: "truncated packed septets",
+			data: mustHex(t, "E8329BFD"),
+			udl:  5,
+			want: "truncated",
+		},
+		{
+			name: "trailing packed septets",
+			data: mustHex(t, "E8329BFD0600"),
+			udl:  5,
+			want: "trailing data",
+		},
+		{
+			name: "UDH longer than declared septets",
+			data: []byte{0x05, 0x00, 0x03, 0x7a, 0x02, 0x01},
+			udl:  5,
+			want: "shorter than UDH septets",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := decodeSMSUserDataWithHeader(tt.data, tt.udl, 0x00, tt.name == "UDH longer than declared septets")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("decodeSMSUserDataWithHeader() err=%v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseSMSDeliverTPDUPreservesProtocolMetadata(t *testing.T) {
 	tpdu := mustHex(t, "E405810180F67F0862705021436500080500037A02014F60")
 	deliver, err := ParseSMSDeliverTPDU(tpdu)

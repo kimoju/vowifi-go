@@ -453,6 +453,43 @@ func TestSRTPMediaSessionReportsRTCPFeedbackInRelayTransform(t *testing.T) {
 	}
 }
 
+func TestSRTPMediaSessionReportsRTCPGoodbyeInRelayTransform(t *testing.T) {
+	events := make(chan RTCPFeedbackEvent, 1)
+	cfg := testSRTPMediaConfig()
+	cfg.RTCPFeedbackHandler = func(event RTCPFeedbackEvent) {
+		events <- event
+	}
+	session, err := NewSRTPMediaSession(cfg)
+	if err != nil {
+		t.Fatalf("NewSRTPMediaSession() error = %v", err)
+	}
+	packet, err := BuildGoodbye([]uint32{0x22222222}, "normal release").Marshal()
+	if err != nil {
+		t.Fatalf("Goodbye Marshal() error = %v", err)
+	}
+	protected, err := session.ProtectIMSRTCP(packet)
+	if err != nil {
+		t.Fatalf("ProtectIMSRTCP() error = %v", err)
+	}
+	transformed, err := session.RelayTransforms().IMSToClientRTCP(protected)
+	if err != nil {
+		t.Fatalf("IMSToClientRTCP() error = %v", err)
+	}
+	plain, err := session.UnprotectClientRTCP(transformed)
+	if err != nil {
+		t.Fatalf("UnprotectClientRTCP() error = %v", err)
+	}
+	if !bytes.Equal(plain, packet) {
+		t.Fatalf("RTCP plain=%x, want %x", plain, packet)
+	}
+	event := readRTCPFeedbackEvent(t, events)
+	if event.Direction != RTCPFeedbackIMSToClient || event.Kind != RTCPFeedbackGoodbye ||
+		event.SSRC != 0x22222222 || event.GoodbyeReason != "normal release" ||
+		!uint32SlicesEqual(event.GoodbyeSSRCs, []uint32{0x22222222}) {
+		t.Fatalf("event=%+v", event)
+	}
+}
+
 func TestSRTPMediaSessionReportsRTPDTMFInRelayTransform(t *testing.T) {
 	events := make(chan RTPDTMFEvent, 1)
 	cfg := testSRTPMediaConfig()

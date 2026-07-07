@@ -226,6 +226,9 @@ func BuildChallengeResponseFromProvider(identity string, request Packet, provide
 		result.Response = response
 		result.SyncFailure = errors.Is(err, sim.ErrSyncFailure)
 		result.AuthFailure = errors.Is(err, sim.ErrAuthFailure)
+		if result.SyncFailure && len(result.AKA.AUTS) == 0 {
+			result.AKA.AUTS = syncFailureAUTS(aka, err)
+		}
 		return result, nil
 	}
 
@@ -424,7 +427,7 @@ func BuildAKAFailureResponse(request Packet, aka sim.AKAResult, cause error) (Pa
 	case cause == nil:
 		return Packet{}, false, nil
 	case errors.Is(cause, sim.ErrSyncFailure):
-		response, err := BuildSynchronizationFailureResponse(request, aka.AUTS)
+		response, err := BuildSynchronizationFailureResponse(request, syncFailureAUTS(aka, cause))
 		return response, true, err
 	case errors.Is(cause, sim.ErrAuthFailure):
 		response, err := BuildAuthenticationRejectResponse(request)
@@ -432,6 +435,24 @@ func BuildAKAFailureResponse(request Packet, aka sim.AKAResult, cause error) (Pa
 	default:
 		return Packet{}, false, cause
 	}
+}
+
+type syncFailureAUTSCarrier interface {
+	AUTS() []byte
+}
+
+func syncFailureAUTS(aka sim.AKAResult, cause error) []byte {
+	if len(aka.AUTS) > 0 {
+		return append([]byte(nil), aka.AUTS...)
+	}
+	if !errors.Is(cause, sim.ErrSyncFailure) {
+		return nil
+	}
+	var carrier syncFailureAUTSCarrier
+	if errors.As(cause, &carrier) {
+		return append([]byte(nil), carrier.AUTS()...)
+	}
+	return nil
 }
 
 func EncryptAttributes(kEncr, iv []byte, attrs []Attribute) (Attribute, error) {

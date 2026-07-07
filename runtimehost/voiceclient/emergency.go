@@ -145,25 +145,165 @@ type EmergencySIPRequestInfo struct {
 	PIDFLOBody      []byte
 }
 
+type emergencyServiceURNDescriptor struct {
+	urn      string
+	category EmergencyServiceCategory
+	aliases  []string
+}
+
+var emergencyServiceURNDescriptors = []emergencyServiceURNDescriptor{
+	{
+		urn:     DefaultEmergencyServiceURN,
+		aliases: []string{"911", "112", "sos", "emergency", "e911"},
+	},
+	{
+		urn:      "urn:service:sos.police",
+		category: EmergencyServiceCategoryPolice,
+		aliases:  []string{"police"},
+	},
+	{
+		urn:      "urn:service:sos.ambulance",
+		category: EmergencyServiceCategoryAmbulance,
+		aliases:  []string{"ambulance", "medical", "ems"},
+	},
+	{
+		urn:      "urn:service:sos.fire",
+		category: EmergencyServiceCategoryFire,
+		aliases:  []string{"fire"},
+	},
+	{
+		urn:     "urn:service:sos.animal-control",
+		aliases: []string{"animal-control", "animalcontrol"},
+	},
+	{
+		urn:     "urn:service:sos.gas",
+		aliases: []string{"gas"},
+	},
+	{
+		urn:      "urn:service:sos.marine",
+		category: EmergencyServiceCategoryMarine,
+		aliases:  []string{"marine"},
+	},
+	{
+		urn:      "urn:service:sos.mountain",
+		category: EmergencyServiceCategoryMountain,
+		aliases:  []string{"mountain"},
+	},
+	{
+		urn:     "urn:service:sos.physician",
+		aliases: []string{"physician"},
+	},
+	{
+		urn:     "urn:service:sos.poison",
+		aliases: []string{"poison"},
+	},
+	{
+		urn:      "urn:service:sos.ecall.manual",
+		category: EmergencyServiceCategoryManualECall,
+		aliases:  []string{"ecall", "manual-ecall", "ecall-manual"},
+	},
+	{
+		urn:      "urn:service:sos.ecall.automatic",
+		category: EmergencyServiceCategoryAutomaticECall,
+		aliases:  []string{"automatic-ecall", "ecall-automatic"},
+	},
+}
+
 func NormalizeEmergencyServiceURN(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	if s == "" {
+	return normalizeEmergencyServiceURNValue(s, true)
+}
+
+func normalizeEmergencyServiceURNValue(value string, allowUnknownSubservice bool) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
 		return ""
 	}
-	switch s {
-	case "911", "112", "sos", DefaultEmergencyServiceURN:
-		return DefaultEmergencyServiceURN
+	if candidate, ok := emergencyServiceWrappedCandidate(value); ok {
+		if urn := normalizeEmergencyServiceURNValue(candidate, false); urn != "" {
+			return urn
+		}
 	}
-	if strings.HasPrefix(s, "urn:service:sos") {
-		return s
+	value = normalizeEmergencyServiceURNPathForm(value)
+	value = strings.TrimPrefix(value, "service:")
+	if strings.HasPrefix(value, "sos.") {
+		value = "urn:service:" + value
 	}
-	if strings.HasPrefix(s, "sos.") {
-		return "urn:service:" + s
+	if isEmergencyServiceURN(value) {
+		return value
 	}
-	if !strings.Contains(s, ":") {
-		return DefaultEmergencyServiceURN + "." + s
+	for _, descriptor := range emergencyServiceURNDescriptors {
+		for _, alias := range descriptor.aliases {
+			if value == alias {
+				return descriptor.urn
+			}
+		}
+	}
+	if allowUnknownSubservice && !strings.Contains(value, ":") {
+		return DefaultEmergencyServiceURN + "." + value
 	}
 	return ""
+}
+
+func emergencyServiceWrappedCandidate(value string) (string, bool) {
+	if uri, ok := emergencyServiceAngleURI(value); ok {
+		return uri, true
+	}
+	switch {
+	case strings.HasPrefix(value, "sip:"):
+		return emergencyServiceSIPURIUser(value[len("sip:"):])
+	case strings.HasPrefix(value, "sips:"):
+		return emergencyServiceSIPURIUser(value[len("sips:"):])
+	case strings.HasPrefix(value, "tel:"):
+		return emergencyServiceURIUser(value[len("tel:"):])
+	default:
+		return "", false
+	}
+}
+
+func emergencyServiceAngleURI(value string) (string, bool) {
+	start := strings.IndexByte(value, '<')
+	if start < 0 {
+		return "", false
+	}
+	end := strings.IndexByte(value[start+1:], '>')
+	if end < 0 {
+		return "", false
+	}
+	uri := strings.TrimSpace(value[start+1 : start+1+end])
+	return uri, uri != ""
+}
+
+func emergencyServiceSIPURIUser(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if user, _, ok := strings.Cut(value, "@"); ok {
+		return emergencyServiceURIUser(user)
+	}
+	return emergencyServiceURIUser(value)
+}
+
+func emergencyServiceURIUser(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if idx := strings.IndexAny(value, ";?"); idx >= 0 {
+		value = strings.TrimSpace(value[:idx])
+	}
+	return value, value != ""
+}
+
+func normalizeEmergencyServiceURNPathForm(value string) string {
+	for _, prefix := range []string{"urn/service/", "urn:service/"} {
+		if strings.HasPrefix(value, prefix) {
+			suffix := strings.Trim(strings.TrimPrefix(value, prefix), "/")
+			if suffix == "" {
+				return value
+			}
+			return "urn:service:" + strings.ReplaceAll(suffix, "/", ".")
+		}
+	}
+	return value
+}
+
+func isEmergencyServiceURN(value string) bool {
+	return value == DefaultEmergencyServiceURN || strings.HasPrefix(value, DefaultEmergencyServiceURN+".")
 }
 
 func EmergencyRequestURI(service string) string {
@@ -178,20 +318,9 @@ func EmergencyServiceURNsForCategory(category EmergencyServiceCategory) []string
 		return []string{DefaultEmergencyServiceURN}
 	}
 	var out []string
-	for _, mapping := range []struct {
-		category EmergencyServiceCategory
-		urn      string
-	}{
-		{EmergencyServiceCategoryPolice, "urn:service:sos.police"},
-		{EmergencyServiceCategoryAmbulance, "urn:service:sos.ambulance"},
-		{EmergencyServiceCategoryFire, "urn:service:sos.fire"},
-		{EmergencyServiceCategoryMarine, "urn:service:sos.marine"},
-		{EmergencyServiceCategoryMountain, "urn:service:sos.mountain"},
-		{EmergencyServiceCategoryManualECall, "urn:service:sos.ecall.manual"},
-		{EmergencyServiceCategoryAutomaticECall, "urn:service:sos.ecall.automatic"},
-	} {
-		if category&mapping.category != 0 {
-			out = append(out, mapping.urn)
+	for _, descriptor := range emergencyServiceURNDescriptors {
+		if descriptor.category != 0 && category&descriptor.category != 0 {
+			out = append(out, descriptor.urn)
 		}
 	}
 	if len(out) == 0 {
@@ -278,7 +407,11 @@ func BuildEmergencyInviteRequest(cfg DialogRequestConfig, info EmergencySIPReque
 	}
 	msg.URI = requestURI
 
-	headers := BuildEmergencySIPHeaders(EmergencySIPHeaderConfig{})
+	headers := BuildEmergencySIPHeaders(EmergencySIPHeaderConfig{
+		AccessNetworkInfo: EmergencyAccessNetworkInfo{
+			Raw: emergencyStringHeaderValue(msg.Headers, "P-Access-Network-Info"),
+		},
+	})
 	for key, value := range info.Headers {
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
@@ -287,7 +420,9 @@ func BuildEmergencyInviteRequest(cfg DialogRequestConfig, info EmergencySIPReque
 		}
 		headers[canonicalHeaderName(key)] = value
 	}
-	if len(info.PIDFLOBody) > 0 && emergencyStringHeaderValue(headers, "Geolocation") == "" {
+	if len(info.PIDFLOBody) > 0 &&
+		emergencyStringHeaderValue(headers, "Geolocation") == "" &&
+		emergencyStringHeaderValue(msg.Headers, "Geolocation") == "" {
 		if contentID := emergencyContentIDForHeader(info.PIDFLOContentID, defaultEmergencyPIDFLOContentID); contentID != "" {
 			headers["Geolocation"] = formatGeolocationURI("cid:" + contentID)
 		}

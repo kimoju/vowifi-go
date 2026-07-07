@@ -48,6 +48,8 @@ type RTCPFeedbackEvent struct {
 	PacketCount      uint32
 	OctetCount       uint32
 	DestinationSSRCs []uint32
+	GoodbyeSSRCs     []uint32
+	GoodbyeReason    string
 	ReportCount      int
 	NACKCount        int
 	FIRCount         int
@@ -433,6 +435,11 @@ func rtcpFeedbackEvents(direction RTCPFeedbackDirection, packet rtcp.Packet) []R
 		event.Kind = RTCPFeedbackSourceDescription
 	case *rtcp.Goodbye:
 		event.Kind = RTCPFeedbackGoodbye
+		event.GoodbyeSSRCs = append([]uint32(nil), p.Sources...)
+		event.GoodbyeReason = p.Reason
+		if len(p.Sources) > 0 {
+			event.SSRC = p.Sources[0]
+		}
 	case *rtcp.ApplicationDefined:
 		event.Kind = RTCPFeedbackApplicationDefined
 		event.SSRC = p.SSRC

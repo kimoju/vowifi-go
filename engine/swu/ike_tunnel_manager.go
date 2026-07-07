@@ -68,6 +68,8 @@ type IKEPacketTunnelManagerConfig struct {
 	InitRunner               IKEInitRunner
 	AuthRunner               IKEAuthRunner
 	PacketSessionFactory     IKEPacketSessionFactory
+	KernelXFRMManager        KernelXFRMManager
+	KernelXFRMConfig         KernelXFRMConfig
 	SA                       ikev2.SecurityAssociation
 	ChildSA                  ikev2.SecurityAssociation
 	ChildSPI                 []byte
@@ -113,7 +115,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	if mode == DataplaneModeDisabled {
 		return nil, fmt.Errorf("%w: dataplane mode is disabled", ErrInvalidTunnelConfig)
 	}
-	if mode != DataplaneModeUserspace {
+	if mode != DataplaneModeUserspace && mode != DataplaneModeKernel {
 		return nil, fmt.Errorf("%w: unsupported dataplane mode %q", ErrInvalidTunnelConfig, mode)
 	}
 	provider := m.Config.SIM
@@ -196,12 +198,15 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	}
 	child := *auth.ChildSA
 	m.updateReauthenticationState(auth)
+	result := tunnelResultFromIKE(cfg, epdg, init, child, mode)
+	closeHandler, mobikeHandler, rekeyHandler, dpdHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
+	if mode == DataplaneModeKernel {
+		return m.establishKernelSession(ctx, cfg, transportCfg, init, child, result, closeHandler)
+	}
 	espTransport, err := m.espTransport(cfg, espCfg)
 	if err != nil {
 		return nil, err
 	}
-	result := tunnelResultFromIKE(cfg, epdg, init, child)
-	closeHandler, mobikeHandler, rekeyHandler, dpdHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
 	livenessCfg := m.Config.Liveness
 	if dpdHandler == nil {
 		livenessCfg.DisableDPD = true
@@ -253,6 +258,47 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		return nil, fmt.Errorf("%w: packet session factory returned nil", ErrInvalidIKETunnelManager)
 	}
 	return session, nil
+}
+
+func (m *IKEPacketTunnelManager) establishKernelSession(ctx context.Context, cfg TunnelConfig, transportCfg IKETransportConfig, init ikev2.InitResult, child ikev2.ChildSAResult, result TunnelResult, closeHandler func(context.Context) error) (TunnelSession, error) {
+	xfrmTemplate := m.Config.KernelXFRMConfig
+	xfrmCfg, err := KernelXFRMConfigFromIKE(KernelXFRMConfigFromIKEConfig{
+		Tunnel:               cfg,
+		Transport:            transportCfg,
+		Init:                 init,
+		ChildSA:              child,
+		InnerLocalPrefix:     xfrmTemplate.InnerLocalPrefix,
+		InnerRemotePrefix:    xfrmTemplate.InnerRemotePrefix,
+		ReqID:                xfrmTemplate.ReqID,
+		Mark:                 xfrmTemplate.Mark,
+		InterfaceID:          xfrmTemplate.InterfaceID,
+		IncludeForwardPolicy: xfrmTemplate.IncludeForwardPolicy,
+		XFRMInterface:        xfrmTemplate.XFRMInterface,
+		NATTraversal:         xfrmTemplate.NATTraversal,
+	})
+	if err != nil {
+		return nil, errors.Join(err, closeIKEBestEffort(ctx, closeHandler))
+	}
+	xfrmManager := m.Config.KernelXFRMManager
+	if xfrmManager == nil {
+		xfrmManager = LinuxXFRMManager{}
+	}
+	xfrmState, err := xfrmManager.Apply(ctx, xfrmCfg)
+	if err != nil {
+		return nil, errors.Join(err, closeIKEBestEffort(ctx, closeHandler))
+	}
+	session, err := newKernelTunnelSession(result, xfrmManager, xfrmState, closeHandler)
+	if err != nil {
+		return nil, errors.Join(err, xfrmManager.Cleanup(ctx, xfrmState), closeIKEBestEffort(ctx, closeHandler))
+	}
+	return session, nil
+}
+
+func closeIKEBestEffort(ctx context.Context, closeHandler func(context.Context) error) error {
+	if closeHandler == nil {
+		return nil
+	}
+	return closeHandler(ctx)
 }
 
 func (m *IKEPacketTunnelManager) updateReauthenticationState(auth ikev2.FullAuthResult) {
@@ -547,10 +593,11 @@ func (c *ikePacketTunnelControl) mobike(ctx context.Context, req MOBIKERequest) 
 	}, nil
 }
 
-func tunnelResultFromIKE(cfg TunnelConfig, epdg string, init ikev2.InitResult, child ikev2.ChildSAResult) TunnelResult {
+func tunnelResultFromIKE(cfg TunnelConfig, epdg string, init ikev2.InitResult, child ikev2.ChildSAResult, mode string) TunnelResult {
+	mode = firstPacketNonEmpty(mode, DataplaneModeUserspace)
 	return TunnelResult{
 		Ready:             true,
-		Mode:              DataplaneModeUserspace,
+		Mode:              mode,
 		EPDGAddress:       epdg,
 		LocalInnerIP:      firstPacketNonEmpty(cfg.InnerLocalIP, childConfigurationAddress(child, ikev2.ConfigInternalIPv4Address), childConfigurationAddress(child, ikev2.ConfigInternalIPv6Address)),
 		RemoteInnerIP:     strings.TrimSpace(cfg.RemoteInnerIP),

@@ -30,6 +30,14 @@ type RTCPSourceDescriptionConfig struct {
 	Tool  string
 }
 
+// BuildGoodbye builds an RTCP BYE packet for media sources that are no longer active.
+func BuildGoodbye(sources []uint32, reason string) *rtcp.Goodbye {
+	return &rtcp.Goodbye{
+		Sources: append([]uint32(nil), sources...),
+		Reason:  strings.TrimSpace(reason),
+	}
+}
+
 // BuildReceiverReport converts RTP reception snapshots into an RTCP RR packet.
 // A ReceiverReport can carry at most 31 report blocks, so extra streams are ignored.
 func BuildReceiverReport(senderSSRC uint32, stats []RTPStreamStats) *rtcp.ReceiverReport {
