@@ -308,7 +308,7 @@ func writeOrderedHeaders(out *bytes.Buffer, headers map[string]string) {
 		"Via", "Route", "Max-Forwards", "To", "From", "Call-ID", "CSeq", "Contact",
 		"Expires", "P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
 		"P-Preferred-Service", "Accept-Contact",
-		"P-Access-Network-Info", "Security-Client", "Security-Verify", "Authorization",
+		"P-Access-Network-Info", "P-Visited-Network-ID", "Security-Client", "Security-Verify", "Authorization",
 		"Proxy-Authorization", "Refer-To", "Referred-By", "Refer-Sub", "Request-Disposition",
 		"Reject-Contact", "Session-Expires", "Min-SE", "Event", "Subscription-State",
 		"Allow-Events", "Content-Type", "Accept",
@@ -913,7 +913,7 @@ func writeOrderedHeaderValues(out *bytes.Buffer, headers map[string][]string) {
 		"Via", "Record-Route", "Route", "Max-Forwards", "To", "From", "Call-ID",
 		"CSeq", "Contact", "Expires", "P-Associated-URI", "Service-Route", "Path",
 		"P-Preferred-Identity", "User-Agent", "Allow", "Supported", "Require",
-		"P-Access-Network-Info", "Security-Client", "Security-Verify",
+		"P-Access-Network-Info", "P-Visited-Network-ID", "Security-Client", "Security-Verify",
 		"Authorization", "Proxy-Authorization", "WWW-Authenticate",
 		"Proxy-Authenticate", "Refer-To", "Referred-By", "Refer-Sub", "Request-Disposition",
 		"Reject-Contact", "Session-Expires", "Min-SE", "Event", "Subscription-State",
@@ -1332,6 +1332,8 @@ func canonicalHeaderName(name string) string {
 		return "P-Preferred-Identity"
 	case "p-access-network-info":
 		return "P-Access-Network-Info"
+	case "p-visited-network-id":
+		return "P-Visited-Network-ID"
 	case "service-route":
 		return "Service-Route"
 	case "security-server":

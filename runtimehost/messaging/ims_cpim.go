@@ -463,7 +463,7 @@ func NormalizeIMSIMDNDispositionNotifications(values ...string) []string {
 	var out []string
 	seen := make(map[string]bool)
 	for _, value := range values {
-		for _, token := range strings.Split(value, ",") {
+		for _, token := range splitIMSHeaderTokenList(value) {
 			notification := normalizeIMSIMDNDispositionNotification(token)
 			if notification == "" || seen[notification] {
 				continue
@@ -476,19 +476,22 @@ func NormalizeIMSIMDNDispositionNotifications(values ...string) []string {
 }
 
 func splitCPIMHeaderBlock(data []byte) (block []byte, rest []byte, ok bool) {
-	crlf := bytes.Index(data, []byte("\r\n\r\n"))
-	lf := bytes.Index(data, []byte("\n\n"))
-	switch {
-	case crlf >= 0 && (lf < 0 || crlf <= lf):
-		return data[:crlf], data[crlf+4:], true
-	case lf >= 0:
-		return data[:lf], data[lf+2:], true
-	default:
-		return nil, nil, false
+	offset := 0
+	for offset < len(data) {
+		lineEnd, sepLen := cpimLineEnding(data[offset:])
+		if lineEnd < 0 {
+			break
+		}
+		if lineEnd == 0 {
+			return data[:offset], data[offset+sepLen:], true
+		}
+		offset += lineEnd + sepLen
 	}
+	return nil, nil, false
 }
 
 func parseCPIMHeaders(block []byte) (map[string][]string, error) {
+	block = normalizeCPIMHeaderBlockLineEndings(block)
 	reader := textproto.NewReader(bufio.NewReader(bytes.NewReader(append(append([]byte(nil), block...), []byte("\r\n\r\n")...))))
 	header, err := reader.ReadMIMEHeader()
 	if err != nil {
@@ -732,13 +735,57 @@ func cpimHeaderTokenRequested(headers map[string][]string, key, token string) bo
 		return false
 	}
 	for _, value := range cpimHeaderValues(headers, key) {
-		for _, part := range strings.Split(value, ",") {
+		for _, part := range splitIMSHeaderTokenList(value) {
 			if strings.EqualFold(strings.TrimSpace(part), token) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func cpimLineEnding(data []byte) (lineEnd int, sepLen int) {
+	for i, b := range data {
+		switch b {
+		case '\n':
+			return i, 1
+		case '\r':
+			if i+1 < len(data) && data[i+1] == '\n' {
+				return i, 2
+			}
+			return i, 1
+		}
+	}
+	return -1, 0
+}
+
+func normalizeCPIMHeaderBlockLineEndings(block []byte) []byte {
+	if len(block) == 0 {
+		return block
+	}
+	var out bytes.Buffer
+	for len(block) > 0 {
+		lineEnd, sepLen := cpimLineEnding(block)
+		if lineEnd < 0 {
+			out.Write(block)
+			break
+		}
+		out.Write(block[:lineEnd])
+		out.WriteString("\r\n")
+		block = block[lineEnd+sepLen:]
+	}
+	return out.Bytes()
+}
+
+func splitIMSHeaderTokenList(value string) []string {
+	return strings.FieldsFunc(value, func(r rune) bool {
+		switch r {
+		case ',', ';', ' ', '\t', '\r', '\n':
+			return true
+		default:
+			return false
+		}
+	})
 }
 
 func parseCPIMNamespaceHeader(value string) (prefix, uri string, ok bool) {

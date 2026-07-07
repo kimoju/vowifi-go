@@ -189,7 +189,9 @@ func TestLoadCarrierOverridesAcceptsNetworkAliases(t *testing.T) {
 				"pcscf_fqdn": " PCSCF-A.ALIAS.EXAMPLE. ",
 				"pcscf_list": ["pcscf-b.alias.example.", "pcscf-a.alias.example"],
 				"epdg": " EPDG.ALIAS.EXAMPLE. ",
-				"emergency_realm": " SOS.ALIAS.EXAMPLE. "
+				"emergency_realm": " SOS.ALIAS.EXAMPLE. ",
+				"p_access_network_info": " IEEE-802.11;i-wlan-node-id=\"node;1\" ",
+				"p_visited_network_id": " visited.alias.example "
 			}
 		}
 	}`), 0600); err != nil {
@@ -202,7 +204,9 @@ func TestLoadCarrierOverridesAcceptsNetworkAliases(t *testing.T) {
 	if cfg.Network.IMSRealm != "ims.alias.example" ||
 		cfg.Network.PrivateIdentityRealm != "ims.alias.example" ||
 		cfg.Network.EPDGFQDN != "epdg.alias.example" ||
-		cfg.Network.EmergencyDomain != "sos.alias.example" {
+		cfg.Network.EmergencyDomain != "sos.alias.example" ||
+		cfg.Network.AccessNetworkInfo != `IEEE-802.11;i-wlan-node-id="node;1"` ||
+		cfg.Network.VisitedNetworkID != "visited.alias.example" {
 		t.Fatalf("Network=%+v, want normalized alias fields", cfg.Network)
 	}
 	wantPCSCF := []string{"pcscf-a.alias.example", "pcscf-b.alias.example"}
@@ -214,7 +218,9 @@ func TestLoadCarrierOverridesAcceptsNetworkAliases(t *testing.T) {
 		t.Fatalf("Marshal(Network) error = %v", err)
 	}
 	if strings.Contains(string(raw), "ims_domain") || strings.Contains(string(raw), "epdg\"") ||
-		!strings.Contains(string(raw), "ims_realm") || !strings.Contains(string(raw), "epdg_fqdn") {
+		strings.Contains(string(raw), "p_access_network_info") || strings.Contains(string(raw), "p_visited_network_id") ||
+		!strings.Contains(string(raw), "ims_realm") || !strings.Contains(string(raw), "epdg_fqdn") ||
+		!strings.Contains(string(raw), "access_network_info") || !strings.Contains(string(raw), "visited_network_id") {
 		t.Fatalf("marshaled network JSON=%s, want canonical field names", raw)
 	}
 }

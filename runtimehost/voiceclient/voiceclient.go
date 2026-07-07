@@ -25,11 +25,13 @@ var ErrInvalidAuthenticationInfo = errors.New("invalid SIP digest authentication
 var ErrRegistrationRejected = errors.New("IMS registration rejected")
 
 type IMSProfile struct {
-	IMPI      string
-	IMPU      string
-	Domain    string
-	LocalIP   string
-	UserAgent string
+	IMPI              string
+	IMPU              string
+	Domain            string
+	LocalIP           string
+	UserAgent         string
+	AccessNetworkInfo string
+	VisitedNetworkID  string
 }
 
 type DigestChallenge struct {
@@ -595,6 +597,12 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 		"P-Preferred-Identity": "<" + impu + ">",
 		"Security-Client":      BuildSecurityClientHeader(DefaultSecurityClientAgreement(nil)),
 	}
+	if accessNetworkInfo := strings.TrimSpace(profile.AccessNetworkInfo); accessNetworkInfo != "" {
+		headers["P-Access-Network-Info"] = accessNetworkInfo
+	}
+	if visitedNetworkID := formatVisitedNetworkIDHeader(profile.VisitedNetworkID); visitedNetworkID != "" {
+		headers["P-Visited-Network-ID"] = visitedNetworkID
+	}
 	return headers
 }
 
@@ -604,6 +612,30 @@ func buildRegisterContactHeader(contactURI string) string {
 		contact += ";" + imsMMTelContactFeature
 	}
 	return contact
+}
+
+func formatVisitedNetworkIDHeader(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return ""
+	}
+	if strings.Contains(value, ",") || (strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)) {
+		return value
+	}
+	return quoteSIPQuotedString(value)
+}
+
+func quoteSIPQuotedString(value string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range value {
+		if r == '\\' || r == '"' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {

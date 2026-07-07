@@ -411,6 +411,35 @@ func TestBuildSIPRequestWireOrdersReferHeaders(t *testing.T) {
 	)
 }
 
+func TestBuildSIPRequestWireCanonicalizesIMSVisitedNetworkID(t *testing.T) {
+	wire, err := buildSIPRequestWire(SIPRequestMessage{
+		Method: "REGISTER",
+		URI:    "sip:ims.example.test",
+		Headers: map[string]string{
+			"Via":                   "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-ims;rport",
+			"To":                    "<sip:user@ims.example.test>",
+			"From":                  "<sip:user@ims.example.test>;tag=local",
+			"Call-ID":               "register-ims-order",
+			"CSeq":                  "1 REGISTER",
+			"Max-Forwards":          "70",
+			"P-Preferred-Identity":  "<sip:user@ims.example.test>",
+			"p-access-network-info": `IEEE-802.11;i-wlan-node-id="node;1"`,
+			"p-visited-network-id":  `"visited.example.test"`,
+			"Security-Client":       "ipsec-3gpp;alg=hmac-sha-1-96",
+		},
+	}, "UDP", nil)
+	if err != nil {
+		t.Fatalf("buildSIPRequestWire() error = %v", err)
+	}
+	assertWireHeaderOrder(t, string(wire),
+		"P-Preferred-Identity: <sip:user@ims.example.test>\r\n",
+		"P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=\"node;1\"\r\n",
+		"P-Visited-Network-ID: \"visited.example.test\"\r\n",
+		"Security-Client: ipsec-3gpp;alg=hmac-sha-1-96\r\n",
+		"Content-Length: 0\r\n",
+	)
+}
+
 func assertWireHeaderOrder(t *testing.T, wire string, headers ...string) {
 	t.Helper()
 	last := -1

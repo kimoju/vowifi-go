@@ -25,6 +25,8 @@ type NetworkConfig struct {
 	PCSCFFQDNs           []string `json:"pcscf_fqdns,omitempty"`
 	EPDGFQDN             string   `json:"epdg_fqdn"`
 	EmergencyDomain      string   `json:"emergency_domain"`
+	AccessNetworkInfo    string   `json:"access_network_info,omitempty"`
+	VisitedNetworkID     string   `json:"visited_network_id,omitempty"`
 }
 
 type networkConfigJSON struct {
@@ -43,6 +45,12 @@ type networkConfigJSON struct {
 	EPDG                  string          `json:"epdg"`
 	EmergencyDomain       string          `json:"emergency_domain"`
 	EmergencyRealm        string          `json:"emergency_realm"`
+	AccessNetworkInfo     string          `json:"access_network_info"`
+	PAccessNetworkInfo    string          `json:"p_access_network_info"`
+	PANI                  string          `json:"pani"`
+	VisitedNetworkID      string          `json:"visited_network_id"`
+	PVisitedNetworkID     string          `json:"p_visited_network_id"`
+	VisitedNetwork        string          `json:"visited_network"`
 }
 
 func (raw networkConfigJSON) networkConfig() (NetworkConfig, error) {
@@ -70,6 +78,8 @@ func (raw networkConfigJSON) networkConfig() (NetworkConfig, error) {
 		PCSCFFQDNs:           append(append(append(pcscf, pcscfList...), pcscfLegacyList...), pcscfAlias...),
 		EPDGFQDN:             firstNetworkString(raw.EPDGFQDN, raw.EPDG),
 		EmergencyDomain:      firstNetworkString(raw.EmergencyDomain, raw.EmergencyRealm),
+		AccessNetworkInfo:    firstNetworkString(raw.AccessNetworkInfo, raw.PAccessNetworkInfo, raw.PANI),
+		VisitedNetworkID:     firstNetworkString(raw.VisitedNetworkID, raw.PVisitedNetworkID, raw.VisitedNetwork),
 	}, nil
 }
 
@@ -446,6 +456,8 @@ func normalizeNetworkConfig(mcc, mnc string, cfg NetworkConfig) NetworkConfig {
 	}
 	cfg.EPDGFQDN = normalizeDomainName(cfg.EPDGFQDN)
 	cfg.EmergencyDomain = normalizeDomainName(cfg.EmergencyDomain)
+	cfg.AccessNetworkInfo = strings.TrimSpace(cfg.AccessNetworkInfo)
+	cfg.VisitedNetworkID = strings.TrimSpace(cfg.VisitedNetworkID)
 	if mcc == "" || mnc == "" {
 		if cfg.PrivateIdentityRealm == "" {
 			cfg.PrivateIdentityRealm = cfg.IMSRealm
@@ -575,6 +587,12 @@ func mergeNetworkAliasConfig(base, alias NetworkConfig) NetworkConfig {
 	}
 	if strings.TrimSpace(base.EmergencyDomain) == "" {
 		base.EmergencyDomain = alias.EmergencyDomain
+	}
+	if strings.TrimSpace(base.AccessNetworkInfo) == "" {
+		base.AccessNetworkInfo = alias.AccessNetworkInfo
+	}
+	if strings.TrimSpace(base.VisitedNetworkID) == "" {
+		base.VisitedNetworkID = alias.VisitedNetworkID
 	}
 	return base
 }

@@ -452,13 +452,19 @@ func TestParseDigestAuthorizationRejectsInvalidHeaders(t *testing.T) {
 
 func TestBuildRegisterHeaders(t *testing.T) {
 	headers := BuildRegisterHeaders(IMSProfile{
-		IMPI:      "310280233641503@private.att.net",
-		IMPU:      "sip:310280233641503@one.att.net",
-		Domain:    "one.att.net",
-		UserAgent: "VoHive",
+		IMPI:              "310280233641503@private.example.test",
+		IMPU:              "sip:310280233641503@ims.example.test",
+		Domain:            "ims.example.test",
+		UserAgent:         "VoHive",
+		AccessNetworkInfo: `IEEE-802.11;i-wlan-node-id="node;1"`,
+		VisitedNetworkID:  `visited.example.test`,
 	}, "sip:310280233641503@192.0.2.10:5060", "call-1", "1")
-	if headers["To"] != "<sip:310280233641503@one.att.net>" || headers["CSeq"] != "1 REGISTER" {
+	if headers["To"] != "<sip:310280233641503@ims.example.test>" || headers["CSeq"] != "1 REGISTER" {
 		t.Fatalf("headers=%+v", headers)
+	}
+	if headers["P-Access-Network-Info"] != `IEEE-802.11;i-wlan-node-id="node;1"` ||
+		headers["P-Visited-Network-ID"] != `"visited.example.test"` {
+		t.Fatalf("IMS access/visited headers=%+v", headers)
 	}
 	if !strings.Contains(headers["Contact"], `+sip.instance="<urn:uuid:vowifi-go>"`) ||
 		!strings.Contains(headers["Contact"], imsMMTelContactFeature) {
@@ -2547,6 +2553,7 @@ func TestBuildIMSDialogRequestsInjectCarrierHeaders(t *testing.T) {
 		CarrierHeaders: map[string]string{
 			"P-Preferred-Identity":  "sip:preferred@example",
 			"P-Access-Network-Info": `3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100abcde`,
+			"p-visited-network-id":  `"visited.example.test"`,
 			"Reason":                `Q.850;cause=16;text="normal call clearing"`,
 			"P-Charging-Vector":     "icid-value=call-carrier",
 			"To":                    "<sip:changed@example>",
@@ -2559,6 +2566,7 @@ func TestBuildIMSDialogRequestsInjectCarrierHeaders(t *testing.T) {
 	}
 	if cancel.Headers["P-Preferred-Identity"] != "<sip:preferred@example>" ||
 		cancel.Headers["P-Access-Network-Info"] != `3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100abcde` ||
+		cancel.Headers["P-Visited-Network-ID"] != `"visited.example.test"` ||
 		cancel.Headers["Reason"] != `Q.850;cause=16;text="normal call clearing"` ||
 		cancel.Headers["P-Charging-Vector"] != "icid-value=call-carrier" {
 		t.Fatalf("carrier CANCEL headers=%+v", cancel.Headers)

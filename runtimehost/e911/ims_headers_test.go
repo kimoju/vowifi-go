@@ -111,6 +111,29 @@ func TestParsePAccessNetworkInfoParsesWLANAndCellularValues(t *testing.T) {
 	}
 }
 
+func TestNormalizePAccessNetworkInfoHandlesQuotedDelimiters(t *testing.T) {
+	got, err := NormalizePAccessNetworkInfo(` IEEE-802.11 ; i-wlan-node-id = "aa:bb\,office" ; operator-specific = "alpha\;beta" , 3GPP-E-UTRAN-FDD ; utran-cell-id-3gpp = "3102600abc\;def" ; network-provided `)
+	if err != nil {
+		t.Fatalf("NormalizePAccessNetworkInfo() error = %v", err)
+	}
+	want := `IEEE-802.11;i-wlan-node-id="aa:bb,office";operator-specific="alpha;beta", 3GPP-E-UTRAN-FDD;network-provided;utran-cell-id-3gpp="3102600abc;def"`
+	if got != want {
+		t.Fatalf("NormalizePAccessNetworkInfo()=%q, want %q", got, want)
+	}
+
+	values, err := ParsePAccessNetworkInfo(got)
+	if err != nil {
+		t.Fatalf("ParsePAccessNetworkInfo(normalized) error = %v", err)
+	}
+	if len(values) != 2 ||
+		values[0].WLANNodeID != "aa:bb,office" ||
+		values[0].Parameters["operator-specific"] != "alpha;beta" ||
+		values[1].Parameters["network-provided"] != "" ||
+		values[1].Parameters["utran-cell-id-3gpp"] != "3102600abc;def" {
+		t.Fatalf("normalized PANI values=%+v", values)
+	}
+}
+
 func TestNormalizePAccessNetworkInfoRoundTripsCommonCarrierParameters(t *testing.T) {
 	got, err := NormalizePAccessNetworkInfo(` 3GPP-E-UTRAN-FDD ; utran-cell-id-3gpp = "3102600abcdef" ; cgi-3gpp=310260ffff `)
 	if err != nil {
@@ -138,6 +161,7 @@ func TestParsePAccessNetworkInfoRejectsMalformedValues(t *testing.T) {
 	for _, header := range []string{
 		`;i-wlan-node-id="aa:bb:cc:dd:ee:ff"`,
 		`IEEE-802.11;i-wlan-node-id="unterminated`,
+		`IEEE-802.11;i-wlan-node-id="node"tail`,
 		`IEEE-802.11;=value`,
 	} {
 		t.Run(header, func(t *testing.T) {
@@ -166,6 +190,27 @@ func TestParseGeolocationHeaderParsesMultipleLocationsAndParameters(t *testing.T
 	}
 	if values[1].URI != "geo:47.6205,-122.3493" || values[1].Parameters["routing-allowed"] != "yes" {
 		t.Fatalf("second value=%+v", values[1])
+	}
+}
+
+func TestNormalizeGeolocationHeaderHandlesQuotedDelimiters(t *testing.T) {
+	got, err := NormalizeGeolocationHeader(` <cid:loc-1@example.test> ; purpose = "emergency\, callback" ; inserted-by = endpoint , <https://lis.example.test/location/abc> ; note = "floor\;unit\"7" `)
+	if err != nil {
+		t.Fatalf("NormalizeGeolocationHeader() error = %v", err)
+	}
+	want := `<cid:loc-1@example.test>;inserted-by=endpoint;purpose="emergency, callback", <https://lis.example.test/location/abc>;note="floor;unit\"7"`
+	if got != want {
+		t.Fatalf("NormalizeGeolocationHeader()=%q, want %q", got, want)
+	}
+
+	values, err := ParseGeolocationHeader(got)
+	if err != nil {
+		t.Fatalf("ParseGeolocationHeader(normalized) error = %v", err)
+	}
+	if len(values) != 2 ||
+		values[0].Parameters["purpose"] != "emergency, callback" ||
+		values[1].Parameters["note"] != `floor;unit"7` {
+		t.Fatalf("normalized geolocation values=%+v", values)
 	}
 }
 
@@ -237,6 +282,8 @@ func TestNormalizeGeolocationHeaderRejectsMalformedValues(t *testing.T) {
 		`<cid:loc-1> garbage`,
 		`;inserted-by=endpoint`,
 		`<cid:loc-1>;=endpoint`,
+		`<cid:loc-1>;purpose="emergency"callback`,
+		`<cid:loc-1>;purpose=emergency"callback`,
 	} {
 		t.Run(header, func(t *testing.T) {
 			if _, err := NormalizeGeolocationHeader(header); err == nil {

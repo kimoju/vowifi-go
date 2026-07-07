@@ -904,12 +904,35 @@ func parseSIPHeaderParameters(params string) (map[string]string, error) {
 			out[key] = ""
 			continue
 		}
-		out[key] = unquoteSIPHeaderParameter(value)
+		parsedValue, err := parseSIPHeaderParameterValue(value)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = parsedValue
 	}
 	if len(out) == 0 {
 		return nil, nil
 	}
 	return out, nil
+}
+
+func parseSIPHeaderParameterValue(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	quotedStart := strings.HasPrefix(value, `"`)
+	quotedEnd := strings.HasSuffix(value, `"`)
+	if quotedStart || quotedEnd {
+		if !quotedStart || !quotedEnd || len(value) < 2 {
+			return "", errors.New("invalid SIP header parameter: malformed quoted value")
+		}
+		return unquoteSIPHeaderParameter(value), nil
+	}
+	if strings.Contains(value, `"`) {
+		return "", errors.New("invalid SIP header parameter: unexpected quote in token value")
+	}
+	return value, nil
 }
 
 func unquoteSIPHeaderParameter(value string) string {

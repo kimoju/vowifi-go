@@ -357,6 +357,35 @@ func TestParseIMSCPIMIMDNDispositionRequestWithFoldedAlias(t *testing.T) {
 	}
 }
 
+func TestParseIMSCPIMIMDNDispositionRequestWithLooseTokenSeparators(t *testing.T) {
+	headers := map[string][]string{
+		"NS":                            {"imdn <urn:ietf:params:imdn>"},
+		"Require":                       {"imdn.Disposition-Notification; other-feature"},
+		"imdn.Message-ID":               {"loose-msg"},
+		"imdn.Disposition-Notification": {"positive; negative-delivery display\tprocessing"},
+	}
+	req := IMSCPIMIMDNDispositionRequestFromHeaders(headers)
+	if !req.Requested() || !req.Required || req.MessageID != "loose-msg" ||
+		!req.PositiveDelivery || !req.NegativeDelivery || !req.Display || !req.Processing {
+		t.Fatalf("loose IMDN disposition request=%+v", req)
+	}
+}
+
+func TestParseIMSCPIMMessageAcceptsMixedLineEndings(t *testing.T) {
+	body := []byte("From: <sip:alice@example.com>\rTo: <sip:bob@example.com>\r\r" +
+		"Content-Type: text/plain\nContent-Length: 5\n\nhello")
+	cpim, err := ParseIMSCPIMMessage(body)
+	if err != nil {
+		t.Fatalf("ParseIMSCPIMMessage() error = %v", err)
+	}
+	if got := textproto.MIMEHeader(cpim.Headers).Get("From"); got != "<sip:alice@example.com>" {
+		t.Fatalf("From=%q", got)
+	}
+	if cpim.ContentType != "text/plain" || string(cpim.Body) != "hello" {
+		t.Fatalf("parsed CPIM content type=%q body=%q", cpim.ContentType, cpim.Body)
+	}
+}
+
 func TestParseIMSCPIMIMDNReportDeliveryFailure(t *testing.T) {
 	payload := strings.Join([]string{
 		`<?xml version="1.0" encoding="UTF-8"?>`,
