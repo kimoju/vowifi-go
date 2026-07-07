@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 var ErrInvalidTUNTunnelManager = errors.New("invalid swu tun tunnel manager")
@@ -57,6 +58,7 @@ type TUNPacketTunnelSession struct {
 
 var _ TunnelManager = (*TUNTunnelManager)(nil)
 var _ TunnelSession = (*TUNPacketTunnelSession)(nil)
+var _ ChildSARekeyScheduler = (*TUNPacketTunnelSession)(nil)
 
 func NewTUNTunnelManager(cfg TUNTunnelManagerConfig) *TUNTunnelManager {
 	return &TUNTunnelManager{Config: cfg}
@@ -280,9 +282,69 @@ func (s *TUNPacketTunnelSession) Result() TunnelResult {
 	if s == nil {
 		return TunnelResult{}
 	}
+	if s.base != nil {
+		if result := s.base.Result(); !isZeroTunnelResult(result) {
+			return s.setResult(result)
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneTunnelResult(s.result)
+}
+
+func (s *TUNPacketTunnelSession) RekeyChildSA(ctx context.Context) (TunnelResult, error) {
+	if s == nil || s.base == nil {
+		return TunnelResult{}, ErrInvalidTUNTunnelManager
+	}
+	controller, ok := s.base.(ChildSARekeyController)
+	if !ok {
+		return TunnelResult{}, fmt.Errorf("%w: base session cannot rekey child sa", ErrInvalidTUNTunnelManager)
+	}
+	result, err := controller.RekeyChildSA(ctx)
+	if err != nil {
+		return TunnelResult{}, err
+	}
+	return s.setResult(result), nil
+}
+
+func (s *TUNPacketTunnelSession) NextChildSARekeyDue() (time.Time, bool) {
+	if s == nil || s.base == nil {
+		return time.Time{}, false
+	}
+	scheduler, ok := s.base.(ChildSARekeyScheduler)
+	if !ok {
+		return time.Time{}, false
+	}
+	return scheduler.NextChildSARekeyDue()
+}
+
+func (s *TUNPacketTunnelSession) RunChildSARekeyDue(ctx context.Context, now time.Time) (ChildSARekeyDecision, error) {
+	if s == nil || s.base == nil {
+		return ChildSARekeyDecision{}, ErrInvalidTUNTunnelManager
+	}
+	scheduler, ok := s.base.(ChildSARekeyScheduler)
+	if !ok {
+		return ChildSARekeyDecision{Action: ChildSARekeyNoAction, Reason: "rekey disabled"}, nil
+	}
+	decision, err := scheduler.RunChildSARekeyDue(ctx, now)
+	if err != nil {
+		return decision, err
+	}
+	if decision.Action == ChildSARekeyDue {
+		s.refreshResultFromBase()
+	}
+	return decision, nil
+}
+
+func (s *TUNPacketTunnelSession) ChildSARekeySnapshot() ChildSARekeySnapshot {
+	if s == nil || s.base == nil {
+		return ChildSARekeySnapshot{}
+	}
+	scheduler, ok := s.base.(ChildSARekeyScheduler)
+	if !ok {
+		return ChildSARekeySnapshot{}
+	}
+	return scheduler.ChildSARekeySnapshot()
 }
 
 func (s *TUNPacketTunnelSession) MOBIKE(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
@@ -313,6 +375,27 @@ func (s *TUNPacketTunnelSession) MOBIKE(ctx context.Context, req MOBIKERequest) 
 		s.result.Reason = res.Reason
 	}
 	return res, nil
+}
+
+func (s *TUNPacketTunnelSession) refreshResultFromBase() TunnelResult {
+	if s == nil || s.base == nil {
+		return TunnelResult{}
+	}
+	result := s.base.Result()
+	if isZeroTunnelResult(result) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return cloneTunnelResult(s.result)
+	}
+	return s.setResult(result)
+}
+
+func (s *TUNPacketTunnelSession) setResult(result TunnelResult) TunnelResult {
+	result = completeTUNResult(result)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.result = result
+	return cloneTunnelResult(s.result)
 }
 
 func (s *TUNPacketTunnelSession) Close(ctx context.Context) error {

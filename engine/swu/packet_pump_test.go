@@ -100,6 +100,78 @@ func TestPacketPumpReportsDeviceWriteErrors(t *testing.T) {
 	}
 }
 
+func TestPacketPumpRunsChildSARekeyBeforeOutbound(t *testing.T) {
+	device := newPumpFakeDevice()
+	session := newPumpFakeSession()
+	session.rekeyDue = time.Now().Add(-time.Second)
+	pump, err := NewPacketPump(PacketPumpConfig{Session: session, Device: device})
+	if err != nil {
+		t.Fatalf("NewPacketPump() error = %v", err)
+	}
+	if err := pump.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	outbound := []byte{0x45, 0, 0, 0x14, 0xaa}
+	device.reads <- outbound
+	if got := readPumpBytes(t, session.sent); !bytes.Equal(got, outbound) {
+		t.Fatalf("sent=%x, want %x", got, outbound)
+	}
+	if err := pump.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	stats, err := pump.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if stats.ChildSARekeys != 1 || stats.ChildSARekeyErrors != 0 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	if calls := session.rekeyCallCount(); calls != 1 {
+		t.Fatalf("rekey calls=%d, want 1", calls)
+	}
+	if events := session.eventLog(); len(events) != 2 || events[0] != "rekey" || events[1] != "send" {
+		t.Fatalf("events=%+v, want rekey before send", events)
+	}
+}
+
+func TestPacketPumpReportsChildSARekeyErrors(t *testing.T) {
+	device := newPumpFakeDevice()
+	wantErr := errors.New("rekey failed")
+	session := newPumpFakeSession()
+	session.rekeyDue = time.Now().Add(-time.Second)
+	session.rekeyErr = wantErr
+	var gotDirection PacketPumpDirection
+	pump, err := NewPacketPump(PacketPumpConfig{
+		Session: session,
+		Device:  device,
+		OnError: func(direction PacketPumpDirection, err error) {
+			gotDirection = direction
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPacketPump() error = %v", err)
+	}
+	if err := pump.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	device.reads <- []byte{0x45, 0, 0, 0x14}
+
+	stats, err := pump.Wait()
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Wait() err=%v, want rekey failed", err)
+	}
+	if gotDirection != PacketPumpDeviceToESP {
+		t.Fatalf("direction=%s, want %s", gotDirection, PacketPumpDeviceToESP)
+	}
+	if stats.ChildSARekeyErrors != 1 || stats.ChildSARekeys != 0 || stats.DeviceToESPPackets != 0 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	if len(session.eventLog()) != 1 || session.eventLog()[0] != "rekey" {
+		t.Fatalf("events=%+v, want only rekey", session.eventLog())
+	}
+}
+
 func TestPacketPumpWaitBeforeStartReturnsError(t *testing.T) {
 	pump, err := NewPacketPump(PacketPumpConfig{Session: newPumpFakeSession(), Device: newPumpFakeDevice()})
 	if err != nil {
@@ -171,12 +243,17 @@ func (d *pumpFakeDevice) Close(ctx context.Context) error {
 }
 
 type pumpFakeSession struct {
-	sent    chan []byte
-	reads   chan PacketTunnelPacket
-	sendErr error
-	readErr error
-	close   sync.Once
-	closed  chan struct{}
+	mu         sync.Mutex
+	sent       chan []byte
+	reads      chan PacketTunnelPacket
+	sendErr    error
+	readErr    error
+	rekeyDue   time.Time
+	rekeyErr   error
+	rekeyCalls int
+	events     []string
+	close      sync.Once
+	closed     chan struct{}
 }
 
 func newPumpFakeSession() *pumpFakeSession {
@@ -204,6 +281,7 @@ func (s *pumpFakeSession) SendInnerPacket(ctx context.Context, packet []byte) er
 	if s.sendErr != nil {
 		return s.sendErr
 	}
+	s.recordEvent("send")
 	select {
 	case s.sent <- append([]byte(nil), packet...):
 		return nil
@@ -239,4 +317,86 @@ func (s *pumpFakeSession) ReadInnerPacket(ctx context.Context) (PacketTunnelPack
 
 func (s *pumpFakeSession) PacketStats() PacketTunnelStats {
 	return PacketTunnelStats{}
+}
+
+func (s *pumpFakeSession) RekeyChildSA(ctx context.Context) (TunnelResult, error) {
+	decision, err := s.RunChildSARekeyDue(ctx, time.Now())
+	if err != nil {
+		return TunnelResult{}, err
+	}
+	return TunnelResult{
+		Ready:             true,
+		IKEEstablished:    true,
+		IPsecEstablished:  true,
+		ChildSAIdentifier: decision.Reason,
+	}, nil
+}
+
+func (s *pumpFakeSession) NextChildSARekeyDue() (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rekeyDue.IsZero() {
+		return time.Time{}, false
+	}
+	return s.rekeyDue, true
+}
+
+func (s *pumpFakeSession) RunChildSARekeyDue(ctx context.Context, now time.Time) (ChildSARekeyDecision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rekeyDue.IsZero() {
+		return ChildSARekeyDecision{Action: ChildSARekeyNoAction, Reason: "rekey disabled"}, nil
+	}
+	dueAt := s.rekeyDue
+	if now.Before(dueAt) {
+		return ChildSARekeyDecision{
+			Action:  ChildSARekeyNoAction,
+			DueAt:   dueAt,
+			NextDue: dueAt,
+			Reason:  "child sa rekey not due",
+		}, nil
+	}
+	s.rekeyCalls++
+	s.events = append(s.events, "rekey")
+	decision := ChildSARekeyDecision{
+		Action:  ChildSARekeyDue,
+		DueAt:   dueAt,
+		NextDue: now.Add(time.Hour),
+		Reason:  "child sa rekey due",
+	}
+	if s.rekeyErr != nil {
+		return decision, s.rekeyErr
+	}
+	s.rekeyDue = decision.NextDue
+	return decision, nil
+}
+
+func (s *pumpFakeSession) ChildSARekeySnapshot() ChildSARekeySnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rekeyDue.IsZero() {
+		return ChildSARekeySnapshot{}
+	}
+	return ChildSARekeySnapshot{
+		Enabled: true,
+		DueAt:   s.rekeyDue,
+	}
+}
+
+func (s *pumpFakeSession) rekeyCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rekeyCalls
+}
+
+func (s *pumpFakeSession) eventLog() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.events...)
+}
+
+func (s *pumpFakeSession) recordEvent(event string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, event)
 }

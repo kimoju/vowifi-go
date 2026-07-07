@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 var ErrInvalidPacketPump = errors.New("invalid swu packet pump")
@@ -44,6 +45,8 @@ type PacketPumpStats struct {
 	DeviceWriteErrors  uint64
 	ESPReadErrors      uint64
 	ESPSendErrors      uint64
+	ChildSARekeys      uint64
+	ChildSARekeyErrors uint64
 }
 
 type PacketPumpConfig struct {
@@ -57,14 +60,15 @@ type PacketPump struct {
 	device  InnerPacketDevice
 	onError func(PacketPumpDirection, error)
 
-	mu      sync.Mutex
-	stats   PacketPumpStats
-	started bool
-	done    chan struct{}
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	err     error
-	once    sync.Once
+	mu            sync.Mutex
+	maintenanceMu sync.Mutex
+	stats         PacketPumpStats
+	started       bool
+	done          chan struct{}
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	err           error
+	once          sync.Once
 }
 
 func NewPacketPump(cfg PacketPumpConfig) (*PacketPump, error) {
@@ -186,6 +190,9 @@ func (p *PacketPump) deviceToESP(ctx context.Context) {
 		if len(packet) == 0 {
 			continue
 		}
+		if err := p.runChildSARekeyDue(ctx, PacketPumpDeviceToESP); err != nil {
+			return
+		}
 		if err := p.session.SendInnerPacket(ctx, packet); err != nil {
 			if p.isNormalStop(ctx, err) {
 				p.requestStop()
@@ -228,7 +235,39 @@ func (p *PacketPump) espToDevice(ctx context.Context) {
 		p.stats.ESPToDevicePackets++
 		p.stats.ESPToDeviceBytes += uint64(len(packet.Payload))
 		p.mu.Unlock()
+		if err := p.runChildSARekeyDue(ctx, PacketPumpESPToDevice); err != nil {
+			return
+		}
 	}
+}
+
+func (p *PacketPump) runChildSARekeyDue(ctx context.Context, direction PacketPumpDirection) error {
+	scheduler, ok := p.session.(ChildSARekeyScheduler)
+	if !ok || scheduler == nil {
+		return nil
+	}
+	now := time.Now()
+	if dueAt, ok := scheduler.NextChildSARekeyDue(); !ok || now.Before(dueAt) {
+		return nil
+	}
+	p.maintenanceMu.Lock()
+	defer p.maintenanceMu.Unlock()
+
+	now = time.Now()
+	if dueAt, ok := scheduler.NextChildSARekeyDue(); !ok || now.Before(dueAt) {
+		return nil
+	}
+	decision, err := scheduler.RunChildSARekeyDue(ctx, now)
+	if err != nil {
+		p.recordError(direction, err, func(stats *PacketPumpStats) { stats.ChildSARekeyErrors++ })
+		return err
+	}
+	if decision.Action == ChildSARekeyDue {
+		p.mu.Lock()
+		p.stats.ChildSARekeys++
+		p.mu.Unlock()
+	}
+	return nil
 }
 
 func (p *PacketPump) closeOnContext(ctx context.Context) {

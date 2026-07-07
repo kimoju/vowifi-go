@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestTUNTunnelManagerStartsPumpAndCleansRouting(t *testing.T) {
@@ -80,6 +81,59 @@ func TestTUNTunnelManagerStartsPumpAndCleansRouting(t *testing.T) {
 	}
 	if len(routing.cleanups) != 1 || routing.cleanups[0].InterfaceName != "vohive0" {
 		t.Fatalf("routing cleanups=%+v", routing.cleanups)
+	}
+}
+
+func TestTUNTunnelManagerResultTracksPumpDrivenChildSARekey(t *testing.T) {
+	baseSession := newTUNManagerPacketSession(TunnelResult{
+		Ready:             true,
+		Mode:              DataplaneModeUserspace,
+		EPDGAddress:       "epdg.example",
+		LocalInnerIP:      "10.0.0.2",
+		IKEEstablished:    true,
+		IPsecEstablished:  true,
+		ChildSAIdentifier: "11111111/22222222",
+		Reason:            "ike ipsec ready",
+	})
+	baseSession.rekeyDue = time.Now().Add(-time.Second)
+	baseSession.rekeyResult = TunnelResult{
+		Ready:             true,
+		Mode:              DataplaneModeUserspace,
+		EPDGAddress:       "epdg.example",
+		LocalInnerIP:      "10.0.0.2",
+		IKEEstablished:    true,
+		IPsecEstablished:  true,
+		ChildSAIdentifier: "33333333/44444444",
+		Reason:            "child sa rekeyed",
+	}
+	device := newTUNManagerDevice("vohive0")
+	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
+		Base:           &tunManagerBase{session: baseSession},
+		DisableRouting: true,
+		DeviceFactory: func(ctx context.Context, cfg TunnelConfig, result TunnelResult) (InnerPacketDevice, string, error) {
+			return device, "vohive0", nil
+		},
+	})
+
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:    "dev-1",
+		Mode:        DataplaneModeUserspace,
+		EPDGAddress: "epdg.example",
+		IMSI:        "310280233641503",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	device.reads <- []byte{0x45, 0, 0, 0x14, 0xaa}
+	_ = readPumpBytes(t, baseSession.sent)
+	if calls := baseSession.rekeyCallCount(); calls != 1 {
+		t.Fatalf("rekey calls=%d, want 1", calls)
+	}
+	result := session.Result()
+	if result.ChildSAIdentifier != "33333333/44444444" || result.Reason != "child sa rekeyed" {
+		t.Fatalf("result after pump-driven rekey=%+v", result)
 	}
 }
 
@@ -314,13 +368,18 @@ func (d *tunManagerDevice) isClosed() bool {
 }
 
 type tunManagerPacketSession struct {
-	result  TunnelResult
-	sent    chan []byte
-	reads   chan PacketTunnelPacket
-	close   sync.Once
-	closed  chan struct{}
-	mobike  MOBIKEResult
-	closeMu sync.Mutex
+	mu          sync.Mutex
+	result      TunnelResult
+	sent        chan []byte
+	reads       chan PacketTunnelPacket
+	close       sync.Once
+	closed      chan struct{}
+	mobike      MOBIKEResult
+	rekeyDue    time.Time
+	rekeyResult TunnelResult
+	rekeyErr    error
+	rekeyCalls  int
+	closeMu     sync.Mutex
 }
 
 func newTUNManagerPacketSession(result TunnelResult) *tunManagerPacketSession {
@@ -338,9 +397,15 @@ func newTUNManagerPacketSession(result TunnelResult) *tunManagerPacketSession {
 	}
 }
 
-func (s *tunManagerPacketSession) Result() TunnelResult { return s.result }
+func (s *tunManagerPacketSession) Result() TunnelResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneTunnelResult(s.result)
+}
 
 func (s *tunManagerPacketSession) MOBIKE(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.mobike, nil
 }
 
@@ -372,6 +437,70 @@ func (s *tunManagerPacketSession) PacketStats() PacketTunnelStats {
 	return PacketTunnelStats{}
 }
 
+func (s *tunManagerPacketSession) RekeyChildSA(ctx context.Context) (TunnelResult, error) {
+	decision, err := s.RunChildSARekeyDue(ctx, time.Now())
+	if err != nil {
+		return TunnelResult{}, err
+	}
+	if decision.Action != ChildSARekeyDue {
+		return s.Result(), nil
+	}
+	return s.Result(), nil
+}
+
+func (s *tunManagerPacketSession) NextChildSARekeyDue() (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rekeyDue.IsZero() {
+		return time.Time{}, false
+	}
+	return s.rekeyDue, true
+}
+
+func (s *tunManagerPacketSession) RunChildSARekeyDue(ctx context.Context, now time.Time) (ChildSARekeyDecision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rekeyDue.IsZero() {
+		return ChildSARekeyDecision{Action: ChildSARekeyNoAction, Reason: "rekey disabled"}, nil
+	}
+	dueAt := s.rekeyDue
+	if now.Before(dueAt) {
+		return ChildSARekeyDecision{
+			Action:  ChildSARekeyNoAction,
+			DueAt:   dueAt,
+			NextDue: dueAt,
+			Reason:  "child sa rekey not due",
+		}, nil
+	}
+	s.rekeyCalls++
+	decision := ChildSARekeyDecision{
+		Action:  ChildSARekeyDue,
+		DueAt:   dueAt,
+		NextDue: now.Add(time.Hour),
+		Reason:  "child sa rekey due",
+	}
+	if s.rekeyErr != nil {
+		return decision, s.rekeyErr
+	}
+	if !isZeroTunnelResult(s.rekeyResult) {
+		s.result = cloneTunnelResult(s.rekeyResult)
+	}
+	s.rekeyDue = decision.NextDue
+	return decision, nil
+}
+
+func (s *tunManagerPacketSession) ChildSARekeySnapshot() ChildSARekeySnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rekeyDue.IsZero() {
+		return ChildSARekeySnapshot{}
+	}
+	return ChildSARekeySnapshot{
+		Enabled: true,
+		DueAt:   s.rekeyDue,
+	}
+}
+
 func (s *tunManagerPacketSession) ReadInnerPacket(ctx context.Context) (PacketTunnelPacket, error) {
 	select {
 	case packet := <-s.reads:
@@ -391,6 +520,12 @@ func (s *tunManagerPacketSession) isClosed() bool {
 	default:
 		return false
 	}
+}
+
+func (s *tunManagerPacketSession) rekeyCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rekeyCalls
 }
 
 type tunManagerPlainSession struct {
