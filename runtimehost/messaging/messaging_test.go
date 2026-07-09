@@ -509,6 +509,196 @@ func TestSendUSSDTransportFailureQueuesIMSRetry(t *testing.T) {
 	}
 }
 
+func TestReplayIMSMessagingRetrySMSSuccessDeletesRetry(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	req := SMSSendRequest{
+		DeviceID:  "dev-1",
+		IMSI:      "310280233641503",
+		Peer:      "+18005551212",
+		MessageID: "msg-1",
+		Part:      SMSPart{PartNo: 1, TotalParts: 1, Text: "hello"},
+	}
+	envelope := NewIMSSMSSubmitRetryEnvelope(
+		req,
+		SMSSendResult{State: "failed", SIPCode: 503, ErrorText: "Service Unavailable", RetryAfter: time.Second},
+		errors.New("Service Unavailable"),
+		IMSMessagingRetryOptions{Attempt: 1, Now: now.Add(-2 * time.Second)},
+	)
+	store := &fakeRetryDeliveryStore{}
+	transport := &fakeSMSTransport{}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	svc.SetSMSTransport(transport)
+
+	result, err := svc.ReplayIMSMessagingRetry(context.Background(), envelope, now)
+	if err != nil {
+		t.Fatalf("ReplayIMSMessagingRetry() error = %v", err)
+	}
+	if !result.Replayed || !result.Deleted || result.Upserted || result.SMSResult.State != "sent" {
+		t.Fatalf("replay result=%+v", result)
+	}
+	if len(transport.requests) != 1 || transport.requests[0].MessageID != "msg-1" {
+		t.Fatalf("transport requests=%+v", transport.requests)
+	}
+	if len(store.retryDeletes) != 1 || store.retryDeletes[0].operation != IMSMessagingRetryOperationSMSSubmit || store.retryDeletes[0].key != envelope.Key {
+		t.Fatalf("retry deletes=%+v", store.retryDeletes)
+	}
+	if len(store.retryUpserts) != 0 {
+		t.Fatalf("retry upserts=%+v", store.retryUpserts)
+	}
+	if len(store.parts) != 1 || store.parts[0].State != "sent" || store.recomputedMessageID != "msg-1" {
+		t.Fatalf("delivery store parts=%+v recomputed=%q", store.parts, store.recomputedMessageID)
+	}
+	if !result.NextEnvelope.Terminal() {
+		t.Fatalf("next envelope should be terminal after success: %+v", result.NextEnvelope)
+	}
+}
+
+func TestReplayIMSMessagingRetrySMSFailureUpsertsNextAttempt(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	req := SMSSendRequest{
+		DeviceID:  "dev-1",
+		IMSI:      "310280233641503",
+		Peer:      "+18005551212",
+		MessageID: "msg-1",
+		Part:      SMSPart{PartNo: 1, TotalParts: 1, Text: "hello"},
+	}
+	envelope := NewIMSSMSSubmitRetryEnvelope(
+		req,
+		SMSSendResult{State: "failed", SIPCode: 503, ErrorText: "Service Unavailable", RetryAfter: time.Second},
+		errors.New("Service Unavailable"),
+		IMSMessagingRetryOptions{Attempt: 1, Now: now.Add(-2 * time.Second)},
+	)
+	store := &fakeRetryDeliveryStore{}
+	transport := &retrySMSTransport{
+		result: SMSSendResult{State: "failed", SIPCode: 503, ErrorText: "Service Unavailable", RetryAfter: 3 * time.Second},
+		err:    errors.New("Service Unavailable"),
+	}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	svc.SetSMSTransport(transport)
+
+	result, err := svc.ReplayIMSMessagingRetry(context.Background(), envelope, now)
+	if err == nil {
+		t.Fatal("ReplayIMSMessagingRetry() err=nil, want retry failure")
+	}
+	if !result.Replayed || !result.Upserted || result.Deleted || len(store.retryUpserts) != 1 || len(store.retryDeletes) != 0 {
+		t.Fatalf("replay result=%+v upserts=%+v deletes=%+v", result, store.retryUpserts, store.retryDeletes)
+	}
+	next := store.retryUpserts[0]
+	if !next.Pending() || next.Key != envelope.Key || next.Attempt != 2 || next.NextAttempt != 3 || !next.DueAt.Equal(now.Add(3*time.Second)) {
+		t.Fatalf("next retry envelope=%+v", next)
+	}
+	if len(transport.requests) != 1 || transport.requests[0].MessageID != "msg-1" {
+		t.Fatalf("transport requests=%+v", transport.requests)
+	}
+}
+
+func TestReplayIMSMessagingRetrySkipsNotDueEnvelope(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	req := SMSSendRequest{
+		DeviceID:  "dev-1",
+		IMSI:      "310280233641503",
+		Peer:      "+18005551212",
+		MessageID: "msg-1",
+		Part:      SMSPart{PartNo: 1, TotalParts: 1, Text: "hello"},
+	}
+	envelope := NewIMSSMSSubmitRetryEnvelope(
+		req,
+		SMSSendResult{State: "failed", SIPCode: 503, ErrorText: "Service Unavailable", RetryAfter: time.Minute},
+		errors.New("Service Unavailable"),
+		IMSMessagingRetryOptions{Attempt: 1, Now: now},
+	)
+	store := &fakeRetryDeliveryStore{}
+	transport := &fakeSMSTransport{}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	svc.SetSMSTransport(transport)
+
+	result, err := svc.ReplayIMSMessagingRetry(context.Background(), envelope, now.Add(10*time.Second))
+	if err != nil {
+		t.Fatalf("ReplayIMSMessagingRetry() error = %v", err)
+	}
+	if result.Replayed || len(transport.requests) != 0 || len(store.retryUpserts) != 0 || len(store.retryDeletes) != 0 {
+		t.Fatalf("result=%+v requests=%+v upserts=%+v deletes=%+v", result, transport.requests, store.retryUpserts, store.retryDeletes)
+	}
+}
+
+func TestReplayIMSMessagingRetryUSSDExecuteSuccessDeletesRetry(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	req := USSDRequest{DeviceID: "dev-1", IMSI: "310280233641503", SessionID: "ussd-1", Command: "*100#"}
+	envelope := NewIMSUSSDSessionRetryEnvelope(
+		req,
+		USSDResult{Status: 503, Done: true, RetryAfter: time.Second},
+		errors.New("Service Unavailable"),
+		IMSMessagingRetryOptions{Attempt: 1, Now: now.Add(-2 * time.Second)},
+	)
+	store := &fakeRetryDeliveryStore{}
+	dispatch := &fakeDispatcher{}
+	transport := &fakeUSSDTransport{executeResult: USSDResult{Text: "1. Balance", Status: 200, Done: false}}
+	svc := NewService("dev-1", "310280233641503", store, dispatch)
+	svc.SetUSSDTransport(transport)
+
+	result, err := svc.ReplayIMSMessagingRetry(context.Background(), envelope, now)
+	if err != nil {
+		t.Fatalf("ReplayIMSMessagingRetry() error = %v", err)
+	}
+	if !result.Replayed || !result.Deleted || result.Upserted || result.USSDResult.SessionID != "ussd-1" || !svc.hasUSSDSession("ussd-1") {
+		t.Fatalf("replay result=%+v active=%v", result, svc.hasUSSDSession("ussd-1"))
+	}
+	if len(transport.executeRequests) != 1 || transport.executeRequests[0].Command != "*100#" {
+		t.Fatalf("execute requests=%+v", transport.executeRequests)
+	}
+	if len(store.retryDeletes) != 1 || store.retryDeletes[0].operation != IMSMessagingRetryOperationUSSDSession || store.retryDeletes[0].key != envelope.Key {
+		t.Fatalf("retry deletes=%+v", store.retryDeletes)
+	}
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%+v", dispatch.events)
+	}
+}
+
+func TestReplayIMSMessagingRetryUSSDContinueSuccessDoesNotRequireLocalSession(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	req := USSDRequest{DeviceID: "dev-1", IMSI: "310280233641503", SessionID: "ussd-1", Input: "1"}
+	envelope := NewIMSUSSDSessionRetryEnvelope(
+		req,
+		USSDResult{Status: 503, Done: true, RetryAfter: time.Second},
+		errors.New("Service Unavailable"),
+		IMSMessagingRetryOptions{Method: "INFO", Attempt: 1, Now: now.Add(-2 * time.Second)},
+	)
+	store := &fakeRetryDeliveryStore{}
+	transport := &fakeUSSDTransport{continueResult: USSDResult{Text: "Balance: 10", Status: 200, Done: true}}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	svc.SetUSSDTransport(transport)
+
+	result, err := svc.ReplayIMSMessagingRetry(context.Background(), envelope, now)
+	if err != nil {
+		t.Fatalf("ReplayIMSMessagingRetry() error = %v", err)
+	}
+	if !result.Replayed || !result.Deleted || len(transport.continueRequests) != 1 || transport.continueRequests[0].Input != "1" {
+		t.Fatalf("result=%+v continue requests=%+v", result, transport.continueRequests)
+	}
+	if svc.hasUSSDSession("ussd-1") {
+		t.Fatal("terminal replayed USSD continue left an active session")
+	}
+}
+
+func TestReplayDueIMSMessagingRetriesSelectsDueWithLimit(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	dueReq := SMSSendRequest{DeviceID: "dev-1", IMSI: "310280233641503", Peer: "+18005551212", MessageID: "due", Part: SMSPart{PartNo: 1, TotalParts: 1, Text: "due"}}
+	laterReq := SMSSendRequest{DeviceID: "dev-1", IMSI: "310280233641503", Peer: "+18005550000", MessageID: "later", Part: SMSPart{PartNo: 1, TotalParts: 1, Text: "later"}}
+	due := NewIMSSMSSubmitRetryEnvelope(dueReq, SMSSendResult{State: "failed", SIPCode: 503, RetryAfter: time.Second}, errors.New("Service Unavailable"), IMSMessagingRetryOptions{Attempt: 1, Now: now.Add(-2 * time.Second)})
+	later := NewIMSSMSSubmitRetryEnvelope(laterReq, SMSSendResult{State: "failed", SIPCode: 503, RetryAfter: time.Minute}, errors.New("Service Unavailable"), IMSMessagingRetryOptions{Attempt: 1, Now: now})
+	transport := &fakeSMSTransport{}
+	svc := NewService("dev-1", "310280233641503", &fakeRetryDeliveryStore{}, nil)
+	svc.SetSMSTransport(transport)
+
+	results, err := svc.ReplayDueIMSMessagingRetries(context.Background(), []IMSMessagingRetryEnvelope{later, due}, now, 1)
+	if err != nil {
+		t.Fatalf("ReplayDueIMSMessagingRetries() error = %v", err)
+	}
+	if len(results) != 1 || !results[0].Replayed || results[0].Envelope.Key != due.Key || len(transport.requests) != 1 || transport.requests[0].MessageID != "due" {
+		t.Fatalf("results=%+v requests=%+v", results, transport.requests)
+	}
+}
+
 func TestUSSDCancelDelegatesAndClearsSession(t *testing.T) {
 	transport := &fakeUSSDTransport{executeResult: USSDResult{Text: "menu", Done: false}}
 	svc := NewService("dev-1", "310280233641503", nil, nil)

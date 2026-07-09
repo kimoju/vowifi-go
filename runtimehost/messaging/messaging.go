@@ -215,6 +215,18 @@ type IMSMessagingRetryStore interface {
 	DeleteIMSMessagingRetry(operation IMSMessagingRetryOperation, key string) error
 }
 
+type IMSMessagingRetryReplayResult struct {
+	Envelope      IMSMessagingRetryEnvelope
+	NextEnvelope  IMSMessagingRetryEnvelope
+	Replayed      bool
+	Upserted      bool
+	Deleted       bool
+	DuplicateRisk bool
+	SMSResult     SMSSendResult
+	USSDResult    USSDResult
+	Err           error
+}
+
 func RPCauseText(code int) string {
 	if code == 0 {
 		return ""
@@ -287,16 +299,156 @@ func (s *Service) retryStore() IMSMessagingRetryStore {
 	return store
 }
 
-func (s *Service) recordIMSMessagingRetry(envelope IMSMessagingRetryEnvelope) {
+func (s *Service) recordIMSMessagingRetry(envelope IMSMessagingRetryEnvelope) (upserted, deleted bool) {
 	store := s.retryStore()
 	if store == nil || strings.TrimSpace(envelope.Key) == "" {
-		return
+		return false, false
 	}
 	if envelope.Pending() {
 		_ = store.UpsertIMSMessagingRetry(envelope)
-		return
+		return true, false
 	}
 	_ = store.DeleteIMSMessagingRetry(envelope.Operation, envelope.Key)
+	return false, true
+}
+
+func (s *Service) ReplayIMSMessagingRetry(ctx context.Context, envelope IMSMessagingRetryEnvelope, now time.Time) (IMSMessagingRetryReplayResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	result := IMSMessagingRetryReplayResult{
+		Envelope:      envelope,
+		DuplicateRisk: envelope.Plan.DuplicateRisk,
+	}
+	if !envelope.ReplayReady(now) {
+		return result, nil
+	}
+	switch envelope.Operation {
+	case IMSMessagingRetryOperationSMSSubmit:
+		return s.replayIMSSMSSubmitRetry(ctx, envelope, now, result)
+	case IMSMessagingRetryOperationUSSDSession:
+		return s.replayIMSUSSDSessionRetry(ctx, envelope, now, result)
+	default:
+		err := fmt.Errorf("unsupported IMS messaging retry operation: %s", envelope.Operation)
+		result.Err = err
+		return result, err
+	}
+}
+
+func (s *Service) ReplayDueIMSMessagingRetries(ctx context.Context, envelopes []IMSMessagingRetryEnvelope, now time.Time, limit int) ([]IMSMessagingRetryReplayResult, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	due := SelectDueIMSMessagingRetryEnvelopes(envelopes, now, limit)
+	if len(due) == 0 {
+		return nil, nil
+	}
+	results := make([]IMSMessagingRetryReplayResult, 0, len(due))
+	var joined error
+	for _, envelope := range due {
+		result, err := s.ReplayIMSMessagingRetry(ctx, envelope, now)
+		results = append(results, result)
+		if err != nil {
+			joined = errors.Join(joined, err)
+		}
+	}
+	return results, joined
+}
+
+func (s *Service) replayIMSSMSSubmitRetry(ctx context.Context, envelope IMSMessagingRetryEnvelope, now time.Time, result IMSMessagingRetryReplayResult) (IMSMessagingRetryReplayResult, error) {
+	req, ok := envelope.SMSSubmitRequest()
+	if !ok {
+		err := errors.New("IMS SMS retry envelope is missing SMS submit payload")
+		result.Err = err
+		return result, err
+	}
+	transport := s.smsTransport()
+	if transport == nil {
+		result.Err = ErrSMSTransportUnavailable
+		return result, ErrSMSTransportUnavailable
+	}
+	res, err := transport.SendSMSPart(ctx, req)
+	result.Replayed = true
+	if err != nil {
+		res.State = "failed"
+		if strings.TrimSpace(res.ErrorText) == "" {
+			res.ErrorText = err.Error()
+		}
+	} else if strings.TrimSpace(res.State) == "" {
+		res.State = "sent"
+	}
+	result.SMSResult = res
+	if s != nil && s.store != nil && strings.TrimSpace(req.MessageID) != "" {
+		_ = s.store.UpsertSMSDeliveryPart(req.MessageID, req.Part.PartNo, res.CallID, res.RPMR, res.State, now)
+		_ = s.store.RecomputeSMSDelivery(req.MessageID, now)
+	}
+	next := NewIMSSMSSubmitRetryEnvelope(req, res, err, IMSMessagingRetryOptions{
+		Attempt:        imsMessagingRetryReplayAttempt(envelope),
+		Now:            now,
+		IdempotencyKey: firstNonEmpty(envelope.IdempotencyKey, envelope.Key),
+	})
+	result.NextEnvelope = next
+	result.Upserted, result.Deleted = s.recordIMSMessagingRetry(next)
+	result.Err = err
+	return result, err
+}
+
+func (s *Service) replayIMSUSSDSessionRetry(ctx context.Context, envelope IMSMessagingRetryEnvelope, now time.Time, result IMSMessagingRetryReplayResult) (IMSMessagingRetryReplayResult, error) {
+	req, ok := envelope.USSDRequest()
+	if !ok {
+		err := errors.New("IMS USSD retry envelope is missing USSD payload")
+		result.Err = err
+		return result, err
+	}
+	transport := s.currentUSSDTransport()
+	if transport == nil {
+		result.Err = ErrUSSDTransportUnavailable
+		return result, ErrUSSDTransportUnavailable
+	}
+	method := normalizeIMSMessagingRetryMethod(envelope.Method, envelope.Operation)
+	var res USSDResult
+	var err error
+	if strings.EqualFold(method, "INFO") || strings.TrimSpace(req.Input) != "" {
+		res, err = transport.ContinueUSSD(ctx, req)
+	} else {
+		res, err = transport.ExecuteUSSD(ctx, req)
+	}
+	result.Replayed = true
+	res = normalizeUSSDResult(res, req.SessionID)
+	result.USSDResult = res
+	if err == nil {
+		s.recordUSSDSession(res)
+		s.dispatchUSSDUpdated(ctx, res)
+	}
+	next := NewIMSUSSDSessionRetryEnvelope(req, res, err, IMSMessagingRetryOptions{
+		Method:     method,
+		Attempt:    imsMessagingRetryReplayAttempt(envelope),
+		Now:        now,
+		SessionKey: firstNonEmpty(envelope.SessionKey, envelope.Key),
+	})
+	result.NextEnvelope = next
+	result.Upserted, result.Deleted = s.recordIMSMessagingRetry(next)
+	result.Err = err
+	return result, err
+}
+
+func imsMessagingRetryReplayAttempt(envelope IMSMessagingRetryEnvelope) int {
+	if envelope.NextAttempt > 0 {
+		return envelope.NextAttempt
+	}
+	if envelope.Plan.NextAttempt > 0 {
+		return envelope.Plan.NextAttempt
+	}
+	if envelope.Attempt > 0 {
+		return envelope.Attempt + 1
+	}
+	if envelope.Plan.Attempt > 0 {
+		return envelope.Plan.Attempt + 1
+	}
+	return 1
 }
 
 func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts SendOptions) (SendOutcome, error) {
