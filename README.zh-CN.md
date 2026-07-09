@@ -38,6 +38,7 @@ go get github.com/boa-z/vowifi-go@latest
 ## 文档
 
 - [功能列表](docs/FEATURES.md) - 当前实现清单与已知缺口。
+- [VoHive 可用性差距](docs/VOHIVE_READINESS.md) - 在 VoHive 中视为可用前仍需完成的工作。
 - [架构说明](docs/ARCHITECTURE.md) - 包布局、运行时边界与高层流程。
 - [开发说明](docs/DEVELOPMENT.md) - CI 目标、本地验证和工作区使用方式。
 - [英文免责声明](docs/DISCLAIMER.md)。

@@ -1,63 +1,102 @@
 # VoHive Readiness Gap Analysis
 
-This document tracks what still has to be completed before `vowifi-go` should
-be treated as usable inside VoHive beyond compile-time compatibility tests.
+This document tracks the remaining work before `vowifi-go` should be treated
+as usable inside VoHive. It is written as an integration checklist: each area
+separates implemented code from the evidence still required for a real VoHive
+runtime.
+
+## Readiness Decision
+
+`vowifi-go` is currently suitable for VoHive compatibility development and
+loopback protocol work. It is not yet proven as a complete runtime replacement
+inside VoHive.
+
+"Usable in VoHive" means all of the following are true:
+
+- An older VoHive checkout can resolve `github.com/boa-z/vowifi-go`, build the
+  relevant runtime packages, and run the compatibility test matrix without a
+  committed local `replace`.
+- A controlled device trial completes modem/SIM identity, AKA, SWu/ePDG tunnel
+  establishment, IMS registration, refresh, and shutdown cleanup.
+- SMS, USSD, outbound voice, inbound voice, and the emergency-call policy are
+  either validated through VoHive or explicitly guarded as unavailable.
+- Runtime recovery for modem hangs, SIM busy, ePDG failure, P-CSCF failure, IMS
+  recovery statuses, messaging failure, and media failure is observable from
+  VoHive without leaking subscriber identifiers, keys, nonces, local machine
+  details, or private paths.
 
 ## Current Position
 
-`vowifi-go` is already shaped around the runtime boundary that VoHive consumes.
-The repository currently has local CI, GitHub Actions CI, module-path hygiene
-checks, and a compatibility script that can rewrite an older VoHive consumer in
-a temporary checkout and run a focused test set against this module.
-The VoHive-facing runtime state also has redacted diagnostic views for logs,
-UI state, event snapshots, IMS registration results, IMS REGISTER recovery
-decisions, IMS registration recovery state, and free-form runtime error text so
-common subscriber identifiers, AKA/digest material, IPs, MACs, and local paths
-are not exposed by default.
+The project has the right repository shape and much of the protocol surface is
+already implemented. Current strengths include:
 
-That proves an important baseline: VoHive can resolve and compile against this
-module in the covered package set, and the loopback/unit tests exercise many
-SIM, SWu, IMS, messaging, E911, and voice helpers. It does not yet prove that a
-real VoHive deployment can replace the closed-source runtime end to end.
+- Canonical module identity, local CI, GitHub Actions CI, module-path hygiene,
+  privacy checks, and an old-VoHive compatibility workflow that runs against a
+  temporary consumer checkout.
+- Public runtime boundaries for SIM/ISIM AKA, SWu/ePDG, IMS registration,
+  messaging, voice, carrier policy, E911, lifecycle state, and diagnostics.
+- Loopback-heavy tests for AT/APDU/QMI helpers, IKEv2/EAP-AKA, ESP/TUN/XFRM
+  primitives, IMS registration, SIP transport, SMS/USSD, E911 helpers, voice
+  dialogs, SDP rewrite, RTP/RTCP, SRTP/SRTCP, and redacted trace fixtures.
+- Redacted VoHive-facing diagnostic shapes for runtime state, event snapshots,
+  IMS registration results, REGISTER recovery decisions, registration recovery
+  state, and free-form runtime error text.
+
+The remaining risk is evidence, integration, and carrier variation. Unit tests
+show that many reconstructed pieces behave correctly in isolation. They do not
+yet prove that VoHive can replace the original closed-source runtime on a real
+modem/SIM/operator path.
 
 ## Readiness Levels
 
 | Level | Meaning | Current Status |
 | --- | --- | --- |
-| Compile-compatible | VoHive resolves the module, selected packages build, and focused tests pass. | Mostly in place for the checked packages. |
+| Compile-compatible | VoHive resolves the module, selected packages build, and focused compatibility tests pass. | Mostly in place for the known checked packages. |
 | Loopback-functional | Runtime flows pass deterministic tests with fake transports, fixture traces, and local sockets. | Partially in place across SIM, SWu, IMS, SMS/USSD, E911, and voice. |
 | Device-functional | A real modem/SIM/ePDG/IMS path can register, keep alive, send SMS/USSD, place calls, and recover from common failures. | Not proven yet. |
 | Production-ready | Carrier variation, emergency behavior, long-running stability, observability, rollback, and operational hardening are validated. | Not complete. |
 
-## P0: Required Before a VoHive Runtime Trial
+## Readiness Matrix
 
-These items are the minimum remaining work before this repository should be
-used by VoHive as the primary runtime implementation in a controlled trial.
+| Area | In Place | Missing Before VoHive Use | Evidence Needed |
+| --- | --- | --- | --- |
+| Module and consumer compatibility | Canonical module path, module-path guard, CI, temporary old-VoHive rewrite/check workflow, main binary build check. | Keep the package matrix synchronized with every VoHive consumer and document the supported VoHive version range per release. | Compatibility job output for the target VoHive branch or tag, plus a release note that names the tested VoHive range. |
+| Runtime lifecycle | `Start`, stop, state snapshots, SWu startup wiring, IMS registration wiring, SMS/USSD/voice transport wrapping, recovery state updates. | Prove start, stop, restart, cancellation, cleanup, and recovery from VoHive's actual call sites. Ensure every VoHive-facing surface consumes safe diagnostics. | A VoHive runtime trial log showing startup, ready state, recovery event, shutdown, and redacted state snapshots. |
+| Modem, SIM, ISIM, and AKA | AT, APDU, CRSM, QMI UIM logical-channel helpers, identity readers, AKA challenge handling, typed recovery planning, opt-in AT control recovery. | Validate real device behavior under busy ports, hung control channels, locked SIMs, missing applets, multi-slot modems, and vendor recovery commands. | Redacted transcripts for IMEI, IMSI, ISIM identities, EF_AD, AKA success, AUTS sync failure, SIM busy, and control-port recovery. |
+| SWu/ePDG tunnel | IKEv2, IKE_AUTH EAP-AKA/AKA', CHILD_SA, ESP, NAT-T helpers, MOBIKE, DPD, rekey metadata, userspace packet session, TUN routing, Linux XFRM planning. | Prove real ePDG tunnel establishment, DNS propagation, packet forwarding, MTU behavior, IPv4/IPv6 routing, rekey, DELETE cleanup, DPD, and MOBIKE under VoHive. | A controlled ePDG run with redacted IKE/EAP state, tunnel addresses, route cleanup, packet counters, and recoverable failure cases. |
+| IMS registration and Security-Agree | REGISTER, Digest AKA, 401/407 retry, 423 retry, 494 planning, Security-Client/Server/Verify, XFRM install planning, refresh, de-registration, P-CSCF failover, CRLF keepalive, recovery hooks. | Prove initial registration, security association selection/install, refresh, failover, de-registration, and recovery against a real IMS path. | Redacted REGISTER traces for success, 401/407, stale nonce, AUTS, 423, 494, 5xx/Retry-After, selected P-CSCF, and shutdown de-registration. |
+| SMS and USSD | SMS segmentation/PDU, CPIM, IMDN/delivery report handling, inbound SMS, USSD INVITE/INFO/BYE helpers, redirect/auth/retry classification, durable retry envelope planning, runtime recovery after recoverable IMS failures. | Add a runtime replay worker/API for due durable retry envelopes, define duplicate-risk handling, and validate carrier-specific payload variants through VoHive. | VoHive SMS/USSD tests for outbound, multipart, delivery report, inbound, USSD continue/cancel, retry replay, duplicate-risk refusal/reporting, and carrier content-type variants. |
+| Voice | Outbound/inbound IMS agents, SIP dialog helpers, PRACK, UPDATE, re-INVITE, REFER/NOTIFY/SUBSCRIBE, OPTIONS, SIP INFO, SDP rewrite, RTP/RTCP relay, DTMF, SRTP/SRTCP, session timers, media quality helpers. | Prove real outbound and inbound calls through VoHive with local softphone interworking, negotiated media, hold/resume, transfer, teardown, and media diagnostics. | VoHive call traces for outbound, inbound, early media, answer, hold/resume, DTMF, transfer, BYE/CANCEL, RTP/RTCP counters, SRTP profile, and at least one recoverable dialog failure. |
+| E911 and emergency policy | TS.43-style entitlement parsing, token/websheet helpers, HTTP Digest AKA, PIDF-LO, emergency headers, service URNs, 380/424 planning, emergency profile helpers. | Validate only in authorized test environments, or keep emergency calling explicitly disabled/guarded in VoHive until that evidence exists. | Entitlement bootstrap traces, PIDF-LO validation cases, emergency profile selection, 380/424 retries, and a documented VoHive guard state when validation is absent. |
+| Carrier profiles | Carrier presets, JSON overrides, P-CSCF candidate normalization, AT&T-style TS.43/E911 profile data. | Build a carrier compatibility matrix with IMS domain, P-CSCF/ePDG discovery, access-network headers, codecs, SMS/USSD quirks, E911 behavior, and recovery policy. | One successful and one recoverable failure trace per supported carrier profile. |
+| Observability and privacy | Redacted diagnostic state, redacted REGISTER recovery decisions, safe diagnostic error text, trace-fixture redaction checks. | Ensure all VoHive call sites use diagnostic views rather than raw protocol errors. Add leak-oriented checks for every new fixture and operator-facing field. | CI redaction reports plus VoHive UI/log examples that preserve actionability without exposing identities, nonces, keys, APDU payloads, IPs, MACs, or local paths. |
+| Release discipline | Shared local/GitHub CI entry point, compatibility self-test, old-VoHive compatibility workflow. | Tag only after compatibility and controlled runtime evidence pass. Reject breaking APIs unless a VoHive migration is ready. | Release checklist with CI result, compat result, runtime trial result, known disabled features, and rollback instructions. |
+
+## P0: Required Before A Controlled VoHive Runtime Trial
+
+These items block using this repository as the primary runtime inside a
+controlled VoHive trial.
 
 ### 1. Full VoHive Consumer Coverage
 
-Current compatibility testing now covers the known VoHive runtime consumer
-matrix (`cmd/vohive`, API, CS call, device, E911, notify, SIM, and VoWiFi host
-packages) and builds the main VoHive binary in the temporary compatibility
-checkout. The remaining gap is to keep that package matrix current as VoHive
-adds new `vowifi-go` consumers, and to expand beyond compile/build evidence
-into real runtime trials.
+The compatibility workflow covers the known runtime consumer matrix and builds
+the main VoHive binary in an isolated checkout. The remaining work is to keep
+that matrix current and make compatibility evidence part of every release
+candidate.
 
 Done means:
 
-- The compatibility workflow runs the complete currently known VoHive package
-  list.
-- At least one job verifies a `go build ./cmd/vohive` pass for the temporary
-  VoHive checkout using this module.
-- The compatibility script has a documented package matrix and defaults to the
-  current VoHive runtime consumers instead of a small focused subset.
+- The compatibility job covers the complete known VoHive package list for the
+  target branch or tag.
+- The temporary VoHive checkout builds the main binary with this module.
+- No compatibility step requires committing a local filesystem `replace`.
+- The tested VoHive version range is recorded in release notes.
 
 ### 2. Real Modem And SIM Access Path
 
-The current SIM/ISIM and AKA layers include AT, APDU, QMI UIM, recovery
-classification, and non-destructive recovery planning. The unproven gap is the
-full device path under real modem contention, busy control ports, locked SIMs,
-multi-slot devices, and vendor-specific recovery decisions.
+SIM/ISIM and AKA layers include substantial AT, APDU, CRSM, QMI UIM, recovery,
+and identity functionality. The unproven gap is the real modem path under
+device contention and vendor-specific recovery behavior.
 
 Done means:
 
@@ -73,9 +112,8 @@ Done means:
 ### 3. SWu/ePDG End-To-End Tunnel
 
 The SWu implementation has IKEv2, EAP-AKA/AKA', ESP, MOBIKE, CHILD_SA,
-userspace packet sessions, TUN, routing, and NAT-T primitives. The gap is
-proving a complete tunnel against a real ePDG and ensuring it survives real
-network behavior.
+userspace packet sessions, TUN, routing, and XFRM primitives. The gap is a
+full tunnel against a real ePDG and real host networking.
 
 Done means:
 
@@ -83,23 +121,24 @@ Done means:
   and packet forwarding are validated against a real ePDG.
 - NAT-T, DPD, DELETE cleanup, MOBIKE address updates, and CHILD_SA rekey are
   exercised in integration tests or captured trace replays.
-- TUN setup, route exclusion, policy rules, MTU handling, IPv4/IPv6 forwarding,
-  and rollback are verified on the target Linux environment.
+- TUN setup, route exclusion, policy rules, MTU handling, IPv4/IPv6
+  forwarding, and rollback are verified on the target Linux environment.
 - Failure modes for authentication rejection, ePDG timeout, DNS failure,
   routing failure, and packet replay are surfaced to VoHive.
 
 ### 4. IMS Registration And Security-Agree Activation
 
-REGISTER, Digest AKA, refresh, de-registration, P-CSCF failover, Security-Agree
-selection, XFRM planning, and recovery plans are implemented in pieces. The gap
-is proving that VoHive can complete a real IMS registration and keep it alive
-through refresh and recovery.
+REGISTER, Digest AKA, refresh, de-registration, P-CSCF failover,
+Security-Agree selection, XFRM planning, keepalive, and recovery hooks are
+implemented in pieces. The gap is proving that VoHive can complete and
+maintain a real IMS registration.
 
 Done means:
 
 - Initial REGISTER succeeds with real AKA challenge material.
 - 401/407, stale nonce, AUTS synchronization failure, 423 Min-Expires, 494
-  Security Agreement Required, and 5xx/Retry-After recovery paths are exercised.
+  Security Agreement Required, and 5xx/Retry-After recovery paths are
+  exercised.
 - Security-Client, Security-Server, Security-Verify, XFRM install, and selected
   SA usage are validated on the host where VoHive runs.
 - P-CSCF failover and sticky selected-proxy behavior work across refresh and
@@ -107,11 +146,11 @@ Done means:
 - Registration refresh, CRLF keepalive, shutdown de-registration, and recovery
   re-registration are observable from VoHive.
 
-### 5. VoHive Runtime Orchestration
+### 5. Runtime Orchestration And Diagnostics
 
-The library exposes runtime hooks, but VoHive still needs a complete
-orchestration contract around state transitions, retries, feature flags, and
-operator-visible diagnostics.
+The library exposes lifecycle hooks and redacted diagnostics. The remaining
+work is proving that VoHive's runtime controller consistently uses those hooks
+for startup, shutdown, retries, support messages, and recovery.
 
 Done means:
 
@@ -120,59 +159,55 @@ Done means:
   without requiring a process restart.
 - Long-running maintenance tasks have cancellation, timeout, and cleanup
   behavior that VoHive can control.
-- Logs and structured state expose enough detail for user support without
-  leaking identities, nonces, keys, or local machine details. A redacted
-  runtime diagnostic state is in place; the remaining work is to ensure every
-  VoHive-facing call site uses it consistently.
+- VoHive displays supportable errors for modem control, SIM auth, ePDG, IMS,
+  messaging, E911, and voice without exposing sensitive protocol material.
 
 ## P1: Required Before Broad VoHive Use
 
-These items can follow the first controlled runtime trial, but they are needed
+These items can follow a first controlled runtime trial, but they are required
 before recommending wider VoHive use.
 
 ### 6. SMS, USSD, And Messaging Recovery
 
 SMS and USSD have substantial encoding, parsing, SIP MESSAGE, CPIM, redirect,
-retry, and delivery-report support. The remaining gap is end-to-end carrier
-validation and durable replay integration in the runtime.
+delivery-report, and retry planning support. The main gap is runtime replay
+and carrier validation.
 
 Done means:
 
 - Outbound SMS, multipart SMS, delivery reports, inbound SMS, USSD INVITE/INFO,
   USSD BYE, redirects, and authentication challenges are tested through VoHive.
-- Durable retry envelopes are consumed by a runtime queue instead of remaining
-  only as planning data.
+- Durable retry envelopes are consumed by a runtime queue or explicit replay
+  API instead of remaining only as planning data.
 - Duplicate-risk cases are clearly separated from safe replay cases.
-- Carrier-specific content-type, CPIM, RP, TP-DCS, and UDH variations have
-  trace fixtures.
+- Carrier-specific content-type, CPIM, RP, TP-DCS, UDH, and national-language
+  variations have trace fixtures.
 
 ### 7. Voice Call Parity
 
-Voice has dialog construction, inbound/outbound agents, SDP rewriting, RTP/RTCP
-relay, DTMF, PRACK, UPDATE, REFER, NOTIFY, SUBSCRIBE, re-INVITE, and session
-timer helpers. The remaining gap is proving full call behavior through VoHive
-with real IMS peers and local softphone interworking.
+Voice has broad SIP dialog, SDP, RTP/RTCP, SRTP, DTMF, supplementary-service,
+and session-timer functionality. The remaining gap is proving real call
+behavior through VoHive and at least one local softphone integration.
 
 Done means:
 
-- Outbound and inbound calls can complete setup, early media, answer, hold,
-  resume, DTMF, transfer, and teardown.
-- Reliable provisional responses and PRACK are wired through the full call
-  path, not only helper APIs.
-- UPDATE, re-INVITE, Session-Expires refresh, CANCEL, BYE, REFER/NOTIFY, and
-  OPTIONS behavior are validated against fixture traces and at least one real
-  IMS environment.
-- RTP/RTCP relay quality events feed runtime recovery or user-visible
-  diagnostics.
-- SRTP/SRTCP negotiation and relay behavior are validated for the codecs and
-  security profiles VoHive expects.
+- Outbound and inbound calls complete setup, early media, answer, hold, resume,
+  DTMF, transfer, and teardown.
+- Reliable provisional responses and PRACK are validated through the full call
+  path.
+- UPDATE, re-INVITE, Session-Expires refresh, CANCEL, BYE, REFER/NOTIFY,
+  SUBSCRIBE, INFO, MESSAGE, and OPTIONS behavior are validated against fixture
+  traces and at least one real IMS environment.
+- RTP/RTCP and SRTP/SRTCP relay quality events feed runtime recovery or
+  user-visible diagnostics.
+- Codec and security-profile support is documented for the VoHive target
+  environment.
 
 ### 8. E911 And Emergency Calling
 
-E911 entitlement, PIDF-LO construction, emergency headers, service URNs, 380
-alternative service, and 424 location-refresh planning exist. The gap is
-operator-safe emergency behavior, which needs stronger validation than normal
-voice.
+E911 support has request construction, entitlement parsing, emergency headers,
+PIDF-LO, and recovery planning. Emergency behavior needs a higher validation
+bar than normal voice.
 
 Done means:
 
@@ -183,7 +218,7 @@ Done means:
 - 380 Alternative Service and 424 Bad Location Information retries rebuild the
   emergency plan and PIDF-LO at runtime.
 - Emergency call behavior is clearly marked experimental until validated with
-  authorized test environments.
+  authorized test environments, or VoHive explicitly disables/guards it.
 
 ### 9. Carrier Profiles And Compatibility Matrix
 
@@ -199,17 +234,17 @@ Done means:
 - Trace fixtures cover at least one successful and one recoverable failure path
   per supported carrier profile.
 
-## P2: Hardening Before Production Claims
+## P2: Required Before Production Claims
 
-These items are needed before any production-readiness claim.
+These items are required before any production-readiness claim.
 
 ### 10. Security And Privacy Hardening
 
 Done means:
 
-- Nonces, keys, IMS identities, SIM material, APDU payloads, and local paths are
-  redacted from logs, runtime diagnostic state, free-form runtime errors, and
-  fixtures by default.
+- Nonces, keys, IMS identities, SIM material, APDU payloads, IPs, MACs, and
+  local paths are redacted from logs, runtime diagnostic state, free-form
+  runtime errors, and fixtures by default.
 - XFRM, TUN, route, and command execution boundaries are privilege-minimized and
   rollback-safe.
 - Long-running goroutines, sockets, file descriptors, TUN devices, routes, and
@@ -223,9 +258,7 @@ Done means:
 
 - Runtime state exposes registration, tunnel, modem, messaging, E911, and voice
   health snapshots.
-- Recovery decisions include reason codes, retry timing, and next actions; IMS
-  registration results, REGISTER response decisions, and registration recovery
-  state now have redacted diagnostic shapes.
+- Recovery decisions include reason codes, retry timing, and next actions.
 - VoHive can present concise user-facing failures for modem control, SIM auth,
   ePDG, IMS registration, messaging, E911, and voice media.
 
@@ -245,36 +278,58 @@ The project should not be described as usable in VoHive until all of the
 following evidence exists:
 
 - A full VoHive compatibility job passes for the target VoHive branch or tag.
-- A controlled runtime test completes modem/SIM identity, AKA, SWu/ePDG,
-  IMS REGISTER, refresh, and shutdown cleanup.
+- A controlled runtime test completes modem/SIM identity, AKA, SWu/ePDG, IMS
+  REGISTER, refresh, and shutdown cleanup.
 - SMS and USSD work through VoHive with recovery behavior documented.
 - At least one outbound and one inbound voice call complete through VoHive,
   including RTP/RTCP media and teardown.
 - Emergency behavior is either validated in an authorized test environment or
   explicitly disabled/guarded in VoHive.
-- Logs and traces pass redaction checks.
+- Logs, runtime states, and trace fixtures pass redaction checks.
 - Recovery behavior for modem hangs, SIM busy, ePDG failure, P-CSCF failure,
-  IMS 401/407/423/494/5xx, and media failure is documented with expected
-  runtime actions.
+  IMS 401/407/423/494/5xx, messaging failure, and media failure is documented
+  with expected runtime actions.
 
 ## Recommended Next Implementation Order
 
-1. Keep the VoHive compatibility package matrix synchronized with VoHive
-   consumers on every release candidate.
-2. Wire registration recovery plans and redacted IMS REGISTER decisions into
-   VoHive-facing runtime state and logs.
-3. Run and document a real modem/SIM identity and AKA validation pass.
-4. Prove SWu/ePDG tunnel setup and cleanup in a controlled environment.
-5. Prove IMS registration with Security-Agree and refresh maintenance.
-6. Wire durable SMS/USSD retry envelopes into a runtime queue.
-7. Connect PRACK/early-media planning into the outbound voice agent path.
-8. Add carrier trace fixtures for registration, SMS/USSD, voice, and E911.
+1. Keep the VoHive compatibility package matrix synchronized with current
+   VoHive consumers on every release candidate.
+2. Capture a real modem/SIM identity and AKA validation pass, including busy
+   control-port and safe recovery cases.
+3. Prove SWu/ePDG tunnel setup, packet forwarding, and cleanup in a controlled
+   environment.
+4. Prove IMS registration with Security-Agree, refresh maintenance, failover,
+   keepalive, and de-registration.
+5. Wire durable SMS/USSD retry envelopes into a runtime replay worker or public
+   replay API.
+6. Run VoHive SMS/USSD trials with outbound, inbound, multipart, delivery
+   report, redirect, authentication, and retry cases.
+7. Run VoHive outbound and inbound voice trials with real media, PRACK,
+   UPDATE/re-INVITE, hold/resume, DTMF, transfer, teardown, and SRTP/RTCP
+   evidence.
+8. Add or update carrier trace fixtures for registration, SMS/USSD, voice, and
+   E911 before claiming carrier support.
+9. Keep emergency calling disabled or guarded until authorized E911 validation
+   evidence exists.
+
+## Status Copy
+
+Use this wording when describing the current state of the project:
+
+> `vowifi-go` is an independent open Go implementation of the VoHive VoWiFi
+> runtime boundary. It already provides a compile-compatible and loopback-tested
+> reconstruction base for SIM/ISIM AKA, SWu/ePDG, IMS registration, messaging,
+> voice, E911, and diagnostics. It is still under active development and is not
+> yet proven as a complete replacement for the original closed-source runtime in
+> VoHive. Real modem/SIM, ePDG, IMS, SMS/USSD, voice, emergency, carrier, and
+> long-running recovery validation are still required before it should be
+> described as usable in VoHive.
 
 ## Current Summary
 
-`vowifi-go` is a strong compatibility and protocol reconstruction base, and it
-is already useful for VoHive integration development. It is not yet proven as a
-complete replacement runtime in VoHive. The shortest path to VoHive usability is
-to broaden compatibility coverage, validate real modem/SIM and SWu/ePDG paths,
-then drive IMS registration, messaging, voice, and E911 through VoHive with
-captured evidence and redacted fixtures.
+`vowifi-go` has moved beyond a placeholder API shim: it now contains many real
+protocol components and VoHive-facing runtime hooks. The decisive remaining
+work is to turn loopback functionality into device evidence, then into VoHive
+integration evidence. Until those evidence gates pass, the correct project
+status is "experimental compatibility development module", not "drop-in VoHive
+runtime replacement".
