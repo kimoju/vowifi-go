@@ -547,6 +547,12 @@ const StartModeMain = "main"
 
 type TunnelManagerFactory func(StartRequest) (swu.TunnelManager, error)
 
+type IMSMessagingRetryWorkerConfig struct {
+	Enabled    bool
+	Interval   time.Duration
+	BatchLimit int
+}
+
 type StartRequest struct {
 	Mode                       string
 	DeviceID                   string
@@ -571,6 +577,7 @@ type StartRequest struct {
 	SMSTransport               messaging.SMSTransport
 	USSDTransport              messaging.USSDTransport
 	DeliveryStore              messaging.DeliveryStore
+	IMSMessagingRetryWorker    IMSMessagingRetryWorkerConfig
 	Dispatch                   eventhost.Dispatcher
 	BeforeStart                func(context.Context, SessionConfig) error
 	ShouldRun                  func() bool
@@ -597,6 +604,8 @@ type Instance struct {
 	voiceConfig  runtimeVoiceAgentConfig
 	imsClose     func(context.Context) error
 	imsRecover   func(context.Context) (IMSRegistrationResult, error)
+	retryCancel  context.CancelFunc
+	retryDone    chan struct{}
 	stopped      bool
 }
 
@@ -730,6 +739,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	}
 	inst.notify(ctx)
 	inst.dispatchRuntimeState(ctx)
+	inst.startIMSMessagingRetryWorker(req.IMSMessagingRetryWorker)
 	return inst, nil
 }
 
@@ -806,6 +816,113 @@ func buildRuntimeVoiceRegistrationUpdate(cfg runtimeVoiceAgentConfig, reg IMSReg
 	}, true
 }
 
+func (i *Instance) startIMSMessagingRetryWorker(cfg IMSMessagingRetryWorkerConfig) {
+	if i == nil || !cfg.Enabled {
+		return
+	}
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	limit := cfg.BatchLimit
+	if limit <= 0 {
+		limit = 16
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	i.mu.Lock()
+	if i.stopped {
+		i.mu.Unlock()
+		cancel()
+		close(done)
+		return
+	}
+	i.retryCancel = cancel
+	i.retryDone = done
+	i.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		i.drainIMSMessagingRetries(ctx, time.Now(), limit, true)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				i.drainIMSMessagingRetries(ctx, now, limit, true)
+			}
+		}
+	}()
+}
+
+func (i *Instance) DrainIMSMessagingRetries(ctx context.Context, now time.Time, limit int) ([]messaging.IMSMessagingRetryReplayResult, error) {
+	return i.drainIMSMessagingRetries(ctx, now, limit, false)
+}
+
+func (i *Instance) drainIMSMessagingRetries(ctx context.Context, now time.Time, limit int, worker bool) ([]messaging.IMSMessagingRetryReplayResult, error) {
+	if i == nil {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	i.mu.RLock()
+	svc := i.service
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped || svc == nil {
+		return nil, nil
+	}
+	results, err := svc.ReplayDueIMSMessagingRetriesFromStore(ctx, now, limit)
+	if len(results) > 0 || err != nil {
+		i.recordIMSMessagingRetryDrain(ctx, results, err, worker)
+	}
+	return results, err
+}
+
+func (i *Instance) recordIMSMessagingRetryDrain(ctx context.Context, results []messaging.IMSMessagingRetryReplayResult, err error, worker bool) {
+	if i == nil {
+		return
+	}
+	replayed, deleted, upserted, failed := 0, 0, 0, 0
+	for _, result := range results {
+		if result.Replayed {
+			replayed++
+		}
+		if result.Deleted {
+			deleted++
+		}
+		if result.Upserted {
+			upserted++
+		}
+		if result.Err != nil {
+			failed++
+		}
+	}
+	reason := fmt.Sprintf("messaging retry replayed=%d deleted=%d rescheduled=%d failed=%d", replayed, deleted, upserted, failed)
+	if worker {
+		reason = "worker " + reason
+	}
+	if err != nil {
+		reason += ": " + err.Error()
+	}
+	i.mu.Lock()
+	if i.stopped {
+		i.mu.Unlock()
+		return
+	}
+	i.state.LastReason = reason
+	i.state.UpdatedAt = time.Now()
+	i.mu.Unlock()
+	i.notify(ctx)
+	i.dispatchRuntimeState(ctx)
+}
+
 func (i *Instance) AddObserver(o Observer) {
 	if i == nil || o == nil {
 		return
@@ -838,8 +955,12 @@ func (i *Instance) Stop(ctx context.Context) error {
 	tunnel := i.tunnel
 	imsClose := i.imsClose
 	voice := i.voice
+	retryCancel := i.retryCancel
+	retryDone := i.retryDone
 	i.tunnel = nil
 	i.imsClose = nil
+	i.retryCancel = nil
+	i.retryDone = nil
 	i.stopped = true
 	i.state.Phase = PhaseStopped
 	i.state.TunnelReady = false
@@ -849,6 +970,16 @@ func (i *Instance) Stop(ctx context.Context) error {
 	var err error
 	if stopper, ok := voice.(interface{ StopSessionTimers() }); ok {
 		stopper.StopSessionTimers()
+	}
+	if retryCancel != nil {
+		retryCancel()
+		if retryDone != nil {
+			select {
+			case <-retryDone:
+			case <-ctx.Done():
+				err = errors.Join(err, ctx.Err())
+			}
+		}
 	}
 	if tunnel != nil {
 		err = tunnel.Close(ctx)

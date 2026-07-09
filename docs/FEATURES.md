@@ -161,8 +161,10 @@ protocol layers needed by VoHive:
   encoding, SMS-SUBMIT TP-PID/TP-DCS overrides with alphabet validation,
   SMS-SUBMIT Reply-Path and Reject-Duplicates first-octet flags, USSD dialog
   target refresh, durable SMS/USSD retry envelope planning with service-level
-  replay APIs for due retry envelopes, and recoverable IMS registration/route
-  failure signals for MESSAGE, USSD INVITE/INFO, and USSD BYE failures
+  replay APIs for due retry envelopes, optional runtime retry worker draining
+  from stores that expose due retry queries, and recoverable IMS
+  registration/route failure signals for MESSAGE, USSD INVITE/INFO, and USSD
+  BYE failures
 - outbound voice dialog bridging helpers, SDP parsing/building, optional SDP
   security parsing/building for RTP/SAVP/SAVPF, SDES crypto, DTLS fingerprint/
   setup attributes, IMS INVITE/ACK/BYE/CANCEL request construction with MMTel
@@ -417,5 +419,6 @@ protocol layers needed by VoHive:
   implemented incrementally.
 - Real hardware, modem, operator, and production-network compatibility require
   separate validation outside the loopback-heavy test suite.
-- Durable SMS/USSD retry replay has a service API, but VoHive or another
-  runtime worker still needs to schedule and drain the persisted queue.
+- Durable SMS/USSD retry replay has service and runtime-worker APIs, but
+  VoHive still needs to enable/configure the worker for its persisted store and
+  validate retry replay on real carriers.

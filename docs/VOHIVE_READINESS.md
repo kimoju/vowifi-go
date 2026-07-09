@@ -65,7 +65,7 @@ modem/SIM/operator path.
 | Modem, SIM, ISIM, and AKA | AT, APDU, CRSM, QMI UIM logical-channel helpers, identity readers, AKA challenge handling, typed recovery planning, opt-in AT control recovery. | Validate real device behavior under busy ports, hung control channels, locked SIMs, missing applets, multi-slot modems, and vendor recovery commands. | Redacted transcripts for IMEI, IMSI, ISIM identities, EF_AD, AKA success, AUTS sync failure, SIM busy, and control-port recovery. |
 | SWu/ePDG tunnel | IKEv2, IKE_AUTH EAP-AKA/AKA', CHILD_SA, ESP, NAT-T helpers, MOBIKE, DPD, rekey metadata, userspace packet session, TUN routing, Linux XFRM planning. | Prove real ePDG tunnel establishment, DNS propagation, packet forwarding, MTU behavior, IPv4/IPv6 routing, rekey, DELETE cleanup, DPD, and MOBIKE under VoHive. | A controlled ePDG run with redacted IKE/EAP state, tunnel addresses, route cleanup, packet counters, and recoverable failure cases. |
 | IMS registration and Security-Agree | REGISTER, Digest AKA, 401/407 retry, 423 retry, 494 planning, Security-Client/Server/Verify, XFRM install planning, refresh, de-registration, P-CSCF failover, CRLF keepalive, recovery hooks. | Prove initial registration, security association selection/install, refresh, failover, de-registration, and recovery against a real IMS path. | Redacted REGISTER traces for success, 401/407, stale nonce, AUTS, 423, 494, 5xx/Retry-After, selected P-CSCF, and shutdown de-registration. |
-| SMS and USSD | SMS segmentation/PDU, CPIM, IMDN/delivery report handling, inbound SMS, USSD INVITE/INFO/BYE helpers, redirect/auth/retry classification, durable retry envelope planning, service-level retry replay APIs, and runtime recovery after recoverable IMS failures. | Wire persisted retry replay into a runtime worker or VoHive scheduler, define duplicate-risk handling, and validate carrier-specific payload variants through VoHive. | VoHive SMS/USSD tests for outbound, multipart, delivery report, inbound, USSD continue/cancel, retry replay, duplicate-risk refusal/reporting, and carrier content-type variants. |
+| SMS and USSD | SMS segmentation/PDU, CPIM, IMDN/delivery report handling, inbound SMS, USSD INVITE/INFO/BYE helpers, redirect/auth/retry classification, durable retry envelope planning, service-level retry replay APIs, optional runtime retry worker, and runtime recovery after recoverable IMS failures. | Enable/configure persisted retry replay in VoHive, define duplicate-risk handling, and validate carrier-specific payload variants through VoHive. | VoHive SMS/USSD tests for outbound, multipart, delivery report, inbound, USSD continue/cancel, retry replay, duplicate-risk refusal/reporting, and carrier content-type variants. |
 | Voice | Outbound/inbound IMS agents, SIP dialog helpers, PRACK, UPDATE, re-INVITE, REFER/NOTIFY/SUBSCRIBE, OPTIONS, SIP INFO, SDP rewrite, RTP/RTCP relay, DTMF, SRTP/SRTCP, session timers, media quality helpers. | Prove real outbound and inbound calls through VoHive with local softphone interworking, negotiated media, hold/resume, transfer, teardown, and media diagnostics. | VoHive call traces for outbound, inbound, early media, answer, hold/resume, DTMF, transfer, BYE/CANCEL, RTP/RTCP counters, SRTP profile, and at least one recoverable dialog failure. |
 | E911 and emergency policy | TS.43-style entitlement parsing, token/websheet helpers, HTTP Digest AKA, PIDF-LO, emergency headers, service URNs, 380/424 planning, emergency profile helpers. | Validate only in authorized test environments, or keep emergency calling explicitly disabled/guarded in VoHive until that evidence exists. | Entitlement bootstrap traces, PIDF-LO validation cases, emergency profile selection, 380/424 retries, and a documented VoHive guard state when validation is absent. |
 | Carrier profiles | Carrier presets, JSON overrides, P-CSCF candidate normalization, AT&T-style TS.43/E911 profile data. | Build a carrier compatibility matrix with IMS domain, P-CSCF/ePDG discovery, access-network headers, codecs, SMS/USSD quirks, E911 behavior, and recovery policy. | One successful and one recoverable failure trace per supported carrier profile. |
@@ -170,15 +170,16 @@ before recommending wider VoHive use.
 ### 6. SMS, USSD, And Messaging Recovery
 
 SMS and USSD have substantial encoding, parsing, SIP MESSAGE, CPIM, redirect,
-delivery-report, retry planning, and service-level retry replay support. The
-main gap is runtime scheduling and carrier validation.
+delivery-report, retry planning, service-level retry replay, and an optional
+runtime retry worker. The main gap is enabling that worker from VoHive and
+carrier validation.
 
 Done means:
 
 - Outbound SMS, multipart SMS, delivery reports, inbound SMS, USSD INVITE/INFO,
   USSD BYE, redirects, and authentication challenges are tested through VoHive.
-- Durable retry envelopes can be replayed through the service API and are
-  drained by a runtime queue or VoHive scheduler.
+- Durable retry envelopes can be replayed through the service API and drained
+  by the runtime retry worker or an explicit VoHive scheduler.
 - Duplicate-risk cases are clearly separated from safe replay cases.
 - Carrier-specific content-type, CPIM, RP, TP-DCS, UDH, and national-language
   variations have trace fixtures.
@@ -300,8 +301,8 @@ following evidence exists:
    environment.
 4. Prove IMS registration with Security-Agree, refresh maintenance, failover,
    keepalive, and de-registration.
-5. Wire durable SMS/USSD retry envelopes into a runtime replay worker or VoHive
-   scheduler using the service replay API.
+5. Enable and tune durable SMS/USSD retry replay from VoHive using the runtime
+   retry worker or an explicit VoHive scheduler.
 6. Run VoHive SMS/USSD trials with outbound, inbound, multipart, delivery
    report, redirect, authentication, and retry cases.
 7. Run VoHive outbound and inbound voice trials with real media, PRACK,

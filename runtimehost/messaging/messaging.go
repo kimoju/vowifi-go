@@ -215,6 +215,10 @@ type IMSMessagingRetryStore interface {
 	DeleteIMSMessagingRetry(operation IMSMessagingRetryOperation, key string) error
 }
 
+type IMSMessagingRetryDueStore interface {
+	ListDueIMSMessagingRetries(now time.Time, limit int) ([]IMSMessagingRetryEnvelope, error)
+}
+
 type IMSMessagingRetryReplayResult struct {
 	Envelope      IMSMessagingRetryEnvelope
 	NextEnvelope  IMSMessagingRetryEnvelope
@@ -356,6 +360,24 @@ func (s *Service) ReplayDueIMSMessagingRetries(ctx context.Context, envelopes []
 		}
 	}
 	return results, joined
+}
+
+func (s *Service) ReplayDueIMSMessagingRetriesFromStore(ctx context.Context, now time.Time, limit int) ([]IMSMessagingRetryReplayResult, error) {
+	if s == nil || s.store == nil {
+		return nil, nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	store, ok := s.store.(IMSMessagingRetryDueStore)
+	if !ok {
+		return nil, nil
+	}
+	envelopes, err := store.ListDueIMSMessagingRetries(now, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.ReplayDueIMSMessagingRetries(ctx, envelopes, now, limit)
 }
 
 func (s *Service) replayIMSSMSSubmitRetry(ctx context.Context, envelope IMSMessagingRetryEnvelope, now time.Time, result IMSMessagingRetryReplayResult) (IMSMessagingRetryReplayResult, error) {

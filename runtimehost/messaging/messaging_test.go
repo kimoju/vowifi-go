@@ -699,6 +699,41 @@ func TestReplayDueIMSMessagingRetriesSelectsDueWithLimit(t *testing.T) {
 	}
 }
 
+func TestReplayDueIMSMessagingRetriesFromStoreLoadsDueEnvelopes(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	req := SMSSendRequest{DeviceID: "dev-1", IMSI: "310280233641503", Peer: "+18005551212", MessageID: "due", Part: SMSPart{PartNo: 1, TotalParts: 1, Text: "due"}}
+	envelope := NewIMSSMSSubmitRetryEnvelope(req, SMSSendResult{State: "failed", SIPCode: 503, RetryAfter: time.Second}, errors.New("Service Unavailable"), IMSMessagingRetryOptions{Attempt: 1, Now: now.Add(-2 * time.Second)})
+	store := &fakeRetryDeliveryStore{dueRetries: []IMSMessagingRetryEnvelope{envelope}}
+	transport := &fakeSMSTransport{}
+	svc := NewService("dev-1", "310280233641503", store, nil)
+	svc.SetSMSTransport(transport)
+
+	results, err := svc.ReplayDueIMSMessagingRetriesFromStore(context.Background(), now, 4)
+	if err != nil {
+		t.Fatalf("ReplayDueIMSMessagingRetriesFromStore() error = %v", err)
+	}
+	if len(results) != 1 || !results[0].Replayed || len(transport.requests) != 1 {
+		t.Fatalf("results=%+v requests=%+v", results, transport.requests)
+	}
+	if store.dueLimit != 4 || !store.dueNow.Equal(now) {
+		t.Fatalf("due query now=%s limit=%d", store.dueNow, store.dueLimit)
+	}
+	if len(store.retryDeletes) != 1 || store.retryDeletes[0].key != envelope.Key {
+		t.Fatalf("retry deletes=%+v", store.retryDeletes)
+	}
+}
+
+func TestReplayDueIMSMessagingRetriesFromStoreSkipsStoresWithoutDueQuery(t *testing.T) {
+	svc := NewService("dev-1", "310280233641503", &fakeDeliveryStore{}, nil)
+	results, err := svc.ReplayDueIMSMessagingRetriesFromStore(context.Background(), time.Now(), 4)
+	if err != nil {
+		t.Fatalf("ReplayDueIMSMessagingRetriesFromStore() error = %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("results=%+v, want none", results)
+	}
+}
+
 func TestUSSDCancelDelegatesAndClearsSession(t *testing.T) {
 	transport := &fakeUSSDTransport{executeResult: USSDResult{Text: "menu", Done: false}}
 	svc := NewService("dev-1", "310280233641503", nil, nil)
@@ -1326,6 +1361,9 @@ type fakeRetryDeliveryStore struct {
 	fakeDeliveryStore
 	retryUpserts []IMSMessagingRetryEnvelope
 	retryDeletes []fakeRetryDelete
+	dueRetries   []IMSMessagingRetryEnvelope
+	dueNow       time.Time
+	dueLimit     int
 }
 
 func (s *fakeDeliveryStore) CreateSMSDelivery(messageID, imsi, deviceID, peer, content string, partsTotal int, at time.Time) error {
@@ -1374,6 +1412,12 @@ func (s *fakeRetryDeliveryStore) UpsertIMSMessagingRetry(envelope IMSMessagingRe
 func (s *fakeRetryDeliveryStore) DeleteIMSMessagingRetry(operation IMSMessagingRetryOperation, key string) error {
 	s.retryDeletes = append(s.retryDeletes, fakeRetryDelete{operation: operation, key: key})
 	return nil
+}
+
+func (s *fakeRetryDeliveryStore) ListDueIMSMessagingRetries(now time.Time, limit int) ([]IMSMessagingRetryEnvelope, error) {
+	s.dueNow = now
+	s.dueLimit = limit
+	return SelectDueIMSMessagingRetryEnvelopes(s.dueRetries, now, limit), nil
 }
 
 func imsRPDataBody(rpMR byte, tpdu []byte) []byte {

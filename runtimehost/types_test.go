@@ -2250,6 +2250,87 @@ func TestStartWiresUSSDTransport(t *testing.T) {
 	}
 }
 
+func TestInstanceDrainsIMSMessagingRetriesFromStore(t *testing.T) {
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	req := messaging.SMSSendRequest{
+		DeviceID:  "dev-1",
+		IMSI:      "310280233641503",
+		Peer:      "+18005551212",
+		MessageID: "retry-msg",
+		Part:      messaging.SMSPart{PartNo: 1, TotalParts: 1, Text: "hello"},
+	}
+	envelope := messaging.NewIMSSMSSubmitRetryEnvelope(req, messaging.SMSSendResult{State: "failed", SIPCode: 503, RetryAfter: time.Second}, errors.New("Service Unavailable"), messaging.IMSMessagingRetryOptions{Attempt: 1, Now: now.Add(-2 * time.Second)})
+	store := &runtimeRetryDeliveryStore{dueRetries: []messaging.IMSMessagingRetryEnvelope{envelope}}
+	transport := &runtimeSMSTransport{}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503"},
+		SMSTransport:  transport,
+		DeliveryStore: store,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	results, err := inst.DrainIMSMessagingRetries(context.Background(), now, 4)
+	if err != nil {
+		t.Fatalf("DrainIMSMessagingRetries() error = %v", err)
+	}
+	if len(results) != 1 || !results[0].Replayed || len(transport.requests) != 1 || transport.requests[0].MessageID != "retry-msg" {
+		t.Fatalf("results=%+v requests=%+v", results, transport.requests)
+	}
+	if store.dueLimit != 4 || len(store.retryDeletes) != 1 || store.retryDeletes[0].key != envelope.Key {
+		t.Fatalf("store dueLimit=%d deletes=%+v", store.dueLimit, store.retryDeletes)
+	}
+	if !strings.Contains(inst.State().LastReason, "messaging retry replayed=1") {
+		t.Fatalf("state=%+v", inst.State())
+	}
+}
+
+func TestStartIMSMessagingRetryWorkerDrainsDueStore(t *testing.T) {
+	now := time.Now()
+	req := messaging.SMSSendRequest{
+		DeviceID:  "dev-worker",
+		IMSI:      "310280233641503",
+		Peer:      "+18005551212",
+		MessageID: "worker-msg",
+		Part:      messaging.SMSPart{PartNo: 1, TotalParts: 1, Text: "hello"},
+	}
+	envelope := messaging.NewIMSSMSSubmitRetryEnvelope(req, messaging.SMSSendResult{State: "failed", SIPCode: 503, RetryAfter: time.Millisecond}, errors.New("Service Unavailable"), messaging.IMSMessagingRetryOptions{Attempt: 1, Now: now.Add(-time.Second)})
+	store := &runtimeRetryDeliveryStore{dueRetries: []messaging.IMSMessagingRetryEnvelope{envelope}}
+	transport := &runtimeWorkerSMSTransport{sent: make(chan messaging.SMSSendRequest, 1)}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-worker",
+		Profile:       identity.Profile{IMSI: "310280233641503"},
+		SMSTransport:  transport,
+		DeliveryStore: store,
+		IMSMessagingRetryWorker: IMSMessagingRetryWorkerConfig{
+			Enabled:    true,
+			Interval:   10 * time.Millisecond,
+			BatchLimit: 1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case got := <-transport.sent:
+		if got.MessageID != "worker-msg" {
+			t.Fatalf("worker replay request=%+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for retry worker replay")
+	}
+	if err := inst.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if len(store.retryDeletes) != 1 || store.retryDeletes[0].key != envelope.Key {
+		t.Fatalf("retry deletes=%+v", store.retryDeletes)
+	}
+	if !strings.Contains(inst.State().LastReason, "stopped") {
+		t.Fatalf("state after stop=%+v", inst.State())
+	}
+}
+
 func TestInstanceHandlesIncomingSMSAndDeliveryReport(t *testing.T) {
 	store := &runtimeDeliveryStore{match: messaging.DeliveryPartMatch{MessageID: "msg-1", PartNo: 1, State: "delivered"}}
 	dispatch := &runtimeDispatcher{}
@@ -2580,6 +2661,23 @@ type runtimeDeliveryStore struct {
 	recomputed  string
 }
 
+type runtimeRetryDelete struct {
+	operation messaging.IMSMessagingRetryOperation
+	key       string
+}
+
+type runtimeRetryDeliveryStore struct {
+	runtimeDeliveryStore
+	dueRetries   []messaging.IMSMessagingRetryEnvelope
+	dueLimit     int
+	retryUpserts []messaging.IMSMessagingRetryEnvelope
+	retryDeletes []runtimeRetryDelete
+}
+
+type runtimeWorkerSMSTransport struct {
+	sent chan messaging.SMSSendRequest
+}
+
 func (s *runtimeDeliveryStore) CreateSMSDelivery(messageID, imsi, deviceID, peer, content string, partsTotal int, at time.Time) error {
 	return nil
 }
@@ -2604,6 +2702,39 @@ func (s *runtimeDeliveryStore) UpdateSMSDeliveryState(messageID, state, lastErro
 
 func (s *runtimeDeliveryStore) GetSMSDeliveryStatus(messageID string) (*messaging.DeliveryStatus, error) {
 	return nil, messaging.ErrDeliveryNotFound
+}
+
+func (s *runtimeRetryDeliveryStore) ListDueIMSMessagingRetries(now time.Time, limit int) ([]messaging.IMSMessagingRetryEnvelope, error) {
+	s.dueLimit = limit
+	return messaging.SelectDueIMSMessagingRetryEnvelopes(s.dueRetries, now, limit), nil
+}
+
+func (s *runtimeRetryDeliveryStore) UpsertIMSMessagingRetry(envelope messaging.IMSMessagingRetryEnvelope) error {
+	s.retryUpserts = append(s.retryUpserts, envelope)
+	return nil
+}
+
+func (s *runtimeRetryDeliveryStore) DeleteIMSMessagingRetry(operation messaging.IMSMessagingRetryOperation, key string) error {
+	s.retryDeletes = append(s.retryDeletes, runtimeRetryDelete{operation: operation, key: key})
+	out := s.dueRetries[:0]
+	for _, envelope := range s.dueRetries {
+		if envelope.Key == key && (operation == "" || envelope.Operation == operation) {
+			continue
+		}
+		out = append(out, envelope)
+	}
+	s.dueRetries = out
+	return nil
+}
+
+func (t *runtimeWorkerSMSTransport) SendSMSPart(ctx context.Context, req messaging.SMSSendRequest) (messaging.SMSSendResult, error) {
+	if t.sent != nil {
+		select {
+		case t.sent <- req:
+		default:
+		}
+	}
+	return messaging.SMSSendResult{State: "sent"}, nil
 }
 
 func (t *runtimeUSSDTransport) ExecuteUSSD(ctx context.Context, req messaging.USSDRequest) (messaging.USSDResult, error) {
