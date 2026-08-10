@@ -558,6 +558,53 @@ func TestUDPTransportExchangesWithNonESPMarker(t *testing.T) {
 	}
 }
 
+func TestPersistentUDPTransportReusesSourceEndpoint(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer server.Close()
+	addresses := make(chan string, 2)
+	errs := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		for i := 0; i < 2; i++ {
+			n, addr, err := server.ReadFrom(buf)
+			if err != nil {
+				errs <- err
+				return
+			}
+			addresses <- addr.String()
+			if _, err := server.WriteTo(buf[:n], addr); err != nil {
+				errs <- err
+				return
+			}
+		}
+		errs <- nil
+	}()
+	transport := NewPersistentUDPTransport(UDPTransport{
+		RemoteAddr: server.LocalAddr().String(),
+		Timeout:    2 * time.Second,
+	})
+	defer transport.Close()
+	for _, request := range [][]byte{{1}, {2}} {
+		response, err := transport.ExchangeIKE(context.Background(), request)
+		if err != nil {
+			t.Fatalf("ExchangeIKE() error = %v", err)
+		}
+		if !bytes.Equal(response, request) {
+			t.Fatalf("response=%x, want %x", response, request)
+		}
+	}
+	first, second := <-addresses, <-addresses
+	if first != second {
+		t.Fatalf("source endpoint changed: %q != %q", first, second)
+	}
+	if err := <-errs; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
 type InitTransportFunc func(context.Context, []byte) ([]byte, error)
 
 func (f InitTransportFunc) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {

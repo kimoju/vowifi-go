@@ -145,6 +145,12 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	if err != nil {
 		return nil, err
 	}
+	transportHandedOff := false
+	defer func() {
+		if !transportHandedOff {
+			_ = closeIKETransport(transport)
+		}
+	}()
 	childSPI, err := m.childSPI(random)
 	if err != nil {
 		return nil, err
@@ -200,7 +206,12 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	result := tunnelResultFromIKE(cfg, epdg, init, child, mode)
 	closeHandler, mobikeHandler, rekeyHandler, dpdHandler := m.controlHandlers(transport, init, auth, child, result, transportCfg)
 	if mode == DataplaneModeKernel {
-		return m.establishKernelSession(ctx, cfg, transportCfg, init, child, result, closeHandler)
+		session, err := m.establishKernelSession(ctx, cfg, transportCfg, init, child, result, closeHandler)
+		if err != nil {
+			return nil, err
+		}
+		transportHandedOff = true
+		return session, nil
 	}
 	espTransport, err := m.espTransport(cfg, espCfg)
 	if err != nil {
@@ -256,6 +267,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		}
 		return nil, fmt.Errorf("%w: packet session factory returned nil", ErrInvalidIKETunnelManager)
 	}
+	transportHandedOff = true
 	return session, nil
 }
 
@@ -378,12 +390,12 @@ func (m *IKEPacketTunnelManager) ikeTransport(cfg TunnelConfig, transportCfg IKE
 	if m.Config.IKETransportFactory != nil {
 		return m.Config.IKETransportFactory(cfg, transportCfg)
 	}
-	return ikev2.UDPTransport{
+	return ikev2.NewPersistentUDPTransport(ikev2.UDPTransport{
 		RemoteAddr:      transportCfg.RemoteAddr,
 		LocalAddr:       transportCfg.LocalAddr,
 		Timeout:         transportCfg.Timeout,
 		UseNonESPMarker: transportCfg.UseNonESPMarker,
-	}, nil
+	}), nil
 }
 
 func (m *IKEPacketTunnelManager) espTransport(cfg TunnelConfig, transportCfg ESPTransportConfig) (ESPPacketTransport, error) {
@@ -419,7 +431,7 @@ func (m *IKEPacketTunnelManager) childSPI(random io.Reader) ([]byte, error) {
 
 func (m *IKEPacketTunnelManager) controlHandlers(transport ikev2.InitTransport, init ikev2.InitResult, auth ikev2.FullAuthResult, child ikev2.ChildSAResult, result TunnelResult, transportCfg IKETransportConfig) (func(context.Context) error, func(context.Context, MOBIKERequest) (MOBIKEResult, error), ChildSARekeyHandler, func(context.Context) error) {
 	if m.Config.DisableControlPlaneHooks || auth.NextMessageID == 0 || !ikeKeysUsable(init.Keys) {
-		return nil, nil, nil, nil
+		return func(context.Context) error { return closeIKETransport(transport) }, nil, nil, nil
 	}
 	control := &ikePacketTunnelControl{
 		transport:             transport,
@@ -461,10 +473,13 @@ type ikePacketTunnelControl struct {
 	random                io.Reader
 }
 
-func (c *ikePacketTunnelControl) close(ctx context.Context) error {
+func (c *ikePacketTunnelControl) close(ctx context.Context) (err error) {
 	if c == nil {
 		return nil
 	}
+	defer func() {
+		err = errors.Join(err, closeIKETransport(c.transport))
+	}()
 	c.mu.Lock()
 	messageID := c.nextMessageID
 	c.nextMessageID++
@@ -482,6 +497,14 @@ func (c *ikePacketTunnelControl) close(ctx context.Context) error {
 		Random:    c.random,
 	})
 	return err
+}
+
+func closeIKETransport(transport ikev2.InitTransport) error {
+	closer, ok := transport.(interface{ Close() error })
+	if !ok || closer == nil {
+		return nil
+	}
+	return closer.Close()
 }
 
 func (c *ikePacketTunnelControl) rekeyChildSA(ctx context.Context) (ikev2.ChildSAResult, error) {

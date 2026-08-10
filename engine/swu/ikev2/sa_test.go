@@ -47,6 +47,19 @@ func TestDefaultESPProposalIncludesSPI(t *testing.T) {
 	}
 }
 
+func TestDefault3GPPProposalsIncludeMODP2048AndSHA1Fallback(t *testing.T) {
+	ike := Default3GPPIKEProposal().Proposals[0]
+	if !proposalHasTransform(ike, Transform{Type: TransformDHRGroup, ID: DHGroup2048BitMODP}) ||
+		!proposalHasTransform(ike, Transform{Type: TransformPRF, ID: PRF_HMAC_SHA1}) ||
+		!proposalHasTransform(ike, Transform{Type: TransformINTEG, ID: INTEG_HMAC_SHA1_96}) {
+		t.Fatalf("3GPP IKE proposal missing compatibility transforms: %+v", ike.Transforms)
+	}
+	esp := Default3GPPESPProposal([]byte{1, 2, 3, 4}).Proposals[0]
+	if !proposalHasTransform(esp, Transform{Type: TransformINTEG, ID: INTEG_HMAC_SHA1_96}) {
+		t.Fatalf("3GPP ESP proposal missing SHA-1 fallback: %+v", esp.Transforms)
+	}
+}
+
 func TestSecurityAssociationRejectsBadTransformCount(t *testing.T) {
 	body := mustHex("0000002c010100050300000c0100000c800e00800300000802000005030000080300000c000000080400001f")
 	_, err := ParseSecurityAssociation(body)

@@ -234,6 +234,26 @@ func TestTUNTunnelManagerAddsDefaultRouteAndEPDGProtection(t *testing.T) {
 	}
 }
 
+func TestTUNTunnelManagerResolvesOuterRouteWhenInterfaceIsUnset(t *testing.T) {
+	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
+		EPDGOuterRouteResolver: func(ctx context.Context, ip net.IP) (EPDGOuterRoute, error) {
+			if got := ip.String(); got != "198.51.100.7" {
+				t.Fatalf("outer route IP=%q", got)
+			}
+			return EPDGOuterRoute{InterfaceName: "eno1", Via: "192.0.2.1", Source: "192.0.2.10"}, nil
+		},
+	})
+	exclusions, err := manager.defaultEPDGRouteExclusions(context.Background(), TunnelConfig{
+		EPDGAddress: "198.51.100.7",
+	}, TunnelResult{}, []TUNRoute{{Destination: "default"}})
+	if err != nil {
+		t.Fatalf("defaultEPDGRouteExclusions() error = %v", err)
+	}
+	if len(exclusions) != 1 || exclusions[0].InterfaceName != "eno1" || exclusions[0].Via != "192.0.2.1" || exclusions[0].Source != "192.0.2.10" {
+		t.Fatalf("exclusions=%+v", exclusions)
+	}
+}
+
 func TestTUNTunnelManagerProtectsEPDGRoutesForPolicyTables(t *testing.T) {
 	baseSession := newTUNManagerPacketSession(TunnelResult{
 		Ready:            true,

@@ -713,10 +713,83 @@ func TestIKEPacketTunnelManagerRejectsMissingChildSA(t *testing.T) {
 	}
 }
 
+func TestIKEPacketTunnelManagerClosesIKETransport(t *testing.T) {
+	t.Run("session close", func(t *testing.T) {
+		transport := &closeTrackingIKETransport{}
+		manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
+			SIM:                      ikeTunnelAKAProvider{},
+			ChildSPI:                 []byte{0x11, 0x22, 0x33, 0x44},
+			Transport:                transport,
+			ESPTransport:             &captureESPPacketTransport{},
+			DisableControlPlaneHooks: true,
+			InitRunner: func(context.Context, ikev2.InitConfig) (ikev2.InitResult, error) {
+				return ikev2.InitResult{}, nil
+			},
+			AuthRunner: func(context.Context, ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
+				child := packetChildSA(true)
+				return ikev2.FullAuthResult{ChildSA: &child}, nil
+			},
+		})
+		session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+			DeviceID: "dev-1", Mode: DataplaneModeUserspace, EPDGAddress: "epdg.example", IMSI: "310280233641503",
+		})
+		if err != nil {
+			t.Fatalf("EstablishTunnel() error = %v", err)
+		}
+		if transport.closed {
+			t.Fatal("IKE transport closed before session close")
+		}
+		if err := session.Close(context.Background()); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		if !transport.closed {
+			t.Fatal("IKE transport was not closed")
+		}
+	})
+
+	t.Run("establishment failure", func(t *testing.T) {
+		transport := &closeTrackingIKETransport{}
+		sentinel := errors.New("auth failed")
+		manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{
+			SIM:       ikeTunnelAKAProvider{},
+			ChildSPI:  []byte{0x11, 0x22, 0x33, 0x44},
+			Transport: transport,
+			InitRunner: func(context.Context, ikev2.InitConfig) (ikev2.InitResult, error) {
+				return ikev2.InitResult{}, nil
+			},
+			AuthRunner: func(context.Context, ikev2.FullAuthConfig) (ikev2.FullAuthResult, error) {
+				return ikev2.FullAuthResult{}, sentinel
+			},
+		})
+		_, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+			DeviceID: "dev-1", Mode: DataplaneModeUserspace, EPDGAddress: "epdg.example", IMSI: "310280233641503",
+		})
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("EstablishTunnel() err=%v, want %v", err, sentinel)
+		}
+		if !transport.closed {
+			t.Fatal("IKE transport was not closed after establishment failure")
+		}
+	})
+}
+
 type ikeTunnelNoopTransport struct{}
 
 func (ikeTunnelNoopTransport) ExchangeIKE(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("unexpected IKE exchange")
+}
+
+type closeTrackingIKETransport struct {
+	closed bool
+}
+
+func (*closeTrackingIKETransport) ExchangeIKE(context.Context, []byte) ([]byte, error) {
+	return nil, errors.New("unexpected IKE exchange")
+}
+
+func (tr *closeTrackingIKETransport) Close() error {
+	tr.closed = true
+	return nil
 }
 
 type ikeTunnelStaticSession struct {
