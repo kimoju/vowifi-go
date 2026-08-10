@@ -205,8 +205,8 @@ func epdgRouteExclusionCommands(exclusion EPDGRouteExclusion) ([]ipCommand, erro
 	}
 	var commands []ipCommand
 	for _, table := range tables {
-		args := []string{"route", "add", dst, "dev", iface}
-		undo := []string{"route", "del", dst, "dev", iface}
+		args := routingFamilyArgs(dst, "route", "add", dst, "dev", iface)
+		undo := routingFamilyArgs(dst, "route", "del", dst, "dev", iface)
 		if strings.TrimSpace(exclusion.Via) != "" {
 			via, err := normalizeIPAddress(exclusion.Via, "epdg route via")
 			if err != nil {
@@ -242,8 +242,8 @@ func routeCommands(iface string, route TUNRoute) ([]string, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	args := []string{"route", "add", dst, "dev", iface}
-	undo := []string{"route", "del", dst, "dev", iface}
+	args := routingFamilyArgs(dst, "route", "add", dst, "dev", iface)
+	undo := routingFamilyArgs(dst, "route", "del", dst, "dev", iface)
 	if strings.TrimSpace(route.Via) != "" {
 		via, err := normalizeIPAddress(route.Via, "route via")
 		if err != nil {
@@ -286,6 +286,7 @@ func ruleCommands(rule TUNRule) ([]string, []string, error) {
 	}
 	args := []string{"rule", "add"}
 	undo := []string{"rule", "del"}
+	familyAddress := ""
 	if rule.Priority < 0 {
 		return nil, nil, fmt.Errorf("%w: rule priority must be positive", ErrInvalidTUNRouting)
 	}
@@ -301,6 +302,7 @@ func ruleCommands(rule TUNRule) ([]string, []string, error) {
 		}
 		args = append(args, "from", from)
 		undo = append(undo, "from", from)
+		familyAddress = from
 	}
 	if strings.TrimSpace(rule.To) != "" {
 		to, err := normalizeIPPrefix(rule.To, "rule to")
@@ -309,6 +311,9 @@ func ruleCommands(rule TUNRule) ([]string, []string, error) {
 		}
 		args = append(args, "to", to)
 		undo = append(undo, "to", to)
+		if familyAddress == "" {
+			familyAddress = to
+		}
 	}
 	if strings.TrimSpace(rule.FwMark) != "" {
 		fwmark, err := normalizeRoutingToken(rule.FwMark, "rule fwmark")
@@ -320,7 +325,30 @@ func ruleCommands(rule TUNRule) ([]string, []string, error) {
 	}
 	args = append(args, "table", table)
 	undo = append(undo, "table", table)
+	if isIPv6RoutingAddress(familyAddress) {
+		args = append([]string{"-6"}, args...)
+		undo = append([]string{"-6"}, undo...)
+	}
 	return args, undo, nil
+}
+
+func routingFamilyArgs(address string, args ...string) []string {
+	out := append([]string(nil), args...)
+	if isIPv6RoutingAddress(address) {
+		out = append([]string{"-6"}, out...)
+	}
+	return out
+}
+
+func isIPv6RoutingAddress(address string) bool {
+	address = strings.TrimSpace(address)
+	if prefix, err := netip.ParsePrefix(address); err == nil {
+		return prefix.Addr().Is6()
+	}
+	if addr, err := netip.ParseAddr(address); err == nil {
+		return addr.Is6()
+	}
+	return false
 }
 
 func runIPUndo(ctx context.Context, runner IPCommandRunner, undo []ipCommand) error {

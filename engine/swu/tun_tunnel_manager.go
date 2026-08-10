@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os/exec"
 	"strings"
 	"sync"
@@ -13,6 +14,11 @@ import (
 )
 
 var ErrInvalidTUNTunnelManager = errors.New("invalid swu tun tunnel manager")
+
+const (
+	DefaultTUNPolicyRoutingTable    = "51820"
+	DefaultTUNPolicyRoutingPriority = 12000
+)
 
 type TUNDeviceFactory func(context.Context, TunnelConfig, TunnelResult) (InnerPacketDevice, string, error)
 
@@ -41,6 +47,9 @@ type TUNTunnelManagerConfig struct {
 	RoutingConfigFactory   TUNRoutingConfigFactory
 	DisableRouting         bool
 	DefaultRoutes          bool
+	SourcePolicyRouting    bool
+	PolicyRoutingTable     string
+	PolicyRoutingPriority  int
 	ProtectEPDGRoutes      bool
 	EPDGRouteResolver      EPDGRouteResolver
 	EPDGOuterRouteResolver EPDGOuterRouteResolver
@@ -196,6 +205,15 @@ func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, 
 	if m.Config.DefaultRoutes && len(routes) == 0 {
 		routes = append(routes, TUNRoute{Destination: "default"})
 	}
+	rules := cloneTUNRules(m.Config.Rules)
+	if m.Config.SourcePolicyRouting && len(routes) == 0 {
+		policyRoutes, policyRules, err := sourcePolicyRouting(addresses, m.Config.PolicyRoutingTable, m.Config.PolicyRoutingPriority)
+		if err != nil {
+			return TUNRoutingConfig{}, err
+		}
+		routes = append(routes, policyRoutes...)
+		rules = append(rules, policyRules...)
+	}
 	exclusions := cloneEPDGRouteExclusions(m.Config.EPDGRouteExclusions)
 	if m.Config.ProtectEPDGRoutes {
 		defaultExclusions, err := m.defaultEPDGRouteExclusions(ctx, cfg, result, routes)
@@ -210,8 +228,52 @@ func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, 
 		Addresses:           addresses,
 		EPDGRouteExclusions: exclusions,
 		Routes:              routes,
-		Rules:               cloneTUNRules(m.Config.Rules),
+		Rules:               rules,
 	}, nil
+}
+
+func sourcePolicyRouting(addresses []string, table string, priority int) ([]TUNRoute, []TUNRule, error) {
+	table = strings.TrimSpace(table)
+	if table == "" {
+		table = DefaultTUNPolicyRoutingTable
+	}
+	if priority == 0 {
+		priority = DefaultTUNPolicyRoutingPriority
+	}
+	if priority < 0 {
+		return nil, nil, fmt.Errorf("%w: policy routing priority must be positive", ErrInvalidTUNTunnelManager)
+	}
+	routeFamilies := map[bool]bool{}
+	seenSources := map[string]bool{}
+	var routes []TUNRoute
+	var rules []TUNRule
+	for _, address := range addresses {
+		source, err := normalizeIPPrefix(address, "policy routing source")
+		if err != nil {
+			return nil, nil, err
+		}
+		prefix, err := netip.ParsePrefix(source)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: policy routing source %q: %v", ErrInvalidTUNTunnelManager, source, err)
+		}
+		isIPv6 := prefix.Addr().Is6()
+		if !routeFamilies[isIPv6] {
+			destination := "0.0.0.0/0"
+			if isIPv6 {
+				destination = "::/0"
+			}
+			routes = append(routes, TUNRoute{Destination: destination, Table: table})
+			routeFamilies[isIPv6] = true
+		}
+		if !seenSources[source] {
+			rules = append(rules, TUNRule{Priority: priority, From: source, Table: table})
+			seenSources[source] = true
+		}
+	}
+	if len(routes) == 0 {
+		return nil, nil, fmt.Errorf("%w: source policy routing requires an inner address", ErrInvalidTUNTunnelManager)
+	}
+	return routes, rules, nil
 }
 
 func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg TunnelConfig, result TunnelResult, routes []TUNRoute) ([]EPDGRouteExclusion, error) {
@@ -320,7 +382,7 @@ func routingTablesForRoutes(routes []TUNRoute) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, route := range routes {
-		if normalizeRouteDestinationForRoutingTables(route.Destination) != "default" {
+		if !isDefaultRouteDestination(route.Destination) {
 			continue
 		}
 		table := strings.TrimSpace(route.Table)
@@ -333,8 +395,13 @@ func routingTablesForRoutes(routes []TUNRoute) []string {
 	return out
 }
 
-func normalizeRouteDestinationForRoutingTables(destination string) string {
-	return strings.ToLower(strings.TrimSpace(destination))
+func isDefaultRouteDestination(destination string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(destination))
+	if normalized == "default" {
+		return true
+	}
+	prefix, err := netip.ParsePrefix(normalized)
+	return err == nil && prefix.Bits() == 0
 }
 
 func (s *TUNPacketTunnelSession) Result() TunnelResult {

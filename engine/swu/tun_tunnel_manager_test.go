@@ -234,6 +234,48 @@ func TestTUNTunnelManagerAddsDefaultRouteAndEPDGProtection(t *testing.T) {
 	}
 }
 
+func TestTUNTunnelManagerUsesInnerSourcePolicyWithoutReplacingHostDefault(t *testing.T) {
+	baseSession := newTUNManagerPacketSession(TunnelResult{
+		Ready:            true,
+		EPDGAddress:      "198.51.100.7",
+		LocalInnerIP:     "2001:db8::2",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+	})
+	routing := &tunManagerRouting{}
+	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
+		Base:                &tunManagerBase{session: baseSession},
+		RoutingManager:      routing,
+		SourcePolicyRouting: true,
+		ProtectEPDGRoutes:   true,
+		DeviceFactory: func(context.Context, TunnelConfig, TunnelResult) (InnerPacketDevice, string, error) {
+			return newTUNManagerDevice("vohive0"), "vohive0", nil
+		},
+	})
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID:       "dev-1",
+		Mode:           DataplaneModeUserspace,
+		EPDGAddress:    "198.51.100.7",
+		LocalInterface: "eno1",
+		OuterLocalIP:   "192.0.2.10",
+		IMSI:           "310280233641503",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	applied := routing.applies[0]
+	if len(applied.Routes) != 1 || applied.Routes[0].Destination != "::/0" || applied.Routes[0].Table != DefaultTUNPolicyRoutingTable {
+		t.Fatalf("routes=%+v", applied.Routes)
+	}
+	if len(applied.Rules) != 1 || applied.Rules[0].From != "2001:db8::2/128" || applied.Rules[0].Table != DefaultTUNPolicyRoutingTable || applied.Rules[0].Priority != DefaultTUNPolicyRoutingPriority {
+		t.Fatalf("rules=%+v", applied.Rules)
+	}
+	if len(applied.EPDGRouteExclusions) != 1 || !stringSlicesEqual(applied.EPDGRouteExclusions[0].Tables, []string{DefaultTUNPolicyRoutingTable}) {
+		t.Fatalf("ePDG exclusions=%+v", applied.EPDGRouteExclusions)
+	}
+}
+
 func TestTUNTunnelManagerResolvesOuterRouteWhenInterfaceIsUnset(t *testing.T) {
 	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
 		EPDGOuterRouteResolver: func(ctx context.Context, ip net.IP) (EPDGOuterRoute, error) {
