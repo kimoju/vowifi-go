@@ -633,7 +633,7 @@ func TestStartAndStopDispatchRuntimeStateSnapshots(t *testing.T) {
 		t.Fatalf("event=%T, want RuntimeStateSnapshot", dispatch.events[0])
 	}
 	if ready.DevID != "dev-1" || ready.Phase != eventhost.RuntimePhaseReady ||
-		!ready.AccessReady || !ready.IMSReady || !ready.SMSReady ||
+		!ready.AccessReady || !ready.IMSReady || ready.SMSReady ||
 		ready.RegStatus != 1 || ready.RegStatusText != "registered" ||
 		ready.NetworkMode != "LTE" || ready.LastReason != "started" ||
 		ready.Time.IsZero() {
@@ -1764,6 +1764,29 @@ func TestStartRejectsIMSRegistrationFailure(t *testing.T) {
 	}
 }
 
+func TestStartClosesTunnelAfterIMSRegistrationFailure(t *testing.T) {
+	session := &runtimeTunnelSession{result: swu.TunnelResult{
+		Ready:            true,
+		Mode:             swu.DataplaneModeUserspace,
+		LocalInnerIP:     "10.0.0.2",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+	}}
+	_, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: &runtimeTunnelManager{session: session},
+		IMSRegistrar:  &testIMSRegistrar{err: errors.New("401 after AKA")},
+	})
+	if err == nil || !strings.Contains(err.Error(), "IMS registration failed") {
+		t.Fatalf("Start() err=%v, want IMS registration failure", err)
+	}
+	if !session.closed {
+		t.Fatal("tunnel was not closed after IMS registration failure")
+	}
+}
+
 func TestStartRejectsUnregisteredIMSResult(t *testing.T) {
 	registrar := &testIMSRegistrar{result: IMSRegistrationResult{Registered: false, StatusCode: 403, Reason: "Forbidden"}}
 	_, err := Start(context.Background(), StartRequest{
@@ -1789,6 +1812,24 @@ func TestStartWithoutIMSRegistrarKeepsCompatibilityReady(t *testing.T) {
 	}
 	if inst.State().TunnelReady {
 		t.Fatalf("TunnelReady=true without explicit tunnel manager")
+	}
+}
+
+func TestStartWithExplicitTunnelDoesNotClaimIMSOrSMSWithoutTransports(t *testing.T) {
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:  "dev-no-ims",
+		Profile:   identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane: DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: &runtimeTunnelManager{session: &runtimeTunnelSession{result: swu.TunnelResult{
+			Ready: true, IKEEstablished: true, IPsecEstablished: true,
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	state := inst.State()
+	if state.IMSReady || state.SMSReady {
+		t.Fatalf("state=%+v, want IMS/SMS not ready", state)
 	}
 }
 
@@ -2111,6 +2152,39 @@ func TestStopClosesTunnel(t *testing.T) {
 	}
 	if !session.closed || inst.State().TunnelReady {
 		t.Fatalf("closed=%t state=%+v", session.closed, inst.State())
+	}
+}
+
+func TestStopDeregistersIMSBeforeClosingTunnel(t *testing.T) {
+	var order []string
+	session := &runtimeTunnelSession{
+		result:  swu.TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true},
+		onClose: func() { order = append(order, "tunnel") },
+	}
+	registrar := &testIMSRegistrar{result: IMSRegistrationResult{
+		Registered:   true,
+		StatusCode:   200,
+		SMSTransport: &runtimeSMSTransport{},
+		Close: func(context.Context) error {
+			order = append(order, "ims")
+			return nil
+		},
+	}}
+	inst, err := Start(context.Background(), StartRequest{
+		DeviceID:      "dev-stop-order",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: &runtimeTunnelManager{session: session},
+		IMSRegistrar:  registrar,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := inst.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if len(order) != 2 || order[0] != "ims" || order[1] != "tunnel" {
+		t.Fatalf("stop order=%v, want [ims tunnel]", order)
 	}
 }
 
@@ -2582,6 +2656,7 @@ type runtimeTunnelSession struct {
 	mobikeErr     error
 	mobikeRequest swu.MOBIKERequest
 	closed        bool
+	onClose       func()
 }
 
 func (s *runtimeTunnelSession) Result() swu.TunnelResult {
@@ -2598,6 +2673,9 @@ func (s *runtimeTunnelSession) MOBIKE(ctx context.Context, req swu.MOBIKERequest
 
 func (s *runtimeTunnelSession) Close(ctx context.Context) error {
 	s.closed = true
+	if s.onClose != nil {
+		s.onClose()
+	}
 	return nil
 }
 

@@ -690,14 +690,17 @@ func TestWireIMSRegistrarProfileFromPreparedCarrierFallbacks(t *testing.T) {
 func TestWireIMSRegistrarDefaultResolverUsesTunnelDNS(t *testing.T) {
 	dnsServers := []string{"10.0.0.53", "2001:db8::53"}
 	flow := WireIMSRegistrar{Timeout: 2 * time.Second}.defaultSIPFlow(IMSRegistrationConfig{
-		Tunnel: swu.TunnelResult{DNSServers: dnsServers},
+		Tunnel: swu.TunnelResult{LocalInnerIP: "2001:db8::2", DNSServers: dnsServers},
 	})
 	dnsServers[0] = "198.51.100.53"
 	resolver, ok := flow.Resolver.(voiceclient.NetSIPResolver)
 	if !ok {
 		t.Fatalf("resolver=%T, want NetSIPResolver", flow.Resolver)
 	}
-	if len(resolver.DNSServers) != 2 || resolver.DNSServers[0] != "10.0.0.53" || resolver.DNSServers[1] != "2001:db8::53" || resolver.Timeout != 2*time.Second {
+	if flow.LocalAddr != "[2001:db8::2]:5060" {
+		t.Fatalf("flow local addr=%q", flow.LocalAddr)
+	}
+	if len(resolver.DNSServers) != 2 || resolver.DNSServers[0] != "10.0.0.53" || resolver.DNSServers[1] != "2001:db8::53" || resolver.LocalAddr != "[2001:db8::2]:0" || resolver.Timeout != 2*time.Second {
 		t.Fatalf("resolver=%+v", resolver)
 	}
 	custom := voiceclient.SIPServerResolverFunc(func(context.Context, string, string) (string, error) {

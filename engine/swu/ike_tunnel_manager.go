@@ -488,7 +488,9 @@ func (c *ikePacketTunnelControl) close(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	_, err = ikev2.RunInformationalExchange(ctx, ikev2.InformationalConfig{
+	deleteCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	_, err = ikev2.RunInformationalExchange(deleteCtx, ikev2.InformationalConfig{
 		Transport: c.transport,
 		Init:      c.init,
 		Keys:      c.keys,
@@ -496,7 +498,18 @@ func (c *ikePacketTunnelControl) close(ctx context.Context) (err error) {
 		Payloads:  payloads,
 		Random:    c.random,
 	})
+	if isBestEffortIKECloseError(err) {
+		return nil
+	}
 	return err
+}
+
+func isBestEffortIKECloseError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func closeIKETransport(transport ikev2.InitTransport) error {

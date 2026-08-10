@@ -230,7 +230,7 @@ func (r WireIMSRegistrar) voiceTransport(cfg IMSRegistrationConfig, profile voic
 	return voiceclient.WireSIPTransport{
 		Network:               r.Network,
 		ServerAddr:            r.ServerAddr,
-		LocalAddr:             r.LocalAddr,
+		LocalAddr:             r.sipLocalAddrForConfig(cfg),
 		Resolver:              r.resolverForConfig(cfg),
 		Timeout:               r.Timeout,
 		RetransmitInterval:    r.RetransmitInterval,
@@ -243,7 +243,7 @@ func (r WireIMSRegistrar) defaultSIPFlow(cfg IMSRegistrationConfig) *voiceclient
 	return &voiceclient.WireSIPFlow{
 		Network:               r.Network,
 		ServerAddr:            r.ServerAddr,
-		LocalAddr:             r.LocalAddr,
+		LocalAddr:             r.sipLocalAddrForConfig(cfg),
 		Resolver:              r.resolverForConfig(cfg),
 		Timeout:               r.Timeout,
 		RetransmitInterval:    r.RetransmitInterval,
@@ -374,6 +374,7 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 		return preparedPCSCFResolver{
 			Candidates: candidates,
 			DNSServers: append([]string(nil), cfg.Tunnel.DNSServers...),
+			LocalAddr:  r.dnsLocalAddrForConfig(cfg),
 			Timeout:    r.Timeout,
 		}
 	}
@@ -382,6 +383,7 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 	}
 	return voiceclient.NetSIPResolver{
 		DNSServers: append([]string(nil), cfg.Tunnel.DNSServers...),
+		LocalAddr:  r.dnsLocalAddrForConfig(cfg),
 		Timeout:    r.Timeout,
 	}
 }
@@ -389,6 +391,7 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 type preparedPCSCFResolver struct {
 	Candidates []string
 	DNSServers []string
+	LocalAddr  string
 	Timeout    time.Duration
 }
 
@@ -406,6 +409,7 @@ func (r preparedPCSCFResolver) ResolveSIPServer(ctx context.Context, network, ur
 func (r preparedPCSCFResolver) ResolveSIPServers(ctx context.Context, network, uri string) ([]string, error) {
 	resolver := voiceclient.NetSIPResolver{
 		DNSServers: append([]string(nil), r.DNSServers...),
+		LocalAddr:  r.LocalAddr,
 		Timeout:    r.Timeout,
 	}
 	var out []string
@@ -434,6 +438,46 @@ func (r preparedPCSCFResolver) ResolveSIPServers(ctx context.Context, network, u
 		return nil, lastErr
 	}
 	return out, nil
+}
+
+func (r WireIMSRegistrar) sipLocalAddrForConfig(cfg IMSRegistrationConfig) string {
+	if local := strings.TrimSpace(r.LocalAddr); local != "" {
+		return local
+	}
+	host := tunnelInnerHost(cfg.Tunnel.LocalInnerIP)
+	if host == "" {
+		return ""
+	}
+	port := r.ContactPort
+	if port <= 0 {
+		port = 5060
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+func (r WireIMSRegistrar) dnsLocalAddrForConfig(cfg IMSRegistrationConfig) string {
+	host := tunnelInnerHost(cfg.Tunnel.LocalInnerIP)
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, "0")
+}
+
+func tunnelInnerHost(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if ip, _, err := net.ParseCIDR(value); err == nil {
+		return ip.String()
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return strings.Trim(host, "[] ")
+	}
+	if ip := net.ParseIP(strings.Trim(value, "[]")); ip != nil {
+		return ip.String()
+	}
+	return ""
 }
 
 func preparedPCSCFCandidates(cfg IMSRegistrationConfig) []string {

@@ -1,6 +1,9 @@
 package voiceclient
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestNormalizeDNSServerAddrs(t *testing.T) {
 	got := normalizeDNSServerAddrs([]string{
@@ -24,6 +27,25 @@ func TestNormalizeDNSServerAddrs(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("addrs[%d]=%q, want %q (all=%+v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+func TestResolveDNSLocalAddrPreservesTunnelSource(t *testing.T) {
+	udpAddr, err := resolveDNSLocalAddr("udp", "2001:db8::2")
+	if err != nil {
+		t.Fatalf("resolveDNSLocalAddr(udp) error = %v", err)
+	}
+	udp, ok := udpAddr.(*net.UDPAddr)
+	if !ok || udp.Port != 0 || !udp.IP.Equal(net.ParseIP("2001:db8::2")) {
+		t.Fatalf("udp addr=%T %+v", udpAddr, udpAddr)
+	}
+	tcpAddr, err := resolveDNSLocalAddr("tcp", "10.0.0.2:0")
+	if err != nil {
+		t.Fatalf("resolveDNSLocalAddr(tcp) error = %v", err)
+	}
+	tcp, ok := tcpAddr.(*net.TCPAddr)
+	if !ok || tcp.Port != 0 || !tcp.IP.Equal(net.ParseIP("10.0.0.2")) {
+		t.Fatalf("tcp addr=%T %+v", tcpAddr, tcpAddr)
 	}
 }
 

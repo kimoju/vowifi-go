@@ -669,7 +669,16 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 			return nil, fmt.Errorf("SWU tunnel establishment incomplete: %s", firstRuntimeNonEmpty(tunnelResult.Reason, "not ready"))
 		}
 	}
-	imsReady := req.IMSRegistrar == nil
+	keepTunnel := false
+	defer func() {
+		if tunnel == nil || keepTunnel {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = tunnel.Close(cleanupCtx)
+	}()
+	imsReady := req.IMSRegistrar == nil && !explicitSWUDataplane(req.Dataplane.Mode)
 	imsReason := ""
 	imsResult := IMSRegistrationResult{}
 	if req.IMSRegistrar != nil {
@@ -704,7 +713,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		AccessReady:   modem != nil,
 		TunnelReady:   tunnelReady,
 		IMSReady:      imsReady,
-		SMSReady:      true,
+		SMSReady:      false,
 		RegStatus:     regStatus,
 		RegStatusText: regText,
 		NetworkMode:   strings.TrimSpace(req.NetworkMode),
@@ -719,6 +728,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	if smsTransport == nil {
 		smsTransport = imsResult.SMSTransport
 	}
+	state.SMSReady = smsTransport != nil
 	ussdTransport := req.USSDTransport
 	if ussdTransport == nil {
 		ussdTransport = imsResult.USSDTransport
@@ -742,6 +752,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	inst.notify(ctx)
 	inst.dispatchRuntimeState(ctx)
 	inst.startIMSMessagingRetryWorker(req.IMSMessagingRetryWorker)
+	keepTunnel = true
 	return inst, nil
 }
 
@@ -983,11 +994,11 @@ func (i *Instance) Stop(ctx context.Context) error {
 			}
 		}
 	}
-	if tunnel != nil {
-		err = tunnel.Close(ctx)
-	}
 	if imsClose != nil {
 		err = errors.Join(err, imsClose(ctx))
+	}
+	if tunnel != nil {
+		err = errors.Join(err, tunnel.Close(ctx))
 	}
 	i.notify(ctx)
 	i.dispatchRuntimeState(ctx)

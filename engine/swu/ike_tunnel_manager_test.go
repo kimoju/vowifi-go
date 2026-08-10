@@ -773,6 +773,33 @@ func TestIKEPacketTunnelManagerClosesIKETransport(t *testing.T) {
 	})
 }
 
+func TestIKEPacketTunnelControlCloseTreatsDeleteTimeoutAsBestEffort(t *testing.T) {
+	init := ikeControlInit(t)
+	control := &ikePacketTunnelControl{
+		transport: ikeInitTransportFunc(func(ctx context.Context, _ []byte) ([]byte, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}),
+		init:          init,
+		keys:          init.Keys,
+		child:         packetChildSA(true),
+		nextMessageID: 3,
+	}
+	started := time.Now()
+	if err := control.close(context.Background()); err != nil {
+		t.Fatalf("close() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("close() elapsed=%v, want bounded best-effort delete", elapsed)
+	}
+}
+
+type ikeInitTransportFunc func(context.Context, []byte) ([]byte, error)
+
+func (f ikeInitTransportFunc) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
+	return f(ctx, request)
+}
+
 type ikeTunnelNoopTransport struct{}
 
 func (ikeTunnelNoopTransport) ExchangeIKE(context.Context, []byte) ([]byte, error) {

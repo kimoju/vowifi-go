@@ -45,6 +45,7 @@ func (f SIPServerCandidateResolverFunc) ResolveSIPServer(ctx context.Context, ne
 type NetSIPResolver struct {
 	Resolver   *net.Resolver
 	DNSServers []string
+	LocalAddr  string
 	Timeout    time.Duration
 }
 
@@ -69,7 +70,7 @@ func (r NetSIPResolver) ResolveSIPServers(ctx context.Context, network, uri stri
 	}
 	resolver := r.Resolver
 	if resolver == nil {
-		resolver = DNSResolverForServers(r.DNSServers, r.Timeout)
+		resolver = DNSResolverForServersWithLocalAddr(r.DNSServers, r.Timeout, r.LocalAddr)
 	}
 	service := "sip"
 	if endpoint.Secure {
@@ -109,6 +110,10 @@ func ResolveSIPServers(ctx context.Context, network, uri string) ([]string, erro
 }
 
 func DNSResolverForServers(servers []string, timeout time.Duration) *net.Resolver {
+	return DNSResolverForServersWithLocalAddr(servers, timeout, "")
+}
+
+func DNSResolverForServersWithLocalAddr(servers []string, timeout time.Duration, localAddr string) *net.Resolver {
 	addrs := normalizeDNSServerAddrs(servers)
 	if len(addrs) == 0 {
 		return net.DefaultResolver
@@ -126,6 +131,13 @@ func DNSResolverForServers(servers []string, timeout time.Duration) *net.Resolve
 			start := int(atomic.AddUint64(&next, 1)-1) % len(addrs)
 			var lastErr error
 			dialer := net.Dialer{}
+			if strings.TrimSpace(localAddr) != "" {
+				addr, err := resolveDNSLocalAddr(network, localAddr)
+				if err != nil {
+					return nil, err
+				}
+				dialer.LocalAddr = addr
+			}
 			for i := 0; i < len(addrs); i++ {
 				addr := addrs[(start+i)%len(addrs)]
 				conn, err := dialer.DialContext(ctx, network, addr)
@@ -139,6 +151,25 @@ func DNSResolverForServers(servers []string, timeout time.Duration) *net.Resolve
 			}
 			return nil, errSIPDNSResolverEmpty()
 		},
+	}
+}
+
+func resolveDNSLocalAddr(network, address string) (net.Addr, error) {
+	network = strings.ToLower(strings.TrimSpace(network))
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return nil, nil
+	}
+	if net.ParseIP(strings.Trim(address, "[]")) != nil {
+		address = net.JoinHostPort(strings.Trim(address, "[]"), "0")
+	}
+	switch {
+	case strings.HasPrefix(network, "udp"):
+		return net.ResolveUDPAddr(network, address)
+	case strings.HasPrefix(network, "tcp"):
+		return net.ResolveTCPAddr(network, address)
+	default:
+		return nil, fmt.Errorf("unsupported DNS network %q", network)
 	}
 }
 
