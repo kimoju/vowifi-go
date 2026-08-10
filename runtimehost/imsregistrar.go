@@ -481,10 +481,11 @@ func tunnelInnerHost(value string) string {
 }
 
 func preparedPCSCFCandidates(cfg IMSRegistrationConfig) []string {
-	if cfg.Prepared == nil {
-		return nil
+	out := appendRuntimeTargets(nil, cfg.Tunnel.PCSCFServers...)
+	if cfg.Prepared != nil {
+		out = appendRuntimeTargets(out, cfg.Prepared.PCSCFFQDNs...)
 	}
-	return appendRuntimeTargets(nil, cfg.Prepared.PCSCFFQDNs...)
+	return out
 }
 
 func pcscfCandidateSIPURI(candidate string) string {

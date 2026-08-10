@@ -48,6 +48,8 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 					{Type: ikev2.ConfigInternalIPv4Address, Value: []byte{10, 0, 0, 2}},
 					{Type: ikev2.ConfigInternalIPv4DNS, Value: []byte{10, 0, 0, 1}},
 					{Type: ikev2.ConfigInternalIPv6DNS, Value: net.ParseIP("2001:db8::53").To16()},
+					{Type: ikev2.ConfigPCSCFIPv4Address, Value: []byte{10, 0, 0, 10}},
+					{Type: ikev2.ConfigPCSCFIPv6Address, Value: net.ParseIP("2001:db8::10").To16()},
 				},
 			}
 			return ikev2.FullAuthResult{ChildSA: &child, NextMessageID: 3}, nil
@@ -78,9 +80,16 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	if len(result.DNSServers) != 2 || result.DNSServers[0] != "10.0.0.1" || result.DNSServers[1] != "2001:db8::53" {
 		t.Fatalf("result DNS=%+v", result.DNSServers)
 	}
+	if len(result.PCSCFServers) != 2 || result.PCSCFServers[0] != "10.0.0.10" || result.PCSCFServers[1] != "2001:db8::10" {
+		t.Fatalf("result P-CSCF=%+v", result.PCSCFServers)
+	}
 	result.DNSServers[0] = "198.51.100.53"
+	result.PCSCFServers[0] = "198.51.100.10"
 	if got := session.Result().DNSServers[0]; got != "10.0.0.1" {
 		t.Fatalf("Result() leaked DNS slice, got %q", got)
+	}
+	if got := session.Result().PCSCFServers[0]; got != "10.0.0.10" {
+		t.Fatalf("Result() leaked P-CSCF slice, got %q", got)
 	}
 	if !result.MOBIKESupported || result.ChildSAIdentifier != "cafebabe/22222222" {
 		t.Fatalf("result MOBIKE/child id = %+v", result)

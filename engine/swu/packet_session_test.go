@@ -90,6 +90,7 @@ func TestPacketSessionResultClonesDNSServers(t *testing.T) {
 			IKEEstablished:   true,
 			IPsecEstablished: true,
 			DNSServers:       []string{"10.0.0.1"},
+			PCSCFServers:     []string{"10.0.0.10"},
 		},
 	})
 	if err != nil {
@@ -97,8 +98,12 @@ func TestPacketSessionResultClonesDNSServers(t *testing.T) {
 	}
 	result := session.Result()
 	result.DNSServers[0] = "198.51.100.53"
+	result.PCSCFServers[0] = "198.51.100.10"
 	if got := session.Result().DNSServers[0]; got != "10.0.0.1" {
 		t.Fatalf("Result() DNS=%q, want original", got)
+	}
+	if got := session.Result().PCSCFServers[0]; got != "10.0.0.10" {
+		t.Fatalf("Result() P-CSCF=%q, want original", got)
 	}
 }
 

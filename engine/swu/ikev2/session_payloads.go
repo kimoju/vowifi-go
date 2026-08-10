@@ -32,6 +32,8 @@ const (
 	ConfigInternalIPv4Subnet    uint16 = 13
 	ConfigSupportedAttributes   uint16 = 14
 	ConfigInternalIPv6Subnet    uint16 = 15
+	ConfigPCSCFIPv4Address      uint16 = 20
+	ConfigPCSCFIPv6Address      uint16 = 21
 )
 
 const (
@@ -149,6 +151,8 @@ func SWuConfigurationRequest() Configuration {
 		{Type: ConfigInternalIPv4DNS},
 		{Type: ConfigInternalIPv6Address},
 		{Type: ConfigInternalIPv6DNS},
+		{Type: ConfigPCSCFIPv4Address},
+		{Type: ConfigPCSCFIPv6Address},
 	}}
 }
 

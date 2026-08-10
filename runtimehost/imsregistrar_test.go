@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -714,6 +715,22 @@ func TestWireIMSRegistrarDefaultResolverUsesTunnelDNS(t *testing.T) {
 	}
 	if _, ok := customFlow.Resolver.(voiceclient.NetSIPResolver); ok {
 		t.Fatalf("custom resolver was overwritten: %T", customFlow.Resolver)
+	}
+}
+
+func TestWireIMSRegistrarPrefersTunnelPCSCFAddresses(t *testing.T) {
+	prepared := identity.PreparedSession{PCSCFFQDNs: []string{"pcscf.ims.example"}}
+	resolver := WireIMSRegistrar{}.resolverForConfig(IMSRegistrationConfig{
+		Prepared: &prepared,
+		Tunnel:   swu.TunnelResult{PCSCFServers: []string{"10.0.0.10", "2001:db8::10"}},
+	})
+	got, ok := resolver.(preparedPCSCFResolver)
+	if !ok {
+		t.Fatalf("resolver=%T, want preparedPCSCFResolver", resolver)
+	}
+	want := []string{"10.0.0.10", "2001:db8::10", "pcscf.ims.example"}
+	if !reflect.DeepEqual(got.Candidates, want) {
+		t.Fatalf("candidates=%+v, want %+v", got.Candidates, want)
 	}
 }
 
