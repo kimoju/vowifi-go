@@ -313,6 +313,14 @@ func TestLinuxIMSSecurityXFRMInstallerApplyInstallAndCleanup(t *testing.T) {
 	}
 }
 
+func TestLinuxIMSSecurityXFRMInstallerRejectsLegacyPlanWithoutKeysAndEndpoints(t *testing.T) {
+	installer := &LinuxIMSSecurityXFRMInstaller{}
+	err := installer.InstallSecurityPlan(context.Background(), IMSSecurityAssociationPlan{})
+	if !errors.Is(err, ErrInvalidIMSSecurityXFRMPlan) {
+		t.Fatalf("InstallSecurityPlan() err=%v, want ErrInvalidIMSSecurityXFRMPlan", err)
+	}
+}
+
 func TestLinuxIMSSecurityXFRMInstallerRollsBackOnFailure(t *testing.T) {
 	wantErr := errors.New("policy install failed")
 	req := validSecurityXFRMInstallRequest()

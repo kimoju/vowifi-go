@@ -71,7 +71,10 @@ type LinuxIMSSecurityXFRMInstaller struct {
 	states []IMSSecurityAssociationXFRMState
 }
 
-var _ SecurityPlanRequestInstaller = (*LinuxIMSSecurityXFRMInstaller)(nil)
+var (
+	_ SecurityPlanInstaller        = (*LinuxIMSSecurityXFRMInstaller)(nil)
+	_ SecurityPlanRequestInstaller = (*LinuxIMSSecurityXFRMInstaller)(nil)
+)
 
 type imsSecurityXFRMParams struct {
 	reqID         string
@@ -109,6 +112,14 @@ func BuildIMSSecurityAssociationXFRMInstallPlan(req IMSSecurityAssociationInstal
 		RemoteAddress: params.remoteAddress,
 		Commands:      commands,
 	}, nil
+}
+
+// InstallSecurityPlan satisfies the legacy installer contract. Linux XFRM
+// installation requires the AKA keys and negotiated endpoints carried only by
+// IMSSecurityAssociationInstallRequest, so callers must use the richer request
+// path selected by RegisterSession.
+func (i *LinuxIMSSecurityXFRMInstaller) InstallSecurityPlan(context.Context, IMSSecurityAssociationPlan) error {
+	return fmt.Errorf("%w: Linux XFRM requires a full IMS security install request", ErrInvalidIMSSecurityXFRMPlan)
 }
 
 func (i *LinuxIMSSecurityXFRMInstaller) InstallSecurityPlanRequest(ctx context.Context, req IMSSecurityAssociationInstallRequest) error {
