@@ -455,6 +455,7 @@ func TestBuildRegisterHeaders(t *testing.T) {
 		IMPI:              "310280233641503@private.example.test",
 		IMPU:              "sip:310280233641503@ims.example.test",
 		Domain:            "ims.example.test",
+		InstanceID:        "urn:gsma:imei:35693803-564380-9",
 		UserAgent:         "VoHive",
 		AccessNetworkInfo: `IEEE-802.11;i-wlan-node-id="node;1"`,
 		VisitedNetworkID:  `visited.example.test`,
@@ -466,9 +467,12 @@ func TestBuildRegisterHeaders(t *testing.T) {
 		headers["P-Visited-Network-ID"] != `"visited.example.test"` {
 		t.Fatalf("IMS access/visited headers=%+v", headers)
 	}
-	if !strings.Contains(headers["Contact"], `+sip.instance="<urn:uuid:vowifi-go>"`) ||
+	if !strings.Contains(headers["Contact"], `+sip.instance="<urn:gsma:imei:35693803-564380-9>"`) ||
 		!strings.Contains(headers["Contact"], imsMMTelContactFeature) {
 		t.Fatalf("Contact=%q", headers["Contact"])
+	}
+	if headers["Require"] != "sec-agree" || headers["Proxy-Require"] != "sec-agree" {
+		t.Fatalf("security agreement requirements=%+v", headers)
 	}
 	if !strings.Contains(headers["Security-Client"], "ipsec-3gpp") {
 		t.Fatalf("Security-Client=%q", headers["Security-Client"])
@@ -1787,7 +1791,7 @@ func TestRegisterSessionDeregisterReinstallsSecurityAgreement(t *testing.T) {
 		t.Fatalf("security requests=%+v requestsAtSecurity=%+v", transport.securityRequests, transport.requestsAtSecurity)
 	}
 	req := transport.securityRequests[0]
-	if req.Plan.SPIClient != 801 || req.Plan.SPIServer != 802 || req.LocalEndpoint.Port != 5070 || req.RemoteEndpoint.Port != 5071 {
+	if req.Plan.SPIClient != 801 || req.Plan.SPIServer != 802 || req.LocalEndpoint.Port != 5062 || req.RemoteEndpoint.Port != 5071 {
 		t.Fatalf("security request=%+v", req)
 	}
 	if got := transport.requests[1].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=801") {
@@ -2256,7 +2260,7 @@ func TestRegisterSessionRefreshReinstallsSecurityAgreement(t *testing.T) {
 		t.Fatalf("security requests=%+v requestsAtSecurity=%+v", transport.securityRequests, transport.requestsAtSecurity)
 	}
 	req := transport.securityRequests[0]
-	if req.Plan.SPIClient != 901 || req.Plan.SPIServer != 902 || req.LocalEndpoint.Port != 5072 || req.RemoteEndpoint.Port != 5073 {
+	if req.Plan.SPIClient != 901 || req.Plan.SPIServer != 902 || req.LocalEndpoint.Port != 5062 || req.RemoteEndpoint.Port != 5073 {
 		t.Fatalf("security request=%+v", req)
 	}
 	if result.Binding.SecurityAgreement.SPIClient != 901 || !strings.Contains(transport.requests[1].Headers["Security-Verify"], "spi-c=901") {

@@ -145,6 +145,45 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	}
 }
 
+func TestIKEPacketTunnelManagerSharesDefaultNATTSocketWithESP(t *testing.T) {
+	ikeTransport := ikev2.NewPersistentUDPTransport(ikev2.UDPTransport{
+		RemoteAddr:      "127.0.0.1:4500",
+		UseNonESPMarker: true,
+	})
+	manager := NewIKEPacketTunnelManager(IKEPacketTunnelManagerConfig{})
+	espTransport, err := manager.espTransport(TunnelConfig{}, ESPTransportConfig{}, ikeTransport)
+	if err != nil {
+		t.Fatalf("espTransport() error = %v", err)
+	}
+	shared, ok := espTransport.(sharedIKEESPPacketTransport)
+	if !ok || shared.transport != ikeTransport {
+		t.Fatalf("ESP transport=%T %+v, want shared IKE transport", espTransport, espTransport)
+	}
+}
+
+func TestResolveIKETransportEndpointsUsesConnectedSocket(t *testing.T) {
+	transport := &ikeEndpointTestTransport{
+		local:  &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 49152},
+		remote: &net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 4500},
+	}
+	cfg, err := resolveIKETransportEndpoints(context.Background(), IKETransportConfig{
+		RemoteAddr: "epdg.example:4500",
+		LocalAddr:  ":0",
+	}, transport)
+	if err != nil {
+		t.Fatalf("resolveIKETransportEndpoints() error = %v", err)
+	}
+	if !transport.opened {
+		t.Fatal("transport was not opened")
+	}
+	if !cfg.LocalIP.Equal(net.IPv4(192, 0, 2, 10)) || cfg.LocalPort != 49152 || cfg.LocalAddr != "192.0.2.10:49152" {
+		t.Fatalf("local endpoint=%s/%s/%d", cfg.LocalAddr, cfg.LocalIP, cfg.LocalPort)
+	}
+	if !cfg.RemoteIP.Equal(net.IPv4(198, 51, 100, 7)) || cfg.RemotePort != 4500 || cfg.RemoteAddr != "198.51.100.7:4500" {
+		t.Fatalf("remote endpoint=%s/%s/%d", cfg.RemoteAddr, cfg.RemoteIP, cfg.RemotePort)
+	}
+}
+
 func TestIKEPacketTunnelManagerEstablishesKernelSession(t *testing.T) {
 	init := ikeControlInit(t)
 	child := xfrmChildSA(ikev2.INTEG_HMAC_SHA2_256_128)
@@ -814,6 +853,24 @@ type ikeTunnelNoopTransport struct{}
 func (ikeTunnelNoopTransport) ExchangeIKE(context.Context, []byte) ([]byte, error) {
 	return nil, errors.New("unexpected IKE exchange")
 }
+
+type ikeEndpointTestTransport struct {
+	local  net.Addr
+	remote net.Addr
+	opened bool
+}
+
+func (t *ikeEndpointTestTransport) Open(context.Context) error {
+	t.opened = true
+	return nil
+}
+
+func (*ikeEndpointTestTransport) ExchangeIKE(context.Context, []byte) ([]byte, error) {
+	return nil, errors.New("unexpected IKE exchange")
+}
+
+func (t *ikeEndpointTestTransport) LocalNetworkAddr() net.Addr  { return t.local }
+func (t *ikeEndpointTestTransport) RemoteNetworkAddr() net.Addr { return t.remote }
 
 type closeTrackingIKETransport struct {
 	closed bool

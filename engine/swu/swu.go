@@ -95,6 +95,8 @@ type TunnelResult struct {
 	IPsecEstablished  bool
 	MOBIKESupported   bool
 	ChildSAIdentifier string
+	ESPEncryptionID   uint16
+	ESPIntegrityID    uint16
 	Reason            string
 	EstablishedAt     time.Time
 }
@@ -121,6 +123,8 @@ func isZeroTunnelResult(r TunnelResult) bool {
 		!r.IPsecEstablished &&
 		!r.MOBIKESupported &&
 		strings.TrimSpace(r.ChildSAIdentifier) == "" &&
+		r.ESPEncryptionID == 0 &&
+		r.ESPIntegrityID == 0 &&
 		strings.TrimSpace(r.Reason) == "" &&
 		r.EstablishedAt.IsZero()
 }

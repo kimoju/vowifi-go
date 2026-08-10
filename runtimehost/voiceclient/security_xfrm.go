@@ -77,19 +77,27 @@ var (
 )
 
 type imsSecurityXFRMParams struct {
-	reqID         string
-	mode          string
-	localAddress  string
-	remoteAddress string
-	localPort     string
-	remotePort    string
-	spiClient     string
-	spiServer     string
-	authAlgorithm string
-	authKey       string
-	authTruncBits string
-	encAlgorithm  string
-	encKey        string
+	reqID             string
+	mode              string
+	localAddress      string
+	remoteAddress     string
+	localPort         string
+	remotePort        string
+	spiClient         string
+	spiServer         string
+	inboundLocalPort  string
+	inboundRemotePort string
+	inboundSPI        string
+	serverLocalPort   string
+	serverRemotePort  string
+	serverInboundSPI  string
+	serverOutboundSPI string
+	hasServerFlow     bool
+	authAlgorithm     string
+	authKey           string
+	authTruncBits     string
+	encAlgorithm      string
+	encKey            string
 }
 
 // BuildIMSSecurityAssociationXFRMInstallPlan converts an IMS Security-Agree
@@ -102,8 +110,22 @@ func BuildIMSSecurityAssociationXFRMInstallPlan(req IMSSecurityAssociationInstal
 	commands := []IMSSecurityAssociationXFRMCommand{
 		imssSecurityXFRMStateCommand(params, true),
 		imssSecurityXFRMStateCommand(params, false),
+	}
+	if params.hasServerFlow {
+		commands = append(commands,
+			imssSecurityXFRMServerStateCommand(params, true),
+			imssSecurityXFRMServerStateCommand(params, false),
+		)
+	}
+	commands = append(commands,
 		imssSecurityXFRMPolicyCommand(params, "out"),
 		imssSecurityXFRMPolicyCommand(params, "in"),
+	)
+	if params.hasServerFlow {
+		commands = append(commands,
+			imssSecurityXFRMServerPolicyCommand(params, "out"),
+			imssSecurityXFRMServerPolicyCommand(params, "in"),
+		)
 	}
 	return IMSSecurityAssociationXFRMInstallPlan{
 		ReqID:         1,
@@ -265,7 +287,8 @@ func normalizeIMSSecurityAssociationXFRMRequest(req IMSSecurityAssociationInstal
 	if err != nil {
 		return imsSecurityXFRMParams{}, err
 	}
-	localPort, err := imssSecurityXFRMPort(firstIMSSecurityPositiveInt(plan.PortClient, plan.Outbound.LocalPort, plan.Inbound.LocalPort, req.Agreement.PortClient, parseSecurityPort(req.SelectedParameters["port-c"]), req.LocalEndpoint.Port), "local")
+	client := req.ClientAgreement
+	localPort, err := imssSecurityXFRMPort(firstIMSSecurityPositiveInt(client.PortClient, req.LocalEndpoint.Port, plan.Outbound.LocalPort, plan.PortClient, req.Agreement.PortClient, parseSecurityPort(req.SelectedParameters["port-c"])), "local")
 	if err != nil {
 		return imsSecurityXFRMParams{}, err
 	}
@@ -281,27 +304,84 @@ func normalizeIMSSecurityAssociationXFRMRequest(req IMSSecurityAssociationInstal
 	if err != nil {
 		return imsSecurityXFRMParams{}, err
 	}
+	inboundLocalPort, err := imssSecurityXFRMPort(firstIMSSecurityPositiveInt(client.PortClient, req.LocalEndpoint.Port, plan.Inbound.LocalPort, plan.PortClient, req.Agreement.PortClient, parseSecurityPort(req.SelectedParameters["port-c"])), "inbound local")
+	if err != nil {
+		return imsSecurityXFRMParams{}, err
+	}
+	inboundRemotePort, err := imssSecurityXFRMPort(firstIMSSecurityPositiveInt(req.Agreement.PortServer, plan.Inbound.RemotePort, req.RemoteEndpoint.Port, parseSecurityPort(req.SelectedParameters["port-s"])), "inbound remote")
+	if err != nil {
+		return imsSecurityXFRMParams{}, err
+	}
+	inboundSPI, err := imssSecurityXFRMSPI(firstIMSSecurityNonZeroUint32(client.SPIClient, plan.Inbound.SPI, req.Agreement.SPIClient, parseSecurityUint32(req.SelectedParameters["spi-c"])), "inbound client")
+	if err != nil {
+		return imsSecurityXFRMParams{}, err
+	}
+	hasServerFlow := !isZeroSecurityAgreement(req.ClientAgreement)
+	serverLocalPort, serverRemotePort, serverInboundSPI, serverOutboundSPI := "", "", "", ""
+	if hasServerFlow {
+		serverLocalPort, err = imssSecurityXFRMPort(client.PortServer, "server local")
+		if err != nil {
+			return imsSecurityXFRMParams{}, err
+		}
+		serverRemotePort, err = imssSecurityXFRMPort(req.Agreement.PortClient, "server remote")
+		if err != nil {
+			return imsSecurityXFRMParams{}, err
+		}
+		serverInboundSPI, err = imssSecurityXFRMSPI(client.SPIServer, "server inbound")
+		if err != nil {
+			return imsSecurityXFRMParams{}, err
+		}
+		serverOutboundSPI, err = imssSecurityXFRMSPI(req.Agreement.SPIClient, "server outbound")
+		if err != nil {
+			return imsSecurityXFRMParams{}, err
+		}
+	}
 	return imsSecurityXFRMParams{
-		reqID:         "1",
-		mode:          mode,
-		localAddress:  localAddress,
-		remoteAddress: remoteAddress,
-		localPort:     localPort,
-		remotePort:    remotePort,
-		spiClient:     spiClient,
-		spiServer:     spiServer,
-		authAlgorithm: authAlgorithm,
-		authKey:       imssSecurityXFRMHexKey(req.AKA.IK),
-		authTruncBits: authTruncBits,
-		encAlgorithm:  encAlgorithm,
-		encKey:        encKey,
+		reqID:             "1",
+		mode:              mode,
+		localAddress:      localAddress,
+		remoteAddress:     remoteAddress,
+		localPort:         localPort,
+		remotePort:        remotePort,
+		spiClient:         spiClient,
+		spiServer:         spiServer,
+		inboundLocalPort:  inboundLocalPort,
+		inboundRemotePort: inboundRemotePort,
+		inboundSPI:        inboundSPI,
+		serverLocalPort:   serverLocalPort,
+		serverRemotePort:  serverRemotePort,
+		serverInboundSPI:  serverInboundSPI,
+		serverOutboundSPI: serverOutboundSPI,
+		hasServerFlow:     hasServerFlow,
+		authAlgorithm:     authAlgorithm,
+		authKey:           imssSecurityXFRMHexKey(req.AKA.IK),
+		authTruncBits:     authTruncBits,
+		encAlgorithm:      encAlgorithm,
+		encKey:            encKey,
 	}, nil
+}
+
+func imssSecurityXFRMServerStateCommand(params imsSecurityXFRMParams, outbound bool) IMSSecurityAssociationXFRMCommand {
+	src, dst, spi, sport, dport := params.localAddress, params.remoteAddress, params.serverOutboundSPI, params.serverLocalPort, params.serverRemotePort
+	if !outbound {
+		src, dst, spi, sport, dport = params.remoteAddress, params.localAddress, params.serverInboundSPI, params.serverRemotePort, params.serverLocalPort
+	}
+	args := []string{
+		"xfrm", "state", "add",
+		"src", src, "dst", dst, "proto", "esp", "spi", spi,
+		"reqid", params.reqID, "mode", params.mode,
+		"auth-trunc", params.authAlgorithm, params.authKey, params.authTruncBits,
+		"enc", params.encAlgorithm, params.encKey,
+		"sel", "src", src, "dst", dst, "proto", "udp", "sport", sport, "dport", dport,
+	}
+	undo := []string{"xfrm", "state", "delete", "src", src, "dst", dst, "proto", "esp", "spi", spi}
+	return IMSSecurityAssociationXFRMCommand{Args: args, UndoArgs: undo}
 }
 
 func imssSecurityXFRMStateCommand(params imsSecurityXFRMParams, outbound bool) IMSSecurityAssociationXFRMCommand {
 	src, dst, spi, sport, dport := params.localAddress, params.remoteAddress, params.spiServer, params.localPort, params.remotePort
 	if !outbound {
-		src, dst, spi, sport, dport = params.remoteAddress, params.localAddress, params.spiClient, params.remotePort, params.localPort
+		src, dst, spi, sport, dport = params.remoteAddress, params.localAddress, params.inboundSPI, params.inboundRemotePort, params.inboundLocalPort
 	}
 	args := []string{
 		"xfrm", "state", "add",
@@ -327,7 +407,7 @@ func imssSecurityXFRMStateCommand(params imsSecurityXFRMParams, outbound bool) I
 func imssSecurityXFRMPolicyCommand(params imsSecurityXFRMParams, dir string) IMSSecurityAssociationXFRMCommand {
 	src, dst, sport, dport := params.localAddress, params.remoteAddress, params.localPort, params.remotePort
 	if dir == "in" {
-		src, dst, sport, dport = params.remoteAddress, params.localAddress, params.remotePort, params.localPort
+		src, dst, sport, dport = params.remoteAddress, params.localAddress, params.inboundRemotePort, params.inboundLocalPort
 	}
 	args := []string{
 		"xfrm", "policy", "add",
@@ -353,6 +433,22 @@ func imssSecurityXFRMPolicyCommand(params imsSecurityXFRMParams, dir string) IMS
 		"dport", dport,
 		"dir", dir,
 	}
+	return IMSSecurityAssociationXFRMCommand{Args: args, UndoArgs: undo}
+}
+
+func imssSecurityXFRMServerPolicyCommand(params imsSecurityXFRMParams, dir string) IMSSecurityAssociationXFRMCommand {
+	src, dst, sport, dport := params.localAddress, params.remoteAddress, params.serverLocalPort, params.serverRemotePort
+	if dir == "in" {
+		src, dst, sport, dport = params.remoteAddress, params.localAddress, params.serverRemotePort, params.serverLocalPort
+	}
+	selector := []string{"src", src, "dst", dst, "proto", "udp", "sport", sport, "dport", dport}
+	args := append([]string{"xfrm", "policy", "add"}, selector...)
+	args = append(args,
+		"dir", dir, "tmpl", "src", src, "dst", dst, "proto", "esp",
+		"reqid", params.reqID, "mode", params.mode,
+	)
+	undo := append([]string{"xfrm", "policy", "delete"}, selector...)
+	undo = append(undo, "dir", dir)
 	return IMSSecurityAssociationXFRMCommand{Args: args, UndoArgs: undo}
 }
 
@@ -388,7 +484,9 @@ func imssSecurityXFRMAuthAlgorithm(algorithm string) (name, truncBits string, er
 func imssSecurityXFRMEncryption(algorithm string, ck []byte) (name, key string, err error) {
 	switch strings.ToLower(strings.TrimSpace(algorithm)) {
 	case DefaultSecurityEAlg:
-		return "ecb(cipher_null)", "0x", nil
+		// iproute2 requires the zero-length key as an empty argv item. "0x"
+		// is parsed as malformed key material and the kernel rejects the SA.
+		return "ecb(cipher_null)", "", nil
 	case SecurityEncryptionAlgorithmAES:
 		if len(ck) != 16 {
 			return "", "", fmt.Errorf("%w: CK length %d for %s", ErrInvalidIMSSecurityXFRMPlan, len(ck), SecurityEncryptionAlgorithmAES)

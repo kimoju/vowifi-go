@@ -319,6 +319,9 @@ func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg T
 			Via:           strings.TrimSpace(outer.Via),
 			Source:        strings.TrimSpace(outer.Source),
 			Tables:        tables,
+			// Policy tables are owned by this tunnel manager. Reconcile their
+			// host route so an interrupted previous process cannot block restart.
+			Replace: len(tables) > 0,
 		})
 	}
 	return out, nil

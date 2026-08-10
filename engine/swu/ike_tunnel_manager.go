@@ -29,6 +29,42 @@ type IKETransportFactory func(TunnelConfig, IKETransportConfig) (ikev2.InitTrans
 
 type IKEESPTransportFactory func(TunnelConfig, ESPTransportConfig) (ESPPacketTransport, error)
 
+type sharedNATTTransport interface {
+	SendNATTPacket(context.Context, []byte) error
+	ReadNATTPacket(context.Context) ([]byte, error)
+	SendNATTKeepalive(context.Context) error
+	LocalNetworkAddr() net.Addr
+}
+
+type ikeEndpointTransport interface {
+	Open(context.Context) error
+	LocalNetworkAddr() net.Addr
+	RemoteNetworkAddr() net.Addr
+}
+
+type sharedIKEESPPacketTransport struct {
+	transport sharedNATTTransport
+}
+
+func (t sharedIKEESPPacketTransport) SendESPPacket(ctx context.Context, packet []byte) error {
+	return t.transport.SendNATTPacket(ctx, packet)
+}
+
+func (t sharedIKEESPPacketTransport) ReadESPPacket(ctx context.Context) ([]byte, error) {
+	return t.transport.ReadNATTPacket(ctx)
+}
+
+func (t sharedIKEESPPacketTransport) SendNATTKeepalive(ctx context.Context) error {
+	return t.transport.SendNATTKeepalive(ctx)
+}
+
+func (t sharedIKEESPPacketTransport) LocalNetworkAddr() net.Addr {
+	return t.transport.LocalNetworkAddr()
+}
+
+// The IKE control-plane owner closes the shared socket after sending DELETE.
+func (t sharedIKEESPPacketTransport) Close(context.Context) error { return nil }
+
 type IKETransportConfig struct {
 	EPDGAddress     string
 	RemoteAddr      string
@@ -145,6 +181,10 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	if err != nil {
 		return nil, err
 	}
+	transportCfg, err = resolveIKETransportEndpoints(ctx, transportCfg, transport)
+	if err != nil {
+		return nil, err
+	}
 	transportHandedOff := false
 	defer func() {
 		if !transportHandedOff {
@@ -213,7 +253,7 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		transportHandedOff = true
 		return session, nil
 	}
-	espTransport, err := m.espTransport(cfg, espCfg)
+	espTransport, err := m.espTransport(cfg, espCfg, transport)
 	if err != nil {
 		return nil, err
 	}
@@ -383,6 +423,45 @@ func (m *IKEPacketTunnelManager) transportConfigs(cfg TunnelConfig, epdg string)
 	return ikeCfg, espCfg
 }
 
+func resolveIKETransportEndpoints(ctx context.Context, cfg IKETransportConfig, transport ikev2.InitTransport) (IKETransportConfig, error) {
+	provider, ok := transport.(ikeEndpointTransport)
+	if !ok {
+		return cfg, nil
+	}
+	if err := provider.Open(ctx); err != nil {
+		return cfg, err
+	}
+	if ip, port := udpNetworkEndpoint(provider.LocalNetworkAddr()); ip != nil {
+		cfg.LocalIP = ip
+		cfg.LocalPort = port
+		cfg.LocalAddr = net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
+	}
+	if ip, port := udpNetworkEndpoint(provider.RemoteNetworkAddr()); ip != nil {
+		cfg.RemoteIP = ip
+		cfg.RemotePort = port
+		cfg.RemoteAddr = net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
+	}
+	return cfg, nil
+}
+
+func udpNetworkEndpoint(addr net.Addr) (net.IP, uint16) {
+	if addr == nil {
+		return nil, 0
+	}
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		return append(net.IP(nil), udpAddr.IP...), uint16(udpAddr.Port)
+	}
+	host, rawPort, err := net.SplitHostPort(strings.TrimSpace(addr.String()))
+	if err != nil {
+		return nil, 0
+	}
+	port, err := strconv.ParseUint(rawPort, 10, 16)
+	if err != nil {
+		return nil, 0
+	}
+	return net.ParseIP(strings.Trim(host, "[]")), uint16(port)
+}
+
 func (m *IKEPacketTunnelManager) ikeTransport(cfg TunnelConfig, transportCfg IKETransportConfig) (ikev2.InitTransport, error) {
 	if m.Config.Transport != nil {
 		return m.Config.Transport, nil
@@ -398,12 +477,15 @@ func (m *IKEPacketTunnelManager) ikeTransport(cfg TunnelConfig, transportCfg IKE
 	}), nil
 }
 
-func (m *IKEPacketTunnelManager) espTransport(cfg TunnelConfig, transportCfg ESPTransportConfig) (ESPPacketTransport, error) {
+func (m *IKEPacketTunnelManager) espTransport(cfg TunnelConfig, transportCfg ESPTransportConfig, ikeTransport ikev2.InitTransport) (ESPPacketTransport, error) {
 	if m.Config.ESPTransport != nil {
 		return m.Config.ESPTransport, nil
 	}
 	if m.Config.ESPTransportFactory != nil {
 		return m.Config.ESPTransportFactory(cfg, transportCfg)
+	}
+	if shared, ok := ikeTransport.(sharedNATTTransport); ok {
+		return sharedIKEESPPacketTransport{transport: shared}, nil
 	}
 	return &UDPESPPacketTransport{
 		RemoteAddr: transportCfg.RemoteAddr,
@@ -633,6 +715,8 @@ func tunnelResultFromIKE(cfg TunnelConfig, epdg string, init ikev2.InitResult, c
 		IPsecEstablished:  true,
 		MOBIKESupported:   init.MOBIKESupported,
 		ChildSAIdentifier: childSAIdentifier(child),
+		ESPEncryptionID:   child.Keys.Profile.EncryptionID,
+		ESPIntegrityID:    child.Keys.Profile.IntegrityID,
 		Reason:            "ike ipsec tunnel ready",
 		EstablishedAt:     time.Now(),
 	}

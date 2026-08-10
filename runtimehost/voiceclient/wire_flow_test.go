@@ -727,7 +727,14 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 		t.Fatalf("ListenPacket(protected) error = %v", err)
 	}
 	defer protected.Close()
-	protectedLocalPort := reserveTestUDPPort(t)
+	protectedResponses, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(protected responses) error = %v", err)
+	}
+	defer protectedResponses.Close()
+	clientLocalPort := reserveTestUDPPort(t)
+	clientServerPort := reserveTestUDPPort(t)
+	serverClientPort := protectedResponses.LocalAddr().(*net.UDPAddr).Port
 	protectedRemotePort := protected.LocalAddr().(*net.UDPAddr).Port
 
 	firstSeen := make(chan string, 1)
@@ -750,7 +757,7 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 		challenge, err := BuildSIPResponseWire(req, 401, "Unauthorized", map[string]string{
 			"WWW-Authenticate": `Digest realm="ims.example", nonce="nonce", algorithm=MD5, qop="auth"`,
 			"Security-Server": "ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=" +
-				strconv.Itoa(protectedLocalPort) + ";port-s=" + strconv.Itoa(protectedRemotePort),
+				strconv.Itoa(serverClientPort) + ";port-s=" + strconv.Itoa(protectedRemotePort),
 		}, nil)
 		if err != nil {
 			firstErr <- "build challenge error: " + err.Error()
@@ -795,7 +802,8 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 			protectedErr <- "build ok error: " + err.Error()
 			return
 		}
-		if _, err := protected.WriteTo(ok, addr); err != nil {
+		responseAddr := &net.UDPAddr{IP: addr.(*net.UDPAddr).IP, Port: clientServerPort}
+		if _, err := protectedResponses.WriteTo(ok, responseAddr); err != nil {
 			protectedErr <- "write ok error: " + err.Error()
 			return
 		}
@@ -805,12 +813,21 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 	flow := &WireSIPFlow{Network: "udp", ServerAddr: initial.LocalAddr().String(), Timeout: time.Second}
 	defer flow.Close()
 	result, err := RegisterSession{
-		Transport:             flow,
-		Profile:               IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
-		RegistrarURI:          "sip:ims.example",
-		ContactURI:            "sip:user@127.0.0.1:5060",
-		CallID:                "flow-security-register",
-		CNonce:                "cnonce",
+		Transport:    flow,
+		Profile:      IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI: "sip:ims.example",
+		ContactURI:   "sip:user@127.0.0.1:5060",
+		CallID:       "flow-security-register",
+		CNonce:       "cnonce",
+		SecurityClients: []SecurityAgreement{{
+			Protocol:            DefaultSecurityProtocol,
+			Algorithm:           DefaultSecurityAlgorithm,
+			EncryptionAlgorithm: DefaultSecurityEAlg,
+			SPIClient:           7001,
+			SPIServer:           7002,
+			PortClient:          clientLocalPort,
+			PortServer:          clientServerPort,
+		}},
 		SecurityPlanInstaller: &fakeSecurityPlanInstaller{},
 		SecurityLocalAddr:     "127.0.0.1",
 		SecurityRemoteAddr:    initial.LocalAddr().String(),
@@ -831,7 +848,7 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 		t.Fatalf("first REGISTER wire=%q", wire)
 	}
 	protectedReq := <-protectedSeen
-	if protectedReq.sourcePort != protectedLocalPort ||
+	if protectedReq.sourcePort != clientLocalPort ||
 		!strings.Contains(protectedReq.wire, "CSeq: 2 REGISTER") ||
 		!strings.Contains(protectedReq.wire, "Authorization: Digest") ||
 		!strings.Contains(protectedReq.wire, "Security-Verify: ipsec-3gpp") {

@@ -540,6 +540,12 @@ func TestWireIMSRegistrarHandlesAKADigestChallenge(t *testing.T) {
 	if !res.Registered || len(transport.requests) != 2 {
 		t.Fatalf("result=%+v requests=%d", res, len(transport.requests))
 	}
+	firstAuthorization := transport.requests[0].Headers["Authorization"]
+	if !strings.Contains(firstAuthorization, `username="310280233641503@ims.mnc280.mcc310.3gppnetwork.org"`) ||
+		!strings.Contains(firstAuthorization, `nonce=""`) ||
+		!strings.Contains(firstAuthorization, `response=""`) {
+		t.Fatalf("initial Authorization=%q", firstAuthorization)
+	}
 	second := transport.requests[1]
 	if !strings.Contains(second.Headers["Authorization"], `username="310280233641503@ims.mnc280.mcc310.3gppnetwork.org"`) {
 		t.Fatalf("Authorization=%q", second.Headers["Authorization"])
@@ -618,6 +624,38 @@ func TestCleanupIMSRegistrationSecurityPlansUsesInstallerCleanup(t *testing.T) {
 	}
 }
 
+func TestWireIMSRegistrarCleansSecurityPlansAfterRegistrationFailure(t *testing.T) {
+	rawNonce := append(runtimeBytesFrom(0x10, 16), runtimeBytesFrom(0x40, 16)...)
+	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{
+		{
+			StatusCode: 401,
+			Reason:     "Unauthorized",
+			Headers: map[string][]string{
+				"WWW-Authenticate": {`Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`},
+				"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=301;spi-s=302;port-c=5062;port-s=5063`},
+			},
+		},
+		{StatusCode: 500, Reason: "Server Error"},
+	}}
+	installer := &wireIMSRegistrarSecurityInstaller{}
+	_, err := WireIMSRegistrar{
+		Transport:             transport,
+		ContactHost:           "192.0.2.10",
+		ContactPort:           5060,
+		ServerAddr:            "198.51.100.10:5060",
+		SecurityPlanInstaller: installer,
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		Profile: identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		SIM:     &wireIMSRegistrarSIM{},
+	})
+	if err == nil {
+		t.Fatal("RegisterIMS() error=nil, want registration failure")
+	}
+	if len(installer.requests) != 1 || installer.cleanupCalls != 1 {
+		t.Fatalf("installer requests=%d cleanupCalls=%d", len(installer.requests), installer.cleanupCalls)
+	}
+}
+
 func TestWireIMSRegistrarUsesTunnelInnerIPForContact(t *testing.T) {
 	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{{
 		StatusCode: 200,
@@ -685,6 +723,27 @@ func TestWireIMSRegistrarProfileFromPreparedCarrierFallbacks(t *testing.T) {
 				t.Fatalf("profile domain empty: %+v", profile)
 			}
 		})
+	}
+}
+
+func TestWireIMSRegistrarBuildsStandardsCompliantInstanceID(t *testing.T) {
+	profile, err := (WireIMSRegistrar{}).profileFromConfig(IMSRegistrationConfig{
+		Profile: identity.Profile{
+			IMSI: "310260514481609",
+			MCC:  "310",
+			MNC:  "260",
+			IMEI: "866069052132956",
+		},
+	})
+	if err != nil {
+		t.Fatalf("profileFromConfig() error = %v", err)
+	}
+	if profile.InstanceID != "urn:gsma:imei:86606905-213295-6" {
+		t.Fatalf("InstanceID=%q", profile.InstanceID)
+	}
+	fallback := stableIMSUUID("impi@example.test")
+	if fallback != "urn:uuid:24c2dd5c-7372-5e13-9772-47d0481745ab" {
+		t.Fatalf("stableIMSUUID()=%q", fallback)
 	}
 }
 
@@ -1694,8 +1753,10 @@ func TestWireIMSRegistrarRefreshAndCloseAdvanceDigestNonceCount(t *testing.T) {
 			t.Fatalf("REGISTER lifecycle used different flows: %+v", requests)
 		}
 	}
-	if strings.Contains(requests[0].wire, "Authorization:") {
-		t.Fatalf("initial REGISTER unexpectedly authenticated: %q", requests[0].wire)
+	if !strings.Contains(requests[0].wire, `Authorization: Digest username="310280233641503@ims.mnc280.mcc310.3gppnetwork.org"`) ||
+		!strings.Contains(requests[0].wire, `nonce=""`) || !strings.Contains(requests[0].wire, `response=""`) ||
+		strings.Contains(requests[0].wire, "nc=") {
+		t.Fatalf("initial REGISTER authorization=%q", requests[0].wire)
 	}
 	if !strings.Contains(requests[1].wire, "Authorization: Digest") || !strings.Contains(requests[1].wire, "nc=00000001") ||
 		!strings.Contains(requests[1].wire, "CSeq: 2 REGISTER\r\n") {

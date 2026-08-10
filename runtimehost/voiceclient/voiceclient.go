@@ -29,6 +29,7 @@ type IMSProfile struct {
 	IMPU              string
 	Domain            string
 	LocalIP           string
+	InstanceID        string
 	UserAgent         string
 	AccessNetworkInfo string
 	VisitedNetworkID  string
@@ -127,6 +128,10 @@ type SecurityAssociationTransport interface {
 	UseSecurityAssociation(context.Context, IMSSecurityAssociationInstallRequest) error
 }
 
+type SecurityAssociationEndpointProvider interface {
+	SecurityAssociationAddresses() (localAddress, remoteAddress string)
+}
+
 type akaPreferenceProvider interface {
 	CalculateAKAWithPreference(rand16, autn16 []byte, preference string) (sim.AKAResult, error)
 }
@@ -141,6 +146,7 @@ type RegisterSession struct {
 	CallID                string
 	CNonce                string
 	Expires               int
+	InitialAuthorization  bool
 	SecurityClient        SecurityAgreement
 	SecurityClients       []SecurityAgreement
 	SecurityRandom        io.Reader
@@ -636,7 +642,7 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 	headers := map[string]string{
 		"To":                   "<" + impu + ">",
 		"From":                 "<" + impu + ">;tag=vowifi-go",
-		"Contact":              buildRegisterContactHeader(contactURI),
+		"Contact":              buildRegisterContactHeaderForInstance(contactURI, profile.InstanceID),
 		"Call-ID":              strings.TrimSpace(callID),
 		"CSeq":                 strings.TrimSpace(cseq) + " REGISTER",
 		"Max-Forwards":         "70",
@@ -644,6 +650,7 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 		"Allow":                "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, NOTIFY, SUBSCRIBE, OPTIONS",
 		"Supported":            "path, gruu, outbound, sec-agree, 100rel, timer",
 		"Require":              "sec-agree",
+		"Proxy-Require":        "sec-agree",
 		"P-Preferred-Identity": "<" + impu + ">",
 		"Security-Client":      BuildSecurityClientHeader(DefaultSecurityClientAgreement(nil)),
 	}
@@ -657,7 +664,15 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 }
 
 func buildRegisterContactHeader(contactURI string) string {
-	contact := "<" + strings.TrimSpace(contactURI) + ">;+sip.instance=\"<urn:uuid:vowifi-go>\""
+	return buildRegisterContactHeaderForInstance(contactURI, "urn:uuid:f81d4fae-7dec-51d0-a765-00a0c91e6bf6")
+}
+
+func buildRegisterContactHeaderForInstance(contactURI, instanceID string) string {
+	instanceID = strings.Trim(strings.TrimSpace(instanceID), "<>")
+	if instanceID == "" {
+		instanceID = "urn:uuid:f81d4fae-7dec-51d0-a765-00a0c91e6bf6"
+	}
+	contact := "<" + strings.TrimSpace(contactURI) + ">;+sip.instance=\"<" + instanceID + ">\""
 	if imsMMTelContactFeature != "" {
 		contact += ";" + imsMMTelContactFeature
 	}
@@ -717,6 +732,9 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		}
 		msg.Headers["Expires"] = strconv.Itoa(expires)
 		msg.Headers["Security-Client"] = securityClientHeader
+		if s.InitialAuthorization && strings.TrimSpace(authHeaderName) == "" {
+			msg.Headers["Authorization"] = buildInitialDigestAuthorization(s.Profile, registrarURI)
+		}
 		if strings.TrimSpace(authHeaderName) != "" && strings.TrimSpace(authz) != "" {
 			msg.Headers[authHeaderName] = authz
 		}
@@ -914,6 +932,23 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	}
 	result.Binding = bindDigestAuthWithChallengeInput(result.Binding, authzHeader, authz, result.AuthState, s.digestChallengeInputFunc())
 	return result, nil
+}
+
+func buildInitialDigestAuthorization(profile IMSProfile, registrarURI string) string {
+	username := strings.TrimSpace(profile.IMPI)
+	realm := identityDomain(username)
+	if realm == "" {
+		realm = strings.TrimSpace(profile.Domain)
+	}
+	return `Digest username="` + quote(username) + `", realm="` + quote(realm) + `", nonce="", uri="` + quote(strings.TrimSpace(registrarURI)) + `", response=""`
+}
+
+func identityDomain(identity string) string {
+	identity = strings.TrimSpace(identity)
+	if at := strings.LastIndexByte(identity, '@'); at >= 0 && at+1 < len(identity) {
+		return strings.TrimSpace(identity[at+1:])
+	}
+	return ""
 }
 
 func registerFailureResult(resp RegisterResponse, attempts int, ch DigestChallenge, authHeader string) RegisterResult {
@@ -1365,11 +1400,20 @@ func (s RegisterSession) securityClientAgreements() []SecurityAgreement {
 }
 
 func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, clients []SecurityAgreement, akaKeys IMSSecurityAKAKeys) (IMSSecurityAssociationInstallRequest, bool, error) {
-	agreement, plan, ok := securityPlanFromChallenge(headers, clients)
+	agreement, clientAgreement, plan, ok := securityPlanFromChallenge(headers, clients)
 	if !ok {
 		return IMSSecurityAssociationInstallRequest{}, false, nil
 	}
-	req := buildIMSSecurityAssociationInstallRequest(plan, agreement, akaKeys, s.SecurityLocalAddr, s.SecurityRemoteAddr, s.ContactURI, s.RegistrarURI)
+	req := buildIMSSecurityAssociationInstallRequest(plan, agreement, clientAgreement, akaKeys, s.SecurityLocalAddr, s.SecurityRemoteAddr, s.ContactURI, s.RegistrarURI)
+	if provider, ok := s.Transport.(SecurityAssociationEndpointProvider); ok {
+		localAddress, remoteAddress := provider.SecurityAssociationAddresses()
+		if strings.TrimSpace(localAddress) != "" {
+			req.LocalEndpoint.Address = strings.TrimSpace(localAddress)
+		}
+		if strings.TrimSpace(remoteAddress) != "" {
+			req.RemoteEndpoint.Address = strings.TrimSpace(remoteAddress)
+		}
+	}
 	if s.SecurityPlanInstaller == nil {
 		return req, false, nil
 	}
@@ -2383,20 +2427,20 @@ func securityServerHeaderValues(headers map[string][]string) []string {
 	return trimHeaderValues(rawHeaderValues(headers, "Security-Server"))
 }
 
-func securityPlanFromChallenge(headers map[string][]string, clients []SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
+func securityPlanFromChallenge(headers map[string][]string, clients []SecurityAgreement) (SecurityAgreement, SecurityAgreement, IMSSecurityAssociationPlan, bool) {
 	return securityPlanFromValues(securityServerHeaderValues(headers), clients)
 }
 
-func securityPlanFromValues(values []string, clients []SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
-	selected, ok := SelectSecurityAgreementForClients(values, clients)
+func securityPlanFromValues(values []string, clients []SecurityAgreement) (SecurityAgreement, SecurityAgreement, IMSSecurityAssociationPlan, bool) {
+	selected, client, ok := selectSecurityAgreementPair(values, clients)
 	if !ok {
-		return SecurityAgreement{}, IMSSecurityAssociationPlan{}, false
+		return SecurityAgreement{}, SecurityAgreement{}, IMSSecurityAssociationPlan{}, false
 	}
 	plan, ok := BuildIMSSecurityAssociationPlan(selected)
 	if !ok {
-		return selected, IMSSecurityAssociationPlan{}, false
+		return selected, client, IMSSecurityAssociationPlan{}, false
 	}
-	return selected, plan, true
+	return selected, client, plan, true
 }
 
 func md5Hex(s string) string {

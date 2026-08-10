@@ -50,20 +50,42 @@ type WireSIPFlow struct {
 	FinalResponseDrain    time.Duration
 	TLSConfig             *tls.Config
 
-	mu          sync.Mutex
-	conn        net.Conn
-	reader      *bufio.Reader
-	network     string
-	target      string
-	targets     []string
-	targetIndex int
-	closed      bool
+	mu                  sync.Mutex
+	conn                net.Conn
+	securityReceiveConn net.Conn
+	reader              *bufio.Reader
+	network             string
+	target              string
+	targets             []string
+	targetIndex         int
+	closed              bool
 }
 
 var _ SIPRegisterTransport = (*WireSIPFlow)(nil)
 var _ SIPRequestTransport = (*WireSIPFlow)(nil)
 var _ SIPInviteTransport = (*WireSIPFlow)(nil)
 var _ SecurityAssociationTransport = (*WireSIPFlow)(nil)
+var _ SecurityAssociationEndpointProvider = (*WireSIPFlow)(nil)
+
+func (f *WireSIPFlow) SecurityAssociationAddresses() (string, string) {
+	if f == nil {
+		return "", ""
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.conn == nil {
+		return endpointHost(f.LocalAddr), endpointHost(firstNonEmpty(f.target, f.ServerAddr))
+	}
+	return endpointHost(f.conn.LocalAddr().String()), endpointHost(f.conn.RemoteAddr().String())
+}
+
+func endpointHost(value string) string {
+	host, _, ok := splitIMSSecurityEndpointAddr(value)
+	if ok {
+		return strings.TrimSpace(host)
+	}
+	return strings.Trim(strings.TrimSpace(value), "[]")
+}
 
 func (f *WireSIPFlow) RoundTripRegister(ctx context.Context, msg RegisterMessage) (RegisterResponse, error) {
 	return f.roundTrip(ctx, SIPRequestMessage{
@@ -252,6 +274,21 @@ func (f *WireSIPFlow) UseSecurityAssociation(ctx context.Context, req IMSSecurit
 	if err != nil {
 		return err
 	}
+	receiveLocalEndpoint := req.LocalEndpoint
+	receiveLocalEndpoint.Port = req.ClientAgreement.PortServer
+	receiveLocalAddr, err := sipSecurityAssociationAddr(f.LocalAddr, receiveLocalEndpoint, true)
+	if err != nil {
+		return err
+	}
+	receiveRemoteEndpoint := remoteEndpoint
+	receiveRemoteEndpoint.Port = req.Agreement.PortClient
+	receiveRemoteAddr, err := sipSecurityAssociationAddr(currentTarget, receiveRemoteEndpoint, false)
+	if err != nil {
+		return err
+	}
+	if err := f.closeConnLocked(); err != nil {
+		return err
+	}
 	if localAddr != "" {
 		f.LocalAddr = localAddr
 	}
@@ -260,7 +297,19 @@ func (f *WireSIPFlow) UseSecurityAssociation(ctx context.Context, req IMSSecurit
 		f.targets = []string{remoteAddr}
 		f.targetIndex = 0
 	}
-	return f.closeConnLocked()
+	if receiveLocalAddr == "" || receiveRemoteAddr == "" || req.ClientAgreement.PortServer <= 0 || req.Agreement.PortClient <= 0 {
+		return nil
+	}
+	timeout := f.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	receiveConn, err := dialSIPConn(ctx, "udp", receiveRemoteAddr, receiveLocalAddr, timeout, nil, "")
+	if err != nil {
+		return err
+	}
+	f.securityReceiveConn = receiveConn
+	return nil
 }
 
 func sipSecurityAssociationAddr(current string, endpoint IMSSecurityAssociationEndpoint, allowWildcardHost bool) (string, error) {
@@ -424,7 +473,7 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 		if err := conn.SetReadDeadline(nextSIPReadDeadline(deadline, readInterval)); err != nil {
 			return SIPResponse{}, err
 		}
-		n, err := conn.Read(buf)
+		n, err := f.readUDPDatagramLocked(conn, buf, nextSIPReadDeadline(deadline, readInterval))
 		if err != nil {
 			if ctx.Err() != nil {
 				return SIPResponse{}, ctx.Err()
@@ -489,6 +538,49 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 	}
 }
 
+type sipUDPReadResult struct {
+	n   int
+	err error
+	buf []byte
+}
+
+func (f *WireSIPFlow) readUDPDatagramLocked(primary net.Conn, buf []byte, deadline time.Time) (int, error) {
+	secondary := f.securityReceiveConn
+	if secondary == nil || secondary == primary {
+		if err := primary.SetReadDeadline(deadline); err != nil {
+			return 0, err
+		}
+		return primary.Read(buf)
+	}
+	primaryBuf := make([]byte, len(buf))
+	secondaryBuf := make([]byte, len(buf))
+	results := make(chan sipUDPReadResult, 2)
+	read := func(conn net.Conn, target []byte) {
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			results <- sipUDPReadResult{err: err, buf: target}
+			return
+		}
+		n, err := conn.Read(target)
+		results <- sipUDPReadResult{n: n, err: err, buf: target}
+	}
+	go read(primary, primaryBuf)
+	go read(secondary, secondaryBuf)
+	first := <-results
+	if first.err == nil {
+		_ = primary.SetReadDeadline(time.Now())
+		_ = secondary.SetReadDeadline(time.Now())
+		<-results
+		copy(buf, first.buf[:first.n])
+		return first.n, nil
+	}
+	second := <-results
+	if second.err == nil {
+		copy(buf, second.buf[:second.n])
+		return second.n, nil
+	}
+	return 0, first.err
+}
+
 func readFinalSIPFlowResponse(ctx context.Context, reader *bufio.Reader, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	gotResponse := false
 	for {
@@ -551,7 +643,7 @@ func (f *WireSIPFlow) ensureConnLocked(ctx context.Context, msg SIPRequestMessag
 	if f.conn != nil && f.network == network && f.target == target {
 		return f.conn, network, timeout, nil
 	}
-	_ = f.closeConnLocked()
+	_ = f.closePrimaryConnLocked()
 	conn, err := dialSIPConn(ctx, network, target, f.LocalAddr, timeout, f.TLSConfig, sipTLSServerNameForURI(msg.URI))
 	if err != nil {
 		return nil, "", 0, err
@@ -618,6 +710,15 @@ func (f *WireSIPFlow) targetCountLocked() int {
 }
 
 func (f *WireSIPFlow) closeConnLocked() error {
+	err := f.closePrimaryConnLocked()
+	if f.securityReceiveConn != nil {
+		err = errors.Join(err, f.securityReceiveConn.Close())
+		f.securityReceiveConn = nil
+	}
+	return err
+}
+
+func (f *WireSIPFlow) closePrimaryConnLocked() error {
 	if f.conn == nil {
 		f.reader = nil
 		f.network = ""

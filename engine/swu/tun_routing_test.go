@@ -129,6 +129,41 @@ func TestLinuxTUNRoutingManagerInstallsEPDGExclusionsBeforeTunnelRoutes(t *testi
 	}
 }
 
+func TestLinuxTUNRoutingManagerReconcilesManagedEPDGExclusion(t *testing.T) {
+	runner := &fakeIPRunner{}
+	manager := LinuxTUNRoutingManager{Runner: runner}
+	state, err := manager.Apply(context.Background(), TUNRoutingConfig{
+		InterfaceName: "vohive0",
+		EPDGRouteExclusions: []EPDGRouteExclusion{{
+			Address:       "198.51.100.7",
+			InterfaceName: "eth0",
+			Via:           "192.0.2.1",
+			Source:        "192.0.2.23",
+			Table:         "51820",
+			Replace:       true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	wantApply := [][]string{
+		{"link", "set", "dev", "vohive0", "up"},
+		{"route", "replace", "198.51.100.7/32", "dev", "eth0", "via", "192.0.2.1", "src", "192.0.2.23", "table", "51820"},
+	}
+	if !reflect.DeepEqual(runner.commands, wantApply) {
+		t.Fatalf("apply commands=\n%v\nwant\n%v", runner.commands, wantApply)
+	}
+	if err := manager.Cleanup(context.Background(), state); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+	wantAll := append(wantApply,
+		[]string{"route", "del", "198.51.100.7/32", "dev", "eth0", "via", "192.0.2.1", "src", "192.0.2.23", "table", "51820"},
+	)
+	if !reflect.DeepEqual(runner.commands, wantAll) {
+		t.Fatalf("all commands=\n%v\nwant\n%v", runner.commands, wantAll)
+	}
+}
+
 func TestLinuxTUNRoutingManagerUsesIPv6FamilyForRoutesAndRules(t *testing.T) {
 	runner := &fakeIPRunner{}
 	manager := LinuxTUNRoutingManager{Runner: runner}

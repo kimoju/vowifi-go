@@ -2,6 +2,7 @@ package runtimehost
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -180,9 +181,14 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 			result, err = registerSession.Register(ctx)
 		}
 		if err != nil {
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
+			cleanupErr := cleanupIMSRegistrationSecurityPlans(cleanupCtx, r.SecurityPlanInstaller)
+			cancelCleanup()
+			var closeErr error
 			if defaultFlow != nil {
-				_ = defaultFlow.Close()
+				closeErr = defaultFlow.Close()
 			}
+			err = errors.Join(err, cleanupErr, closeErr)
 			return imsRegisterFailureResult(result, profile, err), err
 		}
 	}
@@ -263,6 +269,7 @@ func (r WireIMSRegistrar) registerSession(cfg IMSRegistrationConfig, profile voi
 		CallID:                firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
 		CNonce:                firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
 		Expires:               expires,
+		InitialAuthorization:  true,
 		SecurityPlanInstaller: r.SecurityPlanInstaller,
 		SecurityLocalAddr:     firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, r.LocalAddr),
 		SecurityRemoteAddr:    r.ServerAddr,
@@ -1157,10 +1164,38 @@ func (r WireIMSRegistrar) profileFromConfig(cfg IMSRegistrationConfig) (voicecli
 		IMPU:              impu,
 		Domain:            domain,
 		LocalIP:           firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP),
+		InstanceID:        imsInstanceID(cfg, impi),
 		UserAgent:         firstRuntimeNonEmpty(r.UserAgent, "vowifi-go"),
 		AccessNetworkInfo: accessNetworkInfo,
 		VisitedNetworkID:  visitedNetworkID,
 	}, nil
+}
+
+func imsInstanceID(cfg IMSRegistrationConfig, impi string) string {
+	imei := strings.TrimSpace(cfg.Profile.IMEI)
+	if imei == "" && cfg.Prepared != nil {
+		imei = strings.TrimSpace(cfg.Prepared.Profile.IMEI)
+	}
+	if len(imei) == 15 {
+		valid := true
+		for _, r := range imei {
+			if r < '0' || r > '9' {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return "urn:gsma:imei:" + imei[:8] + "-" + imei[8:14] + "-" + imei[14:]
+		}
+	}
+	return stableIMSUUID(impi)
+}
+
+func stableIMSUUID(value string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
+	sum[6] = (sum[6] & 0x0f) | 0x50
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	return fmt.Sprintf("urn:uuid:%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
 func imsAKAAppPreferenceFromConfig(cfg IMSRegistrationConfig) string {

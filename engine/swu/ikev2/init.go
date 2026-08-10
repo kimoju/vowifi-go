@@ -43,22 +43,162 @@ type UDPTransport struct {
 type PersistentUDPTransport struct {
 	Config UDPTransport
 
-	mu   sync.Mutex
-	conn net.Conn
+	exchangeMu sync.Mutex
+	writeMu    sync.Mutex
+	mu         sync.Mutex
+	conn       net.Conn
+	closed     bool
+	done       chan struct{}
+	doneOnce   sync.Once
+	ikePackets chan []byte
+	espPackets chan []byte
+	readErrors chan error
 }
 
 func NewPersistentUDPTransport(config UDPTransport) *PersistentUDPTransport {
-	return &PersistentUDPTransport{Config: config}
+	return &PersistentUDPTransport{
+		Config:     config,
+		done:       make(chan struct{}),
+		ikePackets: make(chan []byte, 8),
+		espPackets: make(chan []byte, 128),
+		readErrors: make(chan error, 1),
+	}
+}
+
+func (t *PersistentUDPTransport) Open(ctx context.Context) error {
+	_, err := t.ensureConn(ctx)
+	return err
 }
 
 func (t *PersistentUDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
 	if t == nil {
 		return nil, fmt.Errorf("%w: persistent UDP transport is nil", ErrInvalidInitConfig)
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.exchangeMu.Lock()
+	defer t.exchangeMu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if !t.Config.UseNonESPMarker {
+		return t.exchangeIKELegacy(ctx, request)
+	}
+	if _, err := t.ensureConn(ctx); err != nil {
+		return nil, err
+	}
+	wire := append([]byte{0, 0, 0, 0}, request...)
+	if err := t.writePacket(ctx, wire); err != nil {
+		_ = t.Close()
+		return nil, err
+	}
+	timer, timeout := persistentUDPTimeout(t.Config.Timeout)
+	if timer != nil {
+		defer timer.Stop()
+	}
+	select {
+	case response := <-t.ikePackets:
+		return response, nil
+	case err := <-t.readErrors:
+		_ = t.Close()
+		return nil, err
+	case <-timeout:
+		_ = t.Close()
+		return nil, context.DeadlineExceeded
+	case <-ctx.Done():
+		_ = t.Close()
+		return nil, ctx.Err()
+	case <-t.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (t *PersistentUDPTransport) Close() error {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
+	t.closed = true
+	conn := t.conn
+	t.conn = nil
+	t.mu.Unlock()
+	t.doneOnce.Do(func() { close(t.done) })
+	if conn == nil {
+		return nil
+	}
+	return conn.Close()
+}
+
+// SendNATTPacket sends an ESP-in-UDP packet on the same socket used by IKE.
+// Strict ePDGs associate the CHILD_SA with this NAT mapping and drop ESP sent
+// from a second local UDP endpoint.
+func (t *PersistentUDPTransport) SendNATTPacket(ctx context.Context, packet []byte) error {
+	if len(packet) == 0 {
+		return fmt.Errorf("%w: empty NAT-T packet", ErrInvalidInitConfig)
+	}
+	if _, err := t.ensureConn(ctx); err != nil {
+		return err
+	}
+	return t.writePacket(ctx, packet)
+}
+
+func (t *PersistentUDPTransport) ReadNATTPacket(ctx context.Context) ([]byte, error) {
+	if t == nil {
+		return nil, fmt.Errorf("%w: persistent UDP transport is nil", ErrInvalidInitConfig)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := t.ensureConn(ctx); err != nil {
+		return nil, err
+	}
+	select {
+	case packet := <-t.espPackets:
+		return packet, nil
+	case err := <-t.readErrors:
+		return nil, err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-t.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (t *PersistentUDPTransport) SendNATTKeepalive(ctx context.Context) error {
+	return t.SendNATTPacket(ctx, []byte{0xff})
+}
+
+func (t *PersistentUDPTransport) LocalNetworkAddr() net.Addr {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.conn == nil {
+		return nil
+	}
+	return t.conn.LocalAddr()
+}
+
+func (t *PersistentUDPTransport) RemoteNetworkAddr() net.Addr {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.conn == nil {
+		return nil
+	}
+	return t.conn.RemoteAddr()
+}
+
+func (t *PersistentUDPTransport) exchangeIKELegacy(ctx context.Context, request []byte) ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, net.ErrClosed
 	}
 	if t.conn == nil {
 		conn, err := dialIKEUDP(ctx, t.Config)
@@ -68,33 +208,104 @@ func (t *PersistentUDPTransport) ExchangeIKE(ctx context.Context, request []byte
 		t.conn = conn
 	}
 	if err := setIKEUDPDeadline(t.conn, ctx, t.Config.Timeout); err != nil {
-		t.closeLocked()
 		return nil, err
 	}
-	resp, err := exchangeIKEUDP(t.conn, request, t.Config)
-	if err != nil {
-		t.closeLocked()
-		return nil, err
-	}
-	return resp, nil
+	return exchangeIKEUDP(t.conn, request, t.Config)
 }
 
-func (t *PersistentUDPTransport) Close() error {
+func (t *PersistentUDPTransport) ensureConn(ctx context.Context) (net.Conn, error) {
 	if t == nil {
-		return nil
+		return nil, fmt.Errorf("%w: persistent UDP transport is nil", ErrInvalidInitConfig)
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.closeLocked()
+	if t.closed {
+		return nil, net.ErrClosed
+	}
+	if t.conn != nil {
+		return t.conn, nil
+	}
+	conn, err := dialIKEUDP(ctx, t.Config)
+	if err != nil {
+		return nil, err
+	}
+	t.conn = conn
+	go t.readLoop(conn)
+	return conn, nil
 }
 
-func (t *PersistentUDPTransport) closeLocked() error {
-	if t.conn == nil {
-		return nil
+func (t *PersistentUDPTransport) writePacket(ctx context.Context, packet []byte) error {
+	conn, err := t.ensureConn(ctx)
+	if err != nil {
+		return err
 	}
-	err := t.conn.Close()
-	t.conn = nil
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	if err := setIKEUDPWriteDeadline(conn, ctx, t.Config.Timeout); err != nil {
+		return err
+	}
+	_, err = conn.Write(packet)
 	return err
+}
+
+func (t *PersistentUDPTransport) readLoop(conn net.Conn) {
+	size := t.Config.ReadBufferSize
+	if size <= 0 {
+		size = 64 * 1024
+	}
+	buf := make([]byte, size)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.publishReadError(err)
+			return
+		}
+		packet := append([]byte(nil), buf[:n]...)
+		switch {
+		case len(packet) == 1 && packet[0] == 0xff:
+			continue
+		case len(packet) >= 4 && packet[0] == 0 && packet[1] == 0 && packet[2] == 0 && packet[3] == 0:
+			if !t.publishPacket(t.ikePackets, packet[4:]) {
+				return
+			}
+		default:
+			if !t.publishPacket(t.espPackets, packet) {
+				return
+			}
+		}
+	}
+}
+
+func (t *PersistentUDPTransport) publishPacket(ch chan []byte, packet []byte) bool {
+	select {
+	case ch <- packet:
+		return true
+	case <-t.done:
+		return false
+	}
+}
+
+func (t *PersistentUDPTransport) publishReadError(err error) {
+	select {
+	case <-t.done:
+		return
+	default:
+	}
+	select {
+	case t.readErrors <- err:
+	default:
+	}
+}
+
+func persistentUDPTimeout(timeout time.Duration) (*time.Timer, <-chan time.Time) {
+	if timeout <= 0 {
+		return nil, nil
+	}
+	timer := time.NewTimer(timeout)
+	return timer, timer.C
 }
 
 func (t UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
@@ -141,6 +352,19 @@ func setIKEUDPDeadline(conn net.Conn, ctx context.Context, timeout time.Duration
 		deadline = ctxDeadline
 	}
 	return conn.SetDeadline(deadline)
+}
+
+func setIKEUDPWriteDeadline(conn net.Conn, ctx context.Context, timeout time.Duration) error {
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	if ctx != nil {
+		if ctxDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || ctxDeadline.Before(deadline)) {
+			deadline = ctxDeadline
+		}
+	}
+	return conn.SetWriteDeadline(deadline)
 }
 
 func exchangeIKEUDP(conn net.Conn, request []byte, config UDPTransport) ([]byte, error) {

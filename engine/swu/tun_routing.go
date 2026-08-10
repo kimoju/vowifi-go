@@ -73,6 +73,7 @@ type EPDGRouteExclusion struct {
 	Table         string
 	Tables        []string
 	Metric        int
+	Replace       bool
 }
 
 type TUNRoutingConfig struct {
@@ -205,7 +206,11 @@ func epdgRouteExclusionCommands(exclusion EPDGRouteExclusion) ([]ipCommand, erro
 	}
 	var commands []ipCommand
 	for _, table := range tables {
-		args := routingFamilyArgs(dst, "route", "add", dst, "dev", iface)
+		action := "add"
+		if exclusion.Replace {
+			action = "replace"
+		}
+		args := routingFamilyArgs(dst, "route", action, dst, "dev", iface)
 		undo := routingFamilyArgs(dst, "route", "del", dst, "dev", iface)
 		if strings.TrimSpace(exclusion.Via) != "" {
 			via, err := normalizeIPAddress(exclusion.Via, "epdg route via")

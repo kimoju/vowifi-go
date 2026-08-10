@@ -30,7 +30,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 				"reqid", "1",
 				"mode", "transport",
 				"auth-trunc", "hmac(sha1)", ik, "96",
-				"enc", "ecb(cipher_null)", "0x",
+				"enc", "ecb(cipher_null)", "",
 				"sel",
 				"src", "192.0.2.20",
 				"dst", "198.51.100.10",
@@ -50,7 +50,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 				"reqid", "1",
 				"mode", "transport",
 				"auth-trunc", "hmac(sha1)", ik, "96",
-				"enc", "ecb(cipher_null)", "0x",
+				"enc", "ecb(cipher_null)", "",
 				"sel",
 				"src", "198.51.100.10",
 				"dst", "192.0.2.20",
@@ -123,6 +123,69 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanDerivesPlanFromAgreement(t *t
 		installPlan.Commands[1].Args[10] != "0x01020304" {
 		t.Fatalf("install plan commands=%+v", installPlan.Commands)
 	}
+}
+
+func TestBuildIMSSecurityAssociationXFRMInstallPlanUsesClientSPIForRegisterReplies(t *testing.T) {
+	req := validSecurityXFRMInstallRequest()
+	req.Agreement.SPIClient = 0x90000001
+	req.Agreement.SPIServer = 0x90000002
+	req.Agreement.PortClient = 65528
+	req.Agreement.PortServer = 65529
+	req.Plan.SPIClient = 0x90000001
+	req.Plan.SPIServer = 0x90000002
+	req.Plan.PortClient = 65528
+	req.Plan.PortServer = 65529
+	req.Plan.Outbound.SPI = 0x90000002
+	req.Plan.Outbound.RemotePort = 65529
+	req.ClientAgreement = SecurityAgreement{
+		Protocol:            DefaultSecurityProtocol,
+		Algorithm:           DefaultSecurityAlgorithm,
+		EncryptionAlgorithm: DefaultSecurityEAlg,
+		SPIClient:           0x80000001,
+		SPIServer:           0x80000002,
+		PortClient:          5062,
+		PortServer:          5063,
+	}
+	plan, err := BuildIMSSecurityAssociationXFRMInstallPlan(req)
+	if err != nil {
+		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
+	}
+	outbound := plan.Commands[0].Args
+	inbound := plan.Commands[1].Args
+	for _, want := range []string{"0x90000002", "5062", "65529"} {
+		if !containsSecurityXFRMArg(outbound, want) {
+			t.Fatalf("outbound=%v missing %q", outbound, want)
+		}
+	}
+	for _, want := range []string{"0x80000001", "65529", "5062"} {
+		if !containsSecurityXFRMArg(inbound, want) {
+			t.Fatalf("inbound=%v missing %q", inbound, want)
+		}
+	}
+	if len(plan.Commands) != 8 {
+		t.Fatalf("commands=%d, want four states and four policies", len(plan.Commands))
+	}
+	serverOutbound := plan.Commands[2].Args
+	serverInbound := plan.Commands[3].Args
+	for _, want := range []string{"0x90000001", "5063", "65528"} {
+		if !containsSecurityXFRMArg(serverOutbound, want) {
+			t.Fatalf("server outbound=%v missing %q", serverOutbound, want)
+		}
+	}
+	for _, want := range []string{"0x80000002", "65528", "5063"} {
+		if !containsSecurityXFRMArg(serverInbound, want) {
+			t.Fatalf("server inbound=%v missing %q", serverInbound, want)
+		}
+	}
+}
+
+func containsSecurityXFRMArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildIMSSecurityAssociationXFRMInstallPlanUsesSelectedParameters(t *testing.T) {
@@ -203,7 +266,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanNullEncryptionDoesNotNeedCK(t
 	if err != nil {
 		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
 	}
-	wantEnc := []string{"enc", "ecb(cipher_null)", "0x"}
+	wantEnc := []string{"enc", "ecb(cipher_null)", ""}
 	for i := 0; i < 2; i++ {
 		if got := installPlan.Commands[i].Args[19:22]; !reflect.DeepEqual(got, wantEnc) {
 			t.Fatalf("state command %d enc args=%v, want %v", i, got, wantEnc)

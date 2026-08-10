@@ -605,6 +605,73 @@ func TestPersistentUDPTransportReusesSourceEndpoint(t *testing.T) {
 	}
 }
 
+func TestPersistentUDPTransportMultiplexesIKEAndESPOnOneEndpoint(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer server.Close()
+
+	addresses := make(chan string, 2)
+	errs := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		n, addr, err := server.ReadFrom(buf)
+		if err != nil {
+			errs <- err
+			return
+		}
+		addresses <- addr.String()
+		if !bytes.Equal(buf[:n], []byte{0, 0, 0, 0, 1, 2, 3}) {
+			errs <- errors.New("unexpected IKE wire packet")
+			return
+		}
+		if _, err := server.WriteTo([]byte{0, 0, 0, 0, 4, 5, 6}, addr); err != nil {
+			errs <- err
+			return
+		}
+
+		n, espAddr, err := server.ReadFrom(buf)
+		if err != nil {
+			errs <- err
+			return
+		}
+		addresses <- espAddr.String()
+		if !bytes.Equal(buf[:n], []byte{9, 8, 7, 6}) {
+			errs <- errors.New("unexpected ESP wire packet")
+			return
+		}
+		_, err = server.WriteTo([]byte{6, 7, 8, 9}, espAddr)
+		errs <- err
+	}()
+
+	transport := NewPersistentUDPTransport(UDPTransport{
+		RemoteAddr:      server.LocalAddr().String(),
+		Timeout:         2 * time.Second,
+		UseNonESPMarker: true,
+	})
+	defer transport.Close()
+	response, err := transport.ExchangeIKE(context.Background(), []byte{1, 2, 3})
+	if err != nil || !bytes.Equal(response, []byte{4, 5, 6}) {
+		t.Fatalf("ExchangeIKE() response=%x error=%v", response, err)
+	}
+	if err := transport.SendNATTPacket(context.Background(), []byte{9, 8, 7, 6}); err != nil {
+		t.Fatalf("SendNATTPacket() error = %v", err)
+	}
+	readCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	packet, err := transport.ReadNATTPacket(readCtx)
+	if err != nil || !bytes.Equal(packet, []byte{6, 7, 8, 9}) {
+		t.Fatalf("ReadNATTPacket() packet=%x error=%v", packet, err)
+	}
+	if first, second := <-addresses, <-addresses; first != second {
+		t.Fatalf("IKE and ESP source endpoints differ: %q != %q", first, second)
+	}
+	if err := <-errs; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
 type InitTransportFunc func(context.Context, []byte) ([]byte, error)
 
 func (f InitTransportFunc) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
