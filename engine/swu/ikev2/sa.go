@@ -83,6 +83,24 @@ func DefaultIKEProposal() SecurityAssociation {
 	}}}
 }
 
+// Default3GPPIKEProposal matches the interoperable algorithm set used by
+// Android IWLAN/ePDG clients. SHA-1 is retained as a fallback because deployed
+// carrier ePDGs still select it; SHA-2 remains the preferred first transform.
+func Default3GPPIKEProposal() SecurityAssociation {
+	return SecurityAssociation{Proposals: []Proposal{{
+		Number:     1,
+		ProtocolID: ProtocolIKE,
+		Transforms: []Transform{
+			{Type: TransformENCR, ID: ENCR_AES_CBC, Attributes: []TransformAttribute{KeyLengthAttribute(128)}},
+			{Type: TransformPRF, ID: PRF_HMAC_SHA2_256},
+			{Type: TransformPRF, ID: PRF_HMAC_SHA1},
+			{Type: TransformINTEG, ID: INTEG_HMAC_SHA2_256_128},
+			{Type: TransformINTEG, ID: INTEG_HMAC_SHA1_96},
+			{Type: TransformDHRGroup, ID: DHGroup2048BitMODP},
+		},
+	}}}
+}
+
 func DefaultESPProposal(spi []byte) SecurityAssociation {
 	return SecurityAssociation{Proposals: []Proposal{{
 		Number:     1,
@@ -91,6 +109,22 @@ func DefaultESPProposal(spi []byte) SecurityAssociation {
 		Transforms: []Transform{
 			{Type: TransformENCR, ID: ENCR_AES_CBC, Attributes: []TransformAttribute{KeyLengthAttribute(128)}},
 			{Type: TransformINTEG, ID: INTEG_HMAC_SHA2_256_128},
+			{Type: TransformESN, ID: ESNNo},
+		},
+	}}}
+}
+
+// Default3GPPESPProposal offers the common SHA-2 and legacy SHA-1 integrity
+// transforms used by commercial ePDGs.
+func Default3GPPESPProposal(spi []byte) SecurityAssociation {
+	return SecurityAssociation{Proposals: []Proposal{{
+		Number:     1,
+		ProtocolID: ProtocolESP,
+		SPI:        append([]byte(nil), spi...),
+		Transforms: []Transform{
+			{Type: TransformENCR, ID: ENCR_AES_CBC, Attributes: []TransformAttribute{KeyLengthAttribute(128)}},
+			{Type: TransformINTEG, ID: INTEG_HMAC_SHA2_256_128},
+			{Type: TransformINTEG, ID: INTEG_HMAC_SHA1_96},
 			{Type: TransformESN, ID: ESNNo},
 		},
 	}}}

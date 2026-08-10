@@ -13,6 +13,7 @@ import (
 	swusim "github.com/boa-z/vowifi-go/engine/sim"
 	"github.com/boa-z/vowifi-go/engine/swu"
 	"github.com/boa-z/vowifi-go/engine/swu/eapaka"
+	"github.com/boa-z/vowifi-go/engine/swu/ikev2"
 	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
 	"github.com/boa-z/vowifi-go/runtimehost/identity"
 	"github.com/boa-z/vowifi-go/runtimehost/messaging"
@@ -1941,6 +1942,7 @@ func TestDefaultTunnelManagerForStartBuildsKernelIKEManager(t *testing.T) {
 	var callbackState swu.EAPReauthenticationState
 	manager, err := defaultTunnelManagerForStart(StartRequest{
 		DeviceID:                   "dev-1",
+		Profile:                    identity.Profile{IMSI: "310260123456789", MCC: "310", MNC: "260"},
 		SIM:                        &runtimeSIMAdapter{},
 		EAPReauthentication:        reauthState,
 		OnEAPReauthenticationState: func(state swu.EAPReauthenticationState) { callbackState = state },
@@ -1959,10 +1961,29 @@ func TestDefaultTunnelManagerForStartBuildsKernelIKEManager(t *testing.T) {
 		ikeManager.Config.Reauthentication.Counter != 5 || ikeManager.Config.OnReauthenticationState == nil {
 		t.Fatalf("ike manager config=%+v", ikeManager.Config)
 	}
+	if ikeManager.Config.EAPIdentity != "0310260123456789@nai.epc.mnc260.mcc310.3gppnetwork.org" {
+		t.Fatalf("EAP identity=%q", ikeManager.Config.EAPIdentity)
+	}
+	if !runtimeProposalHasTransform(ikeManager.Config.SA, ikev2.TransformDHRGroup, ikev2.DHGroup2048BitMODP) ||
+		!runtimeProposalHasTransform(ikeManager.Config.SA, ikev2.TransformPRF, ikev2.PRF_HMAC_SHA1) ||
+		!runtimeProposalHasTransform(ikeManager.Config.ChildSA, ikev2.TransformINTEG, ikev2.INTEG_HMAC_SHA1_96) {
+		t.Fatalf("runtime 3GPP proposals=%+v child=%+v", ikeManager.Config.SA, ikeManager.Config.ChildSA)
+	}
 	ikeManager.Config.OnReauthenticationState(swu.EAPReauthenticationState{Identity: "reauth-kernel-next"})
 	if callbackState.Identity != "reauth-kernel-next" {
 		t.Fatalf("callback state=%+v", callbackState)
 	}
+}
+
+func runtimeProposalHasTransform(sa ikev2.SecurityAssociation, transformType uint8, id uint16) bool {
+	for _, proposal := range sa.Proposals {
+		for _, transform := range proposal.Transforms {
+			if transform.Type == transformType && transform.ID == id {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestDefaultTunnelManagerForStartEnablesTUNRoutingProtection(t *testing.T) {

@@ -96,6 +96,47 @@ func TestUDPESPPacketTransportReadFiltersNATTControlPackets(t *testing.T) {
 	}
 }
 
+func TestUDPESPPacketTransportReadContinuesAcrossIdleTimeouts(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer server.Close()
+	transport := &UDPESPPacketTransport{
+		RemoteAddr: server.LocalAddr().String(),
+		Timeout:    20 * time.Millisecond,
+	}
+	request := []byte{0x12, 0x34, 0x56, 0x78, 0, 0, 0, 1}
+	if err := transport.SendESPPacket(context.Background(), request); err != nil {
+		t.Fatalf("SendESPPacket() error = %v", err)
+	}
+	done := make(chan error, 1)
+	want := []byte{0x87, 0x65, 0x43, 0x21, 0, 0, 0, 2, 0xcc}
+	go func() {
+		buf := make([]byte, 64)
+		_, clientAddr, err := server.ReadFrom(buf)
+		if err != nil {
+			done <- err
+			return
+		}
+		time.Sleep(70 * time.Millisecond)
+		_, err = server.WriteTo(want, clientAddr)
+		done <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := transport.ReadESPPacket(ctx)
+	if err != nil {
+		t.Fatalf("ReadESPPacket() error = %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("ReadESPPacket()=%x, want %x", got, want)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
 func TestUDPESPPacketTransportCloseRejectsTraffic(t *testing.T) {
 	server, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

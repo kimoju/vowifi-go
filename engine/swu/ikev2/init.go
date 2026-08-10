@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,17 +37,89 @@ type UDPTransport struct {
 	ReadBufferSize  int
 }
 
+// PersistentUDPTransport keeps one UDP socket for the lifetime of an IKE SA.
+// IKE_AUTH must use the same endpoint as IKE_SA_INIT; opening a new socket for
+// every exchange changes the initiator port and is rejected by strict ePDGs.
+type PersistentUDPTransport struct {
+	Config UDPTransport
+
+	mu   sync.Mutex
+	conn net.Conn
+}
+
+func NewPersistentUDPTransport(config UDPTransport) *PersistentUDPTransport {
+	return &PersistentUDPTransport{Config: config}
+}
+
+func (t *PersistentUDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
+	if t == nil {
+		return nil, fmt.Errorf("%w: persistent UDP transport is nil", ErrInvalidInitConfig)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if t.conn == nil {
+		conn, err := dialIKEUDP(ctx, t.Config)
+		if err != nil {
+			return nil, err
+		}
+		t.conn = conn
+	}
+	if err := setIKEUDPDeadline(t.conn, ctx, t.Config.Timeout); err != nil {
+		t.closeLocked()
+		return nil, err
+	}
+	resp, err := exchangeIKEUDP(t.conn, request, t.Config)
+	if err != nil {
+		t.closeLocked()
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (t *PersistentUDPTransport) Close() error {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closeLocked()
+}
+
+func (t *PersistentUDPTransport) closeLocked() error {
+	if t.conn == nil {
+		return nil
+	}
+	err := t.conn.Close()
+	t.conn = nil
+	return err
+}
+
 func (t UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	remote := strings.TrimSpace(t.RemoteAddr)
+	conn, err := dialIKEUDP(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if err := setIKEUDPDeadline(conn, ctx, t.Timeout); err != nil {
+		return nil, err
+	}
+	return exchangeIKEUDP(conn, request, t)
+}
+
+func dialIKEUDP(ctx context.Context, config UDPTransport) (net.Conn, error) {
+	remote := strings.TrimSpace(config.RemoteAddr)
 	if remote == "" {
 		return nil, fmt.Errorf("%w: remote address is empty", ErrInvalidInitConfig)
 	}
 	dialer := net.Dialer{}
-	if strings.TrimSpace(t.LocalAddr) != "" {
-		addr, err := net.ResolveUDPAddr("udp", t.LocalAddr)
+	if strings.TrimSpace(config.LocalAddr) != "" {
+		addr, err := net.ResolveUDPAddr("udp", config.LocalAddr)
 		if err != nil {
 			return nil, err
 		}
@@ -56,18 +129,29 @@ func (t UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	if timeout := t.Timeout; timeout > 0 {
-		_ = conn.SetDeadline(time.Now().Add(timeout))
+	return conn, nil
+}
+
+func setIKEUDPDeadline(conn net.Conn, ctx context.Context, timeout time.Duration) error {
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
 	}
+	if ctxDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || ctxDeadline.Before(deadline)) {
+		deadline = ctxDeadline
+	}
+	return conn.SetDeadline(deadline)
+}
+
+func exchangeIKEUDP(conn net.Conn, request []byte, config UDPTransport) ([]byte, error) {
 	wire := request
-	if t.UseNonESPMarker {
+	if config.UseNonESPMarker {
 		wire = append([]byte{0, 0, 0, 0}, request...)
 	}
 	if _, err := conn.Write(wire); err != nil {
 		return nil, err
 	}
-	size := t.ReadBufferSize
+	size := config.ReadBufferSize
 	if size <= 0 {
 		size = 64 * 1024
 	}
@@ -90,6 +174,7 @@ type InitConfig struct {
 	InitiatorSPI      uint64
 	NonceI            []byte
 	X25519PrivateKey  []byte
+	DHPrivateKey      []byte
 	LocalIP           net.IP
 	LocalPort         uint16
 	RemoteIP          net.IP
@@ -141,22 +226,30 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 			return InitResult{}, err
 		}
 	}
-	priv, err := x25519PrivateKey(cfg.X25519PrivateKey, random)
-	if err != nil {
-		return InitResult{}, err
-	}
-	pubI := priv.PublicKey().Bytes()
 	sa := cfg.SA
 	if len(sa.Proposals) == 0 {
 		sa = DefaultIKEProposal()
 	}
+	dhGroup, err := dhGroupFromSA(sa)
+	if err != nil {
+		return InitResult{}, err
+	}
+	privateKey := cfg.DHPrivateKey
+	if dhGroup == DHGroupCurve25519 && len(privateKey) == 0 {
+		privateKey = cfg.X25519PrivateKey
+	}
+	dh, err := newDHKeyExchange(dhGroup, privateKey, random)
+	if err != nil {
+		return InitResult{}, err
+	}
+	pubI := dh.public
 	saPayload, err := SecurityAssociationPayload(sa)
 	if err != nil {
 		return InitResult{}, err
 	}
 	payloads := []Payload{
 		saPayload,
-		KeyExchangePayload(DHGroupCurve25519, pubI),
+		KeyExchangePayload(dhGroup, pubI),
 		NoncePayload(nonceI),
 	}
 	payloads = append(payloads, initNATPayloads(cfg, spiI, 0)...)
@@ -165,20 +258,16 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 	if err != nil {
 		return InitResult{}, err
 	}
-	parsed, err := parseInitResponse(resp, spiI)
+	parsed, err := parseInitResponse(resp, spiI, dhGroup)
 	if err != nil {
 		return InitResult{}, err
 	}
 	if err := ValidateSelectedSA(sa, parsed.sa); err != nil {
 		return InitResult{}, err
 	}
-	respPub, err := ecdh.X25519().NewPublicKey(parsed.keyExchange.KeyData)
+	shared, err := dh.shared(parsed.keyExchange.KeyData)
 	if err != nil {
-		return InitResult{}, fmt.Errorf("%w: responder KE: %w", ErrInvalidInitResponse, err)
-	}
-	shared, err := priv.ECDH(respPub)
-	if err != nil {
-		return InitResult{}, fmt.Errorf("%w: ECDH: %w", ErrInvalidInitResponse, err)
+		return InitResult{}, err
 	}
 	profile, err := KeyMaterialProfileFromSA(parsed.sa)
 	if err != nil {
@@ -311,7 +400,7 @@ type parsedInitResponse struct {
 	mobikeSupported bool
 }
 
-func parseInitResponse(resp Message, spiI uint64) (parsedInitResponse, error) {
+func parseInitResponse(resp Message, spiI uint64, expectedDHGroup uint16) (parsedInitResponse, error) {
 	h := resp.Header
 	if h.InitiatorSPI != spiI {
 		return parsedInitResponse{}, fmt.Errorf("%w: initiator SPI mismatch", ErrInvalidInitResponse)
@@ -339,8 +428,8 @@ func parseInitResponse(resp Message, spiI uint64) (parsedInitResponse, error) {
 			if err != nil {
 				return parsedInitResponse{}, err
 			}
-			if ke.DHGroup != DHGroupCurve25519 {
-				return parsedInitResponse{}, fmt.Errorf("%w: unsupported DH group %d", ErrInvalidInitResponse, ke.DHGroup)
+			if ke.DHGroup != expectedDHGroup {
+				return parsedInitResponse{}, fmt.Errorf("%w: responder DH group %d does not match offered group %d", ErrInvalidInitResponse, ke.DHGroup, expectedDHGroup)
 			}
 			out.keyExchange = ke
 		case PayloadNonce:

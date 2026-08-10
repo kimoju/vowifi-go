@@ -12,6 +12,8 @@ import (
 
 	swusim "github.com/boa-z/vowifi-go/engine/sim"
 	"github.com/boa-z/vowifi-go/engine/swu"
+	"github.com/boa-z/vowifi-go/engine/swu/ikev2"
+	"github.com/boa-z/vowifi-go/runtimehost/carrier"
 	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
 	"github.com/boa-z/vowifi-go/runtimehost/identity"
 	"github.com/boa-z/vowifi-go/runtimehost/messaging"
@@ -2186,10 +2188,24 @@ func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 	if req.SIM == nil {
 		return nil, errors.New("SWU tunnel manager requires SIM AKA provider")
 	}
+	eapIdentity := ""
+	if req.Prepared != nil {
+		eapIdentity = strings.TrimSpace(req.Prepared.CarrierPolicy.IMS.PermanentNAI)
+	}
+	if eapIdentity == "" {
+		profile := req.Profile
+		if req.Prepared != nil && strings.TrimSpace(profile.IMSI) == "" {
+			profile = req.Prepared.Profile
+		}
+		eapIdentity = carrier.DerivePermanentNAI(profile.IMSI, profile.MCC, profile.MNC)
+	}
 	ikeCfg := swu.IKEPacketTunnelManagerConfig{
 		SIM:                     req.SIM,
+		EAPIdentity:             eapIdentity,
 		Reauthentication:        req.EAPReauthentication,
 		OnReauthenticationState: req.OnEAPReauthenticationState,
+		SA:                      ikev2.Default3GPPIKEProposal(),
+		ChildSA:                 ikev2.Default3GPPESPProposal(nil),
 	}
 	if strings.TrimSpace(req.Dataplane.Mode) == swu.DataplaneModeKernel {
 		return swu.NewIKEPacketTunnelManager(ikeCfg), nil
@@ -2230,9 +2246,6 @@ func buildTunnelConfig(req StartRequest, modem Modem) swu.TunnelConfig {
 		IMEI:      strings.TrimSpace(req.Profile.IMEI),
 		Proxy:     toSWUProxyConfig(req.Proxy),
 		StartedAt: time.Now(),
-	}
-	if modem != nil {
-		cfg.LocalInterface = strings.TrimSpace(modem.DeviceID())
 	}
 	if req.Prepared != nil {
 		cfg.EPDGAddress = strings.TrimSpace(req.Prepared.EPDGAddr)

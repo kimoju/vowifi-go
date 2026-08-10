@@ -2,9 +2,11 @@ package swu
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -23,22 +25,31 @@ type TUNRoutingManager interface {
 
 type EPDGRouteResolver func(context.Context, string) ([]net.IP, error)
 
+type EPDGOuterRoute struct {
+	InterfaceName string
+	Via           string
+	Source        string
+}
+
+type EPDGOuterRouteResolver func(context.Context, net.IP) (EPDGOuterRoute, error)
+
 type TUNTunnelManagerConfig struct {
-	Base                 TunnelManager
-	TUN                  TUNDeviceConfig
-	DeviceFactory        TUNDeviceFactory
-	RoutingManager       TUNRoutingManager
-	RoutingConfigFactory TUNRoutingConfigFactory
-	DisableRouting       bool
-	DefaultRoutes        bool
-	ProtectEPDGRoutes    bool
-	EPDGRouteResolver    EPDGRouteResolver
-	MTU                  int
-	Addresses            []string
-	EPDGRouteExclusions  []EPDGRouteExclusion
-	Routes               []TUNRoute
-	Rules                []TUNRule
-	OnPumpError          func(PacketPumpDirection, error)
+	Base                   TunnelManager
+	TUN                    TUNDeviceConfig
+	DeviceFactory          TUNDeviceFactory
+	RoutingManager         TUNRoutingManager
+	RoutingConfigFactory   TUNRoutingConfigFactory
+	DisableRouting         bool
+	DefaultRoutes          bool
+	ProtectEPDGRoutes      bool
+	EPDGRouteResolver      EPDGRouteResolver
+	EPDGOuterRouteResolver EPDGOuterRouteResolver
+	MTU                    int
+	Addresses              []string
+	EPDGRouteExclusions    []EPDGRouteExclusion
+	Routes                 []TUNRoute
+	Rules                  []TUNRule
+	OnPumpError            func(PacketPumpDirection, error)
 }
 
 type TUNTunnelManager struct {
@@ -204,9 +215,6 @@ func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, 
 }
 
 func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg TunnelConfig, result TunnelResult, routes []TUNRoute) ([]EPDGRouteExclusion, error) {
-	if strings.TrimSpace(cfg.LocalInterface) == "" {
-		return nil, fmt.Errorf("%w: ePDG route protection requires outer interface", ErrInvalidTUNTunnelManager)
-	}
 	host := tunnelAddressHost(firstPacketNonEmpty(result.EPDGAddress, cfg.EPDGAddress))
 	if host == "" {
 		return nil, nil
@@ -225,14 +233,65 @@ func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg T
 		if normalized == nil {
 			continue
 		}
-		out = append(out, EPDGRouteExclusion{
-			Address:       normalized.String(),
+		outer := EPDGOuterRoute{
 			InterfaceName: strings.TrimSpace(cfg.LocalInterface),
 			Source:        strings.TrimSpace(cfg.OuterLocalIP),
+		}
+		if outer.InterfaceName == "" {
+			resolver := m.Config.EPDGOuterRouteResolver
+			if resolver == nil {
+				resolver = resolveSystemEPDGOuterRoute
+			}
+			var err error
+			outer, err = resolver(ctx, normalized)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if strings.TrimSpace(outer.InterfaceName) == "" {
+			return nil, fmt.Errorf("%w: ePDG route protection could not resolve outer interface", ErrInvalidTUNTunnelManager)
+		}
+		out = append(out, EPDGRouteExclusion{
+			Address:       normalized.String(),
+			InterfaceName: strings.TrimSpace(outer.InterfaceName),
+			Via:           strings.TrimSpace(outer.Via),
+			Source:        strings.TrimSpace(outer.Source),
 			Tables:        tables,
 		})
 	}
 	return out, nil
+}
+
+func resolveSystemEPDGOuterRoute(ctx context.Context, ip net.IP) (EPDGOuterRoute, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	normalized := normalizedMOBIKEIP(ip)
+	if normalized == nil {
+		return EPDGOuterRoute{}, fmt.Errorf("%w: invalid ePDG route address", ErrInvalidTUNTunnelManager)
+	}
+	output, err := exec.CommandContext(ctx, "ip", "-j", "route", "get", normalized.String()).Output()
+	if err != nil {
+		return EPDGOuterRoute{}, fmt.Errorf("%w: resolve ePDG outer route: %v", ErrInvalidTUNTunnelManager, err)
+	}
+	var rows []struct {
+		Dev     string `json:"dev"`
+		Gateway string `json:"gateway"`
+		PrefSrc string `json:"prefsrc"`
+		Source  string `json:"src"`
+	}
+	if err := json.Unmarshal(output, &rows); err != nil || len(rows) == 0 {
+		return EPDGOuterRoute{}, fmt.Errorf("%w: parse ePDG outer route: %v", ErrInvalidTUNTunnelManager, err)
+	}
+	source := strings.TrimSpace(rows[0].PrefSrc)
+	if source == "" {
+		source = strings.TrimSpace(rows[0].Source)
+	}
+	return EPDGOuterRoute{
+		InterfaceName: strings.TrimSpace(rows[0].Dev),
+		Via:           strings.TrimSpace(rows[0].Gateway),
+		Source:        source,
+	}, nil
 }
 
 func (m *TUNTunnelManager) resolveEPDGRouteIPs(ctx context.Context, host string) ([]net.IP, error) {

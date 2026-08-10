@@ -231,6 +231,22 @@ func IPv4AnyTrafficSelectors() TrafficSelectors {
 	}}}
 }
 
+// SWuAnyTrafficSelectors covers both address families requested by
+// SWuConfigurationRequest. Offering only IPv4 while requesting an IPv6
+// internal address causes strict ePDGs to reject the Child SA selectors.
+func SWuAnyTrafficSelectors() TrafficSelectors {
+	return TrafficSelectors{Selectors: []TrafficSelector{
+		IPv4AnyTrafficSelectors().Selectors[0],
+		{
+			Type:      TSIPv6AddressRange,
+			StartPort: 0,
+			EndPort:   65535,
+			StartAddr: net.ParseIP("::"),
+			EndAddr:   net.ParseIP("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+		},
+	}}
+}
+
 func ValidateTrafficSelectorNarrowing(offered, selected TrafficSelectors) error {
 	if len(offered.Selectors) == 0 {
 		return fmt.Errorf("%w: offered selector count 0", ErrInvalidTrafficSelector)

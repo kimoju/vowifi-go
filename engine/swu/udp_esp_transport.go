@@ -101,6 +101,10 @@ func (t *UDPESPPacketTransport) ReadESPPacket(ctx context.Context) ([]byte, erro
 		}
 		n, err := conn.Read(buf)
 		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() && ctx.Err() == nil {
+				continue
+			}
 			return nil, transportNetError(ctx, err)
 		}
 		wire := buf[:n]

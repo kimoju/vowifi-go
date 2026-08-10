@@ -193,11 +193,11 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	}
 	initialRespBytes, err := cfg.Transport.ExchangeIKE(ctx, initialReqBytes)
 	if err != nil {
-		return AuthResult{}, err
+		return AuthResult{}, fmt.Errorf("initial IKE_AUTH exchange: %w", err)
 	}
 	initialResp, initialInnerResp, err := unprotectAuthResponse(initialRespBytes, cfg.Init, keys, messageID)
 	if err != nil {
-		return AuthResult{}, err
+		return AuthResult{}, fmt.Errorf("initial IKE_AUTH response: %w", err)
 	}
 	eapReq, eapReqRaw, hasEAP, err := firstEAPPacketWithRaw(initialInnerResp)
 	if err != nil {
@@ -244,11 +244,11 @@ func RunIKE_AUTH_EAPIdentity(ctx context.Context, cfg AuthConfig) (AuthResult, e
 	}
 	identityRespBytes, err := cfg.Transport.ExchangeIKE(ctx, identityReqBytes)
 	if err != nil {
-		return AuthResult{}, err
+		return AuthResult{}, fmt.Errorf("EAP identity IKE_AUTH exchange: %w", err)
 	}
 	_, identityInnerResp, err := unprotectAuthResponse(identityRespBytes, cfg.Init, keys, messageID+1)
 	if err != nil {
-		return AuthResult{}, err
+		return AuthResult{}, fmt.Errorf("EAP identity IKE_AUTH response: %w", err)
 	}
 	out.IdentityRequestBytes = append([]byte(nil), identityReqBytes...)
 	out.IdentityResponseBytes = append([]byte(nil), identityRespBytes...)
@@ -298,9 +298,12 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		FinalResponseBytes: append([]byte(nil), finalBytes...),
 		FinalResponseInner: clonePayloads(finalInner),
 	}
-	offeredChildSA := authOfferedChildSA(cfg.ChildSA, localChildSPI)
-	offeredTSi := trafficSelectorsOrIPv4Any(cfg.TSi)
-	offeredTSr := trafficSelectorsOrIPv4Any(cfg.TSr)
+	offeredChildSA, err := authOfferedChildSA(cfg.ChildSA, localChildSPI)
+	if err != nil {
+		return FullAuthResult{}, err
+	}
+	offeredTSi := trafficSelectorsOrSWuAny(cfg.TSi)
+	offeredTSr := trafficSelectorsOrSWuAny(cfg.TSr)
 	if child, ok, err := parseChildSAIfPresent(cfg.Init, finalInner, localChildSPI, out.NextMessageID, offeredChildSA, offeredTSi, offeredTSr); err != nil {
 		return FullAuthResult{}, err
 	} else if ok {
@@ -323,7 +326,15 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 				out.ChildSA = &child
 				return out, nil
 			}
-			return out, fmt.Errorf("%w: EAP success without CHILD_SA", ErrInvalidAuthResponse)
+			child, responseBytes, responseInner, err := runIKEAuthEAPFinal(ctx, cfg, out, localChildSPI, offeredChildSA, offeredTSi, offeredTSr)
+			if err != nil {
+				return out, err
+			}
+			out.ChildSA = &child
+			out.FinalResponseBytes = responseBytes
+			out.FinalResponseInner = responseInner
+			out.NextMessageID++
+			return out, nil
 		}
 		if next.Code == eapaka.CodeFailure {
 			return out, fmt.Errorf("%w: EAP failure", ErrInvalidAuthResponse)
@@ -430,6 +441,86 @@ func RunIKE_AUTH_Full(ctx context.Context, cfg FullAuthConfig) (FullAuthResult, 
 		next = challenge.EAPNext
 	}
 	return out, fmt.Errorf("%w: too many IKE_AUTH EAP exchanges", ErrInvalidAuthResponse)
+}
+
+func runIKEAuthEAPFinal(ctx context.Context, cfg FullAuthConfig, current FullAuthResult, localChildSPI []byte, offeredChildSA SecurityAssociation, offeredTSi, offeredTSr TrafficSelectors) (ChildSAResult, []byte, []Payload, error) {
+	keys := cfg.Keys
+	if keys.Profile.RequiredLength() == 0 {
+		keys = cfg.Init.Keys
+	}
+	if len(current.EAPKeys.MSK) == 0 {
+		return ChildSAResult{}, nil, nil, fmt.Errorf("%w: EAP success without MSK", ErrInvalidAuthResponse)
+	}
+	authData, err := eapSharedKeyAUTH(cfg.Init, keys, cfg.InitiatorID, current.EAPKeys.MSK, true)
+	if err != nil {
+		return ChildSAResult{}, nil, nil, err
+	}
+	authPayload, err := AuthenticationPayload(AuthMethodSharedKeyMIC, authData)
+	if err != nil {
+		return ChildSAResult{}, nil, nil, err
+	}
+	iv, err := authIV(cfg.Random, keys.Profile, nil)
+	if err != nil {
+		return ChildSAResult{}, nil, nil, err
+	}
+	_, requestBytes, err := ProtectMessage(authHeader(cfg.Init, current.NextMessageID, true), keys, true, []Payload{authPayload}, iv)
+	if err != nil {
+		return ChildSAResult{}, nil, nil, err
+	}
+	responseBytes, err := cfg.Transport.ExchangeIKE(ctx, requestBytes)
+	if err != nil {
+		return ChildSAResult{}, nil, nil, fmt.Errorf("final EAP AUTH exchange: %w", err)
+	}
+	_, inner, err := unprotectAuthResponse(responseBytes, cfg.Init, keys, current.NextMessageID)
+	if err != nil {
+		return ChildSAResult{}, nil, nil, fmt.Errorf("final EAP AUTH response: %w", err)
+	}
+	responderID, ok, err := firstIKEAuthIdentity(current.Auth.InitialResponseInner, PayloadIDr)
+	if err != nil {
+		return ChildSAResult{}, nil, nil, err
+	}
+	if !ok {
+		responderID, ok, err = firstIKEAuthIdentity(inner, PayloadIDr)
+		if err != nil {
+			return ChildSAResult{}, nil, nil, err
+		}
+	}
+	if !ok {
+		return ChildSAResult{}, nil, nil, fmt.Errorf("%w: final EAP AUTH response missing IDr", ErrInvalidAuthResponse)
+	}
+	responderAUTH, ok := firstIKEAuthPayload(inner, PayloadAUTH)
+	if !ok {
+		return ChildSAResult{}, nil, nil, fmt.Errorf("%w: final EAP AUTH response missing AUTH", ErrInvalidAuthResponse)
+	}
+	if err := verifyEAPSharedKeyAUTH(cfg.Init, keys, responderID, current.EAPKeys.MSK, responderAUTH, false); err != nil {
+		return ChildSAResult{}, nil, nil, fmt.Errorf("%w: responder AUTH: %w", ErrInvalidAuthResponse, err)
+	}
+	child, ok, err := parseChildSAIfPresent(cfg.Init, inner, localChildSPI, current.NextMessageID+1, offeredChildSA, offeredTSi, offeredTSr)
+	if err != nil {
+		return ChildSAResult{}, nil, nil, err
+	}
+	if !ok {
+		return ChildSAResult{}, nil, nil, fmt.Errorf("%w: final EAP AUTH response missing CHILD_SA", ErrInvalidAuthResponse)
+	}
+	return child, append([]byte(nil), responseBytes...), clonePayloads(inner), nil
+}
+
+func firstIKEAuthIdentity(payloads []Payload, payloadType uint8) (Identity, bool, error) {
+	payload, ok := firstIKEAuthPayload(payloads, payloadType)
+	if !ok {
+		return Identity{}, false, nil
+	}
+	identity, err := ParseIdentity(payload.Body)
+	return identity, true, err
+}
+
+func firstIKEAuthPayload(payloads []Payload, payloadType uint8) (Payload, bool) {
+	for _, payload := range payloads {
+		if payload.Type == payloadType {
+			return payload, true
+		}
+	}
+	return Payload{}, false
 }
 
 func RunIKE_AUTH_AKAChallenge(ctx context.Context, cfg AKAChallengeConfig) (AKAChallengeResult, error) {
@@ -860,6 +951,11 @@ func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
 			return nil, fmt.Errorf("%w: child SPI length %d", ErrInvalidAuthConfig, len(spi))
 		}
 		childSA = DefaultESPProposal(spi)
+	} else {
+		childSA, err = childSAWithLocalSPI(childSA, cfg.ChildSPI)
+		if err != nil {
+			return nil, err
+		}
 	}
 	saPayload, err := SecurityAssociationPayload(childSA)
 	if err != nil {
@@ -867,7 +963,7 @@ func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
 	}
 	tsi := cfg.TSi
 	if len(tsi.Selectors) == 0 {
-		tsi = IPv4AnyTrafficSelectors()
+		tsi = SWuAnyTrafficSelectors()
 	}
 	tsiPayload, err := TrafficSelectorsPayload(PayloadTSi, tsi)
 	if err != nil {
@@ -875,7 +971,7 @@ func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
 	}
 	tsr := cfg.TSr
 	if len(tsr.Selectors) == 0 {
-		tsr = IPv4AnyTrafficSelectors()
+		tsr = SWuAnyTrafficSelectors()
 	}
 	tsrPayload, err := TrafficSelectorsPayload(PayloadTSr, tsr)
 	if err != nil {
@@ -885,7 +981,9 @@ func BuildIKEAuthInitialPayloads(cfg AuthConfig) ([]Payload, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []Payload{idPayload, cfgPayload, saPayload, tsiPayload, tsrPayload}, nil
+	// Keep the first IKE_AUTH request in the RFC 7296 canonical order. Some
+	// deployed ePDGs reject a CP payload placed before SAi2 with INVALID_SYNTAX.
+	return []Payload{idPayload, saPayload, tsiPayload, tsrPayload, cfgPayload}, nil
 }
 
 func authHeader(init InitResult, messageID uint32, fromInitiator bool) Header {
@@ -992,14 +1090,29 @@ func fullAuthLocalChildSPI(cfg FullAuthConfig) ([]byte, error) {
 	return randomBytes(random, 4)
 }
 
-func authOfferedChildSA(sa SecurityAssociation, localSPI []byte) SecurityAssociation {
+func authOfferedChildSA(sa SecurityAssociation, localSPI []byte) (SecurityAssociation, error) {
 	if len(sa.Proposals) == 0 {
 		if len(localSPI) == 0 {
-			return SecurityAssociation{}
+			return SecurityAssociation{}, nil
 		}
-		return DefaultESPProposal(localSPI)
+		return DefaultESPProposal(localSPI), nil
 	}
-	return cloneSecurityAssociation(sa)
+	return childSAWithLocalSPI(sa, localSPI)
+}
+
+func childSAWithLocalSPI(sa SecurityAssociation, localSPI []byte) (SecurityAssociation, error) {
+	out := cloneSecurityAssociation(sa)
+	for i := range out.Proposals {
+		proposal := &out.Proposals[i]
+		if proposal.ProtocolID != ProtocolESP || len(proposal.SPI) != 0 {
+			continue
+		}
+		if len(localSPI) != 4 {
+			return SecurityAssociation{}, fmt.Errorf("%w: child SPI length %d", ErrInvalidAuthConfig, len(localSPI))
+		}
+		proposal.SPI = append([]byte(nil), localSPI...)
+	}
+	return out, nil
 }
 
 func authIV(random io.Reader, profile KeyMaterialProfile, override []byte) ([]byte, error) {
@@ -1030,6 +1143,13 @@ func firstConfiguration(value, fallback Configuration) Configuration {
 		return value
 	}
 	return fallback
+}
+
+func trafficSelectorsOrSWuAny(ts TrafficSelectors) TrafficSelectors {
+	if len(ts.Selectors) == 0 {
+		return SWuAnyTrafficSelectors()
+	}
+	return ts
 }
 
 func clonePayloads(in []Payload) []Payload {
