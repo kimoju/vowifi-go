@@ -544,11 +544,11 @@ func (s *TUNPacketTunnelSession) Close(ctx context.Context) error {
 	s.mu.Unlock()
 
 	var err error
-	if pump != nil {
-		err = pump.Close(ctx)
-	}
 	if routingApplied && routing != nil {
-		err = errors.Join(err, routing.Cleanup(ctx, routingState))
+		err = routing.Cleanup(ctx, routingState)
+	}
+	if pump != nil {
+		err = errors.Join(err, pump.Close(ctx))
 	}
 	return err
 }

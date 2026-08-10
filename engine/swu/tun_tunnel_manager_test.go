@@ -340,6 +340,32 @@ func TestTUNTunnelManagerProtectsEPDGRoutesForPolicyTables(t *testing.T) {
 	}
 }
 
+func TestTUNTunnelSessionRemovesRoutesBeforeClosingDevice(t *testing.T) {
+	var order []string
+	device := newTUNManagerDevice("vohive0")
+	device.onClose = func() { order = append(order, "device") }
+	routing := &tunManagerRouting{onCleanup: func() { order = append(order, "routing") }}
+	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
+		Base:           &tunManagerBase{session: newTUNManagerPacketSession(TunnelResult{Ready: true, LocalInnerIP: "10.0.0.2", IKEEstablished: true, IPsecEstablished: true})},
+		RoutingManager: routing,
+		DeviceFactory: func(context.Context, TunnelConfig, TunnelResult) (InnerPacketDevice, string, error) {
+			return device, "vohive0", nil
+		},
+	})
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{
+		DeviceID: "dev-1", Mode: DataplaneModeUserspace, EPDGAddress: "198.51.100.7", IMSI: "310280233641503",
+	})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got, want := order, []string{"routing", "device"}; !stringSlicesEqual(got, want) {
+		t.Fatalf("close order=%v, want %v", got, want)
+	}
+}
+
 type tunManagerBase struct {
 	config  TunnelConfig
 	session TunnelSession
@@ -355,9 +381,10 @@ func (m *tunManagerBase) EstablishTunnel(ctx context.Context, cfg TunnelConfig) 
 }
 
 type tunManagerRouting struct {
-	applies  []TUNRoutingConfig
-	cleanups []TUNRoutingState
-	applyErr error
+	applies   []TUNRoutingConfig
+	cleanups  []TUNRoutingState
+	applyErr  error
+	onCleanup func()
 }
 
 func (r *tunManagerRouting) Apply(ctx context.Context, cfg TUNRoutingConfig) (TUNRoutingState, error) {
@@ -370,6 +397,9 @@ func (r *tunManagerRouting) Apply(ctx context.Context, cfg TUNRoutingConfig) (TU
 
 func (r *tunManagerRouting) Cleanup(ctx context.Context, state TUNRoutingState) error {
 	r.cleanups = append(r.cleanups, state)
+	if r.onCleanup != nil {
+		r.onCleanup()
+	}
 	return nil
 }
 
@@ -380,6 +410,7 @@ type tunManagerDevice struct {
 	close   sync.Once
 	closed  chan struct{}
 	closeMu sync.Mutex
+	onClose func()
 }
 
 func newTUNManagerDevice(name string) *tunManagerDevice {
@@ -416,7 +447,12 @@ func (d *tunManagerDevice) WriteInnerPacket(ctx context.Context, packet []byte) 
 }
 
 func (d *tunManagerDevice) Close(ctx context.Context) error {
-	d.close.Do(func() { close(d.closed) })
+	d.close.Do(func() {
+		if d.onClose != nil {
+			d.onClose()
+		}
+		close(d.closed)
+	})
 	return nil
 }
 
