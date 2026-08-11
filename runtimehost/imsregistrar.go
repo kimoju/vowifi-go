@@ -578,9 +578,22 @@ func (m *imsRegistrationMaintenance) BindInbound(handler voicehost.IMSMessageHan
 		return errors.New("IMS registration maintenance closed")
 	}
 	server := &voicehost.IMSInboundWireServer{
-		MessageHandler: handler,
-		ContactURI:     binding.ContactURI,
-		UserAgent:      firstRuntimeNonEmpty(m.config.UserAgent, m.profile.UserAgent, "vowifi-go"),
+		MessageHandler: voicehost.IMSMessageHandlerFunc(func(ctx context.Context, req voicehost.IMSMessageRequest) (voicehost.IMSMessageResult, error) {
+			result, err := handler.HandleIMSMessage(ctx, req)
+			if report, ok := imsInboundDeliveryReport(req, result); ok {
+				// 3GPP TS 24.341 requires an empty final response for the
+				// inbound transaction followed by a separate MESSAGE carrying
+				// RP-ACK/RP-ERROR. Starting this asynchronously also ensures the
+				// WireSIPFlow can write the SIP response and release its lock
+				// before the report starts another client transaction.
+				result.ContentType = ""
+				result.Body = nil
+				go m.sendInboundDeliveryReport(handler, report)
+			}
+			return result, err
+		}),
+		ContactURI: binding.ContactURI,
+		UserAgent:  firstRuntimeNonEmpty(m.config.UserAgent, m.profile.UserAgent, "vowifi-go"),
 	}
 	if err := m.flow.SetIncomingRequestHandler(server.HandleRequestWire); err != nil {
 		return err
@@ -602,6 +615,118 @@ func (m *imsRegistrationMaintenance) BindInbound(handler voicehost.IMSMessageHan
 		_ = m.flow.ServeIncomingRequests(ctx)
 	}()
 	return nil
+}
+
+type imsInboundDeliveryReportRequest struct {
+	gatewayURI  string
+	inReplyTo   string
+	contentType string
+	body        []byte
+}
+
+func imsInboundDeliveryReport(req voicehost.IMSMessageRequest, result voicehost.IMSMessageResult) (imsInboundDeliveryReportRequest, bool) {
+	if result.StatusCode < 200 || result.StatusCode >= 300 || len(result.Body) == 0 {
+		return imsInboundDeliveryReportRequest{}, false
+	}
+	contentType := strings.TrimSpace(result.ContentType)
+	if contentType == "" {
+		return imsInboundDeliveryReportRequest{}, false
+	}
+	gatewayURI := runtimeSIPHeaderURI(runtimeSIPHeaderValue(req.Headers, "P-Asserted-Identity"))
+	if gatewayURI == "" {
+		gatewayURI = strings.TrimSpace(req.FromURI)
+	}
+	return imsInboundDeliveryReportRequest{
+		gatewayURI:  gatewayURI,
+		inReplyTo:   strings.TrimSpace(req.CallID),
+		contentType: contentType,
+		body:        append([]byte(nil), result.Body...),
+	}, true
+}
+
+func (m *imsRegistrationMaintenance) sendInboundDeliveryReport(handler voicehost.IMSMessageHandler, report imsInboundDeliveryReportRequest) {
+	result := voicehost.IMSMessageDeliveryReportResult{
+		InReplyTo: report.inReplyTo,
+		Time:      time.Now(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := m.roundTripInboundDeliveryReport(ctx, report)
+	result.StatusCode = resp.StatusCode
+	result.Reason = strings.TrimSpace(resp.Reason)
+	if err != nil {
+		result.Error = err.Error()
+	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		result.Error = fmt.Sprintf("IMS SMS delivery report rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
+	}
+	if observer, ok := handler.(voicehost.IMSMessageDeliveryReportObserver); ok {
+		observer.HandleIMSMessageDeliveryReportResult(context.Background(), result)
+	}
+}
+
+func (m *imsRegistrationMaintenance) roundTripInboundDeliveryReport(ctx context.Context, report imsInboundDeliveryReportRequest) (voiceclient.SIPResponse, error) {
+	if m == nil || m.flow == nil {
+		return voiceclient.SIPResponse{}, errors.New("IMS inbound delivery report flow unavailable")
+	}
+	if strings.TrimSpace(report.gatewayURI) == "" {
+		return voiceclient.SIPResponse{}, errors.New("IMS inbound delivery report gateway URI is empty")
+	}
+	m.mu.Lock()
+	binding := m.binding
+	m.mu.Unlock()
+	callIDBase := strings.TrimSpace(report.inReplyTo)
+	if callIDBase == "" {
+		callIDBase = "ims-sms"
+	}
+	msg, err := voiceclient.BuildMessageRequest(voiceclient.DialogRequestConfig{
+		Profile:         m.profile,
+		Registration:    binding,
+		ContactURI:      binding.ContactURI,
+		LocalURI:        firstRuntimeNonEmpty(binding.PublicIdentity, m.profile.IMPU),
+		RemoteURI:       report.gatewayURI,
+		RemoteTargetURI: report.gatewayURI,
+		CallID:          fmt.Sprintf("%s-rp-%d", callIDBase, time.Now().UnixNano()),
+		LocalTag:        "sms-rp",
+		CSeq:            1,
+		UserAgent:       firstRuntimeNonEmpty(m.config.UserAgent, m.profile.UserAgent, "vowifi-go"),
+	}, report.contentType, report.body)
+	if err != nil {
+		return voiceclient.SIPResponse{}, err
+	}
+	msg.Headers["In-Reply-To"] = report.inReplyTo
+	msg.Headers["Content-Transfer-Encoding"] = "binary"
+	return voiceclient.RoundTripRequestWithDigestAuth(ctx, m.flow, msg)
+}
+
+func runtimeSIPHeaderValue(headers map[string][]string, name string) string {
+	for key, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), strings.TrimSpace(name)) {
+			continue
+		}
+		for _, value := range values {
+			if strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+	return ""
+}
+
+func runtimeSIPHeaderURI(value string) string {
+	value = strings.TrimSpace(value)
+	if start := strings.IndexByte(value, '<'); start >= 0 {
+		if end := strings.IndexByte(value[start+1:], '>'); end >= 0 {
+			return strings.TrimSpace(value[start+1 : start+1+end])
+		}
+	}
+	if comma := strings.IndexByte(value, ','); comma >= 0 {
+		value = value[:comma]
+	}
+	if semi := strings.IndexByte(value, ';'); semi >= 0 {
+		value = value[:semi]
+	}
+	return strings.Trim(strings.TrimSpace(value), "<>")
 }
 
 func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voiceclient.RegisterSession, result voiceclient.RegisterResult, config WireIMSRegistrar, runtimeConfig IMSRegistrationConfig, profile voiceclient.IMSProfile, registeredAt time.Time) *imsRegistrationMaintenance {

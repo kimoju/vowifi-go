@@ -1890,6 +1890,30 @@ func (i *Instance) HandleIMSMessage(ctx context.Context, req voicehost.IMSMessag
 	}, err
 }
 
+func (i *Instance) HandleIMSMessageDeliveryReportResult(ctx context.Context, result voicehost.IMSMessageDeliveryReportResult) {
+	if i == nil {
+		return
+	}
+	i.mu.RLock()
+	dispatcher := i.dispatch
+	deviceID := i.state.DeviceID
+	i.mu.RUnlock()
+	if dispatcher == nil {
+		return
+	}
+	if ctx == nil || ctx.Err() != nil {
+		ctx = context.Background()
+	}
+	dispatcher.Dispatch(ctx, eventhost.SMSDeliveryReportSent{
+		DevID:      deviceID,
+		InReplyTo:  strings.TrimSpace(result.InReplyTo),
+		StatusCode: result.StatusCode,
+		Reason:     strings.TrimSpace(result.Reason),
+		Error:      strings.TrimSpace(result.Error),
+		Time:       result.Time,
+	})
+}
+
 func (i *Instance) HandleIMSInfo(ctx context.Context, req voicehost.IMSInfoRequest) (voicehost.IMSInfoResult, error) {
 	svc := i.Service()
 	if svc == nil {
@@ -2119,6 +2143,7 @@ type EventDispatcher = eventhost.Dispatcher
 type ModuleEvent = eventhost.Event
 type EventSMSReceived = eventhost.SMSReceived
 type EventSMSSent = eventhost.SMSSent
+type EventSMSDeliveryReportSent = eventhost.SMSDeliveryReportSent
 type EventUSSDUpdated = eventhost.USSDUpdated
 type EventLocalNumberLearned = eventhost.LocalNumberLearned
 type EventLogNotify = eventhost.LogNotify

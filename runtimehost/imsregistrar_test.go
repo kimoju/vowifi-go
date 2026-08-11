@@ -20,6 +20,7 @@ import (
 	"github.com/kimoju/vowifi-go/runtimehost/identity"
 	"github.com/kimoju/vowifi-go/runtimehost/messaging"
 	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
+	"github.com/kimoju/vowifi-go/runtimehost/voicehost"
 )
 
 func TestWireIMSRegistrarUsesPreparedIdentity(t *testing.T) {
@@ -949,6 +950,149 @@ func TestWireIMSRegistrarDefaultFlowReusesRegisterSocketForSMS(t *testing.T) {
 	}
 }
 
+func TestWireIMSRegistrarSendsInboundRPAckAsSeparateMessage(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	clientAddr := make(chan net.Addr, 1)
+	registerErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			registerErr <- err
+			return
+		}
+		if !strings.HasPrefix(string(buf[:n]), "REGISTER ") {
+			registerErr <- errors.New("first datagram is not REGISTER")
+			return
+		}
+		response := "SIP/2.0 200 OK\r\n" +
+			"P-Associated-URI: <sip:user@ims.example>\r\n" +
+			"Service-Route: <sip:pcscf.ims.example;lr>\r\n" +
+			"Contact: <sip:user@192.0.2.10:5060>;expires=600\r\n" +
+			"Content-Length: 0\r\n\r\n"
+		_, err = pc.WriteTo([]byte(response), addr)
+		if err == nil {
+			clientAddr <- addr
+		}
+		registerErr <- err
+	}()
+
+	res, err := WireIMSRegistrar{
+		ServerAddr:       pc.LocalAddr().String(),
+		ContactHost:      "192.0.2.10",
+		ContactPort:      5060,
+		Timeout:          time.Second,
+		MaxRetransmits:   1,
+		DisableRefresh:   true,
+		DisableKeepalive: true,
+	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
+		DeviceID: "dev-rp-ack",
+		TraceID:  "trace-rp-ack",
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+	})
+	if err != nil {
+		t.Fatalf("RegisterIMS() error = %v", err)
+	}
+	flow, ok := res.VoiceTransport.(*voiceclient.WireSIPFlow)
+	if !ok {
+		t.Fatalf("VoiceTransport=%T, want *WireSIPFlow", res.VoiceTransport)
+	}
+	defer flow.Close()
+	if err := <-registerErr; err != nil {
+		t.Fatalf("REGISTER server error = %v", err)
+	}
+	handler := &runtimeInboundAckHandler{reports: make(chan voicehost.IMSMessageDeliveryReportResult, 1)}
+	if err := res.BindInbound(handler); err != nil {
+		t.Fatalf("BindInbound() error = %v", err)
+	}
+
+	addr := <-clientAddr
+	inboundBody := []byte{0x01, 0x33, 0x00, 0x00, 0x00}
+	inbound := "MESSAGE sip:user@ims.example SIP/2.0\r\n" +
+		"Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-rp-data\r\n" +
+		"From: <sip:fallback-gateway@ims.example>;tag=network\r\n" +
+		"To: <sip:user@ims.example>\r\n" +
+		"P-Asserted-Identity: <sip:ip-sm-gw@ims.example>\r\n" +
+		"Call-ID: inbound-rp-data-1\r\n" +
+		"CSeq: 7 MESSAGE\r\n" +
+		"Content-Type: application/vnd.3gpp.sms\r\n" +
+		"Content-Length: " + strconv.Itoa(len(inboundBody)) + "\r\n\r\n" + string(inboundBody)
+	if _, err := pc.WriteTo([]byte(inbound), addr); err != nil {
+		t.Fatalf("write inbound MESSAGE error = %v", err)
+	}
+
+	buf := make([]byte, 65535)
+	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, responseAddr, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("read inbound SIP response error = %v", err)
+	}
+	if responseAddr.String() != addr.String() {
+		t.Fatalf("response source=%s, want registration source=%s", responseAddr, addr)
+	}
+	response, err := voiceclient.ParseSIPResponse(buf[:n])
+	if err != nil {
+		t.Fatalf("ParseSIPResponse() error = %v wire=%q", err, buf[:n])
+	}
+	if response.StatusCode != 200 || len(response.Body) != 0 || len(response.Headers["Content-Type"]) != 0 {
+		t.Fatalf("inbound response=%+v body=%x, want empty SIP 200", response, response.Body)
+	}
+
+	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, reportAddr, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("read RP-ACK MESSAGE error = %v", err)
+	}
+	if reportAddr.String() != addr.String() {
+		t.Fatalf("report source=%s, want registration source=%s", reportAddr, addr)
+	}
+	reportRequest, err := voiceclient.ParseSIPRequest(buf[:n])
+	if err != nil {
+		t.Fatalf("ParseSIPRequest() error = %v wire=%q", err, buf[:n])
+	}
+	if reportRequest.Method != "MESSAGE" || reportRequest.URI != "sip:ip-sm-gw@ims.example" ||
+		firstRuntimeTestHeader(reportRequest.Headers, "In-Reply-To") != "inbound-rp-data-1" ||
+		firstRuntimeTestHeader(reportRequest.Headers, "Content-Type") != "application/vnd.3gpp.sms" ||
+		firstRuntimeTestHeader(reportRequest.Headers, "Content-Transfer-Encoding") != "binary" ||
+		string(reportRequest.Body) != string([]byte{0x02, 0x33}) {
+		t.Fatalf("RP-ACK request=%+v body=%x", reportRequest, reportRequest.Body)
+	}
+	if _, err := pc.WriteTo([]byte("SIP/2.0 202 Accepted\r\nContent-Length: 0\r\n\r\n"), addr); err != nil {
+		t.Fatalf("write RP-ACK response error = %v", err)
+	}
+	select {
+	case report := <-handler.reports:
+		if report.InReplyTo != "inbound-rp-data-1" || report.StatusCode != 202 || report.Error != "" {
+			t.Fatalf("delivery report result=%+v", report)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RP-ACK result")
+	}
+}
+
+func TestIMSInboundDeliveryReportUsesFromFallback(t *testing.T) {
+	report, ok := imsInboundDeliveryReport(voicehost.IMSMessageRequest{
+		FromURI: "sip:fallback@ims.example",
+		CallID:  "fallback-call",
+	}, voicehost.IMSMessageResult{
+		StatusCode:  200,
+		ContentType: "application/vnd.3gpp.sms",
+		Body:        []byte{0x02, 0x21},
+	})
+	if !ok || report.gatewayURI != "sip:fallback@ims.example" || report.inReplyTo != "fallback-call" {
+		t.Fatalf("report=%+v ok=%v", report, ok)
+	}
+	if _, ok := imsInboundDeliveryReport(voicehost.IMSMessageRequest{}, voicehost.IMSMessageResult{StatusCode: 500, Body: []byte{1}, ContentType: "application/vnd.3gpp.sms"}); ok {
+		t.Fatal("non-2xx handler result unexpectedly generated delivery report")
+	}
+}
+
 func TestWireIMSRegistrarRecoverReturnsUpdatedBinding(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -1863,6 +2007,32 @@ func TestWireIMSRegistrarFormatsIPv6ContactHost(t *testing.T) {
 type wireIMSRegistrarTransport struct {
 	requests  []voiceclient.RegisterMessage
 	responses []voiceclient.RegisterResponse
+}
+
+type runtimeInboundAckHandler struct {
+	reports chan voicehost.IMSMessageDeliveryReportResult
+}
+
+func (h *runtimeInboundAckHandler) HandleIMSMessage(_ context.Context, _ voicehost.IMSMessageRequest) (voicehost.IMSMessageResult, error) {
+	return voicehost.IMSMessageResult{
+		StatusCode:  200,
+		Reason:      "OK",
+		ContentType: "application/vnd.3gpp.sms",
+		Body:        []byte{0x02, 0x33},
+	}, nil
+}
+
+func (h *runtimeInboundAckHandler) HandleIMSMessageDeliveryReportResult(_ context.Context, result voicehost.IMSMessageDeliveryReportResult) {
+	h.reports <- result
+}
+
+func firstRuntimeTestHeader(headers map[string][]string, name string) string {
+	for key, values := range headers {
+		if strings.EqualFold(key, name) && len(values) > 0 {
+			return strings.TrimSpace(values[0])
+		}
+	}
+	return ""
 }
 
 func (t *wireIMSRegistrarTransport) RoundTripRegister(ctx context.Context, msg voiceclient.RegisterMessage) (voiceclient.RegisterResponse, error) {

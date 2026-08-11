@@ -1,6 +1,9 @@
 package voicehost
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type IMSMessageRequest struct {
 	URI         string
@@ -29,6 +32,23 @@ type IMSMessageHandlerFunc func(context.Context, IMSMessageRequest) (IMSMessageR
 
 func (f IMSMessageHandlerFunc) HandleIMSMessage(ctx context.Context, req IMSMessageRequest) (IMSMessageResult, error) {
 	return f(ctx, req)
+}
+
+// IMSMessageDeliveryReportResult describes the separate SIP MESSAGE used to
+// acknowledge an RP-DATA received over IMS. It is deliberately distinct from
+// the immediate SIP response to the inbound MESSAGE transaction.
+type IMSMessageDeliveryReportResult struct {
+	InReplyTo  string
+	StatusCode int
+	Reason     string
+	Error      string
+	Time       time.Time
+}
+
+// IMSMessageDeliveryReportObserver receives the network result of an
+// automatically generated RP-ACK or RP-ERROR MESSAGE.
+type IMSMessageDeliveryReportObserver interface {
+	HandleIMSMessageDeliveryReportResult(context.Context, IMSMessageDeliveryReportResult)
 }
 
 type IMSInfoRequest struct {

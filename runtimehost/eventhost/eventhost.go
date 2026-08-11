@@ -45,6 +45,17 @@ type SMSSent struct {
 	TotalParts int
 }
 
+// SMSDeliveryReportSent reports the SIP result of the RP acknowledgement sent
+// for an inbound IMS SMS. It contains no message body or subscriber address.
+type SMSDeliveryReportSent struct {
+	DevID      string
+	InReplyTo  string
+	StatusCode int
+	Reason     string
+	Error      string
+	Time       time.Time
+}
+
 type USSDUpdated struct {
 	DevID     string
 	SessionID string
