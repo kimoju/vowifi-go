@@ -1006,7 +1006,7 @@ func TestHandleIMSMessagePreservesUDHPortMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleIMSMessage() error = %v", err)
 	}
-	if result.Incoming == nil || result.Incoming.Content != "hi" || string(result.ReplyBody) != string(BuildSMSRPAck(0x38)) {
+	if result.Incoming == nil || result.Incoming.Content != "[Binary SMS]\nraw=6869" || string(result.ReplyBody) != string(BuildSMSRPAck(0x38)) {
 		t.Fatalf("result=%+v", result)
 	}
 	header := result.Incoming.UserDataHeaderInfo

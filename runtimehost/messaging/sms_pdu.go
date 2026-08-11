@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -1386,7 +1387,10 @@ func decodeSMSUserDataWithHeader(data []byte, udl int, dcs byte, hasUDH bool) (s
 		if err != nil {
 			return "", SMSUserDataHeaderInfo{}, err
 		}
-		return strings.ToValidUTF8(string(payload[:payloadOctets]), ""), headerInfo, nil
+		// TP-DCS 8-bit 表示任意二进制用户数据，不是 UTF-8 文本。直接转成
+		// string 会把运营商控制短信显示成控制字符，并可能在 ToValidUTF8 时
+		// 丢失原始字节。保留完整十六进制载荷，交由上层按二进制短信处理。
+		return formatSMS8BitUserData(payload[:payloadOctets]), headerInfo, nil
 	default:
 		septets := udl
 		if hasUDH {
@@ -1408,6 +1412,10 @@ func decodeSMSUserDataWithHeader(data []byte, udl int, dcs byte, hasUDH bool) (s
 		}
 		return decodeGSM7WithLanguage(unpackSeptets(payload, septets, fillBits), headerInfo.LockingShiftLang, headerInfo.SingleShiftLang), headerInfo, nil
 	}
+}
+
+func formatSMS8BitUserData(payload []byte) string {
+	return "[Binary SMS]\nraw=" + hex.EncodeToString(payload)
 }
 
 func smsOctetUserDataLength(udl int, udh []byte, payload []byte) (int, error) {

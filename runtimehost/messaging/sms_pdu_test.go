@@ -784,7 +784,7 @@ func TestParseSMSDeliverTPDUWith16BitPortUDH(t *testing.T) {
 		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
 	}
 	header := deliver.UserDataHeaderInfo
-	if deliver.Text != "hi" || !deliver.UserDataHeader || deliver.UserDataLength != 9 {
+	if deliver.Text != "[Binary SMS]\nraw=6869" || !deliver.UserDataHeader || deliver.UserDataLength != 9 {
 		t.Fatalf("deliver=%+v", deliver)
 	}
 	if !header.HasPorts || header.PortBits != 16 || header.DestinationPort != 2948 || header.SourcePort != 9200 {
@@ -802,7 +802,7 @@ func TestParseSMSDeliverTPDUWith8BitPortAndUnknownUDH(t *testing.T) {
 		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
 	}
 	header := deliver.UserDataHeaderInfo
-	if deliver.Text != "ok" {
+	if deliver.Text != "[Binary SMS]\nraw=6f6b" {
 		t.Fatalf("deliver=%+v", deliver)
 	}
 	if !header.HasPorts || header.PortBits != 8 || header.DestinationPort != 0x7f || header.SourcePort != 0 {
@@ -810,6 +810,23 @@ func TestParseSMSDeliverTPDUWith8BitPortAndUnknownUDH(t *testing.T) {
 	}
 	if len(header.Elements) != 2 || header.Elements[0].Identifier != 0x04 || header.Elements[1].Identifier != 0x99 {
 		t.Fatalf("UDH elements=%+v", header.Elements)
+	}
+}
+
+func TestParseSMSDeliverTPDUFormats8BitPayloadAsBinary(t *testing.T) {
+	tpdu := mustHex(t, "0004819293000462705021436500060120150E00FF")
+	deliver, err := ParseSMSDeliverTPDU(tpdu)
+	if err != nil {
+		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)
+	}
+	if deliver.Sender != "2939" {
+		t.Fatalf("sender=%q want 2939", deliver.Sender)
+	}
+	if deliver.DataCoding.Alphabet != "8bit" || deliver.DataCodingScheme != 0x04 {
+		t.Fatalf("data coding=%+v dcs=0x%02x", deliver.DataCoding, deliver.DataCodingScheme)
+	}
+	if deliver.Text != "[Binary SMS]\nraw=0120150e00ff" {
+		t.Fatalf("text=%q", deliver.Text)
 	}
 }
 
