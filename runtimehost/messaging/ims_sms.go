@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
+	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
 
 type IMSSMSTransport struct {

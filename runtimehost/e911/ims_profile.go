@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
+	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
 
 var ErrEmergencyRegistrationInvalid = errors.New("invalid emergency registration")

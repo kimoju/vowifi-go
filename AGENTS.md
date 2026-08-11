@@ -82,7 +82,7 @@ VOHIVE_DIR=/path/to/vohive GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt
 ```
 
 The compatibility script uses a temporary VoHive copy, rewrites legacy
-`vowifi-go` module references to `github.com/boa-z/vowifi-go`, verifies the
+`vowifi-go` module references to `github.com/kimoju/vowifi-go`, verifies the
 rewrite and temporary `replace`, then runs the focused package checks. The
 VoHive checkout should remain clean unless the user explicitly requested a
 change there.

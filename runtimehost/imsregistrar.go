@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/boa-z/vowifi-go/runtimehost/carrier"
-	"github.com/boa-z/vowifi-go/runtimehost/identity"
-	"github.com/boa-z/vowifi-go/runtimehost/messaging"
-	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
+	"github.com/kimoju/vowifi-go/runtimehost/carrier"
+	"github.com/kimoju/vowifi-go/runtimehost/identity"
+	"github.com/kimoju/vowifi-go/runtimehost/messaging"
+	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
 
 type IMSRegisterTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, string, string) voiceclient.SIPRegisterTransport

@@ -154,7 +154,7 @@ if [[ ! -d "$VOHIVE_DIR" ]]; then
 fi
 
 GO_BIN="$(find_go)"
-VOWIFI_MODULE="${VOWIFI_MODULE:-github.com/boa-z/vowifi-go}"
+VOWIFI_MODULE="${VOWIFI_MODULE:-github.com/kimoju/vowifi-go}"
 legacy_base="${VOWIFI_COMPAT_LEGACY_BASE:-github.com/iniwex5}"
 legacy_base="${legacy_base%/}"
 LEGACY_MODULE="${legacy_base}/vowifi-go"

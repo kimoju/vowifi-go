@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/boa-z/vowifi-go/engine/swu/esp"
-	"github.com/boa-z/vowifi-go/engine/swu/ikev2"
+	"github.com/kimoju/vowifi-go/engine/swu/esp"
+	"github.com/kimoju/vowifi-go/engine/swu/ikev2"
 )
 
 func TestPacketSessionSendsAndReceivesIPv4AndIPv6(t *testing.T) {

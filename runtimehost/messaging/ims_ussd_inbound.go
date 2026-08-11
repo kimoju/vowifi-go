@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
+	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
 
 type IMSUSSDDialogRequest struct {

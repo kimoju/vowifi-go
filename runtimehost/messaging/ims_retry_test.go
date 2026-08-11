@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
+	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
 
 type imsRetryTimeoutError struct{}

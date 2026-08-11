@@ -46,7 +46,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
 fi
 
 GO_BIN="$(find_go)"
-VOWIFI_MODULE="${VOWIFI_MODULE:-github.com/boa-z/vowifi-go}"
+VOWIFI_MODULE="${VOWIFI_MODULE:-github.com/kimoju/vowifi-go}"
 legacy_base="${VOWIFI_COMPAT_SELFTEST_LEGACY_BASE:-example.invalid/legacy}"
 legacy_base="${legacy_base%/}"
 legacy_module="${legacy_base}/vowifi-go"

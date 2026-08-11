@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/boa-z/vowifi-go/runtimehost/e911"
-	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
+	"github.com/kimoju/vowifi-go/runtimehost/e911"
+	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
 
 func TestIMSOutboundAgentInviteAckAndBye(t *testing.T) {

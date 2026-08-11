@@ -1,4 +1,4 @@
-module github.com/boa-z/vowifi-go
+module github.com/kimoju/vowifi-go
 
 go 1.26.3
 

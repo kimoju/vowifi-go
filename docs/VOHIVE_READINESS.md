@@ -13,7 +13,7 @@ inside VoHive.
 
 "Usable in VoHive" means all of the following are true:
 
-- An older VoHive checkout can resolve `github.com/boa-z/vowifi-go`, build the
+- An older VoHive checkout can resolve `github.com/kimoju/vowifi-go`, build the
   relevant runtime packages, and run the compatibility test matrix without a
   committed local `replace`.
 - A controlled device trial completes modem/SIM identity, AKA, SWu/ePDG tunnel

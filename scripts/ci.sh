@@ -53,7 +53,7 @@ module_path_check() {
 	local module_files=()
 	local legacy_refs=()
 
-	expected="github.com/boa-z/vowifi-go"
+	expected="github.com/kimoju/vowifi-go"
 	legacy_base="${CI_LEGACY_MODULE_BASE:-github.com/iniwex5}"
 	legacy_module="${CI_LEGACY_MODULE:-${legacy_base%/}/vowifi-go}"
 
