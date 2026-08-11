@@ -52,7 +52,7 @@ func TestWireIMSRegistrarUsesPreparedIdentity(t *testing.T) {
 	}.RegisterIMS(context.Background(), IMSRegistrationConfig{
 		DeviceID: "dev-1",
 		TraceID:  "trace-1",
-		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Profile:  identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280", SMSC: "+12063130004"},
 		Prepared: &identity.PreparedSession{
 			IMSIdentity: identity.IMSIdentityResolution{
 				IMPI:   "impi@private.example",
@@ -92,6 +92,10 @@ func TestWireIMSRegistrarUsesPreparedIdentity(t *testing.T) {
 	}
 	if len(voiceTransport.requests) != 1 || voiceTransport.requests[0].Method != "MESSAGE" || voiceTransport.requests[0].Headers["Route"] != "<sip:pcscf.ims.example;lr>" {
 		t.Fatalf("SMS request=%+v", voiceTransport.requests)
+	}
+	rpdu, err := messaging.ParseSMSRPDU(voiceTransport.requests[0].Body)
+	if err != nil || rpdu.Destination != "+12063130004" {
+		t.Fatalf("SMS RP-DATA destination=%q err=%v body=%x", rpdu.Destination, err, voiceTransport.requests[0].Body)
 	}
 	ussdResult, err := res.USSDTransport.ExecuteUSSD(context.Background(), messaging.USSDRequest{SessionID: "ussd-1", Command: "*100#"})
 	if err != nil {

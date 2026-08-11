@@ -11,6 +11,101 @@ import (
 	"time"
 )
 
+func TestWireSIPFlowServesUnsolicitedUDPRequest(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	responseWire := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			responseWire <- "initial read error: " + err.Error()
+			return
+		}
+		initial, err := ParseSIPRequest(buf[:n])
+		if err != nil {
+			responseWire <- "initial parse error: " + err.Error()
+			return
+		}
+		ok, err := BuildSIPResponseWire(initial, 200, "OK", nil, nil)
+		if err != nil {
+			responseWire <- "initial response error: " + err.Error()
+			return
+		}
+		_, _ = pc.WriteTo(ok, addr)
+		request := "MESSAGE sip:user@example SIP/2.0\r\n" +
+			"Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK-inbound\r\n" +
+			"To: <sip:user@example>\r\n" +
+			"From: <sip:smsc@example>;tag=smsc\r\n" +
+			"Call-ID: inbound-sms\r\n" +
+			"CSeq: 1 MESSAGE\r\n" +
+			"Max-Forwards: 70\r\n" +
+			"Content-Type: text/plain\r\n" +
+			"Content-Length: 5\r\n\r\nhello"
+		_, _ = pc.WriteTo([]byte(request), addr)
+		_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err = pc.ReadFrom(buf)
+		if err != nil {
+			responseWire <- "inbound response read error: " + err.Error()
+			return
+		}
+		responseWire <- string(append([]byte(nil), buf[:n]...))
+	}()
+
+	flow := &WireSIPFlow{Network: "udp", ServerAddr: pc.LocalAddr().String(), Timeout: time.Second}
+	defer flow.Close()
+	_, err = flow.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "OPTIONS",
+		URI:    "sip:example",
+		Headers: map[string]string{
+			"To":      "<sip:example>",
+			"From":    "<sip:user@example>;tag=local",
+			"Call-ID": "flow-setup",
+			"CSeq":    "1 OPTIONS",
+		},
+	})
+	if err != nil {
+		t.Fatalf("RoundTripRequest() error = %v", err)
+	}
+	handled := make(chan SIPIncomingRequest, 1)
+	if err := flow.SetIncomingRequestHandler(func(_ context.Context, req SIPIncomingRequest) ([][]byte, error) {
+		handled <- req
+		wire, err := BuildSIPResponseWire(req, 200, "OK", nil, nil)
+		return [][]byte{wire}, err
+	}); err != nil {
+		t.Fatalf("SetIncomingRequestHandler() error = %v", err)
+	}
+	serveCtx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- flow.ServeIncomingRequests(serveCtx) }()
+
+	select {
+	case req := <-handled:
+		if req.Method != "MESSAGE" || string(req.Body) != "hello" {
+			t.Fatalf("inbound request=%+v body=%q", req, req.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for inbound MESSAGE")
+	}
+	if wire := <-responseWire; !strings.HasPrefix(wire, "SIP/2.0 200 OK\r\n") || !strings.Contains(wire, "Call-ID: inbound-sms\r\n") {
+		t.Fatalf("inbound response=%q", wire)
+	}
+	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("ServeIncomingRequests() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeIncomingRequests() did not stop")
+	}
+}
+
 func TestWireSIPFlowReusesUDPFlowForRegisterAndDialog(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

@@ -468,7 +468,8 @@ func TestBuildRegisterHeaders(t *testing.T) {
 		t.Fatalf("IMS access/visited headers=%+v", headers)
 	}
 	if !strings.Contains(headers["Contact"], `+sip.instance="<urn:gsma:imei:35693803-564380-9>"`) ||
-		!strings.Contains(headers["Contact"], imsMMTelContactFeature) {
+		!strings.Contains(headers["Contact"], imsMMTelContactFeature) ||
+		!strings.Contains(headers["Contact"], ";"+imsSMSIPContactFeature) {
 		t.Fatalf("Contact=%q", headers["Contact"])
 	}
 	if headers["Require"] != "sec-agree" || headers["Proxy-Require"] != "sec-agree" {

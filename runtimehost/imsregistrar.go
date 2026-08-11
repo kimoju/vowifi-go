@@ -15,6 +15,7 @@ import (
 	"github.com/kimoju/vowifi-go/runtimehost/identity"
 	"github.com/kimoju/vowifi-go/runtimehost/messaging"
 	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
+	"github.com/kimoju/vowifi-go/runtimehost/voicehost"
 )
 
 type IMSRegisterTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, string, string) voiceclient.SIPRegisterTransport
@@ -200,9 +201,11 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 	maintenance := newIMSRegistrationMaintenance(defaultFlow, registerSession, result, r, cfg, profile, registeredAt)
 	var closeRegistration func(context.Context) error
 	var recoverRegistration func(context.Context) (IMSRegistrationResult, error)
+	var bindInbound func(voicehost.IMSMessageHandler) error
 	if maintenance != nil {
 		closeRegistration = maintenance.Close
 		recoverRegistration = maintenance.Recover
+		bindInbound = maintenance.BindInbound
 	}
 	return IMSRegistrationResult{
 		Registered:     result.Registered,
@@ -218,6 +221,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		VoiceTransport: voiceTransport,
 		SMSTransport:   smsTransport,
 		USSDTransport:  ussdTransport,
+		BindInbound:    bindInbound,
 		Close:          closeRegistration,
 		Recover:        recoverRegistration,
 	}, nil
@@ -554,7 +558,50 @@ type imsRegistrationMaintenance struct {
 	cancel         context.CancelFunc
 	done           chan struct{}
 	wg             sync.WaitGroup
+	inboundCancel  context.CancelFunc
+	inboundDone    chan struct{}
 	closed         bool
+}
+
+func (m *imsRegistrationMaintenance) BindInbound(handler voicehost.IMSMessageHandler) error {
+	if m == nil || m.flow == nil {
+		return errors.New("IMS inbound flow unavailable")
+	}
+	if handler == nil {
+		return errors.New("IMS inbound message handler unavailable")
+	}
+	m.mu.Lock()
+	binding := m.binding
+	closed := m.closed
+	m.mu.Unlock()
+	if closed {
+		return errors.New("IMS registration maintenance closed")
+	}
+	server := &voicehost.IMSInboundWireServer{
+		MessageHandler: handler,
+		ContactURI:     binding.ContactURI,
+		UserAgent:      firstRuntimeNonEmpty(m.config.UserAgent, m.profile.UserAgent, "vowifi-go"),
+	}
+	if err := m.flow.SetIncomingRequestHandler(server.HandleRequestWire); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return errors.New("IMS registration maintenance closed")
+	}
+	if m.inboundCancel != nil {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	m.inboundCancel = cancel
+	m.inboundDone = done
+	go func() {
+		defer close(done)
+		_ = m.flow.ServeIncomingRequests(ctx)
+	}()
+	return nil
 }
 
 func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voiceclient.RegisterSession, result voiceclient.RegisterResult, config WireIMSRegistrar, runtimeConfig IMSRegistrationConfig, profile voiceclient.IMSProfile, registeredAt time.Time) *imsRegistrationMaintenance {
@@ -654,6 +701,7 @@ func (m *imsRegistrationMaintenance) result(defaultReason string) IMSRegistratio
 		VoiceTransport: voiceTransport,
 		SMSTransport:   smsTransport,
 		USSDTransport:  ussdTransport,
+		BindInbound:    m.BindInbound,
 		Close:          m.Close,
 		Recover:        m.Recover,
 	}
@@ -674,6 +722,8 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 	m.closed = true
 	cancel := m.cancel
 	done := m.done
+	inboundCancel := m.inboundCancel
+	inboundDone := m.inboundDone
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -681,6 +731,16 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 	if done != nil {
 		select {
 		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if inboundCancel != nil {
+		inboundCancel()
+	}
+	if inboundDone != nil {
+		select {
+		case <-inboundDone:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -1117,6 +1177,7 @@ func (r WireIMSRegistrar) smsTransport(cfg IMSRegistrationConfig, profile voicec
 		Profile:      profile,
 		Registration: binding,
 		Domain:       profile.Domain,
+		SMSC:         strings.TrimSpace(cfg.Profile.SMSC),
 		UserAgent:    firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
 	}
 }

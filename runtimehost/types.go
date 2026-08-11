@@ -526,6 +526,7 @@ type IMSRegistrationResult struct {
 	VoiceTransport voiceclient.SIPRequestTransport
 	SMSTransport   messaging.SMSTransport
 	USSDTransport  messaging.USSDTransport
+	BindInbound    func(voicehost.IMSMessageHandler) error
 	Close          func(context.Context) error
 	Recover        func(context.Context) (IMSRegistrationResult, error)
 }
@@ -746,6 +747,14 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	}
 	svc.SetSMSTransport(inst.wrapSMSTransport(smsTransport))
 	svc.SetUSSDTransport(inst.wrapUSSDTransport(ussdTransport))
+	if imsResult.BindInbound != nil {
+		if err := imsResult.BindInbound(inst); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = inst.Stop(cleanupCtx)
+			cancel()
+			return nil, fmt.Errorf("IMS inbound listener failed: %w", err)
+		}
+	}
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}

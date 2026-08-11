@@ -210,6 +210,13 @@ type DeliveryStore interface {
 	GetSMSDeliveryStatus(messageID string) (*DeliveryStatus, error)
 }
 
+// DeliverySIPResultStore optionally records the immediate SIP response for an
+// outbound SMS part without breaking DeliveryStore implementations built
+// against earlier vowifi-go versions.
+type DeliverySIPResultStore interface {
+	UpsertSMSDeliveryPartResult(messageID string, partNo int, callID string, rpMR int, state string, sipCode int, errorText string, sentAt time.Time) error
+}
+
 type IMSMessagingRetryStore interface {
 	UpsertIMSMessagingRetry(IMSMessagingRetryEnvelope) error
 	DeleteIMSMessagingRetry(operation IMSMessagingRetryOperation, key string) error
@@ -404,7 +411,7 @@ func (s *Service) replayIMSSMSSubmitRetry(ctx context.Context, envelope IMSMessa
 	}
 	result.SMSResult = res
 	if s != nil && s.store != nil && strings.TrimSpace(req.MessageID) != "" {
-		_ = s.store.UpsertSMSDeliveryPart(req.MessageID, req.Part.PartNo, res.CallID, res.RPMR, res.State, now)
+		s.upsertSMSDeliveryPart(req.MessageID, req.Part.PartNo, res, now)
 		_ = s.store.RecomputeSMSDelivery(req.MessageID, now)
 	}
 	next := NewIMSSMSSubmitRetryEnvelope(req, res, err, IMSMessagingRetryOptions{
@@ -522,7 +529,7 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 			}
 		}
 		if s != nil && s.store != nil {
-			_ = s.store.UpsertSMSDeliveryPart(id, part.PartNo, res.CallID, res.RPMR, res.State, partNow)
+			s.upsertSMSDeliveryPart(id, part.PartNo, res, partNow)
 		}
 		if res.State == "sent" || res.State == "delivered" || res.State == "accepted" {
 			acks++
@@ -551,6 +558,17 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 		return out, errors.New(firstNonEmpty(lastErr, "sms send failed"))
 	}
 	return out, nil
+}
+
+func (s *Service) upsertSMSDeliveryPart(messageID string, partNo int, res SMSSendResult, sentAt time.Time) {
+	if s == nil || s.store == nil {
+		return
+	}
+	if extended, ok := s.store.(DeliverySIPResultStore); ok {
+		_ = extended.UpsertSMSDeliveryPartResult(messageID, partNo, res.CallID, res.RPMR, res.State, res.SIPCode, res.ErrorText, sentAt)
+		return
+	}
+	_ = s.store.UpsertSMSDeliveryPart(messageID, partNo, res.CallID, res.RPMR, res.State, sentAt)
 }
 
 func (s *Service) SendUSSD(ctx context.Context, command string) (*USSDResult, error) {

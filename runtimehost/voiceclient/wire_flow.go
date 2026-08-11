@@ -20,6 +20,12 @@ type sipFinalResponseTimeoutError struct {
 	Err    error
 }
 
+// SIPIncomingRequestHandler turns an unsolicited SIP request into one or more
+// complete SIP response datagrams. The flow owns the socket and writes the
+// returned datagrams from the same protected endpoint that received the
+// request.
+type SIPIncomingRequestHandler func(context.Context, SIPIncomingRequest) ([][]byte, error)
+
 func (e sipFinalResponseTimeoutError) Error() string {
 	method := strings.ToUpper(strings.TrimSpace(e.Method))
 	if method == "" {
@@ -53,6 +59,7 @@ type WireSIPFlow struct {
 	mu                  sync.Mutex
 	conn                net.Conn
 	securityReceiveConn net.Conn
+	incomingHandler     SIPIncomingRequestHandler
 	reader              *bufio.Reader
 	network             string
 	target              string
@@ -102,6 +109,90 @@ func (f *WireSIPFlow) RoundTripRequest(ctx context.Context, msg SIPRequestMessag
 
 func (f *WireSIPFlow) RoundTripInvite(ctx context.Context, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	return f.roundTrip(ctx, msg, onProvisional, sipDialogTargetFailoverStatus)
+}
+
+// SetIncomingRequestHandler installs the handler used for unsolicited SIP
+// requests received on this flow, including requests that arrive while a
+// client transaction is waiting for its response.
+func (f *WireSIPFlow) SetIncomingRequestHandler(handler SIPIncomingRequestHandler) error {
+	if f == nil {
+		return errors.New("nil SIP flow")
+	}
+	if handler == nil {
+		return errors.New("nil SIP incoming request handler")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return ErrSIPFlowClosed
+	}
+	f.incomingHandler = handler
+	return nil
+}
+
+// ServeIncomingRequests continuously drains unsolicited UDP SIP requests.
+// Round trips and this loop share the flow lock so only one reader can consume
+// a protected socket datagram at a time.
+func (f *WireSIPFlow) ServeIncomingRequests(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if f == nil {
+		return errors.New("nil SIP flow")
+	}
+	buf := make([]byte, 65535)
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		f.mu.Lock()
+		if f.closed {
+			f.mu.Unlock()
+			return nil
+		}
+		handler := f.incomingHandler
+		conn := f.securityReceiveConn
+		if conn == nil {
+			conn = f.conn
+		}
+		if handler == nil || conn == nil || isSIPStreamNetwork(f.network) {
+			f.mu.Unlock()
+			if !waitSIPIncomingPoll(ctx, 50*time.Millisecond) {
+				return nil
+			}
+			continue
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+			f.mu.Unlock()
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		n, err := conn.Read(buf)
+		if err == nil && n > 0 && !isSIPResponseWire(buf[:n]) {
+			err = f.handleIncomingRequestLocked(ctx, conn, buf[:n])
+		}
+		f.mu.Unlock()
+		if err == nil || isSIPTimeout(err) {
+			continue
+		}
+		if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
+func waitSIPIncomingPoll(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) error {
@@ -473,7 +564,7 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 		if err := conn.SetReadDeadline(nextSIPReadDeadline(deadline, readInterval)); err != nil {
 			return SIPResponse{}, err
 		}
-		n, err := f.readUDPDatagramLocked(conn, buf, nextSIPReadDeadline(deadline, readInterval))
+		n, source, err := f.readUDPDatagramLocked(conn, buf, nextSIPReadDeadline(deadline, readInterval))
 		if err != nil {
 			if ctx.Err() != nil {
 				return SIPResponse{}, ctx.Err()
@@ -509,6 +600,9 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 			return SIPResponse{}, err
 		}
 		if !isSIPResponseWire(buf[:n]) {
+			if err := f.handleIncomingRequestLocked(ctx, source, buf[:n]); err != nil {
+				return SIPResponse{}, err
+			}
 			continue
 		}
 		resp, err := ParseSIPResponse(buf[:n])
@@ -539,29 +633,31 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 }
 
 type sipUDPReadResult struct {
-	n   int
-	err error
-	buf []byte
+	n    int
+	err  error
+	buf  []byte
+	conn net.Conn
 }
 
-func (f *WireSIPFlow) readUDPDatagramLocked(primary net.Conn, buf []byte, deadline time.Time) (int, error) {
+func (f *WireSIPFlow) readUDPDatagramLocked(primary net.Conn, buf []byte, deadline time.Time) (int, net.Conn, error) {
 	secondary := f.securityReceiveConn
 	if secondary == nil || secondary == primary {
 		if err := primary.SetReadDeadline(deadline); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
-		return primary.Read(buf)
+		n, err := primary.Read(buf)
+		return n, primary, err
 	}
 	primaryBuf := make([]byte, len(buf))
 	secondaryBuf := make([]byte, len(buf))
 	results := make(chan sipUDPReadResult, 2)
 	read := func(conn net.Conn, target []byte) {
 		if err := conn.SetReadDeadline(deadline); err != nil {
-			results <- sipUDPReadResult{err: err, buf: target}
+			results <- sipUDPReadResult{err: err, buf: target, conn: conn}
 			return
 		}
 		n, err := conn.Read(target)
-		results <- sipUDPReadResult{n: n, err: err, buf: target}
+		results <- sipUDPReadResult{n: n, err: err, buf: target, conn: conn}
 	}
 	go read(primary, primaryBuf)
 	go read(secondary, secondaryBuf)
@@ -571,14 +667,38 @@ func (f *WireSIPFlow) readUDPDatagramLocked(primary net.Conn, buf []byte, deadli
 		_ = secondary.SetReadDeadline(time.Now())
 		<-results
 		copy(buf, first.buf[:first.n])
-		return first.n, nil
+		return first.n, first.conn, nil
 	}
 	second := <-results
 	if second.err == nil {
 		copy(buf, second.buf[:second.n])
-		return second.n, nil
+		return second.n, second.conn, nil
 	}
-	return 0, first.err
+	return 0, nil, first.err
+}
+
+func (f *WireSIPFlow) handleIncomingRequestLocked(ctx context.Context, conn net.Conn, raw []byte) error {
+	if f == nil || f.incomingHandler == nil || conn == nil {
+		return nil
+	}
+	req, err := ParseSIPRequest(raw)
+	if err != nil {
+		return nil
+	}
+	handlerCtx := ctx
+	if handlerCtx == nil || handlerCtx.Err() != nil {
+		handlerCtx = context.Background()
+	}
+	wires, _ := f.incomingHandler(handlerCtx, req)
+	for _, wire := range wires {
+		if len(wire) == 0 {
+			continue
+		}
+		if _, err := conn.Write(wire); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func readFinalSIPFlowResponse(ctx context.Context, reader *bufio.Reader, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {

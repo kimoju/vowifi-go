@@ -148,6 +148,26 @@ func (s *IMSInboundWireServer) HandleRequest(ctx context.Context, req voiceclien
 	return s.handleRequest(ctx, req, nil)
 }
 
+// HandleRequestWire builds complete response datagrams for a request received
+// on a connected IMS flow. It applies the same local To tag and transaction
+// handling as ServePacket without taking ownership of the flow socket.
+func (s *IMSInboundWireServer) HandleRequestWire(ctx context.Context, req voiceclient.SIPIncomingRequest) ([][]byte, error) {
+	responses, handlerErr := s.HandleRequest(ctx, req)
+	taggedReq := taggedWireRequest(req, s.localTag())
+	wires := make([][]byte, 0, len(responses))
+	for _, resp := range responses {
+		if resp.NoResponse {
+			continue
+		}
+		wire, err := voiceclient.BuildSIPResponseWire(taggedReq, resp.StatusCode, resp.Reason, resp.Headers, resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		wires = append(wires, wire)
+	}
+	return wires, handlerErr
+}
+
 func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclient.SIPIncomingRequest, emit imsInboundWireResponseEmitter) ([]IMSInboundWireResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()

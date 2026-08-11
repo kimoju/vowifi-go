@@ -676,6 +676,7 @@ func buildRegisterContactHeaderForInstance(contactURI, instanceID string) string
 	if imsMMTelContactFeature != "" {
 		contact += ";" + imsMMTelContactFeature
 	}
+	contact += ";" + imsSMSIPContactFeature
 	return contact
 }
 
