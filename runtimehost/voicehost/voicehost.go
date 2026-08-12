@@ -265,16 +265,18 @@ type DialogResumeRequest struct {
 }
 
 type Gateway struct {
-	mu       sync.RWMutex
-	agents   map[string]Agent
-	dialogs  map[string]DialogInfo
-	client   ClientAdapter
-	notifier any
-	started  bool
+	mu             sync.RWMutex
+	agents         map[string]Agent
+	dialogs        map[string]DialogInfo
+	inbound        map[string]*gatewayInboundCall
+	inboundEnabled bool
+	client         ClientAdapter
+	notifier       any
+	started        bool
 }
 
 func NewGateway() *Gateway {
-	return &Gateway{agents: make(map[string]Agent), dialogs: make(map[string]DialogInfo)}
+	return &Gateway{agents: make(map[string]Agent), dialogs: make(map[string]DialogInfo), inbound: make(map[string]*gatewayInboundCall)}
 }
 
 func (g *Gateway) Start(ctx context.Context) error {

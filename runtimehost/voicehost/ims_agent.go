@@ -197,8 +197,15 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 			return nil
 		})
 		if err != nil {
-			a.deleteDialog(strings.TrimSpace(req.CallID))
-			return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed", RegistrationRecoveryNeeded: true}, err
+			callID := strings.TrimSpace(req.CallID)
+			canceled := ctx.Err() != nil
+			if canceled {
+				cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_, _ = a.CancelVoiceCallWithResult(cancelCtx, DialogInfo{CallID: callID})
+				cancel()
+			}
+			a.deleteDialog(callID)
+			return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed", RegistrationRecoveryNeeded: !canceled}, err
 		}
 		if isInviteDigestChallenge(resp) && invite.AuthSession != nil && allowDigestChallengeRetry && digestChallengeRetries < 2 {
 			retryCfg, retryInvite, retryResult, ok, err := a.buildInviteDigestChallengeRetry(ctx, cfg, invite, resp, nextCSeq, inviteBody)

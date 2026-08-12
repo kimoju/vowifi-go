@@ -1513,6 +1513,10 @@ func (a *IMSInboundAgent) hasInboundDialog(callID string) bool {
 	return ok
 }
 
+func (a *IMSInboundAgent) HasInboundDialog(callID string) bool {
+	return a.hasInboundDialog(callID)
+}
+
 func (a *IMSInboundAgent) inboundDialogCanceled(callID string) bool {
 	state, ok := a.inboundDialog(callID)
 	return ok && state.canceled

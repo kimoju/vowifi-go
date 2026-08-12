@@ -2738,6 +2738,35 @@ func TestIMSOutboundAgentCancelVoiceCallSendsCancelForEarlyDialog(t *testing.T) 
 	}
 }
 
+func TestIMSOutboundAgentCancelsEarlyDialogWhenInviteContextEnds(t *testing.T) {
+	transport := &cancelAwareIMSVoiceTransport{}
+	agent := &IMSOutboundAgent{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5060",
+			PublicIdentity: "sip:user@ims.example",
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := agent.StartOutboundCall(ctx, OutboundCallRequest{
+		CallID:    "call-browser-cancel",
+		Callee:    "+18005551212",
+		RawSDP:    []byte(sampleSDP("127.0.0.1", 4002)),
+		RemoteSDP: SDPInfo{ConnectionIP: "127.0.0.1", MediaPort: 4002},
+	})
+	if err == nil || result.RegistrationRecoveryNeeded {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 || transport.requests[0].Method != "INVITE" || transport.requests[1].Method != "CANCEL" {
+		t.Fatalf("requests=%+v", transport.requests)
+	}
+	if _, ok := agent.dialog("call-browser-cancel"); ok {
+		t.Fatal("canceled early dialog still stored")
+	}
+}
+
 func TestIMSOutboundAgentCancelVoiceCallIgnoresEstablishedDialog(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{{StatusCode: 200, Reason: "OK"}}}
 	agent := &IMSOutboundAgent{Transport: transport}
@@ -3192,6 +3221,25 @@ type fakeIMSVoiceTransport struct {
 	writes       []voiceclient.SIPRequestMessage
 	provisionals []voiceclient.SIPResponse
 	responses    []voiceclient.SIPResponse
+}
+
+type cancelAwareIMSVoiceTransport struct {
+	requests []voiceclient.SIPRequestMessage
+}
+
+func (t *cancelAwareIMSVoiceTransport) RoundTripInvite(ctx context.Context, msg voiceclient.SIPRequestMessage, _ voiceclient.ProvisionalResponseHandler) (voiceclient.SIPResponse, error) {
+	msg.Headers["Via"] = "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-cancel;rport"
+	t.requests = append(t.requests, msg)
+	return voiceclient.SIPResponse{}, ctx.Err()
+}
+
+func (t *cancelAwareIMSVoiceTransport) RoundTripRequest(_ context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	t.requests = append(t.requests, msg)
+	return voiceclient.SIPResponse{StatusCode: 200, Reason: "OK"}, nil
+}
+
+func (*cancelAwareIMSVoiceTransport) WriteRequest(context.Context, voiceclient.SIPRequestMessage) error {
+	return nil
 }
 
 func (t *fakeIMSVoiceTransport) RoundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {

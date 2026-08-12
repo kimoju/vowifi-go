@@ -2869,3 +2869,19 @@ func (t *runtimeSMSTransport) SendSMSPart(ctx context.Context, req messaging.SMS
 	t.requests = append(t.requests, req)
 	return messaging.SMSSendResult{State: "sent"}, nil
 }
+
+func TestDefaultRuntimeVoiceMediaRelayUsesTunnelInnerAddress(t *testing.T) {
+	cfg := defaultRuntimeVoiceMediaRelay(swu.TunnelResult{LocalInnerIP: "2001:db8::10"})
+	if cfg == nil {
+		t.Fatal("defaultRuntimeVoiceMediaRelay() = nil")
+	}
+	if cfg.ClientListenIP != "127.0.0.1" || cfg.ClientAdvertiseIP != "127.0.0.1" {
+		t.Fatalf("client endpoint = %q/%q", cfg.ClientListenIP, cfg.ClientAdvertiseIP)
+	}
+	if cfg.IMSListenIP != "2001:db8::10" || cfg.IMSAdvertiseIP != "2001:db8::10" {
+		t.Fatalf("IMS endpoint = %q/%q", cfg.IMSListenIP, cfg.IMSAdvertiseIP)
+	}
+	if got := defaultRuntimeVoiceMediaRelay(swu.TunnelResult{LocalInnerIP: "not-an-ip"}); got != nil {
+		t.Fatalf("invalid inner IP returned config: %+v", got)
+	}
+}

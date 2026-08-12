@@ -310,6 +310,11 @@ protocol layers needed by VoHive:
   SDP/RTP relay rewriting and early-dialog To-tag, Contact, and Record-Route
   state capture for PRACK, while preserving bodyless final 2xx responses after
   a reliable provisional SDP answer
+- opt-in browser-client call brokering on the runtime voice gateway, including
+  pending-call discovery, answer/reject control, INVITE cancellation, and
+  automatic loopback-to-SWu RTP relay defaults derived from the active tunnel
+  address; canceled outbound browser requests emit SIP CANCEL without forcing
+  an IMS registration recovery
 - wire-level inbound IMS SIP adapters for UDP/TCP listeners, SIP request
   parsing, provisional/final response construction, incoming INVITE/ACK/BYE/
   CANCEL dispatch, response To-tagging, transaction response caching for

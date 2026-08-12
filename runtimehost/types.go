@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -604,6 +605,7 @@ type Instance struct {
 	smsNotify    func(deviceID, sender, content string, ts time.Time)
 	tunnel       swu.TunnelSession
 	voice        voicehost.Agent
+	inboundVoice *voicehost.IMSInboundAgent
 	voiceConfig  runtimeVoiceAgentConfig
 	imsClose     func(context.Context) error
 	imsRecover   func(context.Context) (IMSRegistrationResult, error)
@@ -735,15 +737,19 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		ussdTransport = imsResult.USSDTransport
 	}
 	voiceConfig := runtimeVoiceAgentConfigFromStart(req)
+	if voiceConfig.mediaRelay == nil {
+		voiceConfig.mediaRelay = defaultRuntimeVoiceMediaRelay(tunnelResult)
+	}
 	inst := &Instance{
-		state:       state,
-		service:     svc,
-		dispatch:    req.Dispatch,
-		tunnel:      tunnel,
-		voice:       buildRuntimeVoiceAgentWithConfig(voiceConfig, imsResult),
-		voiceConfig: voiceConfig,
-		imsClose:    imsResult.Close,
-		imsRecover:  imsResult.Recover,
+		state:        state,
+		service:      svc,
+		dispatch:     req.Dispatch,
+		tunnel:       tunnel,
+		voice:        buildRuntimeVoiceAgentWithConfig(voiceConfig, imsResult),
+		inboundVoice: buildRuntimeInboundVoiceAgent(req, voiceConfig, imsResult),
+		voiceConfig:  voiceConfig,
+		imsClose:     imsResult.Close,
+		imsRecover:   imsResult.Recover,
 	}
 	svc.SetSMSTransport(inst.wrapSMSTransport(smsTransport))
 	svc.SetUSSDTransport(inst.wrapUSSDTransport(ussdTransport))
@@ -763,6 +769,53 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	inst.startIMSMessagingRetryWorker(req.IMSMessagingRetryWorker)
 	keepTunnel = true
 	return inst, nil
+}
+
+func buildRuntimeInboundVoiceAgent(req StartRequest, cfg runtimeVoiceAgentConfig, reg IMSRegistrationResult) *voicehost.IMSInboundAgent {
+	if req.VoiceGateway == nil || !reg.Registered || reg.VoiceTransport == nil {
+		return nil
+	}
+	binding := reg.Binding
+	if strings.TrimSpace(binding.ContactURI) == "" {
+		return nil
+	}
+	profile := reg.Profile
+	if strings.TrimSpace(profile.IMPU) == "" {
+		profile.IMPU = strings.TrimSpace(binding.PublicIdentity)
+	}
+	return &voicehost.IMSInboundAgent{
+		ClientTransport:  req.VoiceGateway.ClientTransport(req.DeviceID),
+		Profile:          profile,
+		Registration:     binding,
+		ClientContactURI: req.VoiceGateway.ClientContactURI(req.DeviceID),
+		LocalContactURI:  binding.ContactURI,
+		UserAgent:        firstRuntimeNonEmpty(cfg.userAgent, profile.UserAgent),
+		MediaRelay:       cfg.mediaRelay,
+	}
+}
+
+func (i *Instance) IMSInboundVoiceAgent() *voicehost.IMSInboundAgent {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.inboundVoice
+}
+
+func defaultRuntimeVoiceMediaRelay(tunnel swu.TunnelResult) *voicehost.RTPRelayConfig {
+	innerIP := strings.TrimSpace(tunnel.LocalInnerIP)
+	if net.ParseIP(innerIP) == nil {
+		return nil
+	}
+	return &voicehost.RTPRelayConfig{
+		ClientListenIP:     "127.0.0.1",
+		ClientAdvertiseIP:  "127.0.0.1",
+		IMSListenIP:        innerIP,
+		IMSAdvertiseIP:     innerIP,
+		ClientRTPClockRate: 8000,
+		IMSRTPClockRate:    8000,
+	}
 }
 
 func buildRuntimeVoiceAgent(req StartRequest, reg IMSRegistrationResult) voicehost.Agent {
@@ -1043,6 +1096,9 @@ func (i *Instance) EndVoiceCall(ctx context.Context, info voicehost.DialogInfo) 
 }
 
 func (i *Instance) EndVoiceCallWithResult(ctx context.Context, info voicehost.DialogInfo) (voicehost.DialogInfoResult, error) {
+	if inbound := i.IMSInboundVoiceAgent(); inbound != nil && inbound.HasInboundDialog(info.CallID) {
+		return inbound.EndInboundCallWithResult(ctx, info)
+	}
 	agent := i.dialogTerminatorWithResult()
 	if agent != nil {
 		result, err := agent.EndVoiceCallWithResult(ctx, info)

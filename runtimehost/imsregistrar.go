@@ -595,6 +595,11 @@ func (m *imsRegistrationMaintenance) BindInbound(handler voicehost.IMSMessageHan
 		ContactURI: binding.ContactURI,
 		UserAgent:  firstRuntimeNonEmpty(m.config.UserAgent, m.profile.UserAgent, "vowifi-go"),
 	}
+	if provider, ok := handler.(interface {
+		IMSInboundVoiceAgent() *voicehost.IMSInboundAgent
+	}); ok {
+		server.Agent = provider.IMSInboundVoiceAgent()
+	}
 	if err := m.flow.SetIncomingRequestHandler(server.HandleRequestWire); err != nil {
 		return err
 	}
