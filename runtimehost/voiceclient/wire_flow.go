@@ -15,6 +15,8 @@ import (
 var ErrSIPFlowClosed = errors.New("SIP flow is closed")
 var ErrSIPFinalResponseTimeout = errors.New("SIP final response timeout")
 
+const sipInboundInviteHandlerTimeout = 2 * time.Minute
+
 type sipFinalResponseTimeoutError struct {
 	Method string
 	Err    error
@@ -685,11 +687,31 @@ func (f *WireSIPFlow) handleIncomingRequestLocked(ctx context.Context, conn net.
 	if err != nil {
 		return nil
 	}
+	handler := f.incomingHandler
+	if strings.EqualFold(req.Method, "INVITE") {
+		// An inbound INVITE remains open while the browser is ringing. Running
+		// it on the socket reader would prevent the same IMS flow from reading
+		// the matching CANCEL, leaving a canceled call stuck in the UI.
+		handlerBase := context.Background()
+		if ctx != nil {
+			handlerBase = context.WithoutCancel(ctx)
+		}
+		handlerCtx, cancel := context.WithTimeout(handlerBase, sipInboundInviteHandlerTimeout)
+		go func() {
+			defer cancel()
+			_ = writeSIPIncomingHandlerResponses(handlerCtx, conn, handler, req)
+		}()
+		return nil
+	}
 	handlerCtx := ctx
 	if handlerCtx == nil || handlerCtx.Err() != nil {
 		handlerCtx = context.Background()
 	}
-	wires, _ := f.incomingHandler(handlerCtx, req)
+	return writeSIPIncomingHandlerResponses(handlerCtx, conn, handler, req)
+}
+
+func writeSIPIncomingHandlerResponses(ctx context.Context, conn net.Conn, handler SIPIncomingRequestHandler, req SIPIncomingRequest) error {
+	wires, _ := handler(ctx, req)
 	for _, wire := range wires {
 		if len(wire) == 0 {
 			continue

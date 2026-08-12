@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -96,6 +97,119 @@ func TestWireSIPFlowServesUnsolicitedUDPRequest(t *testing.T) {
 		t.Fatalf("inbound response=%q", wire)
 	}
 	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("ServeIncomingRequests() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeIncomingRequests() did not stop")
+	}
+}
+
+func TestWireSIPFlowReadsCancelWhileInboundInviteHandlerWaits(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	inviteStarted := make(chan struct{})
+	cancelHandled := make(chan struct{})
+	var inviteOnce sync.Once
+	var cancelOnce sync.Once
+	serverDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, addr, readErr := pc.ReadFrom(buf)
+		if readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		setup, parseErr := ParseSIPRequest(buf[:n])
+		if parseErr != nil {
+			serverDone <- parseErr
+			return
+		}
+		ok, buildErr := BuildSIPResponseWire(setup, 200, "OK", nil, nil)
+		if buildErr != nil {
+			serverDone <- buildErr
+			return
+		}
+		if _, writeErr := pc.WriteTo(ok, addr); writeErr != nil {
+			serverDone <- writeErr
+			return
+		}
+
+		invite := "INVITE sip:user@example SIP/2.0\r\n" +
+			"Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK-cancel\r\n" +
+			"To: <sip:user@example>\r\n" +
+			"From: <sip:caller@example>;tag=caller\r\n" +
+			"Call-ID: inbound-cancel\r\n" +
+			"CSeq: 1 INVITE\r\n" +
+			"Max-Forwards: 70\r\n" +
+			"Content-Length: 0\r\n\r\n"
+		if _, writeErr := pc.WriteTo([]byte(invite), addr); writeErr != nil {
+			serverDone <- writeErr
+			return
+		}
+		select {
+		case <-inviteStarted:
+		case <-time.After(time.Second):
+			serverDone <- errors.New("inbound INVITE handler did not start")
+			return
+		}
+		cancel := strings.Replace(invite, "INVITE sip:user@example SIP/2.0", "CANCEL sip:user@example SIP/2.0", 1)
+		cancel = strings.Replace(cancel, "CSeq: 1 INVITE", "CSeq: 1 CANCEL", 1)
+		_, writeErr := pc.WriteTo([]byte(cancel), addr)
+		serverDone <- writeErr
+	}()
+
+	flow := &WireSIPFlow{Network: "udp", ServerAddr: pc.LocalAddr().String(), Timeout: time.Second}
+	defer flow.Close()
+	if _, err = flow.RoundTripRequest(context.Background(), SIPRequestMessage{
+		Method: "OPTIONS",
+		URI:    "sip:example",
+		Headers: map[string]string{
+			"To":      "<sip:example>",
+			"From":    "<sip:user@example>;tag=local",
+			"Call-ID": "flow-cancel-setup",
+			"CSeq":    "1 OPTIONS",
+		},
+	}); err != nil {
+		t.Fatalf("RoundTripRequest() error = %v", err)
+	}
+	if err = flow.SetIncomingRequestHandler(func(_ context.Context, req SIPIncomingRequest) ([][]byte, error) {
+		switch req.Method {
+		case "INVITE":
+			inviteOnce.Do(func() { close(inviteStarted) })
+			<-cancelHandled
+			wire, buildErr := BuildSIPResponseWire(req, 487, "Request Terminated", nil, nil)
+			return [][]byte{wire}, buildErr
+		case "CANCEL":
+			cancelOnce.Do(func() { close(cancelHandled) })
+			wire, buildErr := BuildSIPResponseWire(req, 200, "OK", nil, nil)
+			return [][]byte{wire}, buildErr
+		default:
+			return nil, nil
+		}
+	}); err != nil {
+		t.Fatalf("SetIncomingRequestHandler() error = %v", err)
+	}
+	serveCtx, stopServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- flow.ServeIncomingRequests(serveCtx) }()
+
+	select {
+	case <-cancelHandled:
+	case <-time.After(time.Second):
+		t.Fatal("CANCEL was blocked behind the pending INVITE handler")
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+	stopServe()
 	select {
 	case err := <-serveDone:
 		if err != nil {
