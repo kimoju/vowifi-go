@@ -803,6 +803,20 @@ func (i *Instance) IMSInboundVoiceAgent() *voicehost.IMSInboundAgent {
 	return i.inboundVoice
 }
 
+func (i *Instance) HasVoiceDialog(callID string) bool {
+	if i == nil {
+		return false
+	}
+	i.mu.RLock()
+	outbound := i.voice
+	inbound := i.inboundVoice
+	i.mu.RUnlock()
+	if checker, ok := outbound.(interface{ HasVoiceDialog(string) bool }); ok && checker.HasVoiceDialog(callID) {
+		return true
+	}
+	return inbound != nil && inbound.HasInboundDialog(callID)
+}
+
 func defaultRuntimeVoiceMediaRelay(tunnel swu.TunnelResult) *voicehost.RTPRelayConfig {
 	innerIP := strings.TrimSpace(tunnel.LocalInnerIP)
 	if net.ParseIP(innerIP) == nil {
@@ -1997,6 +2011,20 @@ func (i *Instance) HandleIMSInfo(ctx context.Context, req voicehost.IMSInfoReque
 }
 
 func (i *Instance) HandleIMSBye(ctx context.Context, req voicehost.IMSByeRequest) (voicehost.IMSByeResult, error) {
+	if i != nil {
+		i.mu.RLock()
+		voice := i.voice
+		i.mu.RUnlock()
+		if terminator, ok := voice.(voicehost.RemoteDialogTerminator); ok && terminator.HandleRemoteVoiceBye(voicehost.DialogInfo{
+			CallID:      req.CallID,
+			CSeq:        req.CSeq,
+			ContentType: req.ContentType,
+			Body:        append([]byte(nil), req.Body...),
+			Headers:     firstValueRuntimeSIPHeaders(req.Headers),
+		}) {
+			return voicehost.IMSByeResult{Handled: true, StatusCode: 200, Reason: "OK"}, nil
+		}
+	}
 	svc := i.Service()
 	if svc == nil {
 		return voicehost.IMSByeResult{Handled: true, StatusCode: 503, Reason: "messaging service is nil"}, errors.New("messaging service is nil")
@@ -2234,6 +2262,19 @@ func cloneRuntimeSIPHeaders(headers map[string][]string) map[string][]string {
 	out := make(map[string][]string, len(headers))
 	for key, values := range headers {
 		out[key] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func firstValueRuntimeSIPHeaders(headers map[string][]string) map[string]string {
+	if headers == nil {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for key, values := range headers {
+		if len(values) > 0 {
+			out[key] = values[0]
+		}
 	}
 	return out
 }

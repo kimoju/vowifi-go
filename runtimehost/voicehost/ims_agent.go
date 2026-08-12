@@ -47,6 +47,10 @@ type IMSRegistrationUpdater interface {
 	UpdateIMSRegistration(IMSRegistrationUpdate)
 }
 
+type RemoteDialogTerminator interface {
+	HandleRemoteVoiceBye(DialogInfo) bool
+}
+
 func (a *IMSOutboundAgent) UpdateIMSRegistration(update IMSRegistrationUpdate) {
 	if a == nil {
 		return
@@ -362,6 +366,32 @@ func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) er
 		return fmt.Errorf("IMS BYE rejected: %d %s", result.StatusCode, strings.TrimSpace(result.Reason))
 	}
 	return nil
+}
+
+func (a *IMSOutboundAgent) HasVoiceDialog(callID string) bool {
+	if a == nil {
+		return false
+	}
+	_, ok := a.dialog(strings.TrimSpace(callID))
+	return ok
+}
+
+func (a *IMSOutboundAgent) HandleRemoteVoiceBye(info DialogInfo) bool {
+	if a == nil {
+		return false
+	}
+	callID := strings.TrimSpace(info.CallID)
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if ok {
+		stopDialogSessionRefresh(&state)
+		delete(a.dialogs, callID)
+	}
+	a.mu.Unlock()
+	if ok && state.relay != nil {
+		_ = state.relay.Close()
+	}
+	return ok
 }
 
 func (a *IMSOutboundAgent) EndVoiceCallWithResult(ctx context.Context, info DialogInfo) (DialogInfoResult, error) {

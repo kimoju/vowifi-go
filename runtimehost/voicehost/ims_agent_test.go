@@ -2792,6 +2792,23 @@ func TestIMSOutboundAgentCancelVoiceCallIgnoresEstablishedDialog(t *testing.T) {
 	}
 }
 
+func TestIMSOutboundAgentHandlesRemoteByeWithoutSendingAnotherRequest(t *testing.T) {
+	transport := &fakeIMSVoiceTransport{}
+	agent := &IMSOutboundAgent{Transport: transport}
+	agent.storeDialog("call-remote-bye", imsDialogState{
+		cfg: voiceclient.DialogRequestConfig{CallID: "call-remote-bye"},
+	})
+	if !agent.HasVoiceDialog("call-remote-bye") {
+		t.Fatal("stored dialog was not reported active")
+	}
+	if !agent.HandleRemoteVoiceBye(DialogInfo{CallID: "call-remote-bye"}) {
+		t.Fatal("remote BYE was not handled")
+	}
+	if agent.HasVoiceDialog("call-remote-bye") || len(transport.requests) != 0 {
+		t.Fatalf("active=%v requests=%+v", agent.HasVoiceDialog("call-remote-bye"), transport.requests)
+	}
+}
+
 func TestIMSOutboundAgentCancelVoiceCallWithResultReturnsIMSResponse(t *testing.T) {
 	transport := &fakeIMSVoiceTransport{responses: []voiceclient.SIPResponse{
 		{
