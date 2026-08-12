@@ -82,3 +82,34 @@ func TestGatewayBrowserClientRejectsInboundCallWhileDisabled(t *testing.T) {
 		t.Fatalf("response=%+v calls=%+v", response, gateway.InboundCalls(""))
 	}
 }
+
+func TestGatewayBrowserClientByeTerminatesRingingInvite(t *testing.T) {
+	gateway := NewGateway()
+	gateway.SetInboundEnabled(true)
+	transport := gateway.ClientTransport("dev-1")
+	responseCh := make(chan voiceclient.SIPResponse, 1)
+	go func() {
+		response, _ := transport.RoundTripRequest(context.Background(), voiceclient.SIPRequestMessage{
+			Method: "INVITE", Headers: map[string]string{"Call-ID": "incoming-bye"},
+		})
+		responseCh <- response
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(gateway.InboundCalls("")) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	bye, err := transport.RoundTripRequest(context.Background(), voiceclient.SIPRequestMessage{
+		Method: "BYE", Headers: map[string]string{"Call-ID": "incoming-bye"},
+	})
+	if err != nil || bye.StatusCode != 200 {
+		t.Fatalf("BYE response=%+v err=%v", bye, err)
+	}
+	select {
+	case response := <-responseCh:
+		if response.StatusCode != 487 {
+			t.Fatalf("INVITE response=%+v", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ringing INVITE was not terminated")
+	}
+}

@@ -168,10 +168,29 @@ func (t *gatewayClientTransport) RoundTripRequest(ctx context.Context, msg voice
 		}
 		return voiceclient.SIPResponse{StatusCode: 481, Reason: "Call Does Not Exist"}, nil
 	case "BYE":
-		t.gateway.removeInbound(callID)
+		t.gateway.endInbound(callID)
 		return voiceclient.SIPResponse{StatusCode: 200, Reason: "OK"}, nil
 	default:
 		return voiceclient.SIPResponse{StatusCode: 200, Reason: "OK"}, nil
+	}
+}
+
+func (g *Gateway) endInbound(callID string) {
+	if g == nil {
+		return
+	}
+	callID = strings.TrimSpace(callID)
+	g.mu.Lock()
+	call := g.inbound[callID]
+	if call != nil {
+		delete(g.inbound, callID)
+	}
+	g.mu.Unlock()
+	if call != nil && call.info.State == "ringing" {
+		select {
+		case call.response <- voiceclient.SIPResponse{StatusCode: 487, Reason: "Request Terminated"}:
+		default:
+		}
 	}
 }
 
