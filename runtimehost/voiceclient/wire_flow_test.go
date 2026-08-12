@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -158,6 +159,24 @@ func TestWireSIPFlowReadsCancelWhileInboundInviteHandlerWaits(t *testing.T) {
 		case <-inviteStarted:
 		case <-time.After(time.Second):
 			serverDone <- errors.New("inbound INVITE handler did not start")
+			return
+		}
+		// A SIP caller is only allowed to cancel an INVITE after receiving a
+		// provisional response. Model that behavior so the regression test also
+		// verifies that the socket reader acknowledges the INVITE immediately.
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, readErr = pc.ReadFrom(buf)
+		if readErr != nil {
+			serverDone <- readErr
+			return
+		}
+		trying, parseErr := ParseSIPResponse(buf[:n])
+		if parseErr != nil {
+			serverDone <- parseErr
+			return
+		}
+		if trying.StatusCode != 100 {
+			serverDone <- fmt.Errorf("inbound INVITE response status = %d, want 100", trying.StatusCode)
 			return
 		}
 		cancel := strings.Replace(invite, "INVITE sip:user@example SIP/2.0", "CANCEL sip:user@example SIP/2.0", 1)

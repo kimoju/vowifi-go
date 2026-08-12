@@ -691,7 +691,16 @@ func (f *WireSIPFlow) handleIncomingRequestLocked(ctx context.Context, conn net.
 	if strings.EqualFold(req.Method, "INVITE") {
 		// An inbound INVITE remains open while the browser is ringing. Running
 		// it on the socket reader would prevent the same IMS flow from reading
-		// the matching CANCEL, leaving a canceled call stuck in the UI.
+		// the matching CANCEL, leaving a canceled call stuck in the UI. Send the
+		// mandatory transaction progress response before detaching: a SIP UAC
+		// cannot send CANCEL until it has received a provisional response.
+		trying, buildErr := BuildSIPResponseWire(req, 100, "Trying", nil, nil)
+		if buildErr != nil {
+			return buildErr
+		}
+		if _, writeErr := conn.Write(trying); writeErr != nil {
+			return writeErr
+		}
 		handlerBase := context.Background()
 		if ctx != nil {
 			handlerBase = context.WithoutCancel(ctx)
