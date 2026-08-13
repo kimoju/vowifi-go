@@ -571,6 +571,7 @@ type StartRequest struct {
 	Proxy                      *ProxyConfig
 	EAPReauthentication        swu.EAPReauthenticationState
 	OnEAPReauthenticationState func(swu.EAPReauthenticationState)
+	OnTunnelPumpError          func(swu.PacketPumpDirection, error)
 	TunnelManager              swu.TunnelManager
 	TunnelManagerFactory       TunnelManagerFactory
 	IMSRegistrar               IMSRegistrar
@@ -2364,6 +2365,7 @@ func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 			EPDGRouteExclusions: cloneRuntimeEPDGRouteExclusions(req.Dataplane.TUNEPDGExclusions),
 			Routes:              append([]swu.TUNRoute(nil), req.Dataplane.TUNRoutes...),
 			Rules:               append([]swu.TUNRule(nil), req.Dataplane.TUNRules...),
+			OnPumpError:         req.OnTunnelPumpError,
 		},
 	), nil
 }

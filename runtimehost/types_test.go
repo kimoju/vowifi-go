@@ -2038,11 +2038,18 @@ func TestDefaultTunnelManagerForStartEnablesTUNRoutingProtection(t *testing.T) {
 		},
 	}
 	var callbackState swu.EAPReauthenticationState
+	var pumpDirection swu.PacketPumpDirection
+	var pumpErr error
+	wantPumpErr := errors.New("pump stopped")
 	manager, err := defaultTunnelManagerForStart(StartRequest{
 		DeviceID:                   "dev-1",
 		SIM:                        &runtimeSIMAdapter{},
 		EAPReauthentication:        reauthState,
 		OnEAPReauthenticationState: func(state swu.EAPReauthenticationState) { callbackState = state },
+		OnTunnelPumpError: func(direction swu.PacketPumpDirection, err error) {
+			pumpDirection = direction
+			pumpErr = err
+		},
 		Dataplane: DataplanePolicy{
 			Mode:      swu.DataplaneModeUserspace,
 			TUNName:   "vohive0",
@@ -2062,6 +2069,13 @@ func TestDefaultTunnelManagerForStartEnablesTUNRoutingProtection(t *testing.T) {
 	}
 	if tunManager.Config.DefaultRoutes || !tunManager.Config.SourcePolicyRouting || !tunManager.Config.ProtectEPDGRoutes {
 		t.Fatalf("routing flags default/source-policy/protect = %t/%t/%t", tunManager.Config.DefaultRoutes, tunManager.Config.SourcePolicyRouting, tunManager.Config.ProtectEPDGRoutes)
+	}
+	if tunManager.Config.OnPumpError == nil {
+		t.Fatal("TUN pump error callback is nil")
+	}
+	tunManager.Config.OnPumpError(swu.PacketPumpESPToDevice, wantPumpErr)
+	if pumpDirection != swu.PacketPumpESPToDevice || !errors.Is(pumpErr, wantPumpErr) {
+		t.Fatalf("pump callback direction/error=%s/%v", pumpDirection, pumpErr)
 	}
 	ikeManager, ok := tunManager.Config.Base.(*swu.IKEPacketTunnelManager)
 	if !ok {

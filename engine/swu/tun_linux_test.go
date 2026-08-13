@@ -77,7 +77,11 @@ func TestTUNDeviceCloseUnblocksRead(t *testing.T) {
 		_, readErr := dev.ReadInnerPacket(context.Background())
 		readDone <- readErr
 	}()
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-readDone:
+		t.Fatalf("ReadInnerPacket() returned before close: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
 	if err := dev.Close(context.Background()); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
