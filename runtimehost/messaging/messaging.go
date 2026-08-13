@@ -667,7 +667,12 @@ func (s *Service) HandleIncomingSMS(ctx context.Context, msg IncomingSMS) error 
 	if sender == "" {
 		return errors.New("incoming sms sender is empty")
 	}
-	if content == "" && !incomingSMSHasUserDataHeader(msg) {
+	// A Message Waiting Indication may intentionally carry TP-UDL=0. In
+	// particular, discard-group DCS values (0xC0-0xCF) communicate voicemail,
+	// fax or similar state entirely through TP-DCS. Rejecting that valid control
+	// message with RP-ERROR can leave it at the head of the SMSC queue and block
+	// subsequent user messages.
+	if content == "" && !incomingSMSHasUserDataHeader(msg) && !msg.DataCoding.MessageWaiting {
 		return errors.New("incoming sms content is empty")
 	}
 	at := msg.Timestamp

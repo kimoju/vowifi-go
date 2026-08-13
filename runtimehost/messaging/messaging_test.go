@@ -853,6 +853,50 @@ func TestHandleIncomingSMSAcceptsEmptyControlUDH(t *testing.T) {
 	}
 }
 
+func TestHandleIncomingSMSAcceptsEmptyMessageWaitingIndication(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+
+	err := svc.HandleIncomingSMS(context.Background(), IncomingSMS{
+		Sender:           "128",
+		DataCodingScheme: 0xc8,
+		DataCoding:       ParseSMSDataCodingScheme(0xc8),
+	})
+	if err != nil {
+		t.Fatalf("HandleIncomingSMS(MWI) error = %v", err)
+	}
+	if len(dispatch.events) != 0 {
+		t.Fatalf("events=%+v, want no user SMS event for control-only MWI", dispatch.events)
+	}
+}
+
+func TestHandleIMSMessageAcknowledgesEmptyMessageWaitingIndication(t *testing.T) {
+	dispatch := &fakeDispatcher{}
+	svc := NewService("dev-1", "310280233641503", nil, dispatch)
+	// SMS-DELIVER with TP-DCS 0xc8 (active discard-group voicemail MWI) and
+	// TP-UDL 0. It is a control message and legitimately has no user data.
+	tpdu := mustHex(t, "00038121F300C86270502143650000")
+
+	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
+		FromURI:     "sip:smsc@ims.example",
+		ToURI:       "sip:user@ims.example",
+		CallID:      "sms-empty-mwi",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        imsRPDataBody(0x25, tpdu),
+	})
+	if err != nil {
+		t.Fatalf("HandleIMSMessage(MWI) error = %v", err)
+	}
+	if result.StatusCode != 200 || result.Incoming == nil || !result.Incoming.DataCoding.MessageWaiting ||
+		result.Incoming.DataCodingScheme != 0xc8 || result.Incoming.Content != "" ||
+		result.ReplyContentType != IMS3GPPSMSContentType || string(result.ReplyBody) != string(BuildSMSRPAck(0x25)) {
+		t.Fatalf("result=%+v reply=%x", result, result.ReplyBody)
+	}
+	if len(dispatch.events) != 0 {
+		t.Fatalf("events=%+v, want no user SMS event for control-only MWI", dispatch.events)
+	}
+}
+
 func TestHandleIMSMessageDispatchesRPDataAndReturnsAck(t *testing.T) {
 	dispatch := &fakeDispatcher{}
 	svc := NewService("dev-1", "310280233641503", nil, dispatch)
