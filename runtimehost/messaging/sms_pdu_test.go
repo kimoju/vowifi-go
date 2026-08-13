@@ -420,9 +420,23 @@ func TestParseSMSRPDUAckWithUserData(t *testing.T) {
 	}
 }
 
+func TestParseSMSRPDUNetworkAckUsesUserDataIEI(t *testing.T) {
+	// Network-originated RP-ACK carries optional RP-User-Data as IEI 0x41,
+	// followed by its length and TPDU (3GPP TS 24.011 table 7.7).
+	body := []byte{0x03, 0x25, 0x41, 0x09, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09}
+	rpdu, err := ParseSMSRPDU(body)
+	if err != nil {
+		t.Fatalf("ParseSMSRPDU(network ack) error = %v", err)
+	}
+	if rpdu.Kind != SMSRPDUKindAck || rpdu.RawType != 0x03 || rpdu.MR != 0x25 ||
+		string(rpdu.TPDU) != string(body[4:]) {
+		t.Fatalf("rpdu=%+v tpdu=%x", rpdu, rpdu.TPDU)
+	}
+}
+
 func TestParseSMSRPDUErrorPreservesDiagnosticsAndUserData(t *testing.T) {
 	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000046")
-	body := append([]byte{0x04, 0x56, 0x02, SMSRPCauseTemporaryFailure, 0x80, byte(len(tpdu))}, tpdu...)
+	body := append([]byte{0x04, 0x56, 0x02, SMSRPCauseTemporaryFailure, 0x80, 0x41, byte(len(tpdu))}, tpdu...)
 	rpdu, err := ParseSMSRPDU(body)
 	if err != nil {
 		t.Fatalf("ParseSMSRPDU(error with user data) error = %v", err)
@@ -448,11 +462,11 @@ func TestParseSMSRPDUBoundsUserDataLength(t *testing.T) {
 	if _, err := ParseSMSRPDU(append(append([]byte(nil), rpData...), 0xff)); err == nil || !strings.Contains(err.Error(), "trailing") {
 		t.Fatalf("ParseSMSRPDU(RP-DATA trailing) err=%v, want trailing data", err)
 	}
-	if _, err := ParseSMSRPDU([]byte{0x02, 0x22, 0x00, 0xff}); err == nil || !strings.Contains(err.Error(), "trailing") {
-		t.Fatalf("ParseSMSRPDU(RP-ACK trailing) err=%v, want trailing data", err)
+	if _, err := ParseSMSRPDU([]byte{0x02, 0x22, 0x41, 0x02, 0xff}); err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("ParseSMSRPDU(RP-ACK truncated) err=%v, want truncated data", err)
 	}
-	if _, err := ParseSMSRPDU([]byte{0x04, 0x23, 0x01, SMSRPCauseTemporaryFailure, 0x00, 0xff}); err == nil || !strings.Contains(err.Error(), "trailing") {
-		t.Fatalf("ParseSMSRPDU(RP-ERROR trailing) err=%v, want trailing data", err)
+	if _, err := ParseSMSRPDU([]byte{0x04, 0x23, 0x01, SMSRPCauseTemporaryFailure, 0x41, 0x02, 0xff}); err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("ParseSMSRPDU(RP-ERROR truncated user data) err=%v, want truncated data", err)
 	}
 	if _, err := ParseSMSRPDU([]byte{0x04, 0x23, 0x03, SMSRPCauseTemporaryFailure}); err == nil || !strings.Contains(err.Error(), "truncated") {
 		t.Fatalf("ParseSMSRPDU(RP-ERROR truncated cause) err=%v, want truncation", err)

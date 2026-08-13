@@ -539,6 +539,15 @@ func parseSMSRPUserData(body []byte, offset int, label string) ([]byte, error) {
 	if offset >= len(body) {
 		return nil, nil
 	}
+	// In RP-ACK and RP-ERROR the optional RP-User-Data is a TLV, unlike the
+	// mandatory LV field in RP-DATA. 3GPP TS 24.011 assigns IEI 0x41.
+	if body[offset] != 0x41 {
+		return nil, fmt.Errorf("%s unexpected information element: 0x%02x", label, body[offset])
+	}
+	offset++
+	if offset >= len(body) {
+		return nil, fmt.Errorf("%s user data length missing", label)
+	}
 	udLen := int(body[offset])
 	offset++
 	if offset+udLen > len(body) {
@@ -565,14 +574,14 @@ func BuildSMSRPAckWithTPDU(rpMR byte, tpdu []byte) ([]byte, error) {
 	if len(tpdu) > 255 {
 		return nil, fmt.Errorf("SMS TPDU too long: %d", len(tpdu))
 	}
-	out := make([]byte, 0, 3+len(tpdu))
-	out = append(out, 0x02, rpMR, byte(len(tpdu)))
+	out := make([]byte, 0, 4+len(tpdu))
+	out = append(out, 0x02, rpMR, 0x41, byte(len(tpdu)))
 	out = append(out, tpdu...)
 	return out, nil
 }
 
 func BuildSMSRPError(rpMR byte, cause byte) []byte {
-	return []byte{0x04, rpMR, 0x01, cause, 0x00}
+	return []byte{0x04, rpMR, 0x01, cause}
 }
 
 func BuildSMSRPErrorWithDiagnostics(rpMR byte, cause byte, diagnostics []byte, tpdu []byte) ([]byte, error) {
@@ -582,11 +591,13 @@ func BuildSMSRPErrorWithDiagnostics(rpMR byte, cause byte, diagnostics []byte, t
 	if len(tpdu) > 255 {
 		return nil, fmt.Errorf("SMS TPDU too long: %d", len(tpdu))
 	}
-	out := make([]byte, 0, 5+len(diagnostics)+len(tpdu))
+	out := make([]byte, 0, 6+len(diagnostics)+len(tpdu))
 	out = append(out, 0x04, rpMR, byte(1+len(diagnostics)), cause)
 	out = append(out, diagnostics...)
-	out = append(out, byte(len(tpdu)))
-	out = append(out, tpdu...)
+	if len(tpdu) > 0 {
+		out = append(out, 0x41, byte(len(tpdu)))
+		out = append(out, tpdu...)
+	}
 	return out, nil
 }
 
