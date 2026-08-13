@@ -314,6 +314,37 @@ func TestWireSIPFlowReusesUDPFlowForRegisterAndDialog(t *testing.T) {
 	}
 }
 
+func TestWireSIPFlowRoundTripHonorsEarlierContextDeadline(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer pc.Close()
+
+	flow := &WireSIPFlow{Network: "udp", ServerAddr: pc.LocalAddr().String(), Timeout: time.Second}
+	defer flow.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err = flow.RoundTripRegister(ctx, RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5060>",
+			"Call-ID":      "flow-context-deadline",
+			"CSeq":         "1 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RoundTripRegister() error = %v, want context deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("RoundTripRegister() took %v, ignored earlier context deadline", elapsed)
+	}
+}
+
 func TestWireSIPFlowSendsCRLFKeepaliveOnEstablishedUDPFlow(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

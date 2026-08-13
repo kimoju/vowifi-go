@@ -25,6 +25,11 @@ type IMSUSSDTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile,
 type imsRegistrationWaitFunc func(context.Context, time.Duration) bool
 
 const (
+	// imsCloseDeregisterTimeout keeps a best-effort SIP deregistration from
+	// consuming the whole application shutdown deadline. Local IPsec, routing,
+	// and socket cleanup must still have time to run when the P-CSCF is silent.
+	imsCloseDeregisterTimeout = 2 * time.Second
+
 	// IMSRegisterResponseActionNone means the status does not imply local registration recovery.
 	IMSRegisterResponseActionNone = "none"
 
@@ -864,21 +869,22 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
+	if inboundCancel != nil {
+		inboundCancel()
+	}
+	var waitErr error
 	if done != nil {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return ctx.Err()
+			waitErr = errors.Join(waitErr, ctx.Err())
 		}
-	}
-	if inboundCancel != nil {
-		inboundCancel()
 	}
 	if inboundDone != nil {
 		select {
 		case <-inboundDone:
 		case <-ctx.Done():
-			return ctx.Err()
+			waitErr = errors.Join(waitErr, ctx.Err())
 		}
 	}
 
@@ -895,10 +901,23 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 	m.mu.Unlock()
 
 	var deregisterErr error
-	if registered {
-		_, deregisterErr = m.session.Deregister(ctx, req)
+	if registered && ctx.Err() == nil {
+		deregisterTimeout := m.config.Timeout
+		if deregisterTimeout <= 0 || deregisterTimeout > imsCloseDeregisterTimeout {
+			deregisterTimeout = imsCloseDeregisterTimeout
+		}
+		deregisterCtx, cancelDeregister := context.WithTimeout(ctx, deregisterTimeout)
+		_, deregisterErr = m.session.Deregister(deregisterCtx, req)
+		bestEffortTimeout := errors.Is(deregisterCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+		cancelDeregister()
+		if bestEffortTimeout {
+			// The remote endpoint did not acknowledge the best-effort
+			// deregistration. Continue with mandatory local cleanup without
+			// treating the bounded wait as a teardown failure.
+			deregisterErr = nil
+		}
 	}
-	return errors.Join(deregisterErr, cleanupIMSRegistrationSecurityPlans(ctx, m.session.SecurityPlanInstaller), m.flow.Close())
+	return errors.Join(waitErr, deregisterErr, cleanupIMSRegistrationSecurityPlans(ctx, m.session.SecurityPlanInstaller), m.flow.Close())
 }
 
 func cleanupIMSRegistrationSecurityPlans(ctx context.Context, installer voiceclient.SecurityPlanInstaller) error {

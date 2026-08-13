@@ -197,6 +197,16 @@ func waitSIPIncomingPoll(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
+func sipOperationDeadline(ctx context.Context, timeout time.Duration) time.Time {
+	deadline := time.Now().Add(timeout)
+	if ctx != nil {
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			return ctxDeadline
+		}
+	}
+	return deadline
+}
+
 func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -228,7 +238,7 @@ func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) e
 			}
 			continue
 		}
-		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		if err := conn.SetDeadline(sipOperationDeadline(ctx, timeout)); err != nil {
 			f.closeConnLocked()
 			if !shouldRetry(err) {
 				return err
@@ -286,7 +296,7 @@ func (f *WireSIPFlow) SendCRLFKeepalive(ctx context.Context) error {
 			return err
 		}
 	}
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetDeadline(sipOperationDeadline(ctx, timeout)); err != nil {
 		f.closeConnLocked()
 		return err
 	}
@@ -486,7 +496,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 			}
 			continue
 		}
-		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		if err := conn.SetDeadline(sipOperationDeadline(ctx, timeout)); err != nil {
 			f.closeConnLocked()
 			if !shouldRetry(err) {
 				return SIPResponse{}, err
@@ -554,7 +564,7 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 	buf := make([]byte, 65535)
 	timerConfig := sipFlowTransactionTimerConfig(msg.Method, timeout, f.RetransmitInterval, f.MaxRetransmitInterval)
 	interval := timerConfig.T1
-	deadline := time.Now().Add(timeout)
+	deadline := sipOperationDeadline(ctx, timeout)
 	retransmits := 0
 	state := InitialSIPClientTransactionState(msg.Method)
 	retransmitExhausted := false

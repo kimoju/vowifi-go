@@ -97,7 +97,7 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 		return SIPResponse{}, err
 	}
 	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetDeadline(sipOperationDeadline(ctx, timeout)); err != nil {
 		return SIPResponse{}, err
 	}
 	attempt := msg
@@ -116,7 +116,7 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 	buf := make([]byte, 65535)
 	interval := sipRetransmitInterval(attempt.Method, timeout, t.RetransmitInterval)
 	maxInterval := sipMaxRetransmitInterval(attempt.Method, timeout, t.MaxRetransmitInterval)
-	deadline := time.Now().Add(timeout)
+	deadline := sipOperationDeadline(ctx, timeout)
 	retransmits := 0
 	gotResponse := false
 	retransmitExhausted := false
@@ -212,7 +212,7 @@ func (t WireSIPTransport) writeTarget(ctx context.Context, network, target strin
 		return err
 	}
 	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetDeadline(sipOperationDeadline(ctx, timeout)); err != nil {
 		return err
 	}
 	attempt := msg

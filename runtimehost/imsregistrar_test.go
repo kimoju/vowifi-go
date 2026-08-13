@@ -1996,6 +1996,65 @@ func TestWireIMSRegistrarRequiresContactURI(t *testing.T) {
 	}
 }
 
+func TestIMSRegistrationMaintenanceCloseCancelsAllLoopsBeforeWaiting(t *testing.T) {
+	flow := &voiceclient.WireSIPFlow{Network: "udp", ServerAddr: "127.0.0.1:9"}
+	inboundDone := make(chan struct{})
+	inboundCanceled := false
+	m := &imsRegistrationMaintenance{
+		flow:        flow,
+		done:        make(chan struct{}),
+		inboundDone: inboundDone,
+		cancel:      func() {},
+		inboundCancel: func() {
+			inboundCanceled = true
+			close(inboundDone)
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := m.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close() error = %v, want context deadline", err)
+	}
+	if !inboundCanceled {
+		t.Fatal("Close() did not cancel the inbound loop before waiting")
+	}
+	if err := flow.SendCRLFKeepalive(context.Background()); !errors.Is(err, voiceclient.ErrSIPFlowClosed) {
+		t.Fatalf("flow remained open after timed-out maintenance wait: %v", err)
+	}
+}
+
+func TestIMSRegistrationMaintenanceCloseBoundsBestEffortDeregister(t *testing.T) {
+	transport := blockingDeregisterTransport{}
+	flow := &voiceclient.WireSIPFlow{Network: "udp", ServerAddr: "127.0.0.1:9"}
+	m := &imsRegistrationMaintenance{
+		flow:       flow,
+		registered: true,
+		binding: voiceclient.RegistrationBinding{
+			ContactURI: "sip:user@192.0.2.10:5060",
+		},
+		nextCSeq: 2,
+		config:   WireIMSRegistrar{Timeout: 20 * time.Millisecond},
+		session: voiceclient.RegisterSession{
+			Transport:    transport,
+			Profile:      voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example"},
+			RegistrarURI: "sip:ims.example",
+			ContactURI:   "sip:user@192.0.2.10:5060",
+		},
+	}
+
+	started := time.Now()
+	if err := m.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v, want bounded deregistration timeout to be best effort", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("Close() took %v, want bounded best-effort deregistration", elapsed)
+	}
+	if err := flow.SendCRLFKeepalive(context.Background()); !errors.Is(err, voiceclient.ErrSIPFlowClosed) {
+		t.Fatalf("flow remained open after deregistration timeout: %v", err)
+	}
+}
+
 func TestWireIMSRegistrarFormatsIPv6ContactHost(t *testing.T) {
 	profile := voiceclient.IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"}
 	got := WireIMSRegistrar{ContactHost: "2001:db8::10", ContactPort: 5070}.contactURIForProfile(profile)
@@ -2007,6 +2066,13 @@ func TestWireIMSRegistrarFormatsIPv6ContactHost(t *testing.T) {
 type wireIMSRegistrarTransport struct {
 	requests  []voiceclient.RegisterMessage
 	responses []voiceclient.RegisterResponse
+}
+
+type blockingDeregisterTransport struct{}
+
+func (blockingDeregisterTransport) RoundTripRegister(ctx context.Context, _ voiceclient.RegisterMessage) (voiceclient.RegisterResponse, error) {
+	<-ctx.Done()
+	return voiceclient.RegisterResponse{}, ctx.Err()
 }
 
 type runtimeInboundAckHandler struct {
