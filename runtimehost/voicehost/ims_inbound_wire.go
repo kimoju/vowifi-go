@@ -747,7 +747,11 @@ func wireResponse(statusCode int, reason string) IMSInboundWireResponse {
 	return IMSInboundWireResponse{StatusCode: statusCode, Reason: reason, Headers: make(map[string]string)}
 }
 
-var wireSupportedOptionTags = []string{"100rel", "timer", "replaces", "outbound", "norefersub"}
+// sec-agree is not merely advertised during registration: once the IMS IPsec
+// security association is installed, requests received on that protected flow
+// may legitimately require it (RFC 3329). Treating it as unsupported rejects
+// carrier-originated MESSAGE requests with 420 before the SMS handler runs.
+var wireSupportedOptionTags = []string{"100rel", "timer", "replaces", "outbound", "norefersub", "sec-agree"}
 
 const wireMMTelAcceptContact = `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
 

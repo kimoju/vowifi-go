@@ -834,15 +834,15 @@ func TestIMSInboundWireServerRejectsUnsupportedRequireOptions(t *testing.T) {
 func TestClassifyIMSInboundRequireOptions(t *testing.T) {
 	classification := ClassifyIMSInboundRequireOptions(map[string][]string{
 		"Require": {
-			" 100rel, unknown-feature, timer ",
+			" 100rel, unknown-feature, timer, sec-agree ",
 			"UNKNOWN-FEATURE, norefersub, outbound, another-feature, 100REL",
 		},
 		"Supported": {"path"},
 	})
-	if got := strings.Join(classification.Required, ", "); got != "100rel, unknown-feature, timer, norefersub, outbound, another-feature" {
+	if got := strings.Join(classification.Required, ", "); got != "100rel, unknown-feature, timer, sec-agree, norefersub, outbound, another-feature" {
 		t.Fatalf("Required=%q", got)
 	}
-	if got := strings.Join(classification.Supported, ", "); got != "100rel, timer, norefersub, outbound" {
+	if got := strings.Join(classification.Supported, ", "); got != "100rel, timer, sec-agree, norefersub, outbound" {
 		t.Fatalf("Supported=%q", got)
 	}
 	if got := strings.Join(classification.Unsupported, ", "); got != "unknown-feature, another-feature" {
@@ -862,7 +862,7 @@ func TestIMSInboundWireServerAllowsSupportedRequireOptions(t *testing.T) {
 		}),
 	}
 	headers := wireIMSHeaders("supported-require-options", "MESSAGE", 1)
-	headers["Require"] = []string{"100REL, timer, replaces, outbound"}
+	headers["Require"] = []string{"100REL, timer, replaces, outbound, sec-agree"}
 	responses, err := server.HandleRequest(context.Background(), voiceclient.SIPIncomingRequest{
 		Method:  "MESSAGE",
 		URI:     "sip:user@ims.example",
