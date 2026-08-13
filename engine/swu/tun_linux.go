@@ -37,39 +37,43 @@ func OpenTUNDevice(cfg TUNDeviceConfig) (*TUNDevice, error) {
 	if path == "" {
 		path = defaultTUNDevicePath
 	}
-	file, err := openTUNDeviceFile(path)
+	fd, err := openTUNDeviceFD(path)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidPacketTunnel, err)
 	}
 	ifr, err := unix.NewIfreq(strings.TrimSpace(cfg.Name))
 	if err != nil {
-		_ = file.Close()
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("%w: tun name: %v", ErrInvalidPacketTunnel, err)
 	}
 	ifr.SetUint16(uint16(unix.IFF_TUN | unix.IFF_NO_PI))
-	if err := unix.IoctlIfreq(int(file.Fd()), uint(unix.TUNSETIFF), ifr); err != nil {
-		_ = file.Close()
+	if err := unix.IoctlIfreq(fd, uint(unix.TUNSETIFF), ifr); err != nil {
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("%w: TUNSETIFF: %v", ErrInvalidPacketTunnel, err)
+	}
+	// Register the descriptor with Go's poller only after TUNSETIFF. Registering
+	// the unattached /dev/net/tun descriptor first makes the poller stale when
+	// the ioctl turns it into a concrete interface, and the first read fails
+	// with "not pollable".
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("%w: open %s returned nil file", ErrInvalidPacketTunnel, path)
 	}
 	return &TUNDevice{file: file, name: ifr.Name()}, nil
 }
 
-func openTUNDeviceFile(path string) (*os.File, error) {
+func openTUNDeviceFD(path string) (int, error) {
 	// A blocking TUN descriptor is not registered with Go's network poller.
 	// Closing os.File while another goroutine is blocked in Read then only
 	// drops the owner's reference; the kernel read can remain asleep forever.
-	// O_NONBLOCK lets os.File use the poller so Close evicts the pending read
-	// and PacketPump can finish promptly during tunnel teardown.
+	// O_NONBLOCK lets the os.File created after TUNSETIFF use the poller so
+	// Close evicts the pending read and PacketPump can finish promptly.
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %v", path, err)
+		return -1, fmt.Errorf("open %s: %v", path, err)
 	}
-	file := os.NewFile(uintptr(fd), path)
-	if file == nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("open %s returned nil file", path)
-	}
-	return file, nil
+	return fd, nil
 }
 
 func (d *TUNDevice) Name() string {

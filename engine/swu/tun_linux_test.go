@@ -40,7 +40,7 @@ func TestOpenTUNDeviceRejectsInvalidNameBeforeOpeningDevice(t *testing.T) {
 	}
 }
 
-func TestOpenTUNDeviceFileUsesNonblockingDescriptor(t *testing.T) {
+func TestOpenTUNDeviceFDUsesNonblockingDescriptor(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tun-file")
 	created, err := os.Create(path)
 	if err != nil {
@@ -50,12 +50,12 @@ func TestOpenTUNDeviceFileUsesNonblockingDescriptor(t *testing.T) {
 		t.Fatalf("close test file: %v", err)
 	}
 
-	file, err := openTUNDeviceFile(path)
+	fd, err := openTUNDeviceFD(path)
 	if err != nil {
-		t.Fatalf("openTUNDeviceFile() error = %v", err)
+		t.Fatalf("openTUNDeviceFD() error = %v", err)
 	}
-	defer file.Close()
-	flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFL, 0)
+	defer unix.Close(fd)
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
 	if err != nil {
 		t.Fatalf("F_GETFL: %v", err)
 	}
