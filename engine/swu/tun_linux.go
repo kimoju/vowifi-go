@@ -37,14 +37,9 @@ func OpenTUNDevice(cfg TUNDeviceConfig) (*TUNDevice, error) {
 	if path == "" {
 		path = defaultTUNDevicePath
 	}
-	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	file, err := openTUNDeviceFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("%w: open %s: %v", ErrInvalidPacketTunnel, path, err)
-	}
-	file := os.NewFile(uintptr(fd), path)
-	if file == nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("%w: open %s returned nil file", ErrInvalidPacketTunnel, path)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidPacketTunnel, err)
 	}
 	ifr, err := unix.NewIfreq(strings.TrimSpace(cfg.Name))
 	if err != nil {
@@ -57,6 +52,24 @@ func OpenTUNDevice(cfg TUNDeviceConfig) (*TUNDevice, error) {
 		return nil, fmt.Errorf("%w: TUNSETIFF: %v", ErrInvalidPacketTunnel, err)
 	}
 	return &TUNDevice{file: file, name: ifr.Name()}, nil
+}
+
+func openTUNDeviceFile(path string) (*os.File, error) {
+	// A blocking TUN descriptor is not registered with Go's network poller.
+	// Closing os.File while another goroutine is blocked in Read then only
+	// drops the owner's reference; the kernel read can remain asleep forever.
+	// O_NONBLOCK lets os.File use the poller so Close evicts the pending read
+	// and PacketPump can finish promptly during tunnel teardown.
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %v", path, err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("open %s returned nil file", path)
+	}
+	return file, nil
 }
 
 func (d *TUNDevice) Name() string {
