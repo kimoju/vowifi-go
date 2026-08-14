@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -723,13 +724,14 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	}
 	securityClients := s.securityClientAgreements()
 	securityClientHeader := BuildSecurityClientHeaderList(securityClients)
+	protectedContactURI := contactURI
 
 	attempts := 0
 	cseq := 1
 	sendRegister := func(cseq int, authHeaderName, authz string, challengeHeaders map[string][]string) (RegisterResponse, error) {
 		msg := RegisterMessage{
 			URI:     registrarURI,
-			Headers: BuildRegisterHeaders(s.Profile, contactURI, callID, strconv.Itoa(cseq)),
+			Headers: BuildRegisterHeaders(s.Profile, protectedContactURI, callID, strconv.Itoa(cseq)),
 		}
 		msg.Headers["Expires"] = strconv.Itoa(expires)
 		msg.Headers["Security-Client"] = securityClientHeader
@@ -824,6 +826,9 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		result.AuthHeaderName = authzHeader
 		return result, err
 	}
+	if securityOK {
+		protectedContactURI = registerContactURIForSecurityAssociation(contactURI, securityReq)
+	}
 
 	cseq++
 	resp2, err := sendRegister(cseq, authzHeader, authz, resp.Headers)
@@ -839,7 +844,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		if isSIPSuccess(resp2.StatusCode) {
 			authState := newDigestAuthState(authzHeader, ch, currentAuthInput, authz)
 			authState, err = updateDigestAuthStateFromInfo(authState, resp2.Headers, authzHeader, resp2.Body)
-			binding := bindDigestAuthWithChallengeInput(buildRegistrationBindingForClients(s.Profile, contactURI, resp2, expires, securityClients, securityHeaders), authzHeader, authz, authState, s.digestChallengeInputFunc())
+			binding := bindDigestAuthWithChallengeInput(buildRegistrationBindingForClients(s.Profile, protectedContactURI, resp2, expires, securityClients, securityHeaders), authzHeader, authz, authState, s.digestChallengeInputFunc())
 			result := RegisterResult{
 				Registered:     true,
 				StatusCode:     resp2.StatusCode,
@@ -898,6 +903,9 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 			result.AuthHeaderName = authzHeader
 			return result, err
 		}
+		if securityOK {
+			protectedContactURI = registerContactURIForSecurityAssociation(contactURI, securityReq)
+		}
 		cseq++
 		resp2, err = sendRegister(cseq, authzHeader, authz, nextChallengeHeaders)
 		if err != nil {
@@ -916,7 +924,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		Attempts:       attempts,
 		RetryAfter:     SIPResponseRetryAfter(resp2),
 		Challenge:      ch,
-		Binding:        buildRegistrationBindingForClients(s.Profile, contactURI, resp2, expires, securityClients, securityHeaders),
+		Binding:        buildRegistrationBindingForClients(s.Profile, protectedContactURI, resp2, expires, securityClients, securityHeaders),
 		AuthHeader:     authz,
 		AuthHeaderName: authzHeader,
 		AuthState:      newDigestAuthState(authzHeader, ch, currentAuthInput, authz),
@@ -933,6 +941,44 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	}
 	result.Binding = bindDigestAuthWithChallengeInput(result.Binding, authzHeader, authz, result.AuthState, s.digestChallengeInputFunc())
 	return result, nil
+}
+
+// registerContactURIForSecurityAssociation publishes the protected server
+// endpoint negotiated by Security-Agree. The initial unprotected REGISTER may
+// use the bootstrap port, but authenticated REGISTER requests must advertise
+// port-s so the S-CSCF can route terminating requests back through the inbound
+// IPsec SA.
+func registerContactURIForSecurityAssociation(contactURI string, req IMSSecurityAssociationInstallRequest) string {
+	port := req.ClientAgreement.PortServer
+	if port <= 0 {
+		return strings.TrimSpace(contactURI)
+	}
+	host := strings.TrimSpace(req.LocalEndpoint.Address)
+	if host == "" {
+		if endpoint, err := parseSIPURIEndpoint(contactURI); err == nil {
+			host = strings.TrimSpace(endpoint.Host)
+		}
+	}
+	if host == "" {
+		return strings.TrimSpace(contactURI)
+	}
+
+	value := strings.TrimSpace(contactURI)
+	colon := strings.IndexByte(value, ':')
+	if colon < 0 {
+		return value
+	}
+	authorityStart := colon + 1
+	authorityEnd := len(value)
+	if idx := strings.IndexAny(value[authorityStart:], ";?"); idx >= 0 {
+		authorityEnd = authorityStart + idx
+	}
+	authority := value[authorityStart:authorityEnd]
+	userInfo := ""
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		userInfo = authority[:at+1]
+	}
+	return value[:authorityStart] + userInfo + net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(port)) + value[authorityEnd:]
 }
 
 func buildInitialDigestAuthorization(profile IMSProfile, registrarURI string) string {
