@@ -1110,8 +1110,14 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 	if protectedReq.sourcePort != clientLocalPort ||
 		!strings.Contains(protectedReq.wire, "CSeq: 2 REGISTER") ||
 		!strings.Contains(protectedReq.wire, "Authorization: Digest") ||
-		!strings.Contains(protectedReq.wire, "Security-Verify: ipsec-3gpp") {
+		!strings.Contains(protectedReq.wire, "Security-Verify: ipsec-3gpp") ||
+		!strings.Contains(protectedReq.wire, "Via: SIP/2.0/UDP 127.0.0.1:"+strconv.Itoa(clientServerPort)+";") ||
+		!strings.Contains(protectedReq.wire, "Contact: <sip:user@127.0.0.1:"+strconv.Itoa(clientServerPort)+">") ||
+		!strings.Contains(protectedReq.wire, ";reg-id=1") {
 		t.Fatalf("protected REGISTER sourcePort=%d wire=%q", protectedReq.sourcePort, protectedReq.wire)
+	}
+	if want := "sip:user@127.0.0.1:" + strconv.Itoa(clientServerPort); result.Binding.ContactURI != want {
+		t.Fatalf("binding ContactURI=%q, want protected server endpoint %q", result.Binding.ContactURI, want)
 	}
 }
 
