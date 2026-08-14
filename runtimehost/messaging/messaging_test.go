@@ -302,8 +302,9 @@ func TestSendSMSWithOptionsPropagatesSubmitFirstOctetFlags(t *testing.T) {
 
 func TestSendSMSWithTransportFailureMarksDeliveryFailed(t *testing.T) {
 	store := &fakeDeliveryStore{}
+	dispatch := &fakeDispatcher{}
 	transport := &fakeSMSTransport{failPart: 2}
-	svc := NewService("dev-1", "310280233641503", store, nil)
+	svc := NewService("dev-1", "310280233641503", store, dispatch)
 	svc.SetSMSTransport(transport)
 
 	out, err := svc.SendSMSWithOptions(context.Background(), "+18005551212", strings.Repeat("a", 161), SendOptions{})
@@ -315,6 +316,9 @@ func TestSendSMSWithTransportFailureMarksDeliveryFailed(t *testing.T) {
 	}
 	if !strings.Contains(store.lastError, "part failed") {
 		t.Fatalf("lastError=%q", store.lastError)
+	}
+	if len(dispatch.events) != 0 {
+		t.Fatalf("failed submit dispatched SMSSent: %+v", dispatch.events)
 	}
 }
 

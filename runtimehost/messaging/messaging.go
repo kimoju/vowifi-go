@@ -581,7 +581,7 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 	if s != nil && s.store != nil {
 		_ = s.store.UpdateSMSDeliveryState(id, state, lastErr, acks, time.Now())
 	}
-	if s != nil && s.dispatch != nil {
+	if state != "failed" && s != nil && s.dispatch != nil {
 		s.dispatch.Dispatch(ctx, eventhost.SMSSent{DevID: s.deviceID, TargetURI: to, Content: text, Time: now, TotalParts: len(parts)})
 	}
 	out := SendOutcome{MessageID: id, Parts: acks, PartsTotal: len(parts), State: state, DeliveryState: deliveryState}

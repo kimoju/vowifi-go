@@ -1136,8 +1136,7 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 			protectedErr <- "build ok error: " + err.Error()
 			return
 		}
-		responseAddr := &net.UDPAddr{IP: addr.(*net.UDPAddr).IP, Port: clientServerPort}
-		if _, err := protectedResponses.WriteTo(ok, responseAddr); err != nil {
+		if _, err := protected.WriteTo(ok, addr); err != nil {
 			protectedErr <- "write ok error: " + err.Error()
 			return
 		}
@@ -1186,7 +1185,7 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 		!strings.Contains(protectedReq.wire, "CSeq: 2 REGISTER") ||
 		!strings.Contains(protectedReq.wire, "Authorization: Digest") ||
 		!strings.Contains(protectedReq.wire, "Security-Verify: ipsec-3gpp") ||
-		!strings.Contains(protectedReq.wire, "Via: SIP/2.0/UDP 127.0.0.1:"+strconv.Itoa(clientServerPort)+";") ||
+		!strings.Contains(protectedReq.wire, "Via: SIP/2.0/UDP 127.0.0.1:"+strconv.Itoa(clientLocalPort)+";") ||
 		!strings.Contains(protectedReq.wire, "Contact: <sip:user@127.0.0.1:"+strconv.Itoa(clientServerPort)+">") ||
 		!strings.Contains(protectedReq.wire, ";reg-id=1") {
 		t.Fatalf("protected REGISTER sourcePort=%d wire=%q", protectedReq.sourcePort, protectedReq.wire)

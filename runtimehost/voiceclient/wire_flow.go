@@ -239,7 +239,7 @@ func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) e
 			continue
 		}
 		attempt := cloneSIPRequestMessage(msg)
-		ensureSIPRequestVia(&attempt, transportName(network), f.viaLocalAddrLocked(conn))
+		ensureSIPRequestVia(&attempt, transportName(network), conn.LocalAddr())
 		wire, err := buildSIPRequestWire(attempt, transportName(network), conn.LocalAddr())
 		if err != nil {
 			return err
@@ -408,19 +408,6 @@ func (f *WireSIPFlow) UseSecurityAssociation(ctx context.Context, req IMSSecurit
 	return nil
 }
 
-// viaLocalAddrLocked returns the endpoint on which the UE accepts protected
-// requests. A protected UDP REGISTER is transmitted from port-c but advertises
-// port-s in Via so the network can route terminating requests back to the UE.
-func (f *WireSIPFlow) viaLocalAddrLocked(primary net.Conn) net.Addr {
-	if f != nil && f.securityReceiveConn != nil {
-		return f.securityReceiveConn.LocalAddr()
-	}
-	if primary == nil {
-		return nil
-	}
-	return primary.LocalAddr()
-}
-
 func sipSecurityAssociationAddr(current string, endpoint IMSSecurityAssociationEndpoint, allowWildcardHost bool) (string, error) {
 	host := strings.TrimSpace(endpoint.Address)
 	port := endpoint.Port
@@ -510,7 +497,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 			continue
 		}
 		attempt := cloneSIPRequestMessage(msg)
-		ensureSIPRequestVia(&attempt, transportName(network), f.viaLocalAddrLocked(conn))
+		ensureSIPRequestVia(&attempt, transportName(network), conn.LocalAddr())
 		wire, err := buildSIPRequestWire(attempt, transportName(network), conn.LocalAddr())
 		if err != nil {
 			return SIPResponse{}, err
