@@ -363,8 +363,6 @@ func TestLinuxIMSSecurityXFRMInstallerApplyInstallAndCleanup(t *testing.T) {
 
 	want := append([][]string{}, imsSecurityXFRMCommandArgs(plan.Commands, false)...)
 	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, true)...)
-	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, false)...)
-	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, true)...)
 	if err := installer.Cleanup(context.Background()); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}

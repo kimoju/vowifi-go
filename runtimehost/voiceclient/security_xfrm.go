@@ -157,15 +157,19 @@ func (i *LinuxIMSSecurityXFRMInstaller) Apply(ctx context.Context, req IMSSecuri
 	if err != nil {
 		return IMSSecurityAssociationXFRMState{}, err
 	}
-	// A new AKA challenge can reuse the negotiated addresses, ports and SPIs
-	// while changing the integrity/encryption keys. Linux rejects another
-	// "state add" with EEXIST, so remove the tracked generation before
-	// installing the replacement security association.
-	if i.StateCount() > 0 {
-		if err := i.Cleanup(ctx); err != nil {
-			return IMSSecurityAssociationXFRMState{}, err
+	// A re-authentication challenge can repeat the same Security-Server
+	// agreement while the original protected flow is still authoritative.
+	// Reuse that tracked generation instead of issuing duplicate state adds or
+	// replacing the live keys underneath the transaction.
+	i.mu.Lock()
+	for idx := len(i.states) - 1; idx >= 0; idx-- {
+		if sameIMSSecurityXFRMPlanIdentity(i.states[idx].Plan, plan) {
+			state := i.states[idx]
+			i.mu.Unlock()
+			return state, nil
 		}
 	}
+	i.mu.Unlock()
 	state, err := applyIMSSecurityXFRMPlan(ctx, imssSecurityXFRMRunner(i.Runner), plan)
 	if err != nil {
 		return state, err
@@ -174,6 +178,18 @@ func (i *LinuxIMSSecurityXFRMInstaller) Apply(ctx context.Context, req IMSSecuri
 	i.states = append(i.states, state)
 	i.mu.Unlock()
 	return state, nil
+}
+
+func sameIMSSecurityXFRMPlanIdentity(a, b IMSSecurityAssociationXFRMInstallPlan) bool {
+	if a.ReqID != b.ReqID || a.Mode != b.Mode || a.LocalAddress != b.LocalAddress || a.RemoteAddress != b.RemoteAddress || len(a.Commands) != len(b.Commands) {
+		return false
+	}
+	for idx := range a.Commands {
+		if strings.Join(a.Commands[idx].UndoArgs, "\x00") != strings.Join(b.Commands[idx].UndoArgs, "\x00") {
+			return false
+		}
+	}
+	return true
 }
 
 func (i *LinuxIMSSecurityXFRMInstaller) Cleanup(ctx context.Context) error {
