@@ -63,39 +63,40 @@ type IMSRegisterResponseDecision struct {
 }
 
 type WireIMSRegistrar struct {
-	Transport              voiceclient.SIPRegisterTransport
-	TransportFactory       IMSRegisterTransportFactory
-	VoiceTransport         voiceclient.SIPRequestTransport
-	VoiceFactory           IMSVoiceTransportFactory
-	SMSTransport           messaging.SMSTransport
-	SMSFactory             IMSSMSTransportFactory
-	USSDTransport          messaging.USSDTransport
-	USSDFactory            IMSUSSDTransportFactory
-	RegistrarURI           string
-	ContactURI             string
-	ContactHost            string
-	ContactPort            int
-	Network                string
-	ServerAddr             string
-	LocalAddr              string
-	Resolver               voiceclient.SIPServerResolver
-	Timeout                time.Duration
-	Expires                int
-	DisableRefresh         bool
-	RefreshInterval        time.Duration
-	RefreshLead            time.Duration
-	RefreshRetryInterval   time.Duration
-	RecoveryBackoffInitial time.Duration
-	RecoveryBackoffMax     time.Duration
-	DisableKeepalive       bool
-	KeepaliveInterval      time.Duration
-	UserAgent              string
-	CallID                 string
-	CNonce                 string
-	RetransmitInterval     time.Duration
-	MaxRetransmitInterval  time.Duration
-	MaxRetransmits         int
-	SecurityPlanInstaller  voiceclient.SecurityPlanInstaller
+	Transport                   voiceclient.SIPRegisterTransport
+	TransportFactory            IMSRegisterTransportFactory
+	VoiceTransport              voiceclient.SIPRequestTransport
+	VoiceFactory                IMSVoiceTransportFactory
+	SMSTransport                messaging.SMSTransport
+	SMSFactory                  IMSSMSTransportFactory
+	USSDTransport               messaging.USSDTransport
+	USSDFactory                 IMSUSSDTransportFactory
+	RegistrarURI                string
+	ContactURI                  string
+	ContactHost                 string
+	ContactPort                 int
+	Network                     string
+	ServerAddr                  string
+	LocalAddr                   string
+	Resolver                    voiceclient.SIPServerResolver
+	Timeout                     time.Duration
+	Expires                     int
+	PurgeBindingsBeforeRegister bool
+	DisableRefresh              bool
+	RefreshInterval             time.Duration
+	RefreshLead                 time.Duration
+	RefreshRetryInterval        time.Duration
+	RecoveryBackoffInitial      time.Duration
+	RecoveryBackoffMax          time.Duration
+	DisableKeepalive            bool
+	KeepaliveInterval           time.Duration
+	UserAgent                   string
+	CallID                      string
+	CNonce                      string
+	RetransmitInterval          time.Duration
+	MaxRetransmitInterval       time.Duration
+	MaxRetransmits              int
+	SecurityPlanInstaller       voiceclient.SecurityPlanInstaller
 }
 
 // ClassifyIMSRegisterResponse maps SIP REGISTER status codes to conservative local recovery hints.
@@ -269,19 +270,20 @@ func (r WireIMSRegistrar) defaultSIPFlow(cfg IMSRegistrationConfig) *voiceclient
 
 func (r WireIMSRegistrar) registerSession(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, registrarURI, contactURI string, transport voiceclient.SIPRegisterTransport, expires int) voiceclient.RegisterSession {
 	return voiceclient.RegisterSession{
-		Transport:             transport,
-		AKAProvider:           cfg.SIM,
-		AKAAppPreference:      imsAKAAppPreferenceFromConfig(cfg),
-		Profile:               profile,
-		RegistrarURI:          registrarURI,
-		ContactURI:            contactURI,
-		CallID:                firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
-		CNonce:                firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
-		Expires:               expires,
-		InitialAuthorization:  true,
-		SecurityPlanInstaller: r.SecurityPlanInstaller,
-		SecurityLocalAddr:     firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, r.LocalAddr),
-		SecurityRemoteAddr:    r.ServerAddr,
+		Transport:                   transport,
+		AKAProvider:                 cfg.SIM,
+		AKAAppPreference:            imsAKAAppPreferenceFromConfig(cfg),
+		Profile:                     profile,
+		RegistrarURI:                registrarURI,
+		ContactURI:                  contactURI,
+		CallID:                      firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
+		CNonce:                      firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
+		Expires:                     expires,
+		InitialAuthorization:        true,
+		PurgeBindingsBeforeRegister: r.PurgeBindingsBeforeRegister,
+		SecurityPlanInstaller:       r.SecurityPlanInstaller,
+		SecurityLocalAddr:           firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, r.LocalAddr),
+		SecurityRemoteAddr:          r.ServerAddr,
 	}
 }
 
