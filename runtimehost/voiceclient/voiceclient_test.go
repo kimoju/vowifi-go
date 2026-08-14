@@ -794,6 +794,43 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 	}
 }
 
+func TestRegisterSessionPurgesStaleBindingsBeforeFinalRegister(t *testing.T) {
+	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
+	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		{StatusCode: 401, Reason: "Unauthorized", Headers: map[string][]string{
+			"WWW-Authenticate": {challenge},
+			"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
+		}},
+		{StatusCode: 200, Reason: "Bindings Cleared"},
+		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"Contact": {`<sip:user@192.0.2.10:5060>;expires=3600`}}},
+	}}
+	result, err := RegisterSession{
+		Transport:                   transport,
+		AKAProvider:                 &registerAKAProvider{},
+		Profile:                     IMSProfile{IMPI: "impi@example", IMPU: "sip:user@example", Domain: "example"},
+		RegistrarURI:                "sip:ims.example",
+		ContactURI:                  "sip:user@192.0.2.10:5060",
+		CallID:                      "call-purge",
+		CNonce:                      "cnonce",
+		PurgeBindingsBeforeRegister: true,
+	}.Register(context.Background())
+	if err != nil || !result.Registered || result.Attempts != 3 {
+		t.Fatalf("Register() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 3 {
+		t.Fatalf("requests=%d want 3", len(transport.requests))
+	}
+	purge := transport.requests[1]
+	if purge.Headers["Contact"] != "*" || purge.Headers["Expires"] != "0" || !strings.Contains(purge.Headers["Authorization"], "nc=00000001") {
+		t.Fatalf("purge request=%+v", purge)
+	}
+	register := transport.requests[2]
+	if register.Headers["Contact"] == "*" || register.Headers["Expires"] != "3600" || !strings.Contains(register.Headers["Authorization"], "nc=00000002") {
+		t.Fatalf("final register request=%+v", register)
+	}
+}
+
 func TestRegisterSessionUsesDigestFromCombinedWWWAuthenticate(t *testing.T) {
 	rawNonce := append(bytesFrom(0x21, 16), bytesFrom(0x51, 16)...)
 	challenge := `Basic realm="legacy", Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`

@@ -138,22 +138,23 @@ type akaPreferenceProvider interface {
 }
 
 type RegisterSession struct {
-	Transport             SIPRegisterTransport
-	AKAProvider           sim.AKAProvider
-	AKAAppPreference      string
-	Profile               IMSProfile
-	RegistrarURI          string
-	ContactURI            string
-	CallID                string
-	CNonce                string
-	Expires               int
-	InitialAuthorization  bool
-	SecurityClient        SecurityAgreement
-	SecurityClients       []SecurityAgreement
-	SecurityRandom        io.Reader
-	SecurityPlanInstaller SecurityPlanInstaller
-	SecurityLocalAddr     string
-	SecurityRemoteAddr    string
+	Transport                   SIPRegisterTransport
+	AKAProvider                 sim.AKAProvider
+	AKAAppPreference            string
+	Profile                     IMSProfile
+	RegistrarURI                string
+	ContactURI                  string
+	CallID                      string
+	CNonce                      string
+	Expires                     int
+	InitialAuthorization        bool
+	PurgeBindingsBeforeRegister bool
+	SecurityClient              SecurityAgreement
+	SecurityClients             []SecurityAgreement
+	SecurityRandom              io.Reader
+	SecurityPlanInstaller       SecurityPlanInstaller
+	SecurityLocalAddr           string
+	SecurityRemoteAddr          string
 }
 
 type RegisterResult struct {
@@ -747,6 +748,46 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		attempts++
 		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
 	}
+	sendPurgeBindings := func(cseq int, authHeaderName, authz string, challengeHeaders map[string][]string) (RegisterResponse, error) {
+		msg := RegisterMessage{
+			URI:     registrarURI,
+			Headers: BuildRegisterHeaders(s.Profile, protectedContactURI, callID, strconv.Itoa(cseq)),
+		}
+		msg.Headers["Contact"] = "*"
+		msg.Headers["Expires"] = "0"
+		msg.Headers["Security-Client"] = securityClientHeader
+		if strings.TrimSpace(authHeaderName) != "" && strings.TrimSpace(authz) != "" {
+			msg.Headers[authHeaderName] = authz
+		}
+		if securityVerify := securityVerifyFromChallenge(challengeHeaders); securityVerify != "" {
+			msg.Headers["Security-Verify"] = securityVerify
+		}
+		attempts++
+		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
+	}
+	purgeBindings := func(authHeaderName, authz string, challengeHeaders map[string][]string, ch DigestChallenge, authInput DigestAuthInput) (string, DigestAuthInput, error) {
+		if !s.PurgeBindingsBeforeRegister {
+			return authz, authInput, nil
+		}
+		cseq++
+		purgeResp, err := sendPurgeBindings(cseq, authHeaderName, authz, challengeHeaders)
+		if err != nil {
+			return authz, authInput, err
+		}
+		if !isSIPSuccess(purgeResp.StatusCode) {
+			return authz, authInput, fmt.Errorf("%w: purge bindings %d %s", ErrRegistrationRejected, purgeResp.StatusCode, purgeResp.Reason)
+		}
+		authState := newDigestAuthState(authHeaderName, ch, authInput, authz)
+		authState, err = updateDigestAuthStateFromInfo(authState, purgeResp.Headers, authHeaderName, purgeResp.Body)
+		if err != nil {
+			return authz, authInput, err
+		}
+		_, nextAuthz, nextState, err := nextDigestAuthorization(authState, "REGISTER", registrarURI, authHeaderName, "")
+		if err != nil {
+			return authz, authInput, err
+		}
+		return nextAuthz, nextState.input, nil
+	}
 	retryMinExpires := func(resp RegisterResponse, authHeaderName, authz string, challengeHeaders map[string][]string, authInput *DigestAuthInput, ch DigestChallenge) (RegisterResponse, string, bool, error) {
 		if resp.StatusCode != 423 {
 			return resp, authz, false, nil
@@ -829,6 +870,13 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if securityOK {
 		protectedContactURI = registerContactURIForSecurityAssociation(contactURI, securityReq)
 	}
+	if !syncFailure {
+		authz, currentAuthInput, err = purgeBindings(authzHeader, authz, resp.Headers, ch, currentAuthInput)
+		if err != nil {
+			return RegisterResult{Attempts: attempts, Challenge: ch, AuthHeader: authz}, err
+		}
+		authzInput = currentAuthInput
+	}
 
 	cseq++
 	resp2, err := sendRegister(cseq, authzHeader, authz, resp.Headers)
@@ -906,6 +954,11 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		if securityOK {
 			protectedContactURI = registerContactURIForSecurityAssociation(contactURI, securityReq)
 		}
+		authz, currentAuthInput, err = purgeBindings(authzHeader, authz, nextChallengeHeaders, ch, nextAuthInput)
+		if err != nil {
+			return RegisterResult{Attempts: attempts, Challenge: ch, AuthHeader: authz}, err
+		}
+		nextAuthInput = currentAuthInput
 		cseq++
 		resp2, err = sendRegister(cseq, authzHeader, authz, nextChallengeHeaders)
 		if err != nil {
