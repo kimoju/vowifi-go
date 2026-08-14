@@ -295,13 +295,19 @@ func (f *WireSIPFlow) SendCRLFKeepalive(ctx context.Context) error {
 		connections = append(connections, secondary)
 	}
 	for _, keepaliveConn := range connections {
-		if err := keepaliveConn.SetDeadline(deadline); err != nil {
+		if err := keepaliveConn.SetWriteDeadline(deadline); err != nil {
 			f.closeConnLocked()
 			return err
 		}
-		if _, err := keepaliveConn.Write([]byte("\r\n\r\n")); err != nil {
+		_, writeErr := keepaliveConn.Write([]byte("\r\n\r\n"))
+		clearErr := keepaliveConn.SetWriteDeadline(time.Time{})
+		if writeErr != nil {
 			f.closeConnLocked()
-			return err
+			return writeErr
+		}
+		if clearErr != nil {
+			f.closeConnLocked()
+			return clearErr
 		}
 	}
 	return nil

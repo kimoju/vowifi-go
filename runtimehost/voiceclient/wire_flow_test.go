@@ -497,7 +497,7 @@ func TestWireSIPFlowSendsCRLFKeepaliveOnBothProtectedUDPFlows(t *testing.T) {
 		t.Fatalf("Dial(secondary) error = %v", err)
 	}
 	flow := &WireSIPFlow{
-		Timeout:             time.Second,
+		Timeout:             25 * time.Millisecond,
 		conn:                primary,
 		securityReceiveConn: secondary,
 		network:             "udp",
@@ -520,6 +520,20 @@ func TestWireSIPFlowSendsCRLFKeepaliveOnBothProtectedUDPFlows(t *testing.T) {
 		if got := string(buf[:n]); got != "\r\n\r\n" {
 			t.Fatalf("keepalive(%s)=%q", name, got)
 		}
+	}
+
+	time.Sleep(2 * flow.Timeout)
+	if _, err := secondary.Write([]byte("inbound-response")); err != nil {
+		t.Fatalf("secondary Write(after keepalive deadline) error = %v", err)
+	}
+	buf := make([]byte, 32)
+	_ = secondaryServer.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := secondaryServer.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom(secondary after keepalive deadline) error = %v", err)
+	}
+	if got := string(buf[:n]); got != "inbound-response" {
+		t.Fatalf("secondary response=%q", got)
 	}
 }
 
