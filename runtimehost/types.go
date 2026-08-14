@@ -1548,17 +1548,6 @@ func (t *runtimeRecoveringSMSTransport) SendSMSPart(ctx context.Context, req mes
 	return recovery.SMSTransport.SendSMSPart(ctx, req)
 }
 
-func (t *runtimeRecoveringSMSTransport) NotifySMSMemoryAvailable(ctx context.Context) (messaging.SMSMemoryAvailableResult, error) {
-	if t == nil || t.inner == nil {
-		return messaging.SMSMemoryAvailableResult{}, messaging.ErrSMSTransportUnavailable
-	}
-	notifier, ok := t.inner.(messaging.SMSMemoryAvailableNotifier)
-	if !ok {
-		return messaging.SMSMemoryAvailableResult{}, errors.New("sms transport does not support memory-available notification")
-	}
-	return notifier.NotifySMSMemoryAvailable(ctx)
-}
-
 type runtimeRecoveringUSSDTransport struct {
 	owner *Instance
 	inner messaging.USSDTransport
@@ -1921,16 +1910,6 @@ func (i *Instance) SendSMSWithOptions(ctx context.Context, to, text string, opts
 		return messaging.SendOutcome{}, errors.New("messaging service is nil")
 	}
 	return svc.SendSMSWithOptions(ctx, to, text, opts)
-}
-
-// NotifySMSMemoryAvailable sends RP-SMMA control signalling through the
-// active IMS transport. It does not send a user-visible SMS.
-func (i *Instance) NotifySMSMemoryAvailable(ctx context.Context) (messaging.SMSMemoryAvailableResult, error) {
-	svc := i.Service()
-	if svc == nil {
-		return messaging.SMSMemoryAvailableResult{}, errors.New("messaging service is nil")
-	}
-	return svc.NotifySMSMemoryAvailable(ctx)
 }
 
 func (i *Instance) GetSMSDeliveryStatus(messageID string) (*messaging.DeliveryStatus, error) {

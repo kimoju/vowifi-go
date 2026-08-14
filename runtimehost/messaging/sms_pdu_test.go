@@ -398,20 +398,6 @@ func TestParseSMSRPDUAckAndError(t *testing.T) {
 	}
 }
 
-func TestBuildAndParseSMSRPSMMA(t *testing.T) {
-	body := BuildSMSRPSMMA(0x24)
-	if string(body) != string([]byte{0x06, 0x24}) {
-		t.Fatalf("BuildSMSRPSMMA()=%x", body)
-	}
-	rpdu, err := ParseSMSRPDU(body)
-	if err != nil {
-		t.Fatalf("ParseSMSRPDU(RP-SMMA) error=%v", err)
-	}
-	if rpdu.Kind != SMSRPDUKindSMMA || rpdu.MR != 0x24 || rpdu.RawType != 0x06 {
-		t.Fatalf("RP-SMMA=%+v", rpdu)
-	}
-}
-
 func TestParseSMSRPDUAckWithUserData(t *testing.T) {
 	tpdu := mustHex(t, "02070B918100551512F2627050214365006270502144000000")
 	body, err := BuildSMSRPAckWithTPDU(0x55, tpdu)

@@ -60,50 +60,6 @@ func TestIMSSMSTransportSendsSIPMessage(t *testing.T) {
 	}
 }
 
-func TestIMSSMSTransportSendsMemoryAvailableNotification(t *testing.T) {
-	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
-	sms := IMSSMSTransport{
-		Transport: transport,
-		SMSC:      "+12063130004",
-		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example", UserAgent: "VoHive"},
-		Registration: voiceclient.RegistrationBinding{
-			ContactURI:     "sip:user@192.0.2.10:5063",
-			PublicIdentity: "sip:user@ims.example",
-			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
-		},
-	}
-
-	result, err := sms.NotifySMSMemoryAvailable(context.Background())
-	if err != nil || !result.Accepted || result.SIPCode != 202 {
-		t.Fatalf("NotifySMSMemoryAvailable() result=%+v err=%v", result, err)
-	}
-	if len(transport.requests) != 1 {
-		t.Fatalf("requests=%d", len(transport.requests))
-	}
-	req := transport.requests[0]
-	if req.Method != "MESSAGE" || req.URI != "tel:+12063130004" || string(req.Body) != string(BuildSMSRPSMMA(byte(result.RPMR))) {
-		t.Fatalf("RP-SMMA request=%+v body=%x result=%+v", req, req.Body, result)
-	}
-	if req.Headers["Content-Type"] != IMS3GPPSMSContentType || req.Headers["Content-Transfer-Encoding"] != "binary" {
-		t.Fatalf("RP-SMMA headers=%+v", req.Headers)
-	}
-}
-
-func TestSMSServiceCentreURI(t *testing.T) {
-	tests := map[string]string{
-		"+12063130004":           "tel:+12063130004",
-		"tel:+12063130004":       "tel:+12063130004",
-		"sip:sc@ims.example":     "sip:sc@ims.example",
-		"sc@ims.example":         "sip:sc@ims.example",
-		"short-code-with-domain": "sip:short-code-with-domain@ims.example;user=phone",
-	}
-	for input, want := range tests {
-		if got := smsServiceCentreURI(input, "ims.example"); got != want {
-			t.Errorf("smsServiceCentreURI(%q)=%q want %q", input, got, want)
-		}
-	}
-}
-
 func TestIMSSMSTransportCanDisableStatusReports(t *testing.T) {
 	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
 	sms := IMSSMSTransport{

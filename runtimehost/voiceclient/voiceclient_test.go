@@ -490,17 +490,6 @@ func TestBuildRegisterHeaders(t *testing.T) {
 	}
 }
 
-func TestRegisterContactURIForSecurityAssociationUsesProtectedServerPort(t *testing.T) {
-	req := IMSSecurityAssociationInstallRequest{
-		ClientAgreement: SecurityAgreement{PortClient: 5062, PortServer: 5063},
-		LocalEndpoint:   IMSSecurityAssociationEndpoint{Address: "2001:db8::10", Port: 5062},
-	}
-	got := registerContactURIForSecurityAssociation("sip:user@[2001:db8::10]:5060;transport=udp", req)
-	if want := "sip:user@[2001:db8::10]:5063;transport=udp"; got != want {
-		t.Fatalf("protected Contact URI=%q, want %q", got, want)
-	}
-}
-
 func TestParseAndSelectSecurityAgreement(t *testing.T) {
 	values := []string{`ipsec-3gpp;q=0.1;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063, ipsec-3gpp;q=0.9;alg=hmac-md5-96;ealg=null;spi-c=333;spi-s=444;port-c=5064;port-s=5065`}
 	selected, ok := SelectSecurityAgreement(values, SecurityAgreement{

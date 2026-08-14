@@ -20,7 +20,6 @@ const (
 	SMSRPDUKindData    SMSRPDUKind = "RP-DATA"
 	SMSRPDUKindAck     SMSRPDUKind = "RP-ACK"
 	SMSRPDUKindError   SMSRPDUKind = "RP-ERROR"
-	SMSRPDUKindSMMA    SMSRPDUKind = "RP-SMMA"
 )
 
 type SMSRPDU struct {
@@ -454,18 +453,10 @@ func ParseSMSRPDU(body []byte) (SMSRPDU, error) {
 			return SMSRPDU{}, err
 		}
 		rpdu.TPDU = tpdu
-	case 0x06:
-		rpdu.Kind = SMSRPDUKindSMMA
 	default:
 		return SMSRPDU{}, fmt.Errorf("unsupported RPDU type: 0x%02x", body[0])
 	}
 	return rpdu, nil
-}
-
-// BuildSMSRPSMMA builds an MS-to-network RP-SMMA message as specified by
-// 3GPP TS 24.011: message type followed by the RP message reference.
-func BuildSMSRPSMMA(mr byte) []byte {
-	return []byte{0x06, mr}
 }
 
 func parseSMSRPDataFields(body []byte) (originator string, destination string, tpdu []byte, err error) {
