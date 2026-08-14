@@ -146,8 +146,25 @@ type SMSSendResult struct {
 	RetryAfter                 time.Duration
 }
 
+// SMSMemoryAvailableResult describes the SIP acknowledgement of an RP-SMMA
+// notification. RP-SMMA is control signalling only; it does not submit a text
+// message to a recipient.
+type SMSMemoryAvailableResult struct {
+	CallID   string
+	RPMR     int
+	SIPCode  int
+	Reason   string
+	Accepted bool
+}
+
 type SMSTransport interface {
 	SendSMSPart(context.Context, SMSSendRequest) (SMSSendResult, error)
+}
+
+// SMSMemoryAvailableNotifier is implemented by SMS-over-IMS transports that
+// can clear the network-side "terminal memory unavailable" indication.
+type SMSMemoryAvailableNotifier interface {
+	NotifySMSMemoryAvailable(context.Context) (SMSMemoryAvailableResult, error)
 }
 
 type USSDTransport interface {
@@ -291,6 +308,23 @@ func (s *Service) smsTransport() SMSTransport {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.transport
+}
+
+// NotifySMSMemoryAvailable sends the 3GPP RP-SMMA control notification when
+// supported by the active transport. It never submits an end-user SMS.
+func (s *Service) NotifySMSMemoryAvailable(ctx context.Context) (SMSMemoryAvailableResult, error) {
+	transport := s.smsTransport()
+	if transport == nil {
+		return SMSMemoryAvailableResult{}, ErrSMSTransportUnavailable
+	}
+	notifier, ok := transport.(SMSMemoryAvailableNotifier)
+	if !ok {
+		return SMSMemoryAvailableResult{}, errors.New("sms transport does not support memory-available notification")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return notifier.NotifySMSMemoryAvailable(ctx)
 }
 
 func (s *Service) currentUSSDTransport() USSDTransport {
