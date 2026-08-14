@@ -3,11 +3,89 @@ package messaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
+
+func (t IMSSMSTransport) NotifySMSMemoryAvailable(ctx context.Context) (SMSMemoryAvailableResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if t.Transport == nil {
+		return SMSMemoryAvailableResult{}, ErrSMSTransportUnavailable
+	}
+	localURI := firstNonEmpty(t.LocalURI, t.Registration.PublicIdentity, t.Profile.IMPU)
+	if localURI == "" {
+		return SMSMemoryAvailableResult{}, errors.New("IMS SMS local identity is empty")
+	}
+	remoteURI := firstNonEmpty(t.RemoteTargetURI, smsServiceCentrePSI(t.SMSC, t.Domain, t.Profile.Domain, smsDomainFromURI(t.Registration.PublicIdentity)))
+	if remoteURI == "" {
+		return SMSMemoryAvailableResult{}, errors.New("IMS SMS service-centre identity is empty")
+	}
+	now := time.Now()
+	rpMR := byte(now.UnixNano())
+	callID := fmt.Sprintf("sms-smma-%d@vowifi-go", now.UnixNano())
+	msg, err := voiceclient.BuildMessageRequest(voiceclient.DialogRequestConfig{
+		Profile:         t.Profile,
+		Registration:    t.Registration,
+		LocalURI:        localURI,
+		ContactURI:      firstNonEmpty(t.ContactURI, t.Registration.ContactURI),
+		RemoteURI:       remoteURI,
+		RemoteTargetURI: remoteURI,
+		CallID:          callID,
+		LocalTag:        "sms-smma",
+		CSeq:            1,
+		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
+	}, IMS3GPPSMSContentType, BuildSMSRPSMMA(rpMR))
+	if err != nil {
+		return SMSMemoryAvailableResult{CallID: callID, RPMR: int(rpMR)}, err
+	}
+	msg.Headers["Content-Transfer-Encoding"] = "binary"
+	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, msg)
+	result := SMSMemoryAvailableResult{
+		CallID: callID, RPMR: int(rpMR), SIPCode: resp.StatusCode, Reason: strings.TrimSpace(resp.Reason),
+	}
+	if err != nil {
+		return result, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return result, fmt.Errorf("IMS SMS memory-available notification rejected: %d %s", resp.StatusCode, result.Reason)
+	}
+	result.Accepted = true
+	return result, nil
+}
+
+// smsServiceCentrePSI maps the SIM SMSC address to the home IMS network PSI.
+// A bare tel URI is not sufficient for routing RP-SMMA to the IP-SM-GW on
+// networks such as T-Mobile; use the IMS home domain whenever it is known.
+func smsServiceCentrePSI(smsc string, domains ...string) string {
+	smsc = strings.TrimSpace(smsc)
+	if smsc == "" {
+		return ""
+	}
+	lower := strings.ToLower(smsc)
+	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") {
+		return smsc
+	}
+	if strings.HasPrefix(lower, "tel:") {
+		smsc = strings.TrimSpace(smsc[4:])
+	}
+	if strings.Contains(smsc, "@") {
+		return "sip:" + smsc
+	}
+	domain := firstNonEmpty(domains...)
+	if domain != "" {
+		return "sip:" + smsc + "@" + domain + ";user=phone"
+	}
+	if strings.HasPrefix(smsc, "+") {
+		return "tel:" + smsc
+	}
+	return smsc
+}
 
 type IMSSMSTransport struct {
 	Transport            voiceclient.SIPRequestTransport
