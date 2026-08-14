@@ -108,6 +108,81 @@ func TestWireSIPFlowServesUnsolicitedUDPRequest(t *testing.T) {
 	}
 }
 
+func TestWireSIPFlowServesUnsolicitedRequestFromPrimaryProtectedSocket(t *testing.T) {
+	primaryServer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(primary) error = %v", err)
+	}
+	defer primaryServer.Close()
+	secondaryServer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(secondary) error = %v", err)
+	}
+	defer secondaryServer.Close()
+	primary, err := net.Dial("udp", primaryServer.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial(primary) error = %v", err)
+	}
+	secondary, err := net.Dial("udp", secondaryServer.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial(secondary) error = %v", err)
+	}
+
+	flow := &WireSIPFlow{
+		conn:                primary,
+		securityReceiveConn: secondary,
+		network:             "udp",
+	}
+	defer flow.Close()
+	handled := make(chan SIPIncomingRequest, 1)
+	if err := flow.SetIncomingRequestHandler(func(_ context.Context, req SIPIncomingRequest) ([][]byte, error) {
+		handled <- req
+		wire, buildErr := BuildSIPResponseWire(req, 200, "OK", nil, nil)
+		return [][]byte{wire}, buildErr
+	}); err != nil {
+		t.Fatalf("SetIncomingRequestHandler() error = %v", err)
+	}
+	request := "MESSAGE sip:user@example SIP/2.0\r\n" +
+		"Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK-primary\r\n" +
+		"To: <sip:user@example>\r\n" +
+		"From: <sip:smsc@example>;tag=smsc\r\n" +
+		"Call-ID: inbound-primary\r\n" +
+		"CSeq: 1 MESSAGE\r\n" +
+		"Content-Length: 5\r\n\r\nhello"
+	if _, err := primaryServer.WriteTo([]byte(request), primary.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(primary) error = %v", err)
+	}
+	serveCtx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- flow.ServeIncomingRequests(serveCtx) }()
+	select {
+	case req := <-handled:
+		if req.Method != "MESSAGE" || firstHeader(req.Headers, "Call-ID") != "inbound-primary" {
+			t.Fatalf("inbound request=%+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("primary protected socket MESSAGE was not drained")
+	}
+	buf := make([]byte, 2048)
+	_ = primaryServer.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := primaryServer.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom(primary response) error = %v", err)
+	}
+	if !strings.HasPrefix(string(buf[:n]), "SIP/2.0 200 OK\r\n") {
+		t.Fatalf("primary response=%q", buf[:n])
+	}
+	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("ServeIncomingRequests() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeIncomingRequests() did not stop")
+	}
+}
+
 func TestWireSIPFlowReadsCancelWhileInboundInviteHandlerWaits(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

@@ -153,25 +153,18 @@ func (f *WireSIPFlow) ServeIncomingRequests(ctx context.Context) error {
 			return nil
 		}
 		handler := f.incomingHandler
-		conn := f.securityReceiveConn
-		if conn == nil {
-			conn = f.conn
+		primary := f.conn
+		if primary == nil {
+			primary = f.securityReceiveConn
 		}
-		if handler == nil || conn == nil || isSIPStreamNetwork(f.network) {
+		if handler == nil || primary == nil || isSIPStreamNetwork(f.network) {
 			f.mu.Unlock()
 			if !waitSIPIncomingPoll(ctx, 50*time.Millisecond) {
 				return nil
 			}
 			continue
 		}
-		if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
-			f.mu.Unlock()
-			if ctx.Err() != nil {
-				return nil
-			}
-			return err
-		}
-		n, err := conn.Read(buf)
+		n, conn, err := f.readUDPDatagramLocked(primary, buf, time.Now().Add(200*time.Millisecond))
 		if err == nil && n > 0 && !isSIPResponseWire(buf[:n]) {
 			err = f.handleIncomingRequestLocked(ctx, conn, buf[:n])
 		}
