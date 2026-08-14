@@ -394,6 +394,33 @@ func TestIMSRegistrationMaintenanceReportsUpdatedRefreshSchedule(t *testing.T) {
 	}
 }
 
+func TestIMSRegistrationDefaultRefreshesAtHalfLifetime(t *testing.T) {
+	if got, want := imsRegistrationRefreshDelay(WireIMSRegistrar{}, 3600, 0), 30*time.Minute; got != want {
+		t.Fatalf("default refresh delay=%v, want %v", got, want)
+	}
+	if got, want := imsRegistrationRefreshDelay(WireIMSRegistrar{}, 60, 0), 30*time.Second; got != want {
+		t.Fatalf("short default refresh delay=%v, want %v", got, want)
+	}
+}
+
+func TestIMSRegistrationRefreshTimeoutKeepsValidBinding(t *testing.T) {
+	m := &imsRegistrationMaintenance{
+		registered:   true,
+		registeredAt: time.Now().Add(-time.Minute),
+		binding:      voiceclient.RegistrationBinding{Expires: 3600},
+	}
+	if !m.canKeepCurrentBindingAfterRefreshError(context.DeadlineExceeded) {
+		t.Fatal("valid binding should survive a transient refresh timeout")
+	}
+	m.registeredAt = time.Now().Add(-2 * time.Hour)
+	if m.canKeepCurrentBindingAfterRefreshError(context.DeadlineExceeded) {
+		t.Fatal("expired binding must proceed to full registration recovery")
+	}
+	if m.canKeepCurrentBindingAfterRefreshError(errors.New("invalid response")) {
+		t.Fatal("non-timeout refresh error must not be deferred")
+	}
+}
+
 func TestClassifyIMSRegisterResponse(t *testing.T) {
 	tests := []struct {
 		name                string

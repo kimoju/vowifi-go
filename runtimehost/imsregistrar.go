@@ -997,6 +997,14 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 
 	result, err := m.session.Refresh(ctx, req)
 	if err != nil {
+		// A refresh is normally sent before the current binding expires. A
+		// transient timeout must not tear down the protected server socket:
+		// that socket is still the only path for incoming calls and SMS while
+		// the registrar binding remains valid. Keep serving inbound traffic and
+		// let refreshLoop retry; perform full recovery once the binding expires.
+		if m.canKeepCurrentBindingAfterRefreshError(err) {
+			return err
+		}
 		if m.shouldRecoverRegistration(result, err) {
 			return m.recoverRegistration(ctx, err, result.RetryAfter)
 		}
@@ -1016,6 +1024,33 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *imsRegistrationMaintenance) canKeepCurrentBindingAfterRefreshError(err error) bool {
+	if m == nil || err == nil {
+		return false
+	}
+	var netErr net.Error
+	if !errors.Is(err, context.DeadlineExceeded) &&
+		!errors.Is(err, voiceclient.ErrSIPFinalResponseTimeout) &&
+		(!errors.As(err, &netErr) || !netErr.Timeout()) {
+		return false
+	}
+	m.mu.Lock()
+	registered := m.registered
+	registeredAt := m.registeredAt
+	expires := m.binding.Expires
+	if expires <= 0 {
+		expires = m.session.Expires
+	}
+	m.mu.Unlock()
+	if !registered || registeredAt.IsZero() {
+		return false
+	}
+	if expires <= 0 {
+		expires = 3600
+	}
+	return time.Now().Before(registeredAt.Add(time.Duration(expires) * time.Second))
 }
 
 func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, cause error, retryAfter time.Duration) error {
@@ -1287,13 +1322,10 @@ func imsRegistrationRefreshDelay(config WireIMSRegistrar, bindingExpires, sessio
 	ttl := time.Duration(expires) * time.Second
 	lead := config.RefreshLead
 	if lead <= 0 {
-		lead = ttl / 10
-		if lead < 5*time.Second {
-			lead = 5 * time.Second
-		}
-		if lead > time.Minute {
-			lead = time.Minute
-		}
+		// SIP registrations are conventionally refreshed around half their
+		// lifetime. Waiting until one minute before a one-hour expiry proved too
+		// late for carriers that retire the downlink binding ahead of Expires.
+		return ttl / 2
 	}
 	delay := ttl - lead
 	if delay <= 0 {

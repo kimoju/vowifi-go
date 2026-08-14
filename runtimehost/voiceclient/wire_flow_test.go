@@ -537,6 +537,69 @@ func TestWireSIPFlowSendsCRLFKeepaliveOnBothProtectedUDPFlows(t *testing.T) {
 	}
 }
 
+func TestWireSIPFlowRefreshTimeoutPreservesProtectedReceiveSocket(t *testing.T) {
+	primaryServer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(primary) error = %v", err)
+	}
+	defer primaryServer.Close()
+	secondaryServer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(secondary) error = %v", err)
+	}
+	defer secondaryServer.Close()
+	primary, err := net.Dial("udp", primaryServer.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial(primary) error = %v", err)
+	}
+	secondary, err := net.Dial("udp", secondaryServer.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial(secondary) error = %v", err)
+	}
+	flow := &WireSIPFlow{
+		Timeout:             40 * time.Millisecond,
+		MaxRetransmits:      1,
+		conn:                primary,
+		securityReceiveConn: secondary,
+		network:             "udp",
+	}
+	defer flow.Close()
+
+	_, err = flow.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To":           "<sip:user@example>",
+			"From":         "<sip:user@example>;tag=t",
+			"Contact":      "<sip:user@192.0.2.10:5063>",
+			"Call-ID":      "refresh-timeout",
+			"CSeq":         "2 REGISTER",
+			"Max-Forwards": "70",
+		},
+	})
+	if err == nil {
+		t.Fatal("RoundTripRegister() error=nil, want timeout")
+	}
+	flow.mu.Lock()
+	gotSecondary := flow.securityReceiveConn
+	flow.mu.Unlock()
+	if gotSecondary == nil {
+		t.Fatal("refresh timeout closed protected receive socket")
+	}
+
+	if _, err := secondaryServer.WriteTo([]byte("inbound-still-open"), secondary.LocalAddr()); err != nil {
+		t.Fatalf("WriteTo(secondary) error = %v", err)
+	}
+	buf := make([]byte, 64)
+	_ = secondary.SetReadDeadline(time.Now().Add(time.Second))
+	n, err := secondary.Read(buf)
+	if err != nil {
+		t.Fatalf("protected receive socket is unusable after refresh timeout: %v", err)
+	}
+	if got := string(buf[:n]); got != "inbound-still-open" {
+		t.Fatalf("protected receive payload=%q", got)
+	}
+}
+
 func TestWireSIPFlowUsesResolverForRegisterTarget(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

@@ -232,7 +232,7 @@ func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) e
 			continue
 		}
 		if err := conn.SetDeadline(sipOperationDeadline(ctx, timeout)); err != nil {
-			f.closeConnLocked()
+			f.closePrimaryConnLocked()
 			if !shouldRetry(err) {
 				return err
 			}
@@ -245,7 +245,7 @@ func (f *WireSIPFlow) WriteRequest(ctx context.Context, msg SIPRequestMessage) e
 			return err
 		}
 		if _, err := conn.Write(wire); err != nil {
-			f.closeConnLocked()
+			f.closePrimaryConnLocked()
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -296,17 +296,17 @@ func (f *WireSIPFlow) SendCRLFKeepalive(ctx context.Context) error {
 	}
 	for _, keepaliveConn := range connections {
 		if err := keepaliveConn.SetWriteDeadline(deadline); err != nil {
-			f.closeConnLocked()
+			f.closeTransportConnLocked(keepaliveConn)
 			return err
 		}
 		_, writeErr := keepaliveConn.Write([]byte("\r\n\r\n"))
 		clearErr := keepaliveConn.SetWriteDeadline(time.Time{})
 		if writeErr != nil {
-			f.closeConnLocked()
+			f.closeTransportConnLocked(keepaliveConn)
 			return writeErr
 		}
 		if clearErr != nil {
-			f.closeConnLocked()
+			f.closeTransportConnLocked(keepaliveConn)
 			return clearErr
 		}
 	}
@@ -503,7 +503,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 			continue
 		}
 		if err := conn.SetDeadline(sipOperationDeadline(ctx, timeout)); err != nil {
-			f.closeConnLocked()
+			f.closePrimaryConnLocked()
 			if !shouldRetry(err) {
 				return SIPResponse{}, err
 			}
@@ -516,7 +516,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 			return SIPResponse{}, err
 		}
 		if _, err := conn.Write(wire); err != nil {
-			f.closeConnLocked()
+			f.closePrimaryConnLocked()
 			if ctx.Err() != nil {
 				return SIPResponse{}, ctx.Err()
 			}
@@ -528,7 +528,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 		if isSIPStreamNetwork(network) {
 			resp, err := readFinalSIPFlowResponse(ctx, f.reader, attempt, onProvisional)
 			if err != nil {
-				f.closeConnLocked()
+				f.closePrimaryConnLocked()
 				if ctx.Err() != nil {
 					return SIPResponse{}, ctx.Err()
 				}
@@ -547,7 +547,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 		}
 		resp, err := f.readUDPResponseLocked(ctx, conn, timeout, wire, attempt, onProvisional)
 		if err != nil {
-			f.closeConnLocked()
+			f.closePrimaryConnLocked()
 			if ctx.Err() != nil {
 				return SIPResponse{}, ctx.Err()
 			}
@@ -898,6 +898,21 @@ func (f *WireSIPFlow) closePrimaryConnLocked() error {
 	f.network = ""
 	f.target = ""
 	return err
+}
+
+func (f *WireSIPFlow) closeTransportConnLocked(conn net.Conn) error {
+	if conn == nil {
+		return nil
+	}
+	if conn == f.securityReceiveConn {
+		err := f.securityReceiveConn.Close()
+		f.securityReceiveConn = nil
+		return err
+	}
+	if conn == f.conn {
+		return f.closePrimaryConnLocked()
+	}
+	return conn.Close()
 }
 
 func cloneStringMap(in map[string]string) map[string]string {
