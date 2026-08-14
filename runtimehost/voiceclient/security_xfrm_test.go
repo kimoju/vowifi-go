@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -374,6 +376,42 @@ func TestLinuxIMSSecurityXFRMInstallerApplyInstallAndCleanup(t *testing.T) {
 	}
 }
 
+func TestLinuxIMSSecurityXFRMInstallerRotatesChallengeWithSharedClientSPI(t *testing.T) {
+	runner := &statefulIMSSecurityXFRMRunner{resources: make(map[string]struct{})}
+	installer := &LinuxIMSSecurityXFRMInstaller{Runner: runner}
+	first := validSecurityXFRMInstallRequest()
+	if _, err := installer.Apply(context.Background(), first); err != nil {
+		t.Fatalf("Apply(first) error = %v", err)
+	}
+
+	second := validSecurityXFRMInstallRequest()
+	second.Plan.SPIServer = 0x0a0b0c0e
+	second.Plan.Outbound.SPI = 0x0a0b0c0e
+	second.Agreement.SPIServer = 0x0a0b0c0e
+	second.AKA.IK = securityXFRMBytes(0xc0, 16)
+	second.AKA.CK = securityXFRMBytes(0xd0, 16)
+	secondPlan, err := BuildIMSSecurityAssociationXFRMInstallPlan(second)
+	if err != nil {
+		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan(second) error = %v", err)
+	}
+	if _, err := installer.Apply(context.Background(), second); err != nil {
+		t.Fatalf("Apply(second) error = %v", err)
+	}
+	if installer.StateCount() != 1 {
+		t.Fatalf("StateCount()=%d, want one active generation", installer.StateCount())
+	}
+	if !runner.sawUpdate {
+		t.Fatal("second challenge did not update the shared inbound state/policies")
+	}
+	wantResources := make(map[string]struct{}, len(secondPlan.Commands))
+	for _, command := range secondPlan.Commands {
+		wantResources[imssSecurityXFRMResourceKey(command)] = struct{}{}
+	}
+	if !reflect.DeepEqual(runner.resources, wantResources) {
+		t.Fatalf("active resources=%v, want rotated generation %v", runner.resources, wantResources)
+	}
+}
+
 func TestLinuxIMSSecurityXFRMInstallerRejectsLegacyPlanWithoutKeysAndEndpoints(t *testing.T) {
 	installer := &LinuxIMSSecurityXFRMInstaller{}
 	err := installer.InstallSecurityPlan(context.Background(), IMSSecurityAssociationPlan{})
@@ -493,6 +531,66 @@ type fakeIMSSecurityXFRMRunner struct {
 	commands [][]string
 	failAt   int
 	err      error
+}
+
+type statefulIMSSecurityXFRMRunner struct {
+	resources map[string]struct{}
+	sawUpdate bool
+}
+
+func (r *statefulIMSSecurityXFRMRunner) RunIP(_ context.Context, args ...string) error {
+	key := imssSecurityXFRMResourceKey(IMSSecurityAssociationXFRMCommand{UndoArgs: securityXFRMUndoForArgs(args)})
+	if len(args) < 3 {
+		return fmt.Errorf("short ip command: %v", args)
+	}
+	switch args[2] {
+	case "add":
+		if _, exists := r.resources[key]; exists {
+			return errors.New("RTNETLINK answers: File exists")
+		}
+		r.resources[key] = struct{}{}
+	case "update":
+		if _, exists := r.resources[key]; !exists {
+			return errors.New("RTNETLINK answers: No such file or directory")
+		}
+		r.sawUpdate = true
+	case "delete":
+		delete(r.resources, key)
+	default:
+		return fmt.Errorf("unexpected ip command: %v", args)
+	}
+	return nil
+}
+
+func securityXFRMUndoForArgs(args []string) []string {
+	if len(args) < 3 {
+		return nil
+	}
+	if args[1] == "state" {
+		undo := []string{"xfrm", "state", "delete"}
+		for _, field := range []string{"src", "dst", "proto", "spi"} {
+			for idx := 3; idx+1 < len(args); idx++ {
+				if args[idx] == field {
+					undo = append(undo, field, args[idx+1])
+					break
+				}
+			}
+		}
+		return undo
+	}
+	if args[1] == "policy" {
+		undo := []string{"xfrm", "policy", "delete"}
+		for _, field := range []string{"src", "dst", "proto", "sport", "dport", "dir"} {
+			for idx := 3; idx+1 < len(args); idx++ {
+				if args[idx] == field {
+					undo = append(undo, field, args[idx+1])
+					break
+				}
+			}
+		}
+		return undo
+	}
+	return []string{strings.Join(args, " ")}
 }
 
 func (r *fakeIMSSecurityXFRMRunner) RunIP(ctx context.Context, args ...string) error {

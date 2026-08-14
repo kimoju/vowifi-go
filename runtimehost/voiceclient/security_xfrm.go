@@ -170,12 +170,49 @@ func (i *LinuxIMSSecurityXFRMInstaller) Apply(ctx context.Context, req IMSSecuri
 		}
 	}
 	i.mu.Unlock()
-	state, err := applyIMSSecurityXFRMPlan(ctx, imssSecurityXFRMRunner(i.Runner), plan)
+	i.mu.Lock()
+	previous := append([]IMSSecurityAssociationXFRMState(nil), i.states...)
+	i.mu.Unlock()
+	runner := imssSecurityXFRMRunner(i.Runner)
+	state, err := applyIMSSecurityXFRMPlanUpsert(ctx, runner, plan)
 	if err != nil {
 		return state, err
 	}
+	active := make(map[string]struct{}, len(state.undo))
+	for _, command := range state.undo {
+		active[imssSecurityXFRMResourceKey(command)] = struct{}{}
+	}
+	stale := make([]IMSSecurityAssociationXFRMCommand, 0)
+	seenStale := make(map[string]struct{})
+	for _, oldState := range previous {
+		if oldState.Plan.LocalAddress != plan.LocalAddress || oldState.Plan.RemoteAddress != plan.RemoteAddress {
+			continue
+		}
+		for _, command := range oldState.undo {
+			key := imssSecurityXFRMResourceKey(command)
+			if _, kept := active[key]; kept {
+				continue
+			}
+			if _, seen := seenStale[key]; seen {
+				continue
+			}
+			seenStale[key] = struct{}{}
+			stale = append(stale, command)
+		}
+	}
+	if err := runIMSSecurityXFRMUndo(ctx, runner, stale); err != nil {
+		_ = cleanupIMSSecurityXFRMState(ctx, runner, state)
+		return state, err
+	}
 	i.mu.Lock()
-	i.states = append(i.states, state)
+	kept := i.states[:0]
+	for _, oldState := range i.states {
+		if oldState.Plan.LocalAddress == plan.LocalAddress && oldState.Plan.RemoteAddress == plan.RemoteAddress {
+			continue
+		}
+		kept = append(kept, oldState)
+	}
+	i.states = append(kept, state)
 	i.mu.Unlock()
 	return state, nil
 }
@@ -239,6 +276,47 @@ func applyIMSSecurityXFRMPlan(ctx context.Context, runner IMSSecurityXFRMCommand
 		}
 	}
 	return state, nil
+}
+
+// applyIMSSecurityXFRMPlanUpsert rotates a Security-Agree generation without
+// tearing down the protected flow carrying the re-authentication transaction.
+// The UE keeps its client SPI across challenges, while the P-CSCF may issue a
+// new server SPI. Linux therefore reports EEXIST for the shared inbound state
+// and policies even though the outbound state is a new generation.
+func applyIMSSecurityXFRMPlanUpsert(ctx context.Context, runner IMSSecurityXFRMCommandRunner, plan IMSSecurityAssociationXFRMInstallPlan) (IMSSecurityAssociationXFRMState, error) {
+	state := IMSSecurityAssociationXFRMState{Plan: plan}
+	created := make([]IMSSecurityAssociationXFRMCommand, 0, len(plan.Commands))
+	for _, command := range plan.Commands {
+		err := runner.RunIP(ctx, command.Args...)
+		if err == nil {
+			created = append(created, cloneIMSSecurityXFRMCommand(command, true))
+		} else if imssSecurityXFRMAlreadyExists(err) {
+			update := append([]string(nil), command.Args...)
+			if len(update) < 3 || update[2] != "add" {
+				return state, err
+			}
+			update[2] = "update"
+			if updateErr := runner.RunIP(ctx, update...); updateErr != nil {
+				rollbackErr := runIMSSecurityXFRMUndo(ctx, runner, created)
+				return state, errors.Join(updateErr, rollbackErr)
+			}
+		} else {
+			rollbackErr := runIMSSecurityXFRMUndo(ctx, runner, created)
+			return state, errors.Join(err, rollbackErr)
+		}
+		if len(command.UndoArgs) > 0 {
+			state.undo = append(state.undo, cloneIMSSecurityXFRMCommand(command, true))
+		}
+	}
+	return state, nil
+}
+
+func imssSecurityXFRMAlreadyExists(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "file exists")
+}
+
+func imssSecurityXFRMResourceKey(command IMSSecurityAssociationXFRMCommand) string {
+	return strings.Join(command.UndoArgs, "\x00")
 }
 
 func cleanupIMSSecurityXFRMState(ctx context.Context, runner IMSSecurityXFRMCommandRunner, state IMSSecurityAssociationXFRMState) error {
