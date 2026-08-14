@@ -797,12 +797,18 @@ func TestRegisterSessionHandlesAKAv1MD5Challenge(t *testing.T) {
 func TestRegisterSessionPurgesStaleBindingsBeforeFinalRegister(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
+	nextRawNonce := append(bytesFrom(0x20, 16), bytesFrom(0x50, 16)...)
+	nextChallenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(nextRawNonce) + `", algorithm=AKAv1-MD5, qop="auth"`
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
 		{StatusCode: 401, Reason: "Unauthorized", Headers: map[string][]string{
 			"WWW-Authenticate": {challenge},
 			"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063`},
 		}},
 		{StatusCode: 200, Reason: "Bindings Cleared"},
+		{StatusCode: 401, Reason: "New Challenge", Headers: map[string][]string{
+			"WWW-Authenticate": {nextChallenge},
+			"Security-Server":  {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=333;spi-s=444;port-c=5062;port-s=5063`},
+		}},
 		{StatusCode: 200, Reason: "OK", Headers: map[string][]string{"Contact": {`<sip:user@192.0.2.10:5060>;expires=3600`}}},
 	}}
 	result, err := RegisterSession{
@@ -815,19 +821,22 @@ func TestRegisterSessionPurgesStaleBindingsBeforeFinalRegister(t *testing.T) {
 		CNonce:                      "cnonce",
 		PurgeBindingsBeforeRegister: true,
 	}.Register(context.Background())
-	if err != nil || !result.Registered || result.Attempts != 3 {
+	if err != nil || !result.Registered || result.Attempts != 4 {
 		t.Fatalf("Register() result=%+v err=%v", result, err)
 	}
-	if len(transport.requests) != 3 {
-		t.Fatalf("requests=%d want 3", len(transport.requests))
+	if len(transport.requests) != 4 {
+		t.Fatalf("requests=%d want 4", len(transport.requests))
 	}
 	purge := transport.requests[1]
 	if purge.Headers["Contact"] != "*" || purge.Headers["Expires"] != "0" || !strings.Contains(purge.Headers["Authorization"], "nc=00000001") {
 		t.Fatalf("purge request=%+v", purge)
 	}
-	register := transport.requests[2]
-	if register.Headers["Contact"] == "*" || register.Headers["Expires"] != "3600" || !strings.Contains(register.Headers["Authorization"], "nc=00000002") {
+	register := transport.requests[3]
+	if register.Headers["Contact"] == "*" || register.Headers["Expires"] != "3600" || !strings.Contains(register.Headers["Authorization"], "nc=00000001") {
 		t.Fatalf("final register request=%+v", register)
+	}
+	if transport.requests[2].Headers["Contact"] == "*" {
+		t.Fatalf("bindings were purged more than once: requests=%+v", transport.requests)
 	}
 }
 

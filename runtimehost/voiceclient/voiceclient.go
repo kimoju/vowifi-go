@@ -765,8 +765,9 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		attempts++
 		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
 	}
+	bindingsPurged := false
 	purgeBindings := func(authHeaderName, authz string, challengeHeaders map[string][]string, ch DigestChallenge, authInput DigestAuthInput) (string, DigestAuthInput, error) {
-		if !s.PurgeBindingsBeforeRegister {
+		if !s.PurgeBindingsBeforeRegister || bindingsPurged {
 			return authz, authInput, nil
 		}
 		cseq++
@@ -777,6 +778,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		if !isSIPSuccess(purgeResp.StatusCode) {
 			return authz, authInput, fmt.Errorf("%w: purge bindings %d %s", ErrRegistrationRejected, purgeResp.StatusCode, purgeResp.Reason)
 		}
+		bindingsPurged = true
 		authState := newDigestAuthState(authHeaderName, ch, authInput, authz)
 		authState, err = updateDigestAuthStateFromInfo(authState, purgeResp.Headers, authHeaderName, purgeResp.Body)
 		if err != nil {
@@ -888,7 +890,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		return RegisterResult{Attempts: attempts, Challenge: ch, AuthHeader: authz}, err
 	}
 	currentAuthInput = authzInput
-	if syncFailure {
+	if syncFailure || (bindingsPurged && (resp2.StatusCode == 401 || resp2.StatusCode == 407)) {
 		if isSIPSuccess(resp2.StatusCode) {
 			authState := newDigestAuthState(authzHeader, ch, currentAuthInput, authz)
 			authState, err = updateDigestAuthStateFromInfo(authState, resp2.Headers, authzHeader, resp2.Body)
