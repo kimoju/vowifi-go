@@ -477,6 +477,52 @@ func TestWireSIPFlowSendsCRLFKeepaliveOnEstablishedUDPFlow(t *testing.T) {
 	}
 }
 
+func TestWireSIPFlowSendsCRLFKeepaliveOnBothProtectedUDPFlows(t *testing.T) {
+	primaryServer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(primary) error = %v", err)
+	}
+	defer primaryServer.Close()
+	secondaryServer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(secondary) error = %v", err)
+	}
+	defer secondaryServer.Close()
+	primary, err := net.Dial("udp", primaryServer.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial(primary) error = %v", err)
+	}
+	secondary, err := net.Dial("udp", secondaryServer.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("Dial(secondary) error = %v", err)
+	}
+	flow := &WireSIPFlow{
+		Timeout:             time.Second,
+		conn:                primary,
+		securityReceiveConn: secondary,
+		network:             "udp",
+	}
+	defer flow.Close()
+
+	if err := flow.SendCRLFKeepalive(context.Background()); err != nil {
+		t.Fatalf("SendCRLFKeepalive() error = %v", err)
+	}
+	for name, server := range map[string]net.PacketConn{
+		"primary":   primaryServer,
+		"secondary": secondaryServer,
+	} {
+		buf := make([]byte, 16)
+		_ = server.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, readErr := server.ReadFrom(buf)
+		if readErr != nil {
+			t.Fatalf("ReadFrom(%s) error = %v", name, readErr)
+		}
+		if got := string(buf[:n]); got != "\r\n\r\n" {
+			t.Fatalf("keepalive(%s)=%q", name, got)
+		}
+	}
+}
+
 func TestWireSIPFlowUsesResolverForRegisterTarget(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
