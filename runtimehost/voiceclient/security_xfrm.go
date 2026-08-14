@@ -157,6 +157,15 @@ func (i *LinuxIMSSecurityXFRMInstaller) Apply(ctx context.Context, req IMSSecuri
 	if err != nil {
 		return IMSSecurityAssociationXFRMState{}, err
 	}
+	// A new AKA challenge can reuse the negotiated addresses, ports and SPIs
+	// while changing the integrity/encryption keys. Linux rejects another
+	// "state add" with EEXIST, so remove the tracked generation before
+	// installing the replacement security association.
+	if i.StateCount() > 0 {
+		if err := i.Cleanup(ctx); err != nil {
+			return IMSSecurityAssociationXFRMState{}, err
+		}
+	}
 	state, err := applyIMSSecurityXFRMPlan(ctx, imssSecurityXFRMRunner(i.Runner), plan)
 	if err != nil {
 		return state, err

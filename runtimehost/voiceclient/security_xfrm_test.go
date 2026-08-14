@@ -357,13 +357,13 @@ func TestLinuxIMSSecurityXFRMInstallerApplyInstallAndCleanup(t *testing.T) {
 	if err := installer.InstallSecurityPlanRequest(context.Background(), req); err != nil {
 		t.Fatalf("InstallSecurityPlanRequest() error = %v", err)
 	}
-	if installer.StateCount() != 2 {
-		t.Fatalf("StateCount()=%d, want 2", installer.StateCount())
+	if installer.StateCount() != 1 {
+		t.Fatalf("StateCount()=%d, want one replaced generation", installer.StateCount())
 	}
 
 	want := append([][]string{}, imsSecurityXFRMCommandArgs(plan.Commands, false)...)
-	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, false)...)
 	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, true)...)
+	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, false)...)
 	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, true)...)
 	if err := installer.Cleanup(context.Background()); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
