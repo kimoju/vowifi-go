@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net"
+	"net/netip"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +44,7 @@ type TUNTunnelManagerConfig struct {
 	RoutingConfigFactory   TUNRoutingConfigFactory
 	DisableRouting         bool
 	DefaultRoutes          bool
+	IsolateHostRouting     bool
 	ProtectEPDGRoutes      bool
 	EPDGRouteResolver      EPDGRouteResolver
 	EPDGOuterRouteResolver EPDGOuterRouteResolver
@@ -193,7 +197,16 @@ func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, 
 		addresses = append(addresses, strings.TrimSpace(result.LocalInnerIP))
 	}
 	routes := cloneTUNRoutes(m.Config.Routes)
-	if m.Config.DefaultRoutes && len(routes) == 0 {
+	rules := cloneTUNRules(m.Config.Rules)
+	if m.Config.IsolateHostRouting && len(routes) == 0 && len(rules) == 0 {
+		source, err := isolatedTUNSourcePrefix(result.LocalInnerIP)
+		if err != nil {
+			return TUNRoutingConfig{}, err
+		}
+		table, priority := isolatedTUNRoutingIdentity(iface)
+		routes = append(routes, TUNRoute{Destination: "default", Table: table})
+		rules = append(rules, TUNRule{Priority: priority, From: source, Table: table})
+	} else if m.Config.DefaultRoutes && len(routes) == 0 {
 		routes = append(routes, TUNRoute{Destination: "default"})
 	}
 	exclusions := cloneEPDGRouteExclusions(m.Config.EPDGRouteExclusions)
@@ -210,8 +223,40 @@ func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, 
 		Addresses:           addresses,
 		EPDGRouteExclusions: exclusions,
 		Routes:              routes,
-		Rules:               cloneTUNRules(m.Config.Rules),
+		Rules:               rules,
 	}, nil
+}
+
+func isolatedTUNSourcePrefix(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if prefix, err := netip.ParsePrefix(value); err == nil {
+		return prefix.Masked().String(), nil
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return "", fmt.Errorf("%w: isolated TUN source address %q is invalid", ErrInvalidTUNTunnelManager, value)
+	}
+	return netip.PrefixFrom(addr, addr.BitLen()).String(), nil
+}
+
+// Each auto-created TUN (tun0, tun1, ...) gets its own routing table. Only
+// packets sourced from that tunnel's inner address select the table, so neither
+// a modem nor a reader can replace the host's main/default route.
+func isolatedTUNRoutingIdentity(iface string) (table string, priority int) {
+	trimmed := strings.TrimSpace(iface)
+	start := len(trimmed)
+	for start > 0 && trimmed[start-1] >= '0' && trimmed[start-1] <= '9' {
+		start--
+	}
+	if start < len(trimmed) {
+		if index, err := strconv.Atoi(trimmed[start:]); err == nil && index >= 0 && index < 1000000 {
+			return strconv.Itoa(20000 + index), 20000 + index%10000
+		}
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(trimmed))
+	index := int(h.Sum32() % 10000)
+	return strconv.Itoa(120000 + index), 20000 + index
 }
 
 func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg TunnelConfig, result TunnelResult, routes []TUNRoute) ([]EPDGRouteExclusion, error) {

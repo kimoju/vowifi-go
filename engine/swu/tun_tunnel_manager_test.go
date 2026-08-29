@@ -234,6 +234,39 @@ func TestTUNTunnelManagerAddsDefaultRouteAndEPDGProtection(t *testing.T) {
 	}
 }
 
+func TestTUNTunnelManagerIsolatesRouteByTunnelSource(t *testing.T) {
+	baseSession := newTUNManagerPacketSession(TunnelResult{
+		Ready:            true,
+		LocalInnerIP:     "10.20.30.40/32",
+		IKEEstablished:   true,
+		IPsecEstablished: true,
+	})
+	routing := &tunManagerRouting{}
+	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
+		Base:               &tunManagerBase{session: baseSession},
+		RoutingManager:     routing,
+		IsolateHostRouting: true,
+		DeviceFactory: func(context.Context, TunnelConfig, TunnelResult) (InnerPacketDevice, string, error) {
+			return newTUNManagerDevice("tun7"), "tun7", nil
+		},
+	})
+	session, err := manager.EstablishTunnel(context.Background(), TunnelConfig{DeviceID: "reader-1", Mode: DataplaneModeUserspace})
+	if err != nil {
+		t.Fatalf("EstablishTunnel() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	if len(routing.applies) != 1 {
+		t.Fatalf("routing applies=%d, want 1", len(routing.applies))
+	}
+	applied := routing.applies[0]
+	if len(applied.Routes) != 1 || applied.Routes[0].Destination != "default" || applied.Routes[0].Table != "20007" {
+		t.Fatalf("isolated routes=%+v", applied.Routes)
+	}
+	if len(applied.Rules) != 1 || applied.Rules[0].From != "10.20.30.40/32" || applied.Rules[0].Table != "20007" {
+		t.Fatalf("isolated rules=%+v", applied.Rules)
+	}
+}
+
 func TestTUNTunnelManagerResolvesOuterRouteWhenInterfaceIsUnset(t *testing.T) {
 	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
 		EPDGOuterRouteResolver: func(ctx context.Context, ip net.IP) (EPDGOuterRoute, error) {

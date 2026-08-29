@@ -2215,7 +2215,8 @@ func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 		swu.TUNTunnelManagerConfig{
 			TUN:                 swu.TUNDeviceConfig{Name: strings.TrimSpace(req.Dataplane.TUNName)},
 			DisableRouting:      req.Dataplane.DisableTUNRouting,
-			DefaultRoutes:       true,
+			DefaultRoutes:       false,
+			IsolateHostRouting:  true,
 			ProtectEPDGRoutes:   true,
 			MTU:                 req.Dataplane.TUNMTU,
 			Addresses:           append([]string(nil), req.Dataplane.TUNAddresses...),
