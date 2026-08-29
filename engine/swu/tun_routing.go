@@ -207,6 +207,7 @@ func epdgRouteExclusionCommands(exclusion EPDGRouteExclusion) ([]ipCommand, erro
 	for _, table := range tables {
 		args := []string{"route", "add", dst, "dev", iface}
 		undo := []string{"route", "del", dst, "dev", iface}
+		familyValues := []string{dst}
 		if strings.TrimSpace(exclusion.Via) != "" {
 			via, err := normalizeIPAddress(exclusion.Via, "epdg route via")
 			if err != nil {
@@ -214,6 +215,7 @@ func epdgRouteExclusionCommands(exclusion EPDGRouteExclusion) ([]ipCommand, erro
 			}
 			args = append(args, "via", via)
 			undo = append(undo, "via", via)
+			familyValues = append(familyValues, via)
 		}
 		if strings.TrimSpace(exclusion.Source) != "" {
 			source, err := normalizeIPAddress(exclusion.Source, "epdg route source")
@@ -222,6 +224,7 @@ func epdgRouteExclusionCommands(exclusion EPDGRouteExclusion) ([]ipCommand, erro
 			}
 			args = append(args, "src", source)
 			undo = append(undo, "src", source)
+			familyValues = append(familyValues, source)
 		}
 		if exclusion.Metric > 0 {
 			metric := strconv.Itoa(exclusion.Metric)
@@ -232,6 +235,8 @@ func epdgRouteExclusionCommands(exclusion EPDGRouteExclusion) ([]ipCommand, erro
 			args = append(args, "table", table)
 			undo = append(undo, "table", table)
 		}
+		args = prependIPv6Family(args, familyValues...)
+		undo = prependIPv6Family(undo, familyValues...)
 		commands = append(commands, ipCommand{args: args, undo: undo})
 	}
 	return commands, nil
@@ -244,6 +249,7 @@ func routeCommands(iface string, route TUNRoute) ([]string, []string, error) {
 	}
 	args := []string{"route", "add", dst, "dev", iface}
 	undo := []string{"route", "del", dst, "dev", iface}
+	familyValues := []string{dst}
 	if strings.TrimSpace(route.Via) != "" {
 		via, err := normalizeIPAddress(route.Via, "route via")
 		if err != nil {
@@ -251,6 +257,7 @@ func routeCommands(iface string, route TUNRoute) ([]string, []string, error) {
 		}
 		args = append(args, "via", via)
 		undo = append(undo, "via", via)
+		familyValues = append(familyValues, via)
 	}
 	if strings.TrimSpace(route.Source) != "" {
 		source, err := normalizeIPAddress(route.Source, "route source")
@@ -259,6 +266,7 @@ func routeCommands(iface string, route TUNRoute) ([]string, []string, error) {
 		}
 		args = append(args, "src", source)
 		undo = append(undo, "src", source)
+		familyValues = append(familyValues, source)
 	}
 	if route.Metric < 0 {
 		return nil, nil, fmt.Errorf("%w: route metric must be positive", ErrInvalidTUNRouting)
@@ -276,7 +284,7 @@ func routeCommands(iface string, route TUNRoute) ([]string, []string, error) {
 		args = append(args, "table", table)
 		undo = append(undo, "table", table)
 	}
-	return args, undo, nil
+	return prependIPv6Family(args, familyValues...), prependIPv6Family(undo, familyValues...), nil
 }
 
 func ruleCommands(rule TUNRule) ([]string, []string, error) {
@@ -286,6 +294,7 @@ func ruleCommands(rule TUNRule) ([]string, []string, error) {
 	}
 	args := []string{"rule", "add"}
 	undo := []string{"rule", "del"}
+	var familyValues []string
 	if rule.Priority < 0 {
 		return nil, nil, fmt.Errorf("%w: rule priority must be positive", ErrInvalidTUNRouting)
 	}
@@ -301,6 +310,7 @@ func ruleCommands(rule TUNRule) ([]string, []string, error) {
 		}
 		args = append(args, "from", from)
 		undo = append(undo, "from", from)
+		familyValues = append(familyValues, from)
 	}
 	if strings.TrimSpace(rule.To) != "" {
 		to, err := normalizeIPPrefix(rule.To, "rule to")
@@ -309,6 +319,7 @@ func ruleCommands(rule TUNRule) ([]string, []string, error) {
 		}
 		args = append(args, "to", to)
 		undo = append(undo, "to", to)
+		familyValues = append(familyValues, to)
 	}
 	if strings.TrimSpace(rule.FwMark) != "" {
 		fwmark, err := normalizeRoutingToken(rule.FwMark, "rule fwmark")
@@ -320,7 +331,27 @@ func ruleCommands(rule TUNRule) ([]string, []string, error) {
 	}
 	args = append(args, "table", table)
 	undo = append(undo, "table", table)
-	return args, undo, nil
+	return prependIPv6Family(args, familyValues...), prependIPv6Family(undo, familyValues...), nil
+}
+
+// ip(8) infers the family for address operations, but `ip rule` defaults to
+// IPv4 even when its `from` selector is an IPv6 prefix. Routes whose only
+// selector is `default` are ambiguous as well. Prefix IPv6 commands explicitly;
+// IPv4 commands retain their existing form.
+func prependIPv6Family(args []string, values ...string) []string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || value == "default" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(value); err == nil && prefix.Addr().Is6() {
+			return append([]string{"-6"}, args...)
+		}
+		if addr, err := netip.ParseAddr(value); err == nil && addr.Is6() {
+			return append([]string{"-6"}, args...)
+		}
+	}
+	return args
 }
 
 func runIPUndo(ctx context.Context, runner IPCommandRunner, undo []ipCommand) error {

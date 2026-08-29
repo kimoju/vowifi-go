@@ -129,6 +129,32 @@ func TestLinuxTUNRoutingManagerInstallsEPDGExclusionsBeforeTunnelRoutes(t *testi
 	}
 }
 
+func TestLinuxTUNRoutingManagerUsesIPv6CommandFamilyForRoutesAndRules(t *testing.T) {
+	runner := &fakeIPRunner{}
+	manager := LinuxTUNRoutingManager{Runner: runner}
+	state, err := manager.Apply(context.Background(), TUNRoutingConfig{
+		InterfaceName: "vohive0",
+		Addresses:     []string{"2001:db8::2/128"},
+		Routes:        []TUNRoute{{Destination: "::/0", Table: "200"}},
+		Rules:         []TUNRule{{Priority: 1001, From: "2001:db8::2/128", Table: "200"}},
+	})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	wantApply := [][]string{
+		{"link", "set", "dev", "vohive0", "up"},
+		{"addr", "add", "2001:db8::2/128", "dev", "vohive0"},
+		{"-6", "route", "add", "::/0", "dev", "vohive0", "table", "200"},
+		{"-6", "rule", "add", "priority", "1001", "from", "2001:db8::2/128", "table", "200"},
+	}
+	if !reflect.DeepEqual(runner.commands, wantApply) {
+		t.Fatalf("apply commands=\n%v\nwant\n%v", runner.commands, wantApply)
+	}
+	if err := manager.Cleanup(context.Background(), state); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+}
+
 func TestBuildTUNRoutingCommandsRejectsInvalidInput(t *testing.T) {
 	cases := []struct {
 		name string

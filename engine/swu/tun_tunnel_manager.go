@@ -204,7 +204,11 @@ func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, 
 			return TUNRoutingConfig{}, err
 		}
 		table, priority := isolatedTUNRoutingIdentity(iface)
-		routes = append(routes, TUNRoute{Destination: "default", Table: table})
+		destination := "default"
+		if prefix, parseErr := netip.ParsePrefix(source); parseErr == nil && prefix.Addr().Is6() {
+			destination = "::/0"
+		}
+		routes = append(routes, TUNRoute{Destination: destination, Table: table})
 		rules = append(rules, TUNRule{Priority: priority, From: source, Table: table})
 	} else if m.Config.DefaultRoutes && len(routes) == 0 {
 		routes = append(routes, TUNRoute{Destination: "default"})
