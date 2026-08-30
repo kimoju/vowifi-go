@@ -14,20 +14,21 @@ import (
 )
 
 type IMSInboundWireServer struct {
-	Agent           *IMSInboundAgent
-	MessageHandler  IMSMessageHandler
-	InfoHandler     IMSInfoHandler
-	ByeHandler      IMSByeHandler
-	ContactURI      string
-	LocalTag        string
-	UserAgent       string
-	ResponseHeaders map[string]string
-	ReadTimeout     time.Duration
-	TransactionTTL  time.Duration
-	InviteFinalT1   time.Duration
-	InviteFinalT2   time.Duration
-	Reliable1xxT1   time.Duration
-	Reliable1xxT2   time.Duration
+	Agent                       *IMSInboundAgent
+	MessageHandler              IMSMessageHandler
+	MessageDeliveryReportSender IMSMessageDeliveryReportSender
+	InfoHandler                 IMSInfoHandler
+	ByeHandler                  IMSByeHandler
+	ContactURI                  string
+	LocalTag                    string
+	UserAgent                   string
+	ResponseHeaders             map[string]string
+	ReadTimeout                 time.Duration
+	TransactionTTL              time.Duration
+	InviteFinalT1               time.Duration
+	InviteFinalT2               time.Duration
+	Reliable1xxT1               time.Duration
+	Reliable1xxT2               time.Duration
 
 	mu                    sync.Mutex
 	transactions          map[string]imsInboundWireTransaction
@@ -39,11 +40,12 @@ type IMSInboundWireServer struct {
 }
 
 type IMSInboundWireResponse struct {
-	StatusCode int
-	Reason     string
-	Headers    map[string]string
-	Body       []byte
-	NoResponse bool
+	StatusCode    int
+	Reason        string
+	Headers       map[string]string
+	Body          []byte
+	NoResponse    bool
+	afterResponse func(context.Context)
 }
 
 // IMSInboundRequireOptionClassification partitions inbound Require option-tags by local support.
@@ -402,11 +404,24 @@ func (s *IMSInboundWireServer) handleMessage(ctx context.Context, req voiceclien
 			resp.Headers[strings.TrimSpace(key)] = strings.TrimSpace(value)
 		}
 	}
-	if len(result.Body) > 0 {
+	if result.DeliveryReport != nil && s.MessageDeliveryReportSender != nil && statusCode >= 200 && statusCode < 300 {
+		report := cloneIMSMessageDeliveryReport(*result.DeliveryReport)
+		var once sync.Once
+		resp.afterResponse = func(afterCtx context.Context) {
+			once.Do(func() {
+				_ = s.MessageDeliveryReportSender.SendIMSMessageDeliveryReport(afterCtx, report)
+			})
+		}
+	} else if len(result.Body) > 0 {
 		resp.Body = append([]byte(nil), result.Body...)
 		resp.Headers["Content-Type"] = firstVoiceNonEmpty(result.ContentType, "application/octet-stream")
 	}
 	return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, err
+}
+
+func cloneIMSMessageDeliveryReport(in IMSMessageDeliveryReport) IMSMessageDeliveryReport {
+	in.Body = append([]byte(nil), in.Body...)
+	return in
 }
 
 func (s *IMSInboundWireServer) handleUpdate(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
@@ -651,6 +666,9 @@ func (s *IMSInboundWireServer) handlePacket(ctx context.Context, pc net.PacketCo
 		if err := writePacketSIPResponse(pc, addr, taggedReq, resp); err != nil {
 			return err
 		}
+		if resp.afterResponse != nil {
+			resp.afterResponse(ctx)
+		}
 		s.afterPacketResponse(ctx, pc, addr, taggedReq, resp)
 		return nil
 	}
@@ -692,7 +710,13 @@ func (s *IMSInboundWireServer) handleConn(ctx context.Context, conn net.Conn) {
 			if resp.NoResponse {
 				return nil
 			}
-			return writeStreamSIPResponse(conn, taggedWireRequest(req, s.localTag()), resp)
+			if err := writeStreamSIPResponse(conn, taggedWireRequest(req, s.localTag()), resp); err != nil {
+				return err
+			}
+			if resp.afterResponse != nil {
+				resp.afterResponse(ctx)
+			}
+			return nil
 		})
 		for _, resp := range responses {
 			if resp.NoResponse {
@@ -700,6 +724,9 @@ func (s *IMSInboundWireServer) handleConn(ctx context.Context, conn net.Conn) {
 			}
 			if err := writeStreamSIPResponse(conn, taggedWireRequest(req, s.localTag()), resp); err != nil {
 				return
+			}
+			if resp.afterResponse != nil {
+				resp.afterResponse(ctx)
 			}
 		}
 	}

@@ -37,6 +37,13 @@ type SMSReceived struct {
 	Time    time.Time
 }
 
+type SMSRPAckSent struct {
+	DevID   string
+	SIPCode int
+	Error   string
+	Time    time.Time
+}
+
 type SMSSent struct {
 	DevID      string
 	TargetURI  string

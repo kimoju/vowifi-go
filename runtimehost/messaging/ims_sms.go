@@ -3,8 +3,11 @@ package messaging
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
 )
@@ -23,6 +26,57 @@ type IMSSMSTransport struct {
 	UseCPIM              bool
 	IMDNNotifications    []string
 	DisableStatusReports bool
+}
+
+var imsDeliveryReportCallCounter atomic.Uint64
+
+func (t IMSSMSTransport) SendIMSDeliveryReport(ctx context.Context, req IMSDeliveryReportRequest) (IMSDeliveryReportResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if t.Transport == nil {
+		return IMSDeliveryReportResult{}, ErrSMSTransportUnavailable
+	}
+	localURI := firstNonEmpty(req.LocalURI, t.LocalURI, t.Registration.PublicIdentity, t.Profile.IMPU)
+	remoteURI := strings.TrimSpace(req.RemoteURI)
+	if localURI == "" || remoteURI == "" || len(req.Body) == 0 {
+		return IMSDeliveryReportResult{}, errors.New("IMS SMS delivery report is incomplete")
+	}
+	cfg := voiceclient.DialogRequestConfig{
+		Profile:         t.Profile,
+		Registration:    t.Registration,
+		LocalURI:        localURI,
+		ContactURI:      firstNonEmpty(t.ContactURI, t.Registration.ContactURI),
+		RemoteURI:       remoteURI,
+		RemoteTargetURI: firstNonEmpty(req.RemoteTargetURI, remoteURI),
+		CallID:          fmt.Sprintf("sms-report-%d-%d@vowifi-go", time.Now().UnixNano(), imsDeliveryReportCallCounter.Add(1)),
+		LocalTag:        "sms-report",
+		CSeq:            1,
+		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
+	}
+	msg, err := voiceclient.BuildMessageRequest(cfg, firstNonEmpty(req.ContentType, IMS3GPPSMSContentType), req.Body)
+	if err != nil {
+		return IMSDeliveryReportResult{}, err
+	}
+	if inReplyTo := strings.TrimSpace(req.InReplyTo); inReplyTo != "" {
+		msg.Headers["In-Reply-To"] = inReplyTo
+	}
+	msg.Headers["Request-Disposition"] = "no-fork"
+	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, msg)
+	handling := imsMessagingResponseHandlingFor(resp)
+	result := IMSDeliveryReportResult{
+		SIPCode:                    handling.StatusCode,
+		RetryAfter:                 handling.RetryAfter,
+		RegistrationRecoveryNeeded: handling.RegistrationRecoveryNeeded,
+	}
+	if err != nil {
+		result.RegistrationRecoveryNeeded = true
+		return result, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return result, errors.New(handling.FailureText)
+	}
+	return result, nil
 }
 
 func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (SMSSendResult, error) {

@@ -60,6 +60,39 @@ func TestIMSSMSTransportSendsSIPMessage(t *testing.T) {
 	}
 }
 
+func TestIMSSMSTransportSendsDeliveryReportAsStandaloneMessage(t *testing.T) {
+	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
+	sms := IMSSMSTransport{
+		Transport: transport,
+		Profile:   voiceclient.IMSProfile{IMPU: "sip:user@ims.example", Domain: "ims.example", UserAgent: "VoHive"},
+		Registration: voiceclient.RegistrationBinding{
+			ContactURI:     "sip:user@192.0.2.10:5062",
+			PublicIdentity: "sip:user@ims.example",
+			ServiceRoutes:  []string{"<sip:pcscf.ims.example;lr>"},
+		},
+	}
+	body := BuildSMSRPAck(0x33)
+	result, err := sms.SendIMSDeliveryReport(context.Background(), IMSDeliveryReportRequest{
+		RemoteURI:   "sip:ipsmgw.ims.example",
+		InReplyTo:   "network-delivery-call",
+		ContentType: IMS3GPPSMSContentType,
+		Body:        body,
+	})
+	if err != nil || result.SIPCode != 202 {
+		t.Fatalf("SendIMSDeliveryReport() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("requests=%d, want 1", len(transport.requests))
+	}
+	req := transport.requests[0]
+	if req.Method != "MESSAGE" || req.URI != "sip:ipsmgw.ims.example" || req.Headers["Content-Type"] != IMS3GPPSMSContentType || string(req.Body) != string(body) {
+		t.Fatalf("delivery report MESSAGE=%+v body=%x", req, req.Body)
+	}
+	if req.Headers["In-Reply-To"] != "network-delivery-call" || req.Headers["Request-Disposition"] != "no-fork" || req.Headers["Route"] != "<sip:pcscf.ims.example;lr>" {
+		t.Fatalf("delivery report headers=%+v", req.Headers)
+	}
+}
+
 func TestIMSSMSTransportCanDisableStatusReports(t *testing.T) {
 	transport := &fakeSIPRequestTransport{responses: []voiceclient.SIPResponse{{StatusCode: 202, Reason: "Accepted"}}}
 	sms := IMSSMSTransport{

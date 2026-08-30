@@ -286,6 +286,14 @@ func (s *Service) smsTransport() SMSTransport {
 	return s.transport
 }
 
+func (s *Service) SendIMSDeliveryReport(ctx context.Context, req IMSDeliveryReportRequest) (IMSDeliveryReportResult, error) {
+	transport, ok := s.smsTransport().(IMSDeliveryReportTransport)
+	if !ok || transport == nil {
+		return IMSDeliveryReportResult{}, ErrSMSTransportUnavailable
+	}
+	return transport.SendIMSDeliveryReport(ctx, req)
+}
+
 func (s *Service) currentUSSDTransport() USSDTransport {
 	if s == nil {
 		return nil

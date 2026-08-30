@@ -34,6 +34,27 @@ type IMSMessageResult struct {
 	UnsupportedContent bool
 }
 
+// IMSDeliveryReportRequest is the standalone SIP MESSAGE carrying RP-ACK or
+// RP-ERROR after a network-originated SMS has received its empty SIP 200 OK.
+type IMSDeliveryReportRequest struct {
+	LocalURI        string
+	RemoteURI       string
+	RemoteTargetURI string
+	InReplyTo       string
+	ContentType     string
+	Body            []byte
+}
+
+type IMSDeliveryReportResult struct {
+	SIPCode                    int
+	RetryAfter                 time.Duration
+	RegistrationRecoveryNeeded bool
+}
+
+type IMSDeliveryReportTransport interface {
+	SendIMSDeliveryReport(context.Context, IMSDeliveryReportRequest) (IMSDeliveryReportResult, error)
+}
+
 const (
 	smsConcatTTL         = 10 * time.Minute
 	smsConcatMaxSets     = 64

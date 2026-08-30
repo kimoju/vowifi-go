@@ -1853,6 +1853,66 @@ func TestIMSInboundWireServerDispatchesMessage(t *testing.T) {
 	}
 }
 
+func TestIMSInboundWireServerSendsDeliveryReportOnlyAfterEmptyOK(t *testing.T) {
+	sender := &wireMessageDeliveryReportSender{}
+	server := &IMSInboundWireServer{
+		MessageDeliveryReportSender: sender,
+		MessageHandler: IMSMessageHandlerFunc(func(ctx context.Context, req IMSMessageRequest) (IMSMessageResult, error) {
+			return IMSMessageResult{
+				StatusCode:  200,
+				Reason:      "OK",
+				ContentType: "application/vnd.3gpp.sms",
+				Body:        []byte{0x02, 0x33},
+				DeliveryReport: &IMSMessageDeliveryReport{
+					RemoteURI:   "sip:ipsmgw@ims.example",
+					ContentType: "application/vnd.3gpp.sms",
+					Body:        []byte{0x02, 0x33},
+				},
+			}, nil
+		}),
+	}
+	req := voiceclient.SIPIncomingRequest{
+		Method: "MESSAGE",
+		URI:    "sip:user@ims.example",
+		Headers: map[string][]string{
+			"Via":     {"SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-report"},
+			"Call-ID": {"sms-delivery"},
+			"CSeq":    {"3 MESSAGE"},
+			"From":    {"<sip:ipsmgw@ims.example>;tag=net"},
+			"To":      {"<sip:user@ims.example>"},
+		},
+	}
+	responses, err := server.HandleRequest(context.Background(), req)
+	if err != nil || len(responses) != 1 {
+		t.Fatalf("HandleRequest() responses=%+v err=%v", responses, err)
+	}
+	resp := responses[0]
+	if resp.StatusCode != 200 || len(resp.Body) != 0 || resp.Headers["Content-Type"] != "" {
+		t.Fatalf("SIP acknowledgement must be empty: %+v", resp)
+	}
+	if len(sender.reports) != 0 {
+		t.Fatalf("delivery report sent before SIP 200 write: %+v", sender.reports)
+	}
+	if resp.afterResponse == nil {
+		t.Fatal("afterResponse=nil")
+	}
+	resp.afterResponse(context.Background())
+	resp.afterResponse(context.Background())
+	if len(sender.reports) != 1 || sender.reports[0].RemoteURI != "sip:ipsmgw@ims.example" || string(sender.reports[0].Body) != string([]byte{0x02, 0x33}) {
+		t.Fatalf("delivery reports=%+v", sender.reports)
+	}
+}
+
+type wireMessageDeliveryReportSender struct {
+	reports []IMSMessageDeliveryReport
+}
+
+func (s *wireMessageDeliveryReportSender) SendIMSMessageDeliveryReport(ctx context.Context, report IMSMessageDeliveryReport) error {
+	report.Body = append([]byte(nil), report.Body...)
+	s.reports = append(s.reports, report)
+	return nil
+}
+
 func TestIMSInboundWireServerDispatchesInfoAndUSSDBye(t *testing.T) {
 	var handledInfo IMSInfoRequest
 	var handledBye IMSByeRequest

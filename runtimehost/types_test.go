@@ -2402,12 +2402,16 @@ func TestInstanceHandlesIncomingSMSAndDeliveryReport(t *testing.T) {
 		CallID:      "sms-downlink-1",
 		ContentType: messaging.IMS3GPPSMSContentType,
 		Body:        body,
+		Headers:     map[string][]string{"P-Asserted-Identity": {"<sip:ipsmgw@ims.example>"}},
 	})
 	if err != nil {
 		t.Fatalf("HandleIMSMessage() error = %v", err)
 	}
 	if imsResult.StatusCode != 200 || imsResult.ContentType != messaging.IMS3GPPSMSContentType || string(imsResult.Body) != string(messaging.BuildSMSRPAck(0x33)) {
 		t.Fatalf("imsResult=%+v", imsResult)
+	}
+	if imsResult.DeliveryReport == nil || imsResult.DeliveryReport.RemoteURI != "sip:ipsmgw@ims.example" || imsResult.DeliveryReport.InReplyTo != "sms-downlink-1" || string(imsResult.DeliveryReport.Body) != string(messaging.BuildSMSRPAck(0x33)) {
+		t.Fatalf("delivery report=%+v", imsResult.DeliveryReport)
 	}
 	if len(dispatch.events) != 3 {
 		t.Fatalf("events=%d", len(dispatch.events))

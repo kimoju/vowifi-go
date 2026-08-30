@@ -1512,6 +1512,33 @@ func (t *runtimeRecoveringSMSTransport) SendSMSPart(ctx context.Context, req mes
 	return recovery.SMSTransport.SendSMSPart(ctx, req)
 }
 
+func (t *runtimeRecoveringSMSTransport) SendIMSDeliveryReport(ctx context.Context, req messaging.IMSDeliveryReportRequest) (messaging.IMSDeliveryReportResult, error) {
+	if t == nil || t.inner == nil {
+		return messaging.IMSDeliveryReportResult{}, messaging.ErrSMSTransportUnavailable
+	}
+	sender, ok := t.inner.(messaging.IMSDeliveryReportTransport)
+	if !ok {
+		return messaging.IMSDeliveryReportResult{}, messaging.ErrSMSTransportUnavailable
+	}
+	result, err := sender.SendIMSDeliveryReport(ctx, req)
+	if !result.RegistrationRecoveryNeeded || t.owner == nil {
+		return result, err
+	}
+	retry := runtimeShouldRetryRecoverableIMSStatus(err, result.SIPCode)
+	recovery, recovered, recoveryErr := t.owner.recoverIMSRegistration(ctx, "SMS delivery report registration recovery", true, result.RetryAfter)
+	if recoveryErr != nil {
+		return result, runtimeOperationRecoveryError(err, recoveryErr)
+	}
+	if !retry || !recovered || recovery.SMSTransport == nil {
+		return result, err
+	}
+	recoveredSender, ok := recovery.SMSTransport.(messaging.IMSDeliveryReportTransport)
+	if !ok {
+		return result, err
+	}
+	return recoveredSender.SendIMSDeliveryReport(ctx, req)
+}
+
 type runtimeRecoveringUSSDTransport struct {
 	owner *Instance
 	inner messaging.USSDTransport
@@ -1917,12 +1944,55 @@ func (i *Instance) HandleIMSMessage(ctx context.Context, req voicehost.IMSMessag
 		Body:        append([]byte(nil), req.Body...),
 		Headers:     cloneRuntimeSIPHeaders(req.Headers),
 	})
-	return voicehost.IMSMessageResult{
+	result := voicehost.IMSMessageResult{
 		StatusCode:  res.StatusCode,
 		Reason:      res.Reason,
 		ContentType: res.ReplyContentType,
 		Body:        append([]byte(nil), res.ReplyBody...),
-	}, err
+	}
+	if len(res.ReplyBody) > 0 && strings.TrimSpace(res.ReplyContentType) != "" {
+		remoteURI := runtimeSIPHeaderURI(firstRuntimeSIPHeader(req.Headers, "P-Asserted-Identity"))
+		if remoteURI == "" {
+			remoteURI = strings.TrimSpace(req.FromURI)
+		}
+		result.DeliveryReport = &voicehost.IMSMessageDeliveryReport{
+			LocalURI:        strings.TrimSpace(req.ToURI),
+			RemoteURI:       remoteURI,
+			RemoteTargetURI: remoteURI,
+			InReplyTo:       strings.TrimSpace(req.CallID),
+			ContentType:     strings.TrimSpace(res.ReplyContentType),
+			Body:            append([]byte(nil), res.ReplyBody...),
+		}
+	}
+	return result, err
+}
+
+func (i *Instance) SendIMSMessageDeliveryReport(ctx context.Context, report voicehost.IMSMessageDeliveryReport) error {
+	svc := i.Service()
+	if svc == nil {
+		return errors.New("messaging service is nil")
+	}
+	result, err := svc.SendIMSDeliveryReport(ctx, messaging.IMSDeliveryReportRequest{
+		LocalURI:        report.LocalURI,
+		RemoteURI:       report.RemoteURI,
+		RemoteTargetURI: report.RemoteTargetURI,
+		InReplyTo:       report.InReplyTo,
+		ContentType:     report.ContentType,
+		Body:            append([]byte(nil), report.Body...),
+	})
+	if i.dispatch != nil {
+		errorText := ""
+		if err != nil {
+			errorText = err.Error()
+		}
+		i.dispatch.Dispatch(ctx, eventhost.SMSRPAckSent{
+			DevID:   i.state.DeviceID,
+			SIPCode: result.SIPCode,
+			Error:   errorText,
+			Time:    time.Now(),
+		})
+	}
+	return err
 }
 
 func (i *Instance) HandleIMSInfo(ctx context.Context, req voicehost.IMSInfoRequest) (voicehost.IMSInfoResult, error) {
@@ -2190,6 +2260,28 @@ func cloneRuntimeSIPHeaders(headers map[string][]string) map[string][]string {
 		out[key] = append([]string(nil), values...)
 	}
 	return out
+}
+
+func firstRuntimeSIPHeader(headers map[string][]string, name string) string {
+	for key, values := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) && len(values) > 0 {
+			return strings.TrimSpace(values[0])
+		}
+	}
+	return ""
+}
+
+func runtimeSIPHeaderURI(value string) string {
+	value = strings.TrimSpace(value)
+	if start := strings.IndexByte(value, '<'); start >= 0 {
+		if end := strings.IndexByte(value[start+1:], '>'); end >= 0 {
+			return strings.TrimSpace(value[start+1 : start+1+end])
+		}
+	}
+	if semi := strings.IndexByte(value, ';'); semi >= 0 {
+		value = value[:semi]
+	}
+	return strings.Trim(strings.TrimSpace(value), "<>")
 }
 
 func cloneRuntimeHeaderMap(headers map[string]string) map[string]string {

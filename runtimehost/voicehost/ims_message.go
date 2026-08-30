@@ -19,6 +19,22 @@ type IMSMessageResult struct {
 	ContentType string
 	Body        []byte
 	Headers     map[string]string
+	// DeliveryReport is sent as a new SIP MESSAGE only after the incoming
+	// MESSAGE has received its empty SIP 200 OK.
+	DeliveryReport *IMSMessageDeliveryReport
+}
+
+type IMSMessageDeliveryReport struct {
+	LocalURI        string
+	RemoteURI       string
+	RemoteTargetURI string
+	InReplyTo       string
+	ContentType     string
+	Body            []byte
+}
+
+type IMSMessageDeliveryReportSender interface {
+	SendIMSMessageDeliveryReport(context.Context, IMSMessageDeliveryReport) error
 }
 
 type IMSMessageHandler interface {

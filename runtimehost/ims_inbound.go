@@ -25,11 +25,12 @@ func startRuntimeIMSInbound(cfg IMSInboundConfig, inst *Instance) (*runtimeIMSIn
 	}
 
 	server := &voicehost.IMSInboundWireServer{
-		MessageHandler: inst,
-		InfoHandler:    inst,
-		ByeHandler:     inst,
-		ContactURI:     strings.TrimSpace(cfg.ContactURI),
-		UserAgent:      strings.TrimSpace(cfg.UserAgent),
+		MessageHandler:              inst,
+		MessageDeliveryReportSender: inst,
+		InfoHandler:                 inst,
+		ByeHandler:                  inst,
+		ContactURI:                  strings.TrimSpace(cfg.ContactURI),
+		UserAgent:                   strings.TrimSpace(cfg.UserAgent),
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	inbound := &runtimeIMSInbound{cancel: cancel, done: make(chan struct{})}
