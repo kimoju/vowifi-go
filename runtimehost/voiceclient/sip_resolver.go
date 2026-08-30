@@ -43,9 +43,11 @@ func (f SIPServerCandidateResolverFunc) ResolveSIPServer(ctx context.Context, ne
 }
 
 type NetSIPResolver struct {
-	Resolver   *net.Resolver
-	DNSServers []string
-	Timeout    time.Duration
+	Resolver          *net.Resolver
+	DNSServers        []string
+	LocalIP           string
+	Timeout           time.Duration
+	RequireResolvedIP bool
 }
 
 func (r NetSIPResolver) ResolveSIPServer(ctx context.Context, network, uri string) (string, error) {
@@ -69,7 +71,7 @@ func (r NetSIPResolver) ResolveSIPServers(ctx context.Context, network, uri stri
 	}
 	resolver := r.Resolver
 	if resolver == nil {
-		resolver = DNSResolverForServers(r.DNSServers, r.Timeout)
+		resolver = DNSResolverForServersFromLocal(r.DNSServers, r.LocalIP, r.Timeout)
 	}
 	service := "sip"
 	if endpoint.Secure {
@@ -88,13 +90,18 @@ func (r NetSIPResolver) ResolveSIPServers(ctx context.Context, network, uri stri
 				out = appendSIPTargets(out, addrs...)
 				continue
 			}
-			out = appendSIPTargets(out, net.JoinHostPort(strings.Trim(target, "[]"), port))
+			if !r.RequireResolvedIP {
+				out = appendSIPTargets(out, net.JoinHostPort(strings.Trim(target, "[]"), port))
+			}
 		}
 	}
 	if addrs := resolveSIPHostAddrs(ctx, resolver, network, endpoint.Host, endpoint.Port); len(addrs) > 0 {
 		out = appendSIPTargets(out, addrs...)
 	}
 	if len(out) == 0 {
+		if r.RequireResolvedIP {
+			return nil, fmt.Errorf("SIP DNS returned no IP address for %s", endpoint.Host)
+		}
 		out = appendSIPTargets(out, endpoint.addr())
 	}
 	return out, nil
@@ -109,10 +116,15 @@ func ResolveSIPServers(ctx context.Context, network, uri string) ([]string, erro
 }
 
 func DNSResolverForServers(servers []string, timeout time.Duration) *net.Resolver {
+	return DNSResolverForServersFromLocal(servers, "", timeout)
+}
+
+func DNSResolverForServersFromLocal(servers []string, localIP string, timeout time.Duration) *net.Resolver {
 	addrs := normalizeDNSServerAddrs(servers)
 	if len(addrs) == 0 {
 		return net.DefaultResolver
 	}
+	localIP = normalizedDNSLocalIP(localIP)
 	var next uint64
 	return &net.Resolver{
 		PreferGo: true,
@@ -125,9 +137,14 @@ func DNSResolverForServers(servers []string, timeout time.Duration) *net.Resolve
 			}
 			start := int(atomic.AddUint64(&next, 1)-1) % len(addrs)
 			var lastErr error
-			dialer := net.Dialer{}
 			for i := 0; i < len(addrs); i++ {
 				addr := addrs[(start+i)%len(addrs)]
+				localAddr, compatible := dnsResolverLocalAddr(network, localIP, addr)
+				if !compatible {
+					lastErr = fmt.Errorf("DNS server %s address family does not match local IP %s", addr, localIP)
+					continue
+				}
+				dialer := net.Dialer{LocalAddr: localAddr}
 				conn, err := dialer.DialContext(ctx, network, addr)
 				if err == nil {
 					return conn, nil
@@ -139,6 +156,41 @@ func DNSResolverForServers(servers []string, timeout time.Duration) *net.Resolve
 			}
 			return nil, errSIPDNSResolverEmpty()
 		},
+	}
+}
+
+func normalizedDNSLocalIP(value string) string {
+	value = strings.TrimSpace(value)
+	if prefix := strings.IndexByte(value, '/'); prefix >= 0 {
+		value = value[:prefix]
+	}
+	return strings.Trim(strings.TrimSpace(value), "[]")
+}
+
+func dnsResolverLocalAddr(network, localIP, serverAddr string) (net.Addr, bool) {
+	localIP = normalizedDNSLocalIP(localIP)
+	if localIP == "" {
+		return nil, true
+	}
+	ip := net.ParseIP(localIP)
+	if ip == nil {
+		return nil, false
+	}
+	serverHost, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		return nil, false
+	}
+	serverIP := net.ParseIP(strings.Trim(serverHost, "[]"))
+	if serverIP == nil || (ip.To4() == nil) != (serverIP.To4() == nil) {
+		return nil, false
+	}
+	switch {
+	case strings.HasPrefix(strings.ToLower(network), "udp"):
+		return &net.UDPAddr{IP: ip}, true
+	case strings.HasPrefix(strings.ToLower(network), "tcp"):
+		return &net.TCPAddr{IP: ip}, true
+	default:
+		return nil, false
 	}
 }
 

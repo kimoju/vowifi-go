@@ -30,13 +30,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 				"reqid", "1",
 				"mode", "transport",
 				"auth-trunc", "hmac(sha1)", ik, "96",
-				"enc", "ecb(cipher_null)", "0x",
-				"sel",
-				"src", "192.0.2.20",
-				"dst", "198.51.100.10",
-				"proto", "udp",
-				"sport", "5062",
-				"dport", "5063",
+				"enc", "ecb(cipher_null)", "",
 			},
 			UndoArgs: []string{"xfrm", "state", "delete", "src", "192.0.2.20", "dst", "198.51.100.10", "proto", "esp", "spi", "0x0a0b0c0d"},
 		},
@@ -50,13 +44,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 				"reqid", "1",
 				"mode", "transport",
 				"auth-trunc", "hmac(sha1)", ik, "96",
-				"enc", "ecb(cipher_null)", "0x",
-				"sel",
-				"src", "198.51.100.10",
-				"dst", "192.0.2.20",
-				"proto", "udp",
-				"sport", "5063",
-				"dport", "5062",
+				"enc", "ecb(cipher_null)", "",
 			},
 			UndoArgs: []string{"xfrm", "state", "delete", "src", "198.51.100.10", "dst", "192.0.2.20", "proto", "esp", "spi", "0x01020304"},
 		},
@@ -125,6 +113,92 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanDerivesPlanFromAgreement(t *t
 	}
 }
 
+func TestBuildIMSSecurityAssociationXFRMInstallPlanUsesClientSPIForBothIMSFlows(t *testing.T) {
+	req := validSecurityXFRMInstallRequest()
+	req.Agreement.SPIClient = 0x90000001
+	req.Agreement.SPIServer = 0x90000002
+	req.Agreement.PortClient = 65528
+	req.Agreement.PortServer = 65529
+	req.Plan.SPIClient = 0x90000001
+	req.Plan.SPIServer = 0x90000002
+	req.Plan.PortClient = 65528
+	req.Plan.PortServer = 65529
+	req.Plan.Outbound.SPI = 0x90000002
+	req.Plan.Outbound.RemotePort = 65529
+	req.ClientAgreement = SecurityAgreement{
+		Protocol:            DefaultSecurityProtocol,
+		Algorithm:           DefaultSecurityAlgorithm,
+		EncryptionAlgorithm: DefaultSecurityEAlg,
+		SPIClient:           0x80000001,
+		SPIServer:           0x80000002,
+		PortClient:          5062,
+		PortServer:          5063,
+	}
+	plan, err := BuildIMSSecurityAssociationXFRMInstallPlan(req)
+	if err != nil {
+		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
+	}
+	if len(plan.Commands) != 8 {
+		t.Fatalf("commands=%d, want four states and four policies", len(plan.Commands))
+	}
+	checks := []struct {
+		command int
+		values  []string
+	}{
+		{0, []string{"0x90000002"}},
+		{1, []string{"0x80000001"}},
+		{2, []string{"0x90000001"}},
+		{3, []string{"0x80000002"}},
+		{4, []string{"5062", "65529"}},
+		{5, []string{"65529", "5062"}},
+		{6, []string{"5063", "65528"}},
+		{7, []string{"65528", "5063"}},
+	}
+	for _, check := range checks {
+		args := plan.Commands[check.command].Args
+		for _, want := range check.values {
+			if !containsSecurityXFRMArg(args, want) {
+				t.Fatalf("command %d=%v missing %q", check.command, args, want)
+			}
+		}
+	}
+	for command := 0; command < 4; command++ {
+		if containsSecurityXFRMArg(plan.Commands[command].Args, "sel") {
+			t.Fatalf("state command %d unexpectedly contains a selector: %v", command, plan.Commands[command].Args)
+		}
+	}
+	if !containsSecurityXFRMArgSequence(plan.Commands[0].Args, "reqid", "1") ||
+		!containsSecurityXFRMArgSequence(plan.Commands[1].Args, "reqid", "1") ||
+		!containsSecurityXFRMArgSequence(plan.Commands[2].Args, "reqid", "2") ||
+		!containsSecurityXFRMArgSequence(plan.Commands[3].Args, "reqid", "2") ||
+		!containsSecurityXFRMArgSequence(plan.Commands[4].Args, "reqid", "1") ||
+		!containsSecurityXFRMArgSequence(plan.Commands[6].Args, "reqid", "2") {
+		t.Fatalf("client and server flows do not use distinct reqids: %+v", plan.Commands)
+	}
+	if !containsSecurityXFRMArgSequence(plan.Commands[5].Args, "reqid", "1") ||
+		!containsSecurityXFRMArgSequence(plan.Commands[7].Args, "reqid", "2") {
+		t.Fatalf("inbound policies must require the matching ESP flow: %+v", plan.Commands)
+	}
+}
+
+func containsSecurityXFRMArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSecurityXFRMArgSequence(args []string, first, second string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == first && args[i+1] == second {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBuildIMSSecurityAssociationXFRMInstallPlanUsesSelectedParameters(t *testing.T) {
 	req := validSecurityXFRMInstallRequest()
 	req.Plan = IMSSecurityAssociationPlan{}
@@ -154,9 +228,12 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanUsesSelectedParameters(t *tes
 	if got, want := installPlan.Commands[0].Args[15:22], []string{"auth-trunc", "hmac(md5)", ik, "96", "enc", "cbc(aes)", ck}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("state auth/enc args=%v, want %v", got, want)
 	}
-	if installPlan.Commands[0].Args[29] != "sport" || installPlan.Commands[0].Args[30] != "6062" ||
-		installPlan.Commands[0].Args[31] != "dport" || installPlan.Commands[0].Args[32] != "6063" {
-		t.Fatalf("state selector args=%v", installPlan.Commands[0].Args)
+	if containsSecurityXFRMArg(installPlan.Commands[0].Args, "sel") {
+		t.Fatalf("state unexpectedly contains a selector: %v", installPlan.Commands[0].Args)
+	}
+	if !containsSecurityXFRMArg(installPlan.Commands[2].Args, "6062") ||
+		!containsSecurityXFRMArg(installPlan.Commands[2].Args, "6063") {
+		t.Fatalf("policy selector args=%v", installPlan.Commands[2].Args)
 	}
 }
 
@@ -203,7 +280,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanNullEncryptionDoesNotNeedCK(t
 	if err != nil {
 		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
 	}
-	wantEnc := []string{"enc", "ecb(cipher_null)", "0x"}
+	wantEnc := []string{"enc", "ecb(cipher_null)", ""}
 	for i := 0; i < 2; i++ {
 		if got := installPlan.Commands[i].Args[19:22]; !reflect.DeepEqual(got, wantEnc) {
 			t.Fatalf("state command %d enc args=%v, want %v", i, got, wantEnc)

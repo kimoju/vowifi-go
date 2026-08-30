@@ -29,6 +29,7 @@ type IMSProfile struct {
 	IMPU              string
 	Domain            string
 	LocalIP           string
+	InstanceID        string
 	UserAgent         string
 	AccessNetworkInfo string
 	VisitedNetworkID  string
@@ -127,6 +128,13 @@ type SecurityAssociationTransport interface {
 	UseSecurityAssociation(context.Context, IMSSecurityAssociationInstallRequest) error
 }
 
+// SecurityAssociationEndpointProvider reports the concrete addresses selected
+// by a resolving SIP transport. IMS XFRM rules must use these IP addresses,
+// not the registrar hostname from the Request-URI.
+type SecurityAssociationEndpointProvider interface {
+	SecurityAssociationAddresses() (localAddress, remoteAddress string)
+}
+
 type akaPreferenceProvider interface {
 	CalculateAKAWithPreference(rand16, autn16 []byte, preference string) (sim.AKAResult, error)
 }
@@ -141,6 +149,7 @@ type RegisterSession struct {
 	CallID                string
 	CNonce                string
 	Expires               int
+	InitialAuthorization  bool
 	SecurityClient        SecurityAgreement
 	SecurityClients       []SecurityAgreement
 	SecurityRandom        io.Reader
@@ -494,7 +503,7 @@ func BuildDigestAuthorization(ch DigestChallenge, in DigestAuthInput) (string, e
 		ha2 = digestHashHex(algorithm, method+":"+uri)
 	case "auth":
 		ha2 = digestHashHex(algorithm, method+":"+uri)
-	case "auth-int":
+	case "auth-int", "auth-init":
 		ha2 = digestHashHex(algorithm, method+":"+uri+":"+digestHashBytesHex(algorithm, in.Body))
 	default:
 		return "", fmt.Errorf("unsupported digest qop %q", qop)
@@ -636,7 +645,7 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 	headers := map[string]string{
 		"To":                   "<" + impu + ">",
 		"From":                 "<" + impu + ">;tag=vowifi-go",
-		"Contact":              buildRegisterContactHeader(contactURI),
+		"Contact":              buildRegisterContactHeader(contactURI, profile.InstanceID, callID),
 		"Call-ID":              strings.TrimSpace(callID),
 		"CSeq":                 strings.TrimSpace(cseq) + " REGISTER",
 		"Max-Forwards":         "70",
@@ -644,6 +653,7 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 		"Allow":                "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, MESSAGE, REFER, NOTIFY, SUBSCRIBE, OPTIONS",
 		"Supported":            "path, gruu, outbound, sec-agree, 100rel, timer",
 		"Require":              "sec-agree",
+		"Proxy-Require":        "sec-agree",
 		"P-Preferred-Identity": "<" + impu + ">",
 		"Security-Client":      BuildSecurityClientHeader(DefaultSecurityClientAgreement(nil)),
 	}
@@ -656,12 +666,32 @@ func BuildRegisterHeaders(profile IMSProfile, contactURI, callID, cseq string) m
 	return headers
 }
 
-func buildRegisterContactHeader(contactURI string) string {
-	contact := "<" + strings.TrimSpace(contactURI) + ">;+sip.instance=\"<urn:uuid:vowifi-go>\""
+func buildRegisterContactHeader(contactURI, instanceID, callID string) string {
+	instanceID = strings.Trim(strings.TrimSpace(instanceID), "<>")
+	if instanceID == "" {
+		instanceID = registerInstanceURN(callID, contactURI)
+	}
+	contact := "<" + strings.TrimSpace(contactURI) + ">;+sip.instance=\"<" + instanceID + ">\""
 	if imsMMTelContactFeature != "" {
 		contact += ";" + imsMMTelContactFeature
 	}
+	contact += ";" + imsSMSIPContactFeature
 	return contact
+}
+
+func registerInstanceURN(callID, contactURI string) string {
+	seed := strings.TrimSpace(callID)
+	if seed == "" {
+		seed = strings.TrimSpace(contactURI)
+	}
+	sum := sha256.Sum256([]byte(seed))
+	id := sum[:16]
+	// Keep the identifier deterministic for a registration session while using
+	// the RFC 4122 UUID layout required by the SIP +sip.instance parameter.
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(id)
+	return "urn:uuid:" + encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32]
 }
 
 func formatVisitedNetworkIDHeader(value string) string {
@@ -717,6 +747,9 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		}
 		msg.Headers["Expires"] = strconv.Itoa(expires)
 		msg.Headers["Security-Client"] = securityClientHeader
+		if s.InitialAuthorization && strings.TrimSpace(authHeaderName) == "" {
+			msg.Headers["Authorization"] = buildInitialDigestAuthorization(s.Profile, registrarURI)
+		}
 		if strings.TrimSpace(authHeaderName) != "" && strings.TrimSpace(authz) != "" {
 			msg.Headers[authHeaderName] = authz
 		}
@@ -767,7 +800,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 			NextCSeq:   cseq + 1,
 		}, nil
 	}
-	if resp.StatusCode != 401 && resp.StatusCode != 407 {
+	if !isRegisterDigestChallengeResponse(resp) {
 		return registerFailureResult(resp, attempts, DigestChallenge{}, ""), fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
 	}
 
@@ -839,7 +872,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 			}
 			return result, nil
 		}
-		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
+		if !isRegisterDigestChallengeResponse(resp2) {
 			return registerFailureResult(resp2, attempts, ch, authz), fmt.Errorf("%w: %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 		}
 		nextHeaderName := "WWW-Authenticate"
@@ -914,6 +947,23 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	}
 	result.Binding = bindDigestAuthWithChallengeInput(result.Binding, authzHeader, authz, result.AuthState, s.digestChallengeInputFunc())
 	return result, nil
+}
+
+func buildInitialDigestAuthorization(profile IMSProfile, registrarURI string) string {
+	username := strings.TrimSpace(profile.IMPI)
+	realm := identityDomain(username)
+	if realm == "" {
+		realm = strings.TrimSpace(profile.Domain)
+	}
+	return `Digest username="` + quote(username) + `", realm="` + quote(realm) + `", nonce="", uri="` + quote(strings.TrimSpace(registrarURI)) + `", response=""`
+}
+
+func identityDomain(identity string) string {
+	identity = strings.TrimSpace(identity)
+	if at := strings.LastIndexByte(identity, '@'); at >= 0 && at+1 < len(identity) {
+		return strings.TrimSpace(identity[at+1:])
+	}
+	return ""
 }
 
 func registerFailureResult(resp RegisterResponse, attempts int, ch DigestChallenge, authHeader string) RegisterResult {
@@ -1082,7 +1132,7 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 	if isSIPSuccess(resp.StatusCode) {
 		return DeregisterResult{Deregistered: true, StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, nil
 	}
-	if resp.StatusCode != 401 && resp.StatusCode != 407 {
+	if !isRegisterDigestChallengeResponse(resp) {
 		result := deregisterFailureResult(resp, attempts)
 		return result, fmt.Errorf("%w: deregister %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
 	}
@@ -1111,7 +1161,7 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 		return DeregisterResult{Attempts: attempts}, err
 	}
 	if syncFailure && !isSIPSuccess(resp2.StatusCode) {
-		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
+		if !isRegisterDigestChallengeResponse(resp2) {
 			result := deregisterFailureResult(resp2, attempts)
 			return result, fmt.Errorf("%w: deregister %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 		}
@@ -1255,7 +1305,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		}
 		return result, nil
 	}
-	if resp.StatusCode != 401 && resp.StatusCode != 407 {
+	if !isRegisterDigestChallengeResponse(resp) {
 		result := refreshFailureResult(resp, attempts, "", "", DigestAuthState{})
 		return result, fmt.Errorf("%w: refresh %d %s", ErrRegistrationRejected, resp.StatusCode, resp.Reason)
 	}
@@ -1290,7 +1340,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	}
 	challengeHeaders := resp.Headers
 	if syncFailure && !isSIPSuccess(resp2.StatusCode) {
-		if resp2.StatusCode != 401 && resp2.StatusCode != 407 {
+		if !isRegisterDigestChallengeResponse(resp2) {
 			result := refreshFailureResult(resp2, attempts, authz, authHeaderName, authState)
 			return result, fmt.Errorf("%w: refresh %d %s", ErrRegistrationRejected, resp2.StatusCode, resp2.Reason)
 		}
@@ -1365,11 +1415,20 @@ func (s RegisterSession) securityClientAgreements() []SecurityAgreement {
 }
 
 func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, clients []SecurityAgreement, akaKeys IMSSecurityAKAKeys) (IMSSecurityAssociationInstallRequest, bool, error) {
-	agreement, plan, ok := securityPlanFromChallenge(headers, clients)
+	agreement, clientAgreement, plan, ok := securityPlanFromChallenge(headers, clients)
 	if !ok {
 		return IMSSecurityAssociationInstallRequest{}, false, nil
 	}
-	req := buildIMSSecurityAssociationInstallRequest(plan, agreement, akaKeys, s.SecurityLocalAddr, s.SecurityRemoteAddr, s.ContactURI, s.RegistrarURI)
+	req := buildIMSSecurityAssociationInstallRequest(plan, agreement, clientAgreement, akaKeys, s.SecurityLocalAddr, s.SecurityRemoteAddr, s.ContactURI, s.RegistrarURI)
+	if provider, ok := s.Transport.(SecurityAssociationEndpointProvider); ok {
+		localAddress, remoteAddress := provider.SecurityAssociationAddresses()
+		if strings.TrimSpace(localAddress) != "" {
+			req.LocalEndpoint.Address = strings.TrimSpace(localAddress)
+		}
+		if strings.TrimSpace(remoteAddress) != "" {
+			req.RemoteEndpoint.Address = strings.TrimSpace(remoteAddress)
+		}
+	}
 	if s.SecurityPlanInstaller == nil {
 		return req, false, nil
 	}
@@ -1554,7 +1613,7 @@ func digestRspauth(state DigestAuthState, qop string, body []byte) (string, erro
 		ha2 = digestHashHex(algorithm, ":"+input.URI)
 	case "auth":
 		ha2 = digestHashHex(algorithm, ":"+input.URI)
-	case "auth-int":
+	case "auth-int", "auth-init":
 		ha2 = digestHashHex(algorithm, ":"+input.URI+":"+digestHashBytesHex(algorithm, body))
 	default:
 		return "", fmt.Errorf("%w: unsupported rspauth qop %q", ErrInvalidAuthenticationInfo, qop)
@@ -1763,7 +1822,7 @@ func digestQOPSupported(qop string) bool {
 		return true
 	}
 	switch firstQOP(qop) {
-	case "auth", "auth-int":
+	case "auth", "auth-int", "auth-init":
 		return true
 	default:
 		return false
@@ -2002,7 +2061,26 @@ func firstQOP(qop string) string {
 			return p
 		}
 	}
+	for _, part := range strings.Split(qop, ",") {
+		p := strings.ToLower(strings.TrimSpace(part))
+		if p == "auth-init" {
+			return p
+		}
+	}
 	return strings.ToLower(strings.TrimSpace(qop))
+}
+
+func isRegisterDigestChallengeResponse(resp RegisterResponse) bool {
+	if resp.StatusCode == 401 || resp.StatusCode == 407 {
+		return true
+	}
+	if resp.StatusCode != 400 {
+		return false
+	}
+	// Some IMS SBCs use 400 for their initial Digest handshake. Limit this
+	// interoperability path to responses that actually carry a challenge.
+	return firstHeader(resp.Headers, "WWW-Authenticate") != "" ||
+		firstHeader(resp.Headers, "Proxy-Authenticate") != ""
 }
 
 func firstHeader(headers map[string][]string, name string) string {
@@ -2383,20 +2461,20 @@ func securityServerHeaderValues(headers map[string][]string) []string {
 	return trimHeaderValues(rawHeaderValues(headers, "Security-Server"))
 }
 
-func securityPlanFromChallenge(headers map[string][]string, clients []SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
+func securityPlanFromChallenge(headers map[string][]string, clients []SecurityAgreement) (SecurityAgreement, SecurityAgreement, IMSSecurityAssociationPlan, bool) {
 	return securityPlanFromValues(securityServerHeaderValues(headers), clients)
 }
 
-func securityPlanFromValues(values []string, clients []SecurityAgreement) (SecurityAgreement, IMSSecurityAssociationPlan, bool) {
-	selected, ok := SelectSecurityAgreementForClients(values, clients)
+func securityPlanFromValues(values []string, clients []SecurityAgreement) (SecurityAgreement, SecurityAgreement, IMSSecurityAssociationPlan, bool) {
+	selected, client, ok := selectSecurityAgreementPair(values, clients)
 	if !ok {
-		return SecurityAgreement{}, IMSSecurityAssociationPlan{}, false
+		return SecurityAgreement{}, SecurityAgreement{}, IMSSecurityAssociationPlan{}, false
 	}
 	plan, ok := BuildIMSSecurityAssociationPlan(selected)
 	if !ok {
-		return selected, IMSSecurityAssociationPlan{}, false
+		return selected, client, IMSSecurityAssociationPlan{}, false
 	}
-	return selected, plan, true
+	return selected, client, plan, true
 }
 
 func md5Hex(s string) string {

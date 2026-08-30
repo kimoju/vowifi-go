@@ -84,18 +84,23 @@ func (c TunnelConfig) Validate() error {
 }
 
 type TunnelResult struct {
-	Ready             bool
-	Mode              string
-	EPDGAddress       string
-	LocalInnerIP      string
-	RemoteInnerIP     string
-	DNSServers        []string
-	IKEEstablished    bool
-	IPsecEstablished  bool
-	MOBIKESupported   bool
-	ChildSAIdentifier string
-	Reason            string
-	EstablishedAt     time.Time
+	Ready              bool
+	Mode               string
+	EPDGAddress        string
+	LocalInnerIP       string
+	RemoteInnerIP      string
+	DNSServers         []string
+	PCSCFServers       []string
+	ESPEncryptionID    uint16
+	ESPIntegrityID     uint16
+	InitiatorSelectors []string
+	ResponderSelectors []string
+	IKEEstablished     bool
+	IPsecEstablished   bool
+	MOBIKESupported    bool
+	ChildSAIdentifier  string
+	Reason             string
+	EstablishedAt      time.Time
 }
 
 func (r TunnelResult) IsReady() bool {
@@ -104,6 +109,9 @@ func (r TunnelResult) IsReady() bool {
 
 func cloneTunnelResult(r TunnelResult) TunnelResult {
 	r.DNSServers = append([]string(nil), r.DNSServers...)
+	r.PCSCFServers = append([]string(nil), r.PCSCFServers...)
+	r.InitiatorSelectors = append([]string(nil), r.InitiatorSelectors...)
+	r.ResponderSelectors = append([]string(nil), r.ResponderSelectors...)
 	return r
 }
 
@@ -114,6 +122,11 @@ func isZeroTunnelResult(r TunnelResult) bool {
 		strings.TrimSpace(r.LocalInnerIP) == "" &&
 		strings.TrimSpace(r.RemoteInnerIP) == "" &&
 		len(r.DNSServers) == 0 &&
+		len(r.PCSCFServers) == 0 &&
+		r.ESPEncryptionID == 0 &&
+		r.ESPIntegrityID == 0 &&
+		len(r.InitiatorSelectors) == 0 &&
+		len(r.ResponderSelectors) == 0 &&
 		!r.IKEEstablished &&
 		!r.IPsecEstablished &&
 		!r.MOBIKESupported &&

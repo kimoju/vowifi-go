@@ -617,6 +617,26 @@ func TestCleanupIMSRegistrationSecurityPlansUsesInstallerCleanup(t *testing.T) {
 	}
 }
 
+func TestIMSRegistrationMaintenanceCloseCleansSecurityAfterContextCancellation(t *testing.T) {
+	installer := &wireIMSRegistrarSecurityInstaller{}
+	m := &imsRegistrationMaintenance{
+		flow:    &voiceclient.WireSIPFlow{},
+		session: voiceclient.RegisterSession{SecurityPlanInstaller: installer},
+		done:    make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.Close(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close() error = %v, want context.Canceled", err)
+	}
+	if installer.cleanupCalls != 1 {
+		t.Fatalf("cleanupCalls=%d, want 1", installer.cleanupCalls)
+	}
+	if installer.cleanupContextErr != nil {
+		t.Fatalf("cleanup context error=%v, want live cleanup context", installer.cleanupContextErr)
+	}
+}
+
 func TestWireIMSRegistrarUsesTunnelInnerIPForContact(t *testing.T) {
 	transport := &wireIMSRegistrarTransport{responses: []voiceclient.RegisterResponse{{
 		StatusCode: 200,
@@ -711,6 +731,18 @@ func TestWireIMSRegistrarDefaultResolverUsesTunnelDNS(t *testing.T) {
 	}
 	if _, ok := customFlow.Resolver.(voiceclient.NetSIPResolver); ok {
 		t.Fatalf("custom resolver was overwritten: %T", customFlow.Resolver)
+	}
+}
+
+func TestRuntimePCSCFCandidatesPreferTunnelAddresses(t *testing.T) {
+	candidates := runtimePCSCFCandidates(IMSRegistrationConfig{
+		Tunnel: swu.TunnelResult{PCSCFServers: []string{"2001:db8::20"}},
+		Prepared: &identity.PreparedSession{
+			PCSCFFQDNs: []string{"pcscf.ims.example"},
+		},
+	})
+	if len(candidates) != 2 || candidates[0] != "2001:db8::20" || candidates[1] != "pcscf.ims.example" {
+		t.Fatalf("candidates=%+v", candidates)
 	}
 }
 
@@ -1674,8 +1706,9 @@ func TestWireIMSRegistrarRefreshAndCloseAdvanceDigestNonceCount(t *testing.T) {
 			t.Fatalf("REGISTER lifecycle used different flows: %+v", requests)
 		}
 	}
-	if strings.Contains(requests[0].wire, "Authorization:") {
-		t.Fatalf("initial REGISTER unexpectedly authenticated: %q", requests[0].wire)
+	if !strings.Contains(requests[0].wire, "Authorization: Digest") ||
+		!strings.Contains(requests[0].wire, `nonce=""`) || !strings.Contains(requests[0].wire, `response=""`) {
+		t.Fatalf("initial REGISTER missing IMS empty digest identity: %q", requests[0].wire)
 	}
 	if !strings.Contains(requests[1].wire, "Authorization: Digest") || !strings.Contains(requests[1].wire, "nc=00000001") ||
 		!strings.Contains(requests[1].wire, "CSeq: 2 REGISTER\r\n") {
@@ -1791,9 +1824,10 @@ func (t *wireIMSRegistrarTransport) RoundTripRegister(ctx context.Context, msg v
 }
 
 type wireIMSRegistrarSecurityInstaller struct {
-	requests     []voiceclient.IMSSecurityAssociationInstallRequest
-	legacyCalls  []voiceclient.IMSSecurityAssociationPlan
-	cleanupCalls int
+	requests          []voiceclient.IMSSecurityAssociationInstallRequest
+	legacyCalls       []voiceclient.IMSSecurityAssociationPlan
+	cleanupCalls      int
+	cleanupContextErr error
 }
 
 func (i *wireIMSRegistrarSecurityInstaller) InstallSecurityPlan(ctx context.Context, plan voiceclient.IMSSecurityAssociationPlan) error {
@@ -1817,6 +1851,7 @@ func (i *wireIMSRegistrarSecurityInstaller) InstallSecurityPlanRequest(ctx conte
 
 func (i *wireIMSRegistrarSecurityInstaller) Cleanup(ctx context.Context) error {
 	i.cleanupCalls++
+	i.cleanupContextErr = ctx.Err()
 	return nil
 }
 

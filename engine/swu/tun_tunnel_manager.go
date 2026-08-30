@@ -277,11 +277,17 @@ func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg T
 	}
 	tables := routingTablesForRoutes(routes)
 	out := make([]EPDGRouteExclusion, 0, len(ips))
+	seen := make(map[string]bool, len(ips))
 	for _, ip := range ips {
 		normalized := normalizedMOBIKEIP(ip)
 		if normalized == nil {
 			continue
 		}
+		key := normalized.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		outer := EPDGOuterRoute{
 			InterfaceName: strings.TrimSpace(cfg.LocalInterface),
 			Source:        strings.TrimSpace(cfg.OuterLocalIP),
@@ -301,7 +307,7 @@ func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg T
 			return nil, fmt.Errorf("%w: ePDG route protection could not resolve outer interface", ErrInvalidTUNTunnelManager)
 		}
 		out = append(out, EPDGRouteExclusion{
-			Address:       normalized.String(),
+			Address:       key,
 			InterfaceName: strings.TrimSpace(outer.InterfaceName),
 			Via:           strings.TrimSpace(outer.Via),
 			Source:        strings.TrimSpace(outer.Source),
@@ -526,11 +532,16 @@ func (s *TUNPacketTunnelSession) Close(ctx context.Context) error {
 	s.mu.Unlock()
 
 	var err error
-	if pump != nil {
-		err = pump.Close(ctx)
-	}
 	if routingApplied && routing != nil {
-		err = errors.Join(err, routing.Cleanup(ctx, routingState))
+		// Runtime shutdown commonly arrives with an already-cancelled request
+		// context. Route/rule cleanup must still run so a stopped device cannot
+		// leave host networking artifacts behind.
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
+		err = routing.Cleanup(cleanupCtx, routingState)
+		cancelCleanup()
+	}
+	if pump != nil {
+		err = errors.Join(err, pump.Close(ctx))
 	}
 	return err
 }

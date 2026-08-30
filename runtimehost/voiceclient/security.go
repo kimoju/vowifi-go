@@ -73,6 +73,7 @@ type IMSSecurityAssociationEndpoint struct {
 type IMSSecurityAssociationInstallRequest struct {
 	Plan               IMSSecurityAssociationPlan
 	Agreement          SecurityAgreement
+	ClientAgreement    SecurityAgreement
 	AKA                IMSSecurityAKAKeys
 	LocalEndpoint      IMSSecurityAssociationEndpoint
 	RemoteEndpoint     IMSSecurityAssociationEndpoint
@@ -143,9 +144,14 @@ func SelectSecurityAgreement(values []string, client SecurityAgreement) (Securit
 }
 
 func SelectSecurityAgreementForClients(values []string, clients []SecurityAgreement) (SecurityAgreement, bool) {
+	server, _, ok := selectSecurityAgreementPair(values, clients)
+	return server, ok
+}
+
+func selectSecurityAgreementPair(values []string, clients []SecurityAgreement) (SecurityAgreement, SecurityAgreement, bool) {
 	offers := ParseSecurityAgreements(values)
 	if len(offers) == 0 {
-		return SecurityAgreement{}, false
+		return SecurityAgreement{}, SecurityAgreement{}, false
 	}
 	if len(clients) == 0 {
 		clients = []SecurityAgreement{{}}
@@ -158,6 +164,7 @@ func SelectSecurityAgreementForClients(values []string, clients []SecurityAgreem
 	bestClientIndex := len(completedClients)
 	bestScore := -1
 	var best SecurityAgreement
+	var bestClient SecurityAgreement
 	for i, offer := range offers {
 		offer = completeSecurityAgreement(offer)
 		for j, client := range completedClients {
@@ -170,13 +177,14 @@ func SelectSecurityAgreementForClients(values []string, clients []SecurityAgreem
 				bestClientIndex = j
 				bestScore = score
 				best = offer
+				bestClient = client
 			}
 		}
 	}
 	if bestIndex < 0 {
-		return SecurityAgreement{}, false
+		return SecurityAgreement{}, SecurityAgreement{}, false
 	}
-	return best, true
+	return best, bestClient, true
 }
 
 func BuildIMSSecurityAssociationPlan(agreement SecurityAgreement) (IMSSecurityAssociationPlan, bool) {
@@ -311,13 +319,18 @@ func isZeroIMSSecurityAssociationPlan(plan IMSSecurityAssociationPlan) bool {
 	return plan == IMSSecurityAssociationPlan{}
 }
 
-func buildIMSSecurityAssociationInstallRequest(plan IMSSecurityAssociationPlan, agreement SecurityAgreement, aka IMSSecurityAKAKeys, localAddr, remoteAddr, contactURI, registrarURI string) IMSSecurityAssociationInstallRequest {
+func buildIMSSecurityAssociationInstallRequest(plan IMSSecurityAssociationPlan, agreement, clientAgreement SecurityAgreement, aka IMSSecurityAKAKeys, localAddr, remoteAddr, contactURI, registrarURI string) IMSSecurityAssociationInstallRequest {
 	agreement = cloneSecurityAgreement(agreement)
+	localPort := clientAgreement.PortClient
+	if localPort <= 0 {
+		localPort = plan.PortClient
+	}
 	return IMSSecurityAssociationInstallRequest{
 		Plan:               plan,
 		Agreement:          agreement,
+		ClientAgreement:    cloneSecurityAgreement(clientAgreement),
 		AKA:                cloneIMSSecurityAKAKeys(aka),
-		LocalEndpoint:      imssSecurityEndpoint(localAddr, contactURI, plan.PortClient),
+		LocalEndpoint:      imssSecurityEndpoint(localAddr, contactURI, localPort),
 		RemoteEndpoint:     imssSecurityEndpoint(remoteAddr, registrarURI, plan.PortServer),
 		SelectedParameters: cloneSecurityParameters(agreement.Parameters),
 	}
@@ -325,6 +338,7 @@ func buildIMSSecurityAssociationInstallRequest(plan IMSSecurityAssociationPlan, 
 
 func cloneIMSSecurityAssociationInstallRequest(req IMSSecurityAssociationInstallRequest) IMSSecurityAssociationInstallRequest {
 	req.Agreement = cloneSecurityAgreement(req.Agreement)
+	req.ClientAgreement = cloneSecurityAgreement(req.ClientAgreement)
 	req.AKA = cloneIMSSecurityAKAKeys(req.AKA)
 	req.SelectedParameters = cloneSecurityParameters(req.SelectedParameters)
 	return req

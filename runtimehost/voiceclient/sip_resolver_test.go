@@ -1,6 +1,9 @@
 package voiceclient
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestNormalizeDNSServerAddrs(t *testing.T) {
 	got := normalizeDNSServerAddrs([]string{
@@ -24,6 +27,20 @@ func TestNormalizeDNSServerAddrs(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("addrs[%d]=%q, want %q (all=%+v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+func TestDNSResolverLocalAddrUsesTunnelSourceFamily(t *testing.T) {
+	addr, ok := dnsResolverLocalAddr("udp", "2001:db8::20/128", "[2001:db8::53]:53")
+	if !ok {
+		t.Fatal("IPv6 tunnel source must be compatible with IPv6 DNS")
+	}
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok || udpAddr.IP.String() != "2001:db8::20" || udpAddr.Port != 0 {
+		t.Fatalf("local addr=%#v, want IPv6 UDP source with ephemeral port", addr)
+	}
+	if _, ok := dnsResolverLocalAddr("udp", "2001:db8::20", "192.0.2.53:53"); ok {
+		t.Fatal("IPv6 tunnel source must not be used with IPv4 DNS")
 	}
 }
 

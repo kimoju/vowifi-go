@@ -2,9 +2,11 @@ package runtimehost
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -180,8 +182,13 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 			result, err = registerSession.Register(ctx)
 		}
 		if err != nil {
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
+			cleanupErr := cleanupIMSRegistrationSecurityPlans(cleanupCtx, r.SecurityPlanInstaller)
+			cancelCleanup()
 			if defaultFlow != nil {
-				_ = defaultFlow.Close()
+				err = errors.Join(err, cleanupErr, defaultFlow.Close())
+			} else {
+				err = errors.Join(err, cleanupErr)
 			}
 			return imsRegisterFailureResult(result, profile, err), err
 		}
@@ -212,6 +219,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		VoiceTransport: voiceTransport,
 		SMSTransport:   smsTransport,
 		USSDTransport:  ussdTransport,
+		Inbound:        r.inboundConfig(cfg, profile, contactURI, result.Binding, defaultFlow),
 		Close:          closeRegistration,
 		Recover:        recoverRegistration,
 	}, nil
@@ -243,13 +251,116 @@ func (r WireIMSRegistrar) defaultSIPFlow(cfg IMSRegistrationConfig) *voiceclient
 	return &voiceclient.WireSIPFlow{
 		Network:               r.Network,
 		ServerAddr:            r.ServerAddr,
-		LocalAddr:             r.LocalAddr,
+		LocalAddr:             r.localAddrForConfig(cfg),
 		Resolver:              r.resolverForConfig(cfg),
 		Timeout:               r.Timeout,
 		RetransmitInterval:    r.RetransmitInterval,
 		MaxRetransmitInterval: r.MaxRetransmitInterval,
 		MaxRetransmits:        r.MaxRetransmits,
 	}
+}
+
+func (r WireIMSRegistrar) localAddrForConfig(cfg IMSRegistrationConfig) string {
+	if local := strings.TrimSpace(r.LocalAddr); local != "" {
+		return local
+	}
+	host := normalizedRuntimeIPHost(firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP))
+	if host == "" || !runtimeIPHostIsAssigned(host) {
+		return ""
+	}
+	port := 0
+	if r.SecurityPlanInstaller != nil {
+		port = voiceclient.DefaultSecurityClientAgreement(nil).PortClient
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+func runtimeIPHostIsAssigned(host string) bool {
+	want, err := netip.ParseAddr(strings.TrimSpace(host))
+	if err != nil {
+		return false
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, assigned := range addrs {
+		value := strings.TrimSpace(assigned.String())
+		if prefix, parseErr := netip.ParsePrefix(value); parseErr == nil && prefix.Addr() == want {
+			return true
+		}
+		if addr, parseErr := netip.ParseAddr(value); parseErr == nil && addr == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (r WireIMSRegistrar) inboundConfig(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, contactURI string, binding voiceclient.RegistrationBinding, flow *voiceclient.WireSIPFlow) *IMSInboundConfig {
+	host := normalizedRuntimeIPHost(firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, cfg.Tunnel.LocalInnerIP))
+	if host == "" {
+		return nil
+	}
+	port := r.ContactPort
+	if port <= 0 {
+		port = 5060
+	}
+	if agreements := voiceclient.ParseSecurityAgreements([]string{binding.SecurityClient}); len(agreements) > 0 && agreements[0].PortServer > 0 {
+		port = agreements[0].PortServer
+	}
+	var packet net.PacketConn
+	if flow != nil {
+		packet = flow.TakeSecurityResponsePacketConn()
+		if packet != nil {
+			if local := packet.LocalAddr(); local != nil {
+				return &IMSInboundConfig{
+					Network:    networkForPacketAddr(local),
+					LocalAddr:  local.String(),
+					ContactURI: strings.TrimSpace(contactURI),
+					UserAgent:  firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
+					PacketConn: packet,
+				}
+			}
+		}
+	}
+	network := strings.ToLower(strings.TrimSpace(r.Network))
+	switch network {
+	case "", "udp":
+		if addr, err := netip.ParseAddr(host); err == nil && addr.Is6() {
+			network = "udp6"
+		} else {
+			network = "udp4"
+		}
+	case "udp4", "udp6", "tcp", "tcp4", "tcp6":
+	default:
+		// TLS accepts inbound requests on the established client connection and
+		// cannot be represented by a separate listener yet.
+		return nil
+	}
+	return &IMSInboundConfig{
+		Network:    network,
+		LocalAddr:  net.JoinHostPort(host, strconv.Itoa(port)),
+		ContactURI: strings.TrimSpace(contactURI),
+		UserAgent:  firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
+	}
+}
+
+func networkForPacketAddr(addr net.Addr) string {
+	if udp, ok := addr.(*net.UDPAddr); ok && udp.IP.To4() == nil {
+		return "udp6"
+	}
+	return "udp4"
+}
+
+func normalizedRuntimeIPHost(value string) string {
+	value = strings.Trim(strings.TrimSpace(value), "[]")
+	if prefix, err := netip.ParsePrefix(value); err == nil {
+		return prefix.Addr().String()
+	}
+	if addr, err := netip.ParseAddr(value); err == nil {
+		return addr.String()
+	}
+	return value
 }
 
 func (r WireIMSRegistrar) registerSession(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, registrarURI, contactURI string, transport voiceclient.SIPRegisterTransport, expires int) voiceclient.RegisterSession {
@@ -263,6 +374,7 @@ func (r WireIMSRegistrar) registerSession(cfg IMSRegistrationConfig, profile voi
 		CallID:                firstRuntimeNonEmpty(r.CallID, cfg.TraceID, cfg.DeviceID+"-ims-register"),
 		CNonce:                firstRuntimeNonEmpty(r.CNonce, cfg.TraceID, cfg.DeviceID),
 		Expires:               expires,
+		InitialAuthorization:  true,
 		SecurityPlanInstaller: r.SecurityPlanInstaller,
 		SecurityLocalAddr:     firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, r.LocalAddr),
 		SecurityRemoteAddr:    r.ServerAddr,
@@ -370,10 +482,11 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 	if r.Resolver != nil {
 		return r.Resolver
 	}
-	if candidates := preparedPCSCFCandidates(cfg); len(candidates) > 0 {
+	if candidates := runtimePCSCFCandidates(cfg); len(candidates) > 0 {
 		return preparedPCSCFResolver{
 			Candidates: candidates,
 			DNSServers: append([]string(nil), cfg.Tunnel.DNSServers...),
+			LocalIP:    normalizedRuntimeIPHost(cfg.Tunnel.LocalInnerIP),
 			Timeout:    r.Timeout,
 		}
 	}
@@ -381,14 +494,22 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 		return nil
 	}
 	return voiceclient.NetSIPResolver{
-		DNSServers: append([]string(nil), cfg.Tunnel.DNSServers...),
-		Timeout:    r.Timeout,
+		DNSServers:        append([]string(nil), cfg.Tunnel.DNSServers...),
+		LocalIP:           normalizedRuntimeIPHost(cfg.Tunnel.LocalInnerIP),
+		Timeout:           r.Timeout,
+		RequireResolvedIP: true,
 	}
+}
+
+func runtimePCSCFCandidates(cfg IMSRegistrationConfig) []string {
+	out := appendRuntimeTargets(nil, cfg.Tunnel.PCSCFServers...)
+	return appendRuntimeTargets(out, preparedPCSCFCandidates(cfg)...)
 }
 
 type preparedPCSCFResolver struct {
 	Candidates []string
 	DNSServers []string
+	LocalIP    string
 	Timeout    time.Duration
 }
 
@@ -405,8 +526,10 @@ func (r preparedPCSCFResolver) ResolveSIPServer(ctx context.Context, network, ur
 
 func (r preparedPCSCFResolver) ResolveSIPServers(ctx context.Context, network, uri string) ([]string, error) {
 	resolver := voiceclient.NetSIPResolver{
-		DNSServers: append([]string(nil), r.DNSServers...),
-		Timeout:    r.Timeout,
+		DNSServers:        append([]string(nil), r.DNSServers...),
+		LocalIP:           normalizedRuntimeIPHost(r.LocalIP),
+		Timeout:           r.Timeout,
+		RequireResolvedIP: len(r.DNSServers) > 0,
 	}
 	var out []string
 	var lastErr error
@@ -626,11 +749,12 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
+	var waitErr error
 	if done != nil {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return ctx.Err()
+			waitErr = ctx.Err()
 		}
 	}
 
@@ -650,7 +774,13 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 	if registered {
 		_, deregisterErr = m.session.Deregister(ctx, req)
 	}
-	return errors.Join(deregisterErr, cleanupIMSRegistrationSecurityPlans(ctx, m.session.SecurityPlanInstaller), m.flow.Close())
+	// Runtime shutdown commonly reaches here with an expired/cancelled request
+	// context. XFRM cleanup must still execute or a stopped device leaves stale
+	// SAs and policies that can collide with its next registration.
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
+	cleanupErr := cleanupIMSRegistrationSecurityPlans(cleanupCtx, m.session.SecurityPlanInstaller)
+	cancelCleanup()
+	return errors.Join(waitErr, deregisterErr, cleanupErr, m.flow.Close())
 }
 
 func cleanupIMSRegistrationSecurityPlans(ctx context.Context, installer voiceclient.SecurityPlanInstaller) error {
@@ -1111,11 +1241,39 @@ func (r WireIMSRegistrar) profileFromConfig(cfg IMSRegistrationConfig) (voicecli
 		IMPI:              impi,
 		IMPU:              impu,
 		Domain:            domain,
-		LocalIP:           firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP),
+		LocalIP:           normalizedRuntimeIPHost(firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP)),
+		InstanceID:        imsInstanceID(cfg, impi),
 		UserAgent:         firstRuntimeNonEmpty(r.UserAgent, "vowifi-go"),
 		AccessNetworkInfo: accessNetworkInfo,
 		VisitedNetworkID:  visitedNetworkID,
 	}, nil
+}
+
+func imsInstanceID(cfg IMSRegistrationConfig, impi string) string {
+	imei := strings.TrimSpace(cfg.Profile.IMEI)
+	if imei == "" && cfg.Prepared != nil {
+		imei = strings.TrimSpace(cfg.Prepared.Profile.IMEI)
+	}
+	if len(imei) == 15 {
+		valid := true
+		for _, r := range imei {
+			if r < '0' || r > '9' {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return "urn:gsma:imei:" + imei[:8] + "-" + imei[8:14] + "-" + imei[14:]
+		}
+	}
+	return stableIMSUUID(impi)
+}
+
+func stableIMSUUID(value string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
+	sum[6] = (sum[6] & 0x0f) | 0x50
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	return fmt.Sprintf("urn:uuid:%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
 func imsAKAAppPreferenceFromConfig(cfg IMSRegistrationConfig) string {
@@ -1140,9 +1298,9 @@ func imsRegistrationNetworkHeaders(cfg IMSRegistrationConfig) (string, string) {
 }
 
 func (r WireIMSRegistrar) contactURIForProfile(profile voiceclient.IMSProfile) string {
-	host := strings.TrimSpace(r.ContactHost)
+	host := normalizedRuntimeIPHost(r.ContactHost)
 	if host == "" {
-		host = strings.TrimSpace(profile.LocalIP)
+		host = normalizedRuntimeIPHost(profile.LocalIP)
 	}
 	if host == "" {
 		return ""

@@ -145,6 +145,23 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 	if err != nil {
 		return nil, err
 	}
+	if preparer, ok := transport.(interface {
+		prepareNetworkEndpoints(context.Context) (net.Addr, net.Addr, error)
+	}); ok {
+		localEndpoint, remoteEndpoint, prepareErr := preparer.prepareNetworkEndpoints(ctx)
+		if prepareErr != nil {
+			_ = closeIKETransport(transport)
+			return nil, prepareErr
+		}
+		if udpEndpoint, ok := localEndpoint.(*net.UDPAddr); ok && udpEndpoint.Port > 0 && udpEndpoint.Port <= 65535 {
+			transportCfg.LocalIP = append(net.IP(nil), udpEndpoint.IP...)
+			transportCfg.LocalPort = uint16(udpEndpoint.Port)
+		}
+		if udpEndpoint, ok := remoteEndpoint.(*net.UDPAddr); ok && udpEndpoint.Port > 0 && udpEndpoint.Port <= 65535 {
+			transportCfg.RemoteIP = append(net.IP(nil), udpEndpoint.IP...)
+			transportCfg.RemotePort = uint16(udpEndpoint.Port)
+		}
+	}
 	transportHandedOff := false
 	defer func() {
 		if !transportHandedOff {
@@ -213,9 +230,14 @@ func (m *IKEPacketTunnelManager) EstablishTunnel(ctx context.Context, cfg Tunnel
 		transportHandedOff = true
 		return session, nil
 	}
-	espTransport, err := m.espTransport(cfg, espCfg)
-	if err != nil {
-		return nil, err
+	var espTransport ESPPacketTransport
+	if provider, ok := transport.(sharedNATTESPProvider); ok && m.Config.ESPTransport == nil && m.Config.ESPTransportFactory == nil {
+		espTransport = provider.sharedESPTransport()
+	} else {
+		espTransport, err = m.espTransport(cfg, espCfg)
+		if err != nil {
+			return nil, err
+		}
 	}
 	livenessCfg := m.Config.Liveness
 	if dpdHandler == nil {
@@ -390,12 +412,7 @@ func (m *IKEPacketTunnelManager) ikeTransport(cfg TunnelConfig, transportCfg IKE
 	if m.Config.IKETransportFactory != nil {
 		return m.Config.IKETransportFactory(cfg, transportCfg)
 	}
-	return ikev2.NewPersistentUDPTransport(ikev2.UDPTransport{
-		RemoteAddr:      transportCfg.RemoteAddr,
-		LocalAddr:       transportCfg.LocalAddr,
-		Timeout:         transportCfg.Timeout,
-		UseNonESPMarker: transportCfg.UseNonESPMarker,
-	}), nil
+	return newSharedNATTTransport(transportCfg.RemoteAddr, transportCfg.LocalAddr, transportCfg.Timeout), nil
 }
 
 func (m *IKEPacketTunnelManager) espTransport(cfg TunnelConfig, transportCfg ESPTransportConfig) (ESPPacketTransport, error) {
@@ -609,19 +626,34 @@ func (c *ikePacketTunnelControl) mobike(ctx context.Context, req MOBIKERequest) 
 func tunnelResultFromIKE(cfg TunnelConfig, epdg string, init ikev2.InitResult, child ikev2.ChildSAResult, mode string) TunnelResult {
 	mode = firstPacketNonEmpty(mode, DataplaneModeUserspace)
 	return TunnelResult{
-		Ready:             true,
-		Mode:              mode,
-		EPDGAddress:       epdg,
-		LocalInnerIP:      firstPacketNonEmpty(cfg.InnerLocalIP, childConfigurationAddress(child, ikev2.ConfigInternalIPv4Address), childConfigurationAddress(child, ikev2.ConfigInternalIPv6Address)),
-		RemoteInnerIP:     strings.TrimSpace(cfg.RemoteInnerIP),
-		DNSServers:        childConfigurationDNS(child),
-		IKEEstablished:    true,
-		IPsecEstablished:  true,
-		MOBIKESupported:   init.MOBIKESupported,
-		ChildSAIdentifier: childSAIdentifier(child),
-		Reason:            "ike ipsec tunnel ready",
-		EstablishedAt:     time.Now(),
+		Ready:              true,
+		Mode:               mode,
+		EPDGAddress:        epdg,
+		LocalInnerIP:       firstPacketNonEmpty(cfg.InnerLocalIP, childConfigurationAddress(child, ikev2.ConfigInternalIPv4Address), childConfigurationAddress(child, ikev2.ConfigInternalIPv6Address)),
+		RemoteInnerIP:      strings.TrimSpace(cfg.RemoteInnerIP),
+		DNSServers:         childConfigurationDNS(child),
+		PCSCFServers:       childConfigurationPCSCF(child),
+		ESPEncryptionID:    child.Keys.Profile.EncryptionID,
+		ESPIntegrityID:     child.Keys.Profile.IntegrityID,
+		InitiatorSelectors: childTrafficSelectorStrings(child.TSi),
+		ResponderSelectors: childTrafficSelectorStrings(child.TSr),
+		IKEEstablished:     true,
+		IPsecEstablished:   true,
+		MOBIKESupported:    init.MOBIKESupported,
+		ChildSAIdentifier:  childSAIdentifier(child),
+		Reason:             "ike ipsec tunnel ready",
+		EstablishedAt:      time.Now(),
 	}
+}
+
+func childTrafficSelectorStrings(selectors ikev2.TrafficSelectors) []string {
+	out := make([]string, 0, len(selectors.Selectors))
+	for _, selector := range selectors.Selectors {
+		out = append(out, fmt.Sprintf("type=%d proto=%d ports=%d-%d addr=%s-%s",
+			selector.Type, selector.IPProtocol, selector.StartPort, selector.EndPort,
+			selector.StartAddr.String(), selector.EndAddr.String()))
+	}
+	return out
 }
 
 func childConfigurationAddress(child ikev2.ChildSAResult, attrType uint16) string {
@@ -636,15 +668,19 @@ func childConfigurationDNS(child ikev2.ChildSAResult) []string {
 	return append(childConfigurationIPStrings(child, ikev2.ConfigInternalIPv4DNS), childConfigurationIPStrings(child, ikev2.ConfigInternalIPv6DNS)...)
 }
 
+func childConfigurationPCSCF(child ikev2.ChildSAResult) []string {
+	return append(childConfigurationIPStrings(child, ikev2.ConfigPCSCFIPv4Address), childConfigurationIPStrings(child, ikev2.ConfigPCSCFIPv6Address)...)
+}
+
 func childConfigurationIPStrings(child ikev2.ChildSAResult, attrType uint16) []string {
 	if child.Configuration == nil {
 		return nil
 	}
 	width := 0
 	switch attrType {
-	case ikev2.ConfigInternalIPv4Address, ikev2.ConfigInternalIPv4DNS:
+	case ikev2.ConfigInternalIPv4Address, ikev2.ConfigInternalIPv4DNS, ikev2.ConfigPCSCFIPv4Address:
 		width = net.IPv4len
-	case ikev2.ConfigInternalIPv6Address, ikev2.ConfigInternalIPv6DNS:
+	case ikev2.ConfigInternalIPv6Address, ikev2.ConfigInternalIPv6DNS, ikev2.ConfigPCSCFIPv6Address:
 		width = net.IPv6len
 	default:
 		return nil

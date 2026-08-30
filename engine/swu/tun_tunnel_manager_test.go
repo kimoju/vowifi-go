@@ -84,6 +84,23 @@ func TestTUNTunnelManagerStartsPumpAndCleansRouting(t *testing.T) {
 	}
 }
 
+func TestTUNPacketTunnelSessionCleansRoutingWithCancelledCallerContext(t *testing.T) {
+	routing := &tunManagerRouting{}
+	session := &TUNPacketTunnelSession{
+		routing:        routing,
+		routingState:   TUNRoutingState{InterfaceName: "tun7"},
+		routingApplied: true,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := session.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if routing.cleanupCtxErr != nil || len(routing.cleanups) != 1 {
+		t.Fatalf("cleanup context err=%v cleanups=%+v", routing.cleanupCtxErr, routing.cleanups)
+	}
+}
+
 func TestTUNTunnelManagerResultTracksPumpDrivenChildSARekey(t *testing.T) {
 	baseSession := newTUNManagerPacketSession(TunnelResult{
 		Ready:             true,
@@ -317,6 +334,26 @@ func TestTUNTunnelManagerResolvesOuterRouteWhenInterfaceIsUnset(t *testing.T) {
 	}
 }
 
+func TestTUNTunnelManagerDeduplicatesResolvedEPDGRouteIPs(t *testing.T) {
+	manager := NewTUNTunnelManager(TUNTunnelManagerConfig{
+		EPDGRouteResolver: func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("198.51.100.7"), net.ParseIP("198.51.100.7")}, nil
+		},
+		EPDGOuterRouteResolver: func(context.Context, net.IP) (EPDGOuterRoute, error) {
+			return EPDGOuterRoute{InterfaceName: "eno1", Via: "192.0.2.1", Source: "192.0.2.10"}, nil
+		},
+	})
+	exclusions, err := manager.defaultEPDGRouteExclusions(context.Background(), TunnelConfig{
+		EPDGAddress: "epdg.example",
+	}, TunnelResult{}, []TUNRoute{{Destination: "default"}})
+	if err != nil {
+		t.Fatalf("defaultEPDGRouteExclusions() error = %v", err)
+	}
+	if len(exclusions) != 1 || exclusions[0].Address != "198.51.100.7" {
+		t.Fatalf("exclusions=%+v", exclusions)
+	}
+}
+
 func TestTUNTunnelManagerProtectsEPDGRoutesForPolicyTables(t *testing.T) {
 	baseSession := newTUNManagerPacketSession(TunnelResult{
 		Ready:            true,
@@ -376,9 +413,10 @@ func (m *tunManagerBase) EstablishTunnel(ctx context.Context, cfg TunnelConfig) 
 }
 
 type tunManagerRouting struct {
-	applies  []TUNRoutingConfig
-	cleanups []TUNRoutingState
-	applyErr error
+	applies       []TUNRoutingConfig
+	cleanups      []TUNRoutingState
+	applyErr      error
+	cleanupCtxErr error
 }
 
 func (r *tunManagerRouting) Apply(ctx context.Context, cfg TUNRoutingConfig) (TUNRoutingState, error) {
@@ -390,6 +428,7 @@ func (r *tunManagerRouting) Apply(ctx context.Context, cfg TUNRoutingConfig) (TU
 }
 
 func (r *tunManagerRouting) Cleanup(ctx context.Context, state TUNRoutingState) error {
+	r.cleanupCtxErr = ctx.Err()
 	r.cleanups = append(r.cleanups, state)
 	return nil
 }

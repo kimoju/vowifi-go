@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var ErrInvalidTUNRouting = errors.New("invalid swu tun routing")
@@ -89,6 +90,11 @@ type TUNRoutingState struct {
 	undo          []ipCommand
 }
 
+var sharedTUNRouteCommands = struct {
+	sync.Mutex
+	refs map[string]int
+}{refs: make(map[string]int)}
+
 type LinuxTUNRoutingManager struct {
 	Runner IPCommandRunner
 }
@@ -107,15 +113,21 @@ func (m LinuxTUNRoutingManager) Apply(ctx context.Context, cfg TUNRoutingConfig)
 	}
 	state := TUNRoutingState{InterfaceName: strings.TrimSpace(cfg.InterfaceName)}
 	for _, command := range commands {
-		if err := runner.RunIP(ctx, command.args...); err != nil {
+		var applyErr error
+		if command.sharedKey != "" {
+			applyErr = acquireSharedIPCommand(ctx, runner, command)
+		} else {
+			applyErr = runner.RunIP(ctx, command.args...)
+		}
+		if applyErr != nil {
 			rollbackErr := runIPUndo(ctx, runner, state.undo)
 			if rollbackErr != nil {
-				return state, errors.Join(err, rollbackErr)
+				return state, errors.Join(applyErr, rollbackErr)
 			}
-			return state, err
+			return state, applyErr
 		}
 		if len(command.undo) > 0 {
-			state.undo = append(state.undo, ipCommand{args: append([]string(nil), command.undo...)})
+			state.undo = append(state.undo, ipCommand{args: append([]string(nil), command.undo...), sharedKey: command.sharedKey})
 		}
 	}
 	return state, nil
@@ -133,8 +145,9 @@ func (m LinuxTUNRoutingManager) Cleanup(ctx context.Context, state TUNRoutingSta
 }
 
 type ipCommand struct {
-	args []string
-	undo []string
+	args      []string
+	undo      []string
+	sharedKey string
 }
 
 func buildTUNRoutingCommands(cfg TUNRoutingConfig) ([]ipCommand, error) {
@@ -205,7 +218,7 @@ func epdgRouteExclusionCommands(exclusion EPDGRouteExclusion) ([]ipCommand, erro
 	}
 	var commands []ipCommand
 	for _, table := range tables {
-		args := []string{"route", "add", dst, "dev", iface}
+		args := []string{"route", "replace", dst, "dev", iface}
 		undo := []string{"route", "del", dst, "dev", iface}
 		familyValues := []string{dst}
 		if strings.TrimSpace(exclusion.Via) != "" {
@@ -237,7 +250,7 @@ func epdgRouteExclusionCommands(exclusion EPDGRouteExclusion) ([]ipCommand, erro
 		}
 		args = prependIPv6Family(args, familyValues...)
 		undo = prependIPv6Family(undo, familyValues...)
-		commands = append(commands, ipCommand{args: args, undo: undo})
+		commands = append(commands, ipCommand{args: args, undo: undo, sharedKey: strings.Join(undo, "\x00")})
 	}
 	return commands, nil
 }
@@ -360,11 +373,46 @@ func runIPUndo(ctx context.Context, runner IPCommandRunner, undo []ipCommand) er
 		if len(undo[i].args) == 0 {
 			continue
 		}
-		if err := runner.RunIP(ctx, undo[i].args...); err != nil {
+		var err error
+		if undo[i].sharedKey != "" {
+			err = releaseSharedIPCommand(ctx, runner, undo[i])
+		} else {
+			err = runner.RunIP(ctx, undo[i].args...)
+		}
+		if err != nil {
 			out = errors.Join(out, err)
 		}
 	}
 	return out
+}
+
+func acquireSharedIPCommand(ctx context.Context, runner IPCommandRunner, command ipCommand) error {
+	sharedTUNRouteCommands.Lock()
+	defer sharedTUNRouteCommands.Unlock()
+	if sharedTUNRouteCommands.refs[command.sharedKey] > 0 {
+		sharedTUNRouteCommands.refs[command.sharedKey]++
+		return nil
+	}
+	if err := runner.RunIP(ctx, command.args...); err != nil {
+		return err
+	}
+	sharedTUNRouteCommands.refs[command.sharedKey] = 1
+	return nil
+}
+
+func releaseSharedIPCommand(ctx context.Context, runner IPCommandRunner, command ipCommand) error {
+	sharedTUNRouteCommands.Lock()
+	defer sharedTUNRouteCommands.Unlock()
+	refs := sharedTUNRouteCommands.refs[command.sharedKey]
+	if refs > 1 {
+		sharedTUNRouteCommands.refs[command.sharedKey] = refs - 1
+		return nil
+	}
+	delete(sharedTUNRouteCommands.refs, command.sharedKey)
+	if refs == 0 {
+		return nil
+	}
+	return runner.RunIP(ctx, command.args...)
 }
 
 func normalizedRoutingTables(primary string, extra []string) ([]string, error) {

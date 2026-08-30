@@ -27,14 +27,14 @@ func TestSWuConfigurationRequestMarshalParse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary() error = %v", err)
 	}
-	if got, want := hex.EncodeToString(body), "01000000000100000003000000080000000a0000"; got != want {
+	if got, want := hex.EncodeToString(body), "01000000000100000003000000080000000a00000014000000150000"; got != want {
 		t.Fatalf("cfg body=%s, want %s", got, want)
 	}
 	parsed, err := ParseConfiguration(body)
 	if err != nil {
 		t.Fatalf("ParseConfiguration() error = %v", err)
 	}
-	if parsed.Type != CFGRequest || len(parsed.Attributes) != 4 || parsed.Attributes[2].Type != ConfigInternalIPv6Address {
+	if parsed.Type != CFGRequest || len(parsed.Attributes) != 6 || parsed.Attributes[2].Type != ConfigInternalIPv6Address || parsed.Attributes[5].Type != ConfigPCSCFIPv6Address {
 		t.Fatalf("parsed=%+v", parsed)
 	}
 }

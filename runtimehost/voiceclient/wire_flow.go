@@ -50,20 +50,42 @@ type WireSIPFlow struct {
 	FinalResponseDrain    time.Duration
 	TLSConfig             *tls.Config
 
-	mu          sync.Mutex
-	conn        net.Conn
-	reader      *bufio.Reader
-	network     string
-	target      string
-	targets     []string
-	targetIndex int
-	closed      bool
+	mu                   sync.Mutex
+	conn                 net.Conn
+	securityResponseConn net.PacketConn
+	reader               *bufio.Reader
+	network              string
+	target               string
+	targets              []string
+	targetIndex          int
+	closed               bool
 }
 
 var _ SIPRegisterTransport = (*WireSIPFlow)(nil)
 var _ SIPRequestTransport = (*WireSIPFlow)(nil)
 var _ SIPInviteTransport = (*WireSIPFlow)(nil)
 var _ SecurityAssociationTransport = (*WireSIPFlow)(nil)
+var _ SecurityAssociationEndpointProvider = (*WireSIPFlow)(nil)
+
+func (f *WireSIPFlow) SecurityAssociationAddresses() (string, string) {
+	if f == nil {
+		return "", ""
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.conn != nil {
+		return sipEndpointHost(f.conn.LocalAddr().String()), sipEndpointHost(f.conn.RemoteAddr().String())
+	}
+	return sipEndpointHost(f.LocalAddr), sipEndpointHost(firstNonEmpty(f.target, f.ServerAddr))
+}
+
+func sipEndpointHost(value string) string {
+	host, _, ok := splitIMSSecurityEndpointAddr(value)
+	if ok {
+		return strings.TrimSpace(host)
+	}
+	return strings.Trim(strings.TrimSpace(value), "[]")
+}
 
 func (f *WireSIPFlow) RoundTripRegister(ctx context.Context, msg RegisterMessage) (RegisterResponse, error) {
 	return f.roundTrip(ctx, SIPRequestMessage{
@@ -189,7 +211,12 @@ func (f *WireSIPFlow) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = true
-	return f.closeConnLocked()
+	err := f.closeConnLocked()
+	if f.securityResponseConn != nil {
+		err = errors.Join(err, f.securityResponseConn.Close())
+		f.securityResponseConn = nil
+	}
+	return err
 }
 
 func (f *WireSIPFlow) Reset() error {
@@ -260,7 +287,46 @@ func (f *WireSIPFlow) UseSecurityAssociation(ctx context.Context, req IMSSecurit
 		f.targets = []string{remoteAddr}
 		f.targetIndex = 0
 	}
-	return f.closeConnLocked()
+	if err := f.closeConnLocked(); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(f.Network)), "tcp") &&
+		!strings.HasPrefix(strings.ToLower(strings.TrimSpace(f.Network)), "tls") {
+		responsePort := req.ClientAgreement.PortServer
+		if responsePort > 0 {
+			responseAddr := net.JoinHostPort(strings.TrimSpace(req.LocalEndpoint.Address), strconv.Itoa(responsePort))
+			packet, listenErr := net.ListenPacket(sipPacketNetwork(responseAddr), responseAddr)
+			if listenErr != nil {
+				return listenErr
+			}
+			if f.securityResponseConn != nil {
+				_ = f.securityResponseConn.Close()
+			}
+			f.securityResponseConn = packet
+		}
+	}
+	return nil
+}
+
+func sipPacketNetwork(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err == nil && strings.Contains(host, ":") {
+		return "udp6"
+	}
+	return "udp4"
+}
+
+// TakeSecurityResponsePacketConn transfers the protected IMS server port to
+// the inbound SIP server after REGISTER completes.
+func (f *WireSIPFlow) TakeSecurityResponsePacketConn() net.PacketConn {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	packet := f.securityResponseConn
+	f.securityResponseConn = nil
+	return packet
 }
 
 func sipSecurityAssociationAddr(current string, endpoint IMSSecurityAssociationEndpoint, allowWildcardHost bool) (string, error) {
@@ -387,7 +453,13 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 			}
 			return resp, nil
 		}
-		resp, err := f.readUDPResponseLocked(ctx, conn, timeout, wire, attempt, onProvisional)
+		readConn := net.Conn(conn)
+		if f.securityResponseConn != nil {
+			if protected, ok := f.securityResponseConn.(net.Conn); ok {
+				readConn = protected
+			}
+		}
+		resp, err := f.readUDPResponseLocked(ctx, readConn, conn, timeout, wire, attempt, onProvisional)
 		if err != nil {
 			f.closeConnLocked()
 			if ctx.Err() != nil {
@@ -408,7 +480,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 	}
 }
 
-func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, timeout time.Duration, wire []byte, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
+func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, readConn, writeConn net.Conn, timeout time.Duration, wire []byte, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	buf := make([]byte, 65535)
 	timerConfig := sipFlowTransactionTimerConfig(msg.Method, timeout, f.RetransmitInterval, f.MaxRetransmitInterval)
 	interval := timerConfig.T1
@@ -421,10 +493,10 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 		if retransmitExhausted || !sipClientTransactionRetransmitTimerActive(msg.Method, state) {
 			readInterval = time.Until(deadline)
 		}
-		if err := conn.SetReadDeadline(nextSIPReadDeadline(deadline, readInterval)); err != nil {
+		if err := readConn.SetReadDeadline(nextSIPReadDeadline(deadline, readInterval)); err != nil {
 			return SIPResponse{}, err
 		}
-		n, err := conn.Read(buf)
+		n, err := readConn.Read(buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return SIPResponse{}, ctx.Err()
@@ -446,7 +518,7 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 			})
 			state = step.NextState
 			if !retransmitExhausted && step.RetransmitRequest {
-				if _, writeErr := conn.Write(wire); writeErr != nil {
+				if _, writeErr := writeConn.Write(wire); writeErr != nil {
 					return SIPResponse{}, writeErr
 				}
 				retransmits++
@@ -478,7 +550,7 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, conn net.Conn, 
 		})
 		state = step.NextState
 		if step.Final && step.DeliverResponse {
-			drainSIPUDPFinalResponses(ctx, conn, msg, sipFinalResponseDrainDuration(msg.Method, f.FinalResponseDrain))
+			drainSIPUDPFinalResponses(ctx, readConn, msg, sipFinalResponseDrainDuration(msg.Method, f.FinalResponseDrain))
 			return resp, nil
 		}
 		if step.Provisional && step.DeliverResponse && onProvisional != nil && shouldReportSIPProvisionalResponse(msg.Method) {

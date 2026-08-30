@@ -729,6 +729,11 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 	defer protected.Close()
 	protectedLocalPort := reserveTestUDPPort(t)
 	protectedRemotePort := protected.LocalAddr().(*net.UDPAddr).Port
+	protectedReply, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(protectedLocalPort)))
+	if err != nil {
+		t.Fatalf("ListenPacket(protected reply) error = %v", err)
+	}
+	defer protectedReply.Close()
 
 	firstSeen := make(chan string, 1)
 	firstErr := make(chan string, 1)
@@ -795,7 +800,8 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 			protectedErr <- "build ok error: " + err.Error()
 			return
 		}
-		if _, err := protected.WriteTo(ok, addr); err != nil {
+		responseAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: DefaultSecurityPortS}
+		if _, err := protectedReply.WriteTo(ok, responseAddr); err != nil {
 			protectedErr <- "write ok error: " + err.Error()
 			return
 		}
@@ -831,7 +837,7 @@ func TestWireSIPFlowUsesSecurityAssociationPortsForAuthenticatedRegister(t *test
 		t.Fatalf("first REGISTER wire=%q", wire)
 	}
 	protectedReq := <-protectedSeen
-	if protectedReq.sourcePort != protectedLocalPort ||
+	if protectedReq.sourcePort != DefaultSecurityPortC ||
 		!strings.Contains(protectedReq.wire, "CSeq: 2 REGISTER") ||
 		!strings.Contains(protectedReq.wire, "Authorization: Digest") ||
 		!strings.Contains(protectedReq.wire, "Security-Verify: ipsec-3gpp") {

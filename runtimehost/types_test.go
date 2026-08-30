@@ -1753,26 +1753,40 @@ func TestRuntimeIMSRecoveryRetriesUSSDInviteAfterRecoverableSIPStatus(t *testing
 }
 
 func TestStartRejectsIMSRegistrationFailure(t *testing.T) {
+	session := &runtimeTunnelSession{result: swu.TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true}}
 	registrar := &testIMSRegistrar{err: errors.New("401 after AKA")}
 	_, err := Start(context.Background(), StartRequest{
-		DeviceID:     "dev-1",
-		Access:       NewModemAccessAdapter(testModem{}),
-		IMSRegistrar: registrar,
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Access:        NewModemAccessAdapter(testModem{}),
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: &runtimeTunnelManager{session: session},
+		IMSRegistrar:  registrar,
 	})
 	if err == nil || !strings.Contains(err.Error(), "IMS registration failed") {
 		t.Fatalf("Start() err=%v, want IMS registration failure", err)
 	}
+	if !session.closed {
+		t.Fatal("tunnel was not closed after IMS registration failure")
+	}
 }
 
 func TestStartRejectsUnregisteredIMSResult(t *testing.T) {
+	session := &runtimeTunnelSession{result: swu.TunnelResult{Ready: true, IKEEstablished: true, IPsecEstablished: true}}
 	registrar := &testIMSRegistrar{result: IMSRegistrationResult{Registered: false, StatusCode: 403, Reason: "Forbidden"}}
 	_, err := Start(context.Background(), StartRequest{
-		DeviceID:     "dev-1",
-		Access:       NewModemAccessAdapter(testModem{}),
-		IMSRegistrar: registrar,
+		DeviceID:      "dev-1",
+		Profile:       identity.Profile{IMSI: "310280233641503", MCC: "310", MNC: "280"},
+		Access:        NewModemAccessAdapter(testModem{}),
+		Dataplane:     DataplanePolicy{Mode: swu.DataplaneModeUserspace},
+		TunnelManager: &runtimeTunnelManager{session: session},
+		IMSRegistrar:  registrar,
 	})
 	if err == nil || !strings.Contains(err.Error(), "IMS registration rejected") {
 		t.Fatalf("Start() err=%v, want rejected IMS registration", err)
+	}
+	if !session.closed {
+		t.Fatal("tunnel was not closed after IMS registration rejection")
 	}
 }
 

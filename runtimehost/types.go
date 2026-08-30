@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -526,8 +527,20 @@ type IMSRegistrationResult struct {
 	VoiceTransport voiceclient.SIPRequestTransport
 	SMSTransport   messaging.SMSTransport
 	USSDTransport  messaging.USSDTransport
+	Inbound        *IMSInboundConfig
 	Close          func(context.Context) error
 	Recover        func(context.Context) (IMSRegistrationResult, error)
+}
+
+// IMSInboundConfig describes the socket advertised by IMS REGISTER Contact.
+// The runtime binds it after registration and routes unsolicited SIP MESSAGE
+// requests into the per-device messaging service.
+type IMSInboundConfig struct {
+	Network    string
+	LocalAddr  string
+	ContactURI string
+	UserAgent  string
+	PacketConn net.PacketConn
 }
 
 type IMSRegistrationRecoveryState struct {
@@ -606,9 +619,17 @@ type Instance struct {
 	voiceConfig  runtimeVoiceAgentConfig
 	imsClose     func(context.Context) error
 	imsRecover   func(context.Context) (IMSRegistrationResult, error)
+	inbound      *runtimeIMSInbound
 	retryCancel  context.CancelFunc
 	retryDone    chan struct{}
 	stopped      bool
+}
+
+type runtimeIMSInbound struct {
+	cancel   context.CancelFunc
+	done     chan struct{}
+	packet   net.PacketConn
+	listener net.Listener
 }
 
 func Start(ctx context.Context, req StartRequest) (*Instance, error) {
@@ -687,9 +708,11 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		}
 		res, err := req.IMSRegistrar.RegisterIMS(ctx, imsCfg)
 		if err != nil {
+			closeTunnelAfterIMSStartFailure(tunnel)
 			return nil, fmt.Errorf("IMS registration failed: %w", err)
 		}
 		if !res.Registered {
+			closeTunnelAfterIMSStartFailure(tunnel)
 			return nil, fmt.Errorf("IMS registration rejected: %d %s", res.StatusCode, strings.TrimSpace(res.Reason))
 		}
 		imsReady = true
@@ -704,7 +727,10 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		AccessReady:   modem != nil,
 		TunnelReady:   tunnelReady,
 		IMSReady:      imsReady,
-		SMSReady:      true,
+		// Legacy/no-registrar callers keep their compatibility state. A real wire
+		// registrar only becomes SMS-ready after its advertised Contact socket is
+		// successfully bound below.
+		SMSReady:      req.IMSRegistrar == nil,
 		RegStatus:     regStatus,
 		RegStatusText: regText,
 		NetworkMode:   strings.TrimSpace(req.NetworkMode),
@@ -734,6 +760,21 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 		imsClose:    imsResult.Close,
 		imsRecover:  imsResult.Recover,
 	}
+	if imsResult.Inbound != nil {
+		inbound, err := startRuntimeIMSInbound(*imsResult.Inbound, inst)
+		if err != nil {
+			if imsResult.Close != nil {
+				_ = imsResult.Close(ctx)
+			}
+			if tunnel != nil {
+				_ = tunnel.Close(ctx)
+			}
+			return nil, fmt.Errorf("IMS inbound listener failed: %w", err)
+		}
+		inst.inbound = inbound
+		inst.state.SMSReady = true
+		inst.state.LastReason = firstRuntimeNonEmpty(inst.state.LastReason, "IMS inbound ready")
+	}
 	svc.SetSMSTransport(inst.wrapSMSTransport(smsTransport))
 	svc.SetUSSDTransport(inst.wrapUSSDTransport(ussdTransport))
 	if req.VoiceGateway != nil {
@@ -743,6 +784,15 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	inst.dispatchRuntimeState(ctx)
 	inst.startIMSMessagingRetryWorker(req.IMSMessagingRetryWorker)
 	return inst, nil
+}
+
+func closeTunnelAfterIMSStartFailure(tunnel swu.TunnelSession) {
+	if tunnel == nil {
+		return
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = tunnel.Close(closeCtx)
 }
 
 func buildRuntimeVoiceAgent(req StartRequest, reg IMSRegistrationResult) voicehost.Agent {
@@ -956,11 +1006,13 @@ func (i *Instance) Stop(ctx context.Context) error {
 	i.mu.Lock()
 	tunnel := i.tunnel
 	imsClose := i.imsClose
+	inbound := i.inbound
 	voice := i.voice
 	retryCancel := i.retryCancel
 	retryDone := i.retryDone
 	i.tunnel = nil
 	i.imsClose = nil
+	i.inbound = nil
 	i.retryCancel = nil
 	i.retryDone = nil
 	i.stopped = true
@@ -970,6 +1022,9 @@ func (i *Instance) Stop(ctx context.Context) error {
 	i.state.UpdatedAt = time.Now()
 	i.mu.Unlock()
 	var err error
+	if inbound != nil {
+		err = errors.Join(err, inbound.close(ctx))
+	}
 	if stopper, ok := voice.(interface{ StopSessionTimers() }); ok {
 		stopper.StopSessionTimers()
 	}

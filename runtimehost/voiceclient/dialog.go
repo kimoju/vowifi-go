@@ -13,6 +13,7 @@ var ErrInvalidDialogConfig = errors.New("invalid IMS dialog config")
 const (
 	imsMMTelService            = "urn:urn-7:3gpp-service.ims.icsi.mmtel"
 	imsMMTelContactFeature     = `+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
+	imsSMSIPContactFeature     = "+g.3gpp.smsip"
 	imsMMTelAcceptContact      = "*;" + imsMMTelContactFeature
 	DefaultDialogMessageAccept = "text/plain, application/vnd.3gpp.sms, message/cpim"
 	DefaultSubscribeExpires    = "3600"

@@ -105,8 +105,8 @@ func TestLinuxTUNRoutingManagerInstallsEPDGExclusionsBeforeTunnelRoutes(t *testi
 	wantApply := [][]string{
 		{"link", "set", "dev", "vohive0", "up"},
 		{"addr", "add", "10.10.0.2/32", "dev", "vohive0"},
-		{"route", "add", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "main"},
-		{"route", "add", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "200"},
+		{"route", "replace", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "main"},
+		{"route", "replace", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "200"},
 		{"route", "add", "default", "dev", "vohive0", "table", "200"},
 		{"rule", "add", "priority", "1000", "from", "10.10.0.2/32", "table", "200"},
 	}
@@ -127,6 +127,63 @@ func TestLinuxTUNRoutingManagerInstallsEPDGExclusionsBeforeTunnelRoutes(t *testi
 	if !reflect.DeepEqual(runner.commands, wantAll) {
 		t.Fatalf("all commands=\n%v\nwant\n%v", runner.commands, wantAll)
 	}
+}
+
+func TestLinuxTUNRoutingManagerSharesEPDGRouteAcrossDevices(t *testing.T) {
+	runner := &fakeIPRunner{}
+	manager := LinuxTUNRoutingManager{Runner: runner}
+	cfg := TUNRoutingConfig{
+		InterfaceName: "vohive0",
+		EPDGRouteExclusions: []EPDGRouteExclusion{{
+			Address:       "198.51.100.8",
+			InterfaceName: "wwan0",
+			Via:           "192.0.2.1",
+			Source:        "192.0.2.23",
+		}},
+	}
+	first, err := manager.Apply(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("first Apply() error = %v", err)
+	}
+	second, err := manager.Apply(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("second Apply() error = %v", err)
+	}
+	if got := countIPCommand(runner.commands, "route", "replace", "198.51.100.8/32"); got != 1 {
+		t.Fatalf("shared route installs=%d, want 1", got)
+	}
+	if err := manager.Cleanup(context.Background(), first); err != nil {
+		t.Fatalf("first Cleanup() error = %v", err)
+	}
+	if got := countIPCommand(runner.commands, "route", "del", "198.51.100.8/32"); got != 0 {
+		t.Fatalf("shared route removed while second device is online: deletes=%d", got)
+	}
+	if err := manager.Cleanup(context.Background(), second); err != nil {
+		t.Fatalf("second Cleanup() error = %v", err)
+	}
+	if got := countIPCommand(runner.commands, "route", "del", "198.51.100.8/32"); got != 1 {
+		t.Fatalf("shared route deletes=%d, want 1 after final cleanup", got)
+	}
+}
+
+func countIPCommand(commands [][]string, prefix ...string) int {
+	count := 0
+	for _, command := range commands {
+		if len(command) < len(prefix) {
+			continue
+		}
+		match := true
+		for i := range prefix {
+			if command[i] != prefix[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			count++
+		}
+	}
+	return count
 }
 
 func TestLinuxTUNRoutingManagerUsesIPv6CommandFamilyForRoutesAndRules(t *testing.T) {

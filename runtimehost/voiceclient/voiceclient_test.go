@@ -466,9 +466,18 @@ func TestBuildRegisterHeaders(t *testing.T) {
 		headers["P-Visited-Network-ID"] != `"visited.example.test"` {
 		t.Fatalf("IMS access/visited headers=%+v", headers)
 	}
-	if !strings.Contains(headers["Contact"], `+sip.instance="<urn:uuid:vowifi-go>"`) ||
-		!strings.Contains(headers["Contact"], imsMMTelContactFeature) {
+	if !strings.Contains(headers["Contact"], `+sip.instance="<urn:uuid:`) ||
+		!strings.Contains(headers["Contact"], imsMMTelContactFeature) ||
+		!strings.Contains(headers["Contact"], ";"+imsSMSIPContactFeature) ||
+		headers["Proxy-Require"] != "sec-agree" {
 		t.Fatalf("Contact=%q", headers["Contact"])
+	}
+	instance := registerInstanceURN("call-1", "sip:310280233641503@192.0.2.10:5060")
+	if instance != registerInstanceURN("call-1", "sip:changed@192.0.2.20:5060") ||
+		instance == registerInstanceURN("call-2", "sip:310280233641503@192.0.2.10:5060") ||
+		len(instance) != len("urn:uuid:00000000-0000-4000-8000-000000000000") ||
+		instance[23] != '4' || !strings.Contains("89ab", instance[28:29]) {
+		t.Fatalf("invalid/stable SIP instance URN: %q", instance)
 	}
 	if !strings.Contains(headers["Security-Client"], "ipsec-3gpp") {
 		t.Fatalf("Security-Client=%q", headers["Security-Client"])
@@ -482,6 +491,45 @@ func TestBuildRegisterHeaders(t *testing.T) {
 	}
 	if !strings.Contains(headers["Allow"], "INFO") || !strings.Contains(headers["Allow"], "NOTIFY") || !strings.Contains(headers["Allow"], "SUBSCRIBE") {
 		t.Fatalf("Allow=%q", headers["Allow"])
+	}
+}
+
+func TestRegisterSessionHandlesIMS400AuthInitChallenge(t *testing.T) {
+	challenge := `Digest realm="msg.example", algorithm=MD5, nonce="nonce-1", opaque="opaque-1", qop="auth-init"`
+	challengeResponse := RegisterResponse{
+		StatusCode: 400,
+		Reason:     "Bad Request",
+		Headers: map[string][]string{
+			"WWW-Authenticate": {challenge},
+			"Security-Server":  {`ipsec-3gpp;q=0.091;alg=hmac-sha-1-96;mod=trans;ealg=null`},
+		},
+	}
+	transport := &fakeRegisterTransport{responses: []RegisterResponse{
+		challengeResponse,
+		{StatusCode: 200, Reason: "OK"},
+	}}
+	result, err := (RegisterSession{
+		Transport:    transport,
+		Profile:      IMSProfile{IMPI: "impi@msg.example", IMPU: "sip:user@ims.example", Domain: "msg.example"},
+		RegistrarURI: "sip:msg.example",
+		ContactURI:   "sip:user@[2001:db8::1]:5060",
+		CallID:       "call-auth-init",
+		CNonce:       "cnonce-1",
+	}).Register(context.Background())
+	if err != nil || !result.Registered || result.Attempts != 2 {
+		t.Fatalf("Register() result=%+v err=%v", result, err)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("requests=%d, want 2", len(transport.requests))
+	}
+	auth := transport.requests[1].Headers["Authorization"]
+	if !strings.Contains(auth, `qop=auth-init`) || !strings.Contains(auth, `username="impi@msg.example"`) ||
+		!strings.Contains(auth, `algorithm=MD5`) {
+		t.Fatalf("Authorization=%q", auth)
+	}
+	if !isRegisterDigestChallengeResponse(challengeResponse) ||
+		isRegisterDigestChallengeResponse(RegisterResponse{StatusCode: 400, Reason: "Bad Request"}) {
+		t.Fatal("400 response challenge classification is not header-gated")
 	}
 }
 
@@ -1787,7 +1835,8 @@ func TestRegisterSessionDeregisterReinstallsSecurityAgreement(t *testing.T) {
 		t.Fatalf("security requests=%+v requestsAtSecurity=%+v", transport.securityRequests, transport.requestsAtSecurity)
 	}
 	req := transport.securityRequests[0]
-	if req.Plan.SPIClient != 801 || req.Plan.SPIServer != 802 || req.LocalEndpoint.Port != 5070 || req.RemoteEndpoint.Port != 5071 {
+	if req.Plan.SPIClient != 801 || req.Plan.SPIServer != 802 || req.LocalEndpoint.Port != 5062 || req.RemoteEndpoint.Port != 5071 ||
+		req.ClientAgreement.SPIClient != 101 || req.ClientAgreement.SPIServer != 102 {
 		t.Fatalf("security request=%+v", req)
 	}
 	if got := transport.requests[1].Headers["Security-Verify"]; !strings.Contains(got, "spi-c=801") {
@@ -2256,7 +2305,8 @@ func TestRegisterSessionRefreshReinstallsSecurityAgreement(t *testing.T) {
 		t.Fatalf("security requests=%+v requestsAtSecurity=%+v", transport.securityRequests, transport.requestsAtSecurity)
 	}
 	req := transport.securityRequests[0]
-	if req.Plan.SPIClient != 901 || req.Plan.SPIServer != 902 || req.LocalEndpoint.Port != 5072 || req.RemoteEndpoint.Port != 5073 {
+	if req.Plan.SPIClient != 901 || req.Plan.SPIServer != 902 || req.LocalEndpoint.Port != 5062 || req.RemoteEndpoint.Port != 5073 ||
+		req.ClientAgreement.SPIClient != 101 || req.ClientAgreement.SPIServer != 102 {
 		t.Fatalf("security request=%+v", req)
 	}
 	if result.Binding.SecurityAgreement.SPIClient != 901 || !strings.Contains(transport.requests[1].Headers["Security-Verify"], "spi-c=901") {
