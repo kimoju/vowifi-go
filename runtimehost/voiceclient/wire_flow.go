@@ -59,6 +59,10 @@ type WireSIPFlow struct {
 	targets              []string
 	targetIndex          int
 	closed               bool
+
+	responseMu       sync.RWMutex
+	responseExternal bool
+	responsePacketCh chan []byte
 }
 
 var _ SIPRegisterTransport = (*WireSIPFlow)(nil)
@@ -326,7 +330,60 @@ func (f *WireSIPFlow) TakeSecurityResponsePacketConn() net.PacketConn {
 	defer f.mu.Unlock()
 	packet := f.securityResponseConn
 	f.securityResponseConn = nil
+	if packet != nil {
+		f.responseMu.Lock()
+		if f.responsePacketCh == nil {
+			f.responsePacketCh = make(chan []byte, 32)
+		}
+		f.responseExternal = true
+		f.responseMu.Unlock()
+	}
 	return packet
+}
+
+// HandleSIPResponsePacket forwards a SIP response read by the shared protected
+// inbound socket to the currently serialized client transaction. After IMS
+// registration, that socket is owned by IMSInboundWireServer, while REGISTER
+// refresh responses still arrive on it.
+func (f *WireSIPFlow) HandleSIPResponsePacket(raw []byte) bool {
+	if f == nil || !isSIPResponseWire(raw) {
+		return false
+	}
+	f.responseMu.RLock()
+	external := f.responseExternal
+	ch := f.responsePacketCh
+	f.responseMu.RUnlock()
+	if !external || ch == nil {
+		return false
+	}
+	packet := append([]byte(nil), raw...)
+	select {
+	case ch <- packet:
+	default:
+		// The flow serializes client transactions, so a full queue consists of
+		// stale retransmissions. Drop the oldest packet before accepting new data.
+		select {
+		case <-ch:
+		default:
+		}
+		select {
+		case ch <- packet:
+		default:
+		}
+	}
+	return true
+}
+
+func (f *WireSIPFlow) externalResponsePackets() <-chan []byte {
+	if f == nil {
+		return nil
+	}
+	f.responseMu.RLock()
+	defer f.responseMu.RUnlock()
+	if !f.responseExternal {
+		return nil
+	}
+	return f.responsePacketCh
 }
 
 func sipSecurityAssociationAddr(current string, endpoint IMSSecurityAssociationEndpoint, allowWildcardHost bool) (string, error) {
@@ -459,7 +516,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 				readConn = protected
 			}
 		}
-		resp, err := f.readUDPResponseLocked(ctx, readConn, conn, timeout, wire, attempt, onProvisional)
+		resp, err := f.readUDPResponseLocked(ctx, readConn, f.externalResponsePackets(), conn, timeout, wire, attempt, onProvisional)
 		if err != nil {
 			f.closeConnLocked()
 			if ctx.Err() != nil {
@@ -480,7 +537,7 @@ func (f *WireSIPFlow) roundTrip(ctx context.Context, msg SIPRequestMessage, onPr
 	}
 }
 
-func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, readConn, writeConn net.Conn, timeout time.Duration, wire []byte, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
+func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, readConn net.Conn, responsePackets <-chan []byte, writeConn net.Conn, timeout time.Duration, wire []byte, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
 	buf := make([]byte, 65535)
 	timerConfig := sipFlowTransactionTimerConfig(msg.Method, timeout, f.RetransmitInterval, f.MaxRetransmitInterval)
 	interval := timerConfig.T1
@@ -493,10 +550,8 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, readConn, write
 		if retransmitExhausted || !sipClientTransactionRetransmitTimerActive(msg.Method, state) {
 			readInterval = time.Until(deadline)
 		}
-		if err := readConn.SetReadDeadline(nextSIPReadDeadline(deadline, readInterval)); err != nil {
-			return SIPResponse{}, err
-		}
-		n, err := readConn.Read(buf)
+		readDeadline := nextSIPReadDeadline(deadline, readInterval)
+		n, err := readSIPFlowUDPDatagram(ctx, readConn, responsePackets, readDeadline, buf)
 		if err != nil {
 			if ctx.Err() != nil {
 				return SIPResponse{}, ctx.Err()
@@ -550,12 +605,66 @@ func (f *WireSIPFlow) readUDPResponseLocked(ctx context.Context, readConn, write
 		})
 		state = step.NextState
 		if step.Final && step.DeliverResponse {
-			drainSIPUDPFinalResponses(ctx, readConn, msg, sipFinalResponseDrainDuration(msg.Method, f.FinalResponseDrain))
+			if responsePackets != nil {
+				drainSIPFlowExternalFinalResponses(ctx, responsePackets, msg, sipFinalResponseDrainDuration(msg.Method, f.FinalResponseDrain))
+			} else {
+				drainSIPUDPFinalResponses(ctx, readConn, msg, sipFinalResponseDrainDuration(msg.Method, f.FinalResponseDrain))
+			}
 			return resp, nil
 		}
 		if step.Provisional && step.DeliverResponse && onProvisional != nil && shouldReportSIPProvisionalResponse(msg.Method) {
 			if err := onProvisional(ctx, msg, resp); err != nil {
 				return SIPResponse{}, err
+			}
+		}
+	}
+}
+
+type sipFlowPacketTimeoutError struct{}
+
+func (sipFlowPacketTimeoutError) Error() string   { return "SIP packet read timeout" }
+func (sipFlowPacketTimeoutError) Timeout() bool   { return true }
+func (sipFlowPacketTimeoutError) Temporary() bool { return true }
+
+func readSIPFlowUDPDatagram(ctx context.Context, readConn net.Conn, responsePackets <-chan []byte, deadline time.Time, buf []byte) (int, error) {
+	if responsePackets == nil {
+		if err := readConn.SetReadDeadline(deadline); err != nil {
+			return 0, err
+		}
+		return readConn.Read(buf)
+	}
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		return 0, sipFlowPacketTimeoutError{}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-timer.C:
+		return 0, sipFlowPacketTimeoutError{}
+	case raw := <-responsePackets:
+		return copy(buf, raw), nil
+	}
+}
+
+func drainSIPFlowExternalFinalResponses(ctx context.Context, responsePackets <-chan []byte, msg SIPRequestMessage, duration time.Duration) {
+	if duration <= 0 || responsePackets == nil {
+		return
+	}
+	deadline := time.NewTimer(duration)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case raw := <-responsePackets:
+			resp, err := ParseSIPResponse(raw)
+			if err != nil || !sipResponseMatchesRequest(resp, msg) || isSIPProvisionalResponse(resp.StatusCode) {
+				continue
 			}
 		}
 	}

@@ -1907,6 +1907,30 @@ type wireMessageDeliveryReportSender struct {
 	reports []IMSMessageDeliveryReport
 }
 
+type wireResponsePacketHandler struct {
+	packets [][]byte
+}
+
+func (h *wireResponsePacketHandler) HandleSIPResponsePacket(raw []byte) bool {
+	if !strings.HasPrefix(string(raw), "SIP/2.0 ") {
+		return false
+	}
+	h.packets = append(h.packets, append([]byte(nil), raw...))
+	return true
+}
+
+func TestIMSInboundWireServerDemultiplexesSIPResponsePackets(t *testing.T) {
+	handler := &wireResponsePacketHandler{}
+	server := &IMSInboundWireServer{ResponsePacketHandler: handler}
+	raw := []byte("SIP/2.0 200 OK\r\nCall-ID: refresh-1\r\nCSeq: 2 REGISTER\r\nContent-Length: 0\r\n\r\n")
+
+	server.handlePacket(context.Background(), nil, nil, raw)
+
+	if len(handler.packets) != 1 || string(handler.packets[0]) != string(raw) {
+		t.Fatalf("response packets=%q", handler.packets)
+	}
+}
+
 func (s *wireMessageDeliveryReportSender) SendIMSMessageDeliveryReport(ctx context.Context, report IMSMessageDeliveryReport) error {
 	report.Body = append([]byte(nil), report.Body...)
 	s.reports = append(s.reports, report)

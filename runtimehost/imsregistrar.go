@@ -314,11 +314,12 @@ func (r WireIMSRegistrar) inboundConfig(cfg IMSRegistrationConfig, profile voice
 		if packet != nil {
 			if local := packet.LocalAddr(); local != nil {
 				return &IMSInboundConfig{
-					Network:    networkForPacketAddr(local),
-					LocalAddr:  local.String(),
-					ContactURI: strings.TrimSpace(contactURI),
-					UserAgent:  firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
-					PacketConn: packet,
+					Network:               networkForPacketAddr(local),
+					LocalAddr:             local.String(),
+					ContactURI:            strings.TrimSpace(contactURI),
+					UserAgent:             firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
+					PacketConn:            packet,
+					ResponsePacketHandler: flow,
 				}
 			}
 		}

@@ -86,6 +86,58 @@ func TestWireSIPFlowReusesUDPFlowForRegisterAndDialog(t *testing.T) {
 	}
 }
 
+func TestWireSIPFlowReceivesRefreshResponseFromTransferredProtectedSocket(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(server) error=%v", err)
+	}
+	defer pc.Close()
+	protected, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket(protected) error=%v", err)
+	}
+	defer protected.Close()
+
+	flow := &WireSIPFlow{
+		Network: "udp", ServerAddr: pc.LocalAddr().String(), Timeout: time.Second,
+		securityResponseConn: protected,
+	}
+	if got := flow.TakeSecurityResponsePacketConn(); got != protected {
+		t.Fatalf("TakeSecurityResponsePacketConn()=%v want protected socket", got)
+	}
+	defer flow.Close()
+	requestSeen := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 65535)
+		_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, readErr := pc.ReadFrom(buf)
+		if readErr != nil {
+			requestSeen <- "read error: " + readErr.Error()
+			return
+		}
+		requestSeen <- string(append([]byte(nil), buf[:n]...))
+		flow.HandleSIPResponsePacket([]byte("SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"))
+	}()
+
+	resp, err := flow.RoundTripRegister(context.Background(), RegisterMessage{
+		URI: "sip:ims.example",
+		Headers: map[string]string{
+			"To": "<sip:user@example>", "From": "<sip:user@example>;tag=t",
+			"Contact": "<sip:user@192.0.2.10:5063>", "Call-ID": "flow-refresh",
+			"CSeq": "2 REGISTER", "Max-Forwards": "70",
+		},
+	})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("RoundTripRegister() response=%+v err=%v", resp, err)
+	}
+	if wire := <-requestSeen; !strings.Contains(wire, "REGISTER sip:ims.example SIP/2.0") {
+		t.Fatalf("request wire=%q", wire)
+	}
+	if flow.HandleSIPResponsePacket([]byte("MESSAGE sip:user@example SIP/2.0\r\n\r\n")) {
+		t.Fatal("request packet was consumed as a SIP response")
+	}
+}
+
 func TestWireSIPFlowSendsCRLFKeepaliveOnEstablishedUDPFlow(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

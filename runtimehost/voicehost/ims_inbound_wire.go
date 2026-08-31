@@ -17,6 +17,7 @@ type IMSInboundWireServer struct {
 	Agent                       *IMSInboundAgent
 	MessageHandler              IMSMessageHandler
 	MessageDeliveryReportSender IMSMessageDeliveryReportSender
+	ResponsePacketHandler       SIPResponsePacketHandler
 	InfoHandler                 IMSInfoHandler
 	ByeHandler                  IMSByeHandler
 	ContactURI                  string
@@ -37,6 +38,10 @@ type IMSInboundWireServer struct {
 	reliable1xxPending    map[string]time.Time
 	reliable1xxRetransmit map[string]imsInboundResponseRetransmit
 	reliable1xxAcks       map[string]time.Time
+}
+
+type SIPResponsePacketHandler interface {
+	HandleSIPResponsePacket([]byte) bool
 }
 
 type IMSInboundWireResponse struct {
@@ -653,6 +658,9 @@ func applyInboundWireResultHeaders(dst map[string]string, src map[string]string)
 }
 
 func (s *IMSInboundWireServer) handlePacket(ctx context.Context, pc net.PacketConn, addr net.Addr, raw []byte) {
+	if s != nil && s.ResponsePacketHandler != nil && s.ResponsePacketHandler.HandleSIPResponsePacket(raw) {
+		return
+	}
 	req, err := voiceclient.ParseSIPRequest(raw)
 	if err != nil {
 		_ = writePacketSIPResponse(pc, addr, voiceclient.SIPIncomingRequest{}, wireResponse(400, "Bad Request"))

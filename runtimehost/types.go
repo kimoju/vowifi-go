@@ -536,11 +536,12 @@ type IMSRegistrationResult struct {
 // The runtime binds it after registration and routes unsolicited SIP MESSAGE
 // requests into the per-device messaging service.
 type IMSInboundConfig struct {
-	Network    string
-	LocalAddr  string
-	ContactURI string
-	UserAgent  string
-	PacketConn net.PacketConn
+	Network               string
+	LocalAddr             string
+	ContactURI            string
+	UserAgent             string
+	PacketConn            net.PacketConn
+	ResponsePacketHandler voicehost.SIPResponsePacketHandler
 }
 
 type IMSRegistrationRecoveryState struct {

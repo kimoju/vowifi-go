@@ -27,6 +27,7 @@ func startRuntimeIMSInbound(cfg IMSInboundConfig, inst *Instance) (*runtimeIMSIn
 	server := &voicehost.IMSInboundWireServer{
 		MessageHandler:              inst,
 		MessageDeliveryReportSender: inst,
+		ResponsePacketHandler:       cfg.ResponsePacketHandler,
 		InfoHandler:                 inst,
 		ByeHandler:                  inst,
 		ContactURI:                  strings.TrimSpace(cfg.ContactURI),
