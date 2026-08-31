@@ -1955,10 +1955,17 @@ func (i *Instance) HandleIMSMessage(ctx context.Context, req voicehost.IMSMessag
 		if remoteURI == "" {
 			remoteURI = strings.TrimSpace(req.FromURI)
 		}
+		// 3GPP SMS delivery reports are sent to the IP-SM-GW Contact supplied
+		// by the downlink MESSAGE. P-Asserted-Identity remains the logical To
+		// identity, but it is not necessarily a routable Request-URI.
+		remoteTargetURI := runtimeSIPHeaderURI(firstRuntimeSIPHeader(req.Headers, "Contact"))
+		if remoteTargetURI == "" {
+			remoteTargetURI = remoteURI
+		}
 		result.DeliveryReport = &voicehost.IMSMessageDeliveryReport{
 			LocalURI:        strings.TrimSpace(req.ToURI),
 			RemoteURI:       remoteURI,
-			RemoteTargetURI: remoteURI,
+			RemoteTargetURI: remoteTargetURI,
 			InReplyTo:       strings.TrimSpace(req.CallID),
 			ContentType:     strings.TrimSpace(res.ReplyContentType),
 			Body:            append([]byte(nil), res.ReplyBody...),
