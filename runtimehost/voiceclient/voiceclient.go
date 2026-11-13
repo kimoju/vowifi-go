@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/boa-z/vowifi-go/engine/sim"
+	"github.com/kimoju/vowifi-go/engine/sim"
 )
 
 var ErrInvalidChallenge = errors.New("invalid SIP digest challenge")

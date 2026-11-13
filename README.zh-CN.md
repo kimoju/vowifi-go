@@ -29,7 +29,7 @@ make ci
 VoHive 集成时建议在消费者 `go.mod` 中使用 tag 或 pseudo-version：
 
 ```sh
-go get github.com/boa-z/vowifi-go@latest
+go get github.com/kimoju/vowifi-go@latest
 ```
 
 本地兼容验证请使用 `make compat-vohive`；该命令会复制临时 VoHive

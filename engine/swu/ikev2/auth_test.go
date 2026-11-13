@@ -7,8 +7,8 @@ import (
 	"net"
 	"testing"
 
-	"github.com/boa-z/vowifi-go/engine/sim"
-	"github.com/boa-z/vowifi-go/engine/swu/eapaka"
+	"github.com/kimoju/vowifi-go/engine/sim"
+	"github.com/kimoju/vowifi-go/engine/swu/eapaka"
 )
 
 type authFakeTransport struct {

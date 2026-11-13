@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/boa-z/vowifi-go/engine/swu/esp"
-	"github.com/boa-z/vowifi-go/engine/swu/ikev2"
+	"github.com/kimoju/vowifi-go/engine/swu/esp"
+	"github.com/kimoju/vowifi-go/engine/swu/ikev2"
 )
 
 var (

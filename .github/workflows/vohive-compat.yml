@@ -6,7 +6,7 @@ on:
       vohive-repository:
         description: VoHive repository to test against, such as owner/repo.
         required: false
-        default: boa-z/vohive
+        default: kimoju/vohive
       vohive-ref:
         description: Optional branch, tag, or SHA for the VoHive checkout.
         required: false

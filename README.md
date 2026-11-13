@@ -36,7 +36,7 @@ When integrating with VoHive, prefer a tagged release or pseudo-version in the
 consumer `go.mod`:
 
 ```sh
-go get github.com/boa-z/vowifi-go@latest
+go get github.com/kimoju/vowifi-go@latest
 ```
 
 For local compatibility work, use `make compat-vohive`; it creates a temporary

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/boa-z/vowifi-go/internal/tracefixture"
+	"github.com/kimoju/vowifi-go/internal/tracefixture"
 )
 
 var runtimeLocalPathRE = regexp.MustCompile(`(?i)(?:/(?:home|Users)/[A-Za-z0-9_.-]+(?:/[^\s"'<>:;,)]*)*|[A-Za-z]:\\Users\\[A-Za-z0-9_.-]+(?:\\[^\s"'<>:;,)]*)*)`)

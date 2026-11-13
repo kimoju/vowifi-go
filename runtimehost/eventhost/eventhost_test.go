@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
+	"github.com/kimoju/vowifi-go/runtimehost/simtransport"
 )
 
 type captureDispatcher struct {

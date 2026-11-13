@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	swusim "github.com/boa-z/vowifi-go/engine/sim"
-	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
+	swusim "github.com/kimoju/vowifi-go/engine/sim"
+	"github.com/kimoju/vowifi-go/runtimehost/simtransport"
 )
 
 const defaultAKAHostRecoveryAttempts = 1

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/boa-z/vowifi-go/runtimehost/voicehost"
+	"github.com/kimoju/vowifi-go/runtimehost/voicehost"
 )
 
 func startRuntimeIMSInbound(cfg IMSInboundConfig, inst *Instance) (*runtimeIMSInbound, error) {

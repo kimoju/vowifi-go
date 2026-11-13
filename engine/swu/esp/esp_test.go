@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/boa-z/vowifi-go/engine/swu/ikev2"
+	"github.com/kimoju/vowifi-go/engine/swu/ikev2"
 )
 
 func TestSealOpenRoundTrip(t *testing.T) {
