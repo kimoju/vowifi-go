@@ -34,14 +34,15 @@ func TestLinuxXFRMManagerApplyAndCleanup(t *testing.T) {
 		t.Fatalf("Apply() error = %v", err)
 	}
 	wantApply := [][]string{
+		{"link", "del", "ipsec0"},
 		{"link", "add", "ipsec0", "type", "xfrm", "dev", "wwan0", "if_id", "0x2a"},
 		{"link", "set", "dev", "ipsec0", "mtu", "1360"},
 		{"link", "set", "dev", "ipsec0", "up"},
-		{"xfrm", "state", "add", "src", "192.0.2.23", "dst", "198.51.100.7", "proto", "esp", "spi", "0xdeadbeef", "reqid", "77", "mode", "tunnel", "auth-trunc", "hmac(sha256)", xfrmHexKey(bytes.Repeat([]byte{0x20}, 32)), "128", "enc", "cbc(aes)", xfrmHexKey(bytes.Repeat([]byte{0x10}, 16)), "mark", "0x1/0xffffffff", "if_id", "0x2a"},
-		{"xfrm", "state", "add", "src", "198.51.100.7", "dst", "192.0.2.23", "proto", "esp", "spi", "0xcafebabe", "reqid", "77", "mode", "tunnel", "auth-trunc", "hmac(sha256)", xfrmHexKey(bytes.Repeat([]byte{0x40}, 32)), "128", "enc", "cbc(aes)", xfrmHexKey(bytes.Repeat([]byte{0x30}, 16)), "mark", "0x1/0xffffffff", "if_id", "0x2a"},
-		{"xfrm", "policy", "add", "src", "10.10.0.2/32", "dst", "10.20.0.0/24", "dir", "out", "mark", "0x1/0xffffffff", "if_id", "0x2a", "tmpl", "src", "192.0.2.23", "dst", "198.51.100.7", "proto", "esp", "reqid", "77", "mode", "tunnel"},
-		{"xfrm", "policy", "add", "src", "10.20.0.0/24", "dst", "10.10.0.2/32", "dir", "in", "mark", "0x1/0xffffffff", "if_id", "0x2a", "tmpl", "src", "198.51.100.7", "dst", "192.0.2.23", "proto", "esp", "reqid", "77", "mode", "tunnel"},
-		{"xfrm", "policy", "add", "src", "10.20.0.0/24", "dst", "10.10.0.2/32", "dir", "fwd", "mark", "0x1/0xffffffff", "if_id", "0x2a", "tmpl", "src", "198.51.100.7", "dst", "192.0.2.23", "proto", "esp", "reqid", "77", "mode", "tunnel"},
+		{"xfrm", "state", "update", "src", "192.0.2.23", "dst", "198.51.100.7", "proto", "esp", "spi", "0xdeadbeef", "reqid", "77", "mode", "tunnel", "auth-trunc", "hmac(sha256)", xfrmHexKey(bytes.Repeat([]byte{0x20}, 32)), "128", "enc", "cbc(aes)", xfrmHexKey(bytes.Repeat([]byte{0x10}, 16)), "replay-window", "64", "mark", "0x1/0xffffffff", "if_id", "0x2a"},
+		{"xfrm", "state", "update", "src", "198.51.100.7", "dst", "192.0.2.23", "proto", "esp", "spi", "0xcafebabe", "reqid", "77", "mode", "tunnel", "auth-trunc", "hmac(sha256)", xfrmHexKey(bytes.Repeat([]byte{0x40}, 32)), "128", "enc", "cbc(aes)", xfrmHexKey(bytes.Repeat([]byte{0x30}, 16)), "replay-window", "64", "mark", "0x1/0xffffffff", "if_id", "0x2a"},
+		{"xfrm", "policy", "update", "src", "10.10.0.2/32", "dst", "10.20.0.0/24", "dir", "out", "mark", "0x1/0xffffffff", "if_id", "0x2a", "tmpl", "src", "192.0.2.23", "dst", "198.51.100.7", "proto", "esp", "reqid", "77", "mode", "tunnel"},
+		{"xfrm", "policy", "update", "src", "10.20.0.0/24", "dst", "10.10.0.2/32", "dir", "in", "mark", "0x1/0xffffffff", "if_id", "0x2a", "tmpl", "src", "198.51.100.7", "dst", "192.0.2.23", "proto", "esp", "reqid", "77", "mode", "tunnel"},
+		{"xfrm", "policy", "update", "src", "10.20.0.0/24", "dst", "10.10.0.2/32", "dir", "fwd", "mark", "0x1/0xffffffff", "if_id", "0x2a", "tmpl", "src", "198.51.100.7", "dst", "192.0.2.23", "proto", "esp", "reqid", "77", "mode", "tunnel"},
 	}
 	if !reflect.DeepEqual(runner.commands, wantApply) {
 		t.Fatalf("apply commands=\n%v\nwant\n%v", runner.commands, wantApply)
@@ -78,9 +79,9 @@ func TestLinuxXFRMManagerRollsBackOnFailure(t *testing.T) {
 		t.Fatalf("Apply() err=%v, want policy failure", err)
 	}
 	want := [][]string{
-		{"xfrm", "state", "add", "src", "192.0.2.23", "dst", "198.51.100.7", "proto", "esp", "spi", "0xdeadbeef", "reqid", "1", "mode", "tunnel", "auth-trunc", "hmac(sha256)", xfrmHexKey(bytes.Repeat([]byte{0x20}, 32)), "128", "enc", "cbc(aes)", xfrmHexKey(bytes.Repeat([]byte{0x10}, 16))},
-		{"xfrm", "state", "add", "src", "198.51.100.7", "dst", "192.0.2.23", "proto", "esp", "spi", "0xcafebabe", "reqid", "1", "mode", "tunnel", "auth-trunc", "hmac(sha256)", xfrmHexKey(bytes.Repeat([]byte{0x40}, 32)), "128", "enc", "cbc(aes)", xfrmHexKey(bytes.Repeat([]byte{0x30}, 16))},
-		{"xfrm", "policy", "add", "src", "10.10.0.2/32", "dst", "10.20.0.0/24", "dir", "out", "tmpl", "src", "192.0.2.23", "dst", "198.51.100.7", "proto", "esp", "reqid", "1", "mode", "tunnel"},
+		{"xfrm", "state", "update", "src", "192.0.2.23", "dst", "198.51.100.7", "proto", "esp", "spi", "0xdeadbeef", "reqid", "1", "mode", "tunnel", "auth-trunc", "hmac(sha256)", xfrmHexKey(bytes.Repeat([]byte{0x20}, 32)), "128", "enc", "cbc(aes)", xfrmHexKey(bytes.Repeat([]byte{0x10}, 16)), "replay-window", "64"},
+		{"xfrm", "state", "update", "src", "198.51.100.7", "dst", "192.0.2.23", "proto", "esp", "spi", "0xcafebabe", "reqid", "1", "mode", "tunnel", "auth-trunc", "hmac(sha256)", xfrmHexKey(bytes.Repeat([]byte{0x40}, 32)), "128", "enc", "cbc(aes)", xfrmHexKey(bytes.Repeat([]byte{0x30}, 16)), "replay-window", "64"},
+		{"xfrm", "policy", "update", "src", "10.10.0.2/32", "dst", "10.20.0.0/24", "dir", "out", "tmpl", "src", "192.0.2.23", "dst", "198.51.100.7", "proto", "esp", "reqid", "1", "mode", "tunnel"},
 		{"xfrm", "state", "delete", "src", "198.51.100.7", "dst", "192.0.2.23", "proto", "esp", "spi", "0xcafebabe"},
 		{"xfrm", "state", "delete", "src", "192.0.2.23", "dst", "198.51.100.7", "proto", "esp", "spi", "0xdeadbeef"},
 	}
@@ -124,7 +125,7 @@ func TestBuildKernelXFRMCommandsSupportsAESGCM(t *testing.T) {
 		t.Fatalf("buildKernelXFRMCommands() error = %v", err)
 	}
 	wantOutbound := []string{
-		"xfrm", "state", "add",
+		"xfrm", "state", "update",
 		"src", "192.0.2.23",
 		"dst", "198.51.100.7",
 		"proto", "esp",
@@ -132,6 +133,7 @@ func TestBuildKernelXFRMCommandsSupportsAESGCM(t *testing.T) {
 		"reqid", "1",
 		"mode", "tunnel",
 		"aead", xfrmAeadAESGCMRFC4106, xfrmHexKey(child.Keys.Outbound.EncryptionKey), "128",
+		"replay-window", "64",
 		"encap", "espinudp", "55000", "4500", "0.0.0.0",
 	}
 	if !reflect.DeepEqual(commands[0].args, wantOutbound) {
@@ -199,7 +201,7 @@ func TestBuildKernelXFRMCommandsSupportsIPv6AddressFamilies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildKernelXFRMCommands() error = %v", err)
 	}
-	want := []string{"xfrm", "policy", "add", "src", "2001:db8:10::2/128", "dst", "2001:db8:20::/64", "dir", "out"}
+	want := []string{"xfrm", "policy", "update", "src", "2001:db8:10::2/128", "dst", "2001:db8:20::/64", "dir", "out"}
 	if got := commands[2].args[:len(want)]; !reflect.DeepEqual(got, want) {
 		t.Fatalf("out policy prefix args=%v, want %v", got, want)
 	}

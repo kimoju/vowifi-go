@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -1363,8 +1364,20 @@ func formatEmergencySIPRoute(value string) string {
 	}
 	uri := value
 	lower := strings.ToLower(uri)
-	if !strings.HasPrefix(lower, "sip:") && !strings.HasPrefix(lower, "sips:") && !strings.Contains(uri, ":") {
-		uri = "sip:" + uri
+	if !strings.HasPrefix(lower, "sip:") && !strings.HasPrefix(lower, "sips:") && !strings.HasPrefix(lower, "tel:") {
+		hostPart := uri
+		suffix := ""
+		if idx := indexOutsideBrackets(uri, ';'); idx >= 0 {
+			hostPart = uri[:idx]
+			suffix = uri[idx:]
+		} else if idx := indexOutsideBrackets(uri, '?'); idx >= 0 {
+			hostPart = uri[:idx]
+			suffix = uri[idx:]
+		}
+		if ip := net.ParseIP(strings.TrimSpace(hostPart)); ip != nil && strings.Contains(hostPart, ":") && !strings.HasPrefix(hostPart, "[") {
+			hostPart = "[" + ip.String() + "]"
+		}
+		uri = "sip:" + hostPart + suffix
 		lower = strings.ToLower(uri)
 	}
 	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") {

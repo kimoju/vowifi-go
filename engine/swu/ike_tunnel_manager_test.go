@@ -127,7 +127,7 @@ func TestIKEPacketTunnelManagerEstablishesPacketSession(t *testing.T) {
 	if !ok {
 		t.Fatalf("session type %T does not implement PacketTunnelSession", session)
 	}
-	if err := packetSession.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14}); err != nil {
+	if err := packetSession.SendInnerPacket(context.Background(), testValidIPv4Packet(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 20), nil)); err != nil {
 		t.Fatalf("SendInnerPacket() error = %v", err)
 	}
 	if len(espTransport.packets) != 1 {
@@ -464,7 +464,7 @@ func TestIKEPacketTunnelManagerDerivesEPDGAndAKAIdentity(t *testing.T) {
 	defer session.Close(context.Background())
 
 	wantEPDG := "epdg.epc.mnc028.mcc310.pub.3gppnetwork.org"
-	wantIdentity := "0310280233641503@nai.epc.mnc028.mcc310.3gppnetwork.org"
+	wantIdentity := "6310280233641503@nai.epc.mnc028.mcc310.3gppnetwork.org"
 	if gotIKETransport.EPDGAddress != wantEPDG || gotIKETransport.RemoteAddr != wantEPDG+":4500" {
 		t.Fatalf("IKE transport=%+v", gotIKETransport)
 	}

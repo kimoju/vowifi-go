@@ -18,22 +18,159 @@ const (
 	maxDigestAttempts               = 4
 )
 
+type entitlementDigestCredential struct {
+	HeaderName string
+	Challenge  voiceclient.DigestChallenge
+	Username   string
+	Password   string
+	NC         int
+}
+
+type entitlementSessionState struct {
+	cookies        map[string]string
+	cookieOrder    []string
+	digestByHeader map[string]entitlementDigestCredential
+}
+
+func (s *entitlementSessionState) captureCookies(headers []HeaderPair) {
+	if s == nil || len(headers) == 0 {
+		return
+	}
+	h := make(http.Header)
+	for _, hp := range headers {
+		if strings.EqualFold(hp.Key, "Set-Cookie") {
+			h.Add("Set-Cookie", hp.Value)
+		}
+	}
+	if len(h) == 0 {
+		return
+	}
+	for _, c := range (&http.Response{Header: h}).Cookies() {
+		name := strings.TrimSpace(c.Name)
+		if name == "" {
+			continue
+		}
+		if c.MaxAge < 0 {
+			delete(s.cookies, name)
+			continue
+		}
+		if s.cookies == nil {
+			s.cookies = make(map[string]string)
+		}
+		if _, exists := s.cookies[name]; !exists {
+			s.cookieOrder = append(s.cookieOrder, name)
+		}
+		s.cookies[name] = c.Value
+	}
+}
+
+func (s *entitlementSessionState) applyCookies(httpReq *HTTPRequest) *HTTPRequest {
+	if s == nil || len(s.cookies) == 0 {
+		return httpReq
+	}
+	var pairs []string
+	for _, h := range httpReq.Headers {
+		if strings.EqualFold(h.Key, "Cookie") && strings.TrimSpace(h.Value) != "" {
+			// Preserve caller-supplied cookies that were not updated by Set-Cookie.
+			for _, part := range strings.Split(h.Value, ";") {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				k, _, ok := strings.Cut(part, "=")
+				if ok && s.cookies[strings.TrimSpace(k)] != "" {
+					continue
+				}
+				pairs = append(pairs, part)
+			}
+		}
+	}
+	for _, name := range s.cookieOrder {
+		if val, ok := s.cookies[name]; ok {
+			pairs = append(pairs, name+"="+val)
+		}
+	}
+	if len(pairs) == 0 {
+		return httpReq
+	}
+	next := cloneHTTPRequest(httpReq)
+	next.Headers = replaceHeader(next.Headers, "Cookie", strings.Join(pairs, "; "))
+	return next
+}
+
 func doEntitlementWithHTTPDigest(ctx context.Context, client HTTPClient, trace TraceSink, httpReq *HTTPRequest, req Request) (*HTTPResponse, error) {
+	return doEntitlementWithHTTPDigestAndSession(ctx, client, trace, httpReq, req, nil)
+}
+
+func doEntitlementWithHTTPDigestAndSession(ctx context.Context, client HTTPClient, trace TraceSink, httpReq *HTTPRequest, req Request, session *entitlementSessionState) (*HTTPResponse, error) {
 	current := cloneHTTPRequest(httpReq)
 	if current.Context == nil {
 		current.Context = ctx
 	}
+	activeCreds := make(map[string]entitlementDigestCredential, 2)
+	if session != nil && len(session.digestByHeader) > 0 {
+		for _, headerName := range []string{"Authorization", "Proxy-Authorization"} {
+			cred, ok := session.digestByHeader[headerName]
+			if !ok || cred.Password == "" || strings.TrimSpace(cred.Challenge.Nonce) == "" {
+				continue
+			}
+			cnonce, err := entitlementHTTPDigestCNonce(req)
+			if err != nil {
+				return nil, err
+			}
+			cred.NC++
+			if cred.NC <= 0 {
+				cred.NC = 1
+			}
+			value, err := voiceclient.BuildDigestAuthorization(cred.Challenge, voiceclient.DigestAuthInput{
+				Method:   firstNonEmpty(current.Method, http.MethodGet),
+				URI:      entitlementHTTPDigestURI(current.URL),
+				Username: cred.Username,
+				Password: cred.Password,
+				CNonce:   cnonce,
+				NC:       cred.NC,
+				Body:     append([]byte(nil), current.Body...),
+			})
+			if err != nil {
+				continue
+			}
+			current = entitlementRequestWithAuthorization(current, entitlementHTTPDigestAuthorization{
+				HeaderName: headerName,
+				Value:      value,
+			})
+			activeCreds[headerName] = cred
+		}
+	}
+
 	sentNormalAuth := make(map[string]bool, 2)
 	for attempt := 0; ; attempt++ {
-		resp, err := doEntitlement(ctx, client, trace, current)
+		if session != nil {
+			current = session.applyCookies(current)
+		}
+		resp, err := doEntitlementExchange(ctx, client, trace, current)
+		if resp != nil && session != nil {
+			session.captureCookies(resp.Headers)
+		}
 		if err == nil {
+			if session != nil && len(activeCreds) > 0 {
+				if session.digestByHeader == nil {
+					session.digestByHeader = make(map[string]entitlementDigestCredential, len(activeCreds))
+				}
+				for headerName, cred := range activeCreds {
+					if nextNonce := strings.TrimSpace(entitlementHTTPDigestNextNonce(resp.Headers, headerName)); nextNonce != "" && nextNonce != cred.Challenge.Nonce {
+						cred.Challenge.Nonce = nextNonce
+						cred.NC = 0
+					}
+					session.digestByHeader[headerName] = cred
+				}
+			}
 			return resp, nil
 		}
 		var challengeErr *HTTPAuthenticationChallengeError
 		if !errors.As(err, &challengeErr) || attempt >= maxDigestAttempts {
 			return nil, err
 		}
-		auth, syncFailure, stale, buildErr := buildEntitlementHTTPDigestAuthorization(current, req, challengeErr)
+		auth, cred, syncFailure, stale, buildErr := buildEntitlementHTTPDigestAuthorizationWithCred(current, req, challengeErr)
 		if buildErr != nil {
 			if errors.Is(buildErr, ErrChallengeNotImplemented) {
 				return nil, err
@@ -45,6 +182,11 @@ func doEntitlementWithHTTPDigest(ctx context.Context, client HTTPClient, trace T
 		}
 		current = entitlementRequestWithAuthorization(current, auth)
 		sentNormalAuth[auth.HeaderName] = !syncFailure
+		if !syncFailure && cred.Password != "" {
+			activeCreds[auth.HeaderName] = cred
+		} else {
+			delete(activeCreds, auth.HeaderName)
+		}
 	}
 }
 
@@ -54,28 +196,40 @@ type entitlementHTTPDigestAuthorization struct {
 }
 
 func buildEntitlementHTTPDigestAuthorization(httpReq *HTTPRequest, req Request, challengeErr *HTTPAuthenticationChallengeError) (entitlementHTTPDigestAuthorization, bool, bool, error) {
+	auth, _, syncFailure, stale, err := buildEntitlementHTTPDigestAuthorizationWithCred(httpReq, req, challengeErr)
+	return auth, syncFailure, stale, err
+}
+
+func buildEntitlementHTTPDigestAuthorizationWithCred(httpReq *HTTPRequest, req Request, challengeErr *HTTPAuthenticationChallengeError) (entitlementHTTPDigestAuthorization, entitlementDigestCredential, bool, bool, error) {
 	if challengeErr == nil {
-		return entitlementHTTPDigestAuthorization{}, false, false, ErrChallengeNotImplemented
+		return entitlementHTTPDigestAuthorization{}, entitlementDigestCredential{}, false, false, ErrChallengeNotImplemented
 	}
 	challengeHeader, authHeader := entitlementHTTPDigestHeaderNames(challengeErr.StatusCode)
 	headers := entitlementHTTPDigestChallengeHeaders(challengeErr.Challenges, challengeHeader)
 	challenge, err := voiceclient.SelectDigestChallenge(headers, challengeHeader)
 	if err != nil {
-		return entitlementHTTPDigestAuthorization{}, false, false, fmt.Errorf("%w: %v", ErrChallengeNotImplemented, err)
+		return entitlementHTTPDigestAuthorization{}, entitlementDigestCredential{}, false, false, fmt.Errorf("%w: %v", ErrChallengeNotImplemented, err)
 	}
 	challenge = entitlementHTTPDigestNormalizeChallenge(challenge)
 	input, syncFailure, err := entitlementHTTPDigestInput(httpReq, req, challenge)
 	if err != nil {
-		return entitlementHTTPDigestAuthorization{}, false, false, err
+		return entitlementHTTPDigestAuthorization{}, entitlementDigestCredential{}, false, false, err
 	}
 	value, err := voiceclient.BuildDigestAuthorization(challenge, input)
 	if err != nil {
-		return entitlementHTTPDigestAuthorization{}, false, false, err
+		return entitlementHTTPDigestAuthorization{}, entitlementDigestCredential{}, false, false, err
+	}
+	cred := entitlementDigestCredential{
+		HeaderName: authHeader,
+		Challenge:  challenge,
+		Username:   input.Username,
+		Password:   input.Password,
+		NC:         input.NC,
 	}
 	return entitlementHTTPDigestAuthorization{
 		HeaderName: authHeader,
 		Value:      value,
-	}, syncFailure, challenge.Stale, nil
+	}, cred, syncFailure, challenge.Stale, nil
 }
 
 func entitlementHTTPDigestInput(httpReq *HTTPRequest, req Request, challenge voiceclient.DigestChallenge) (voiceclient.DigestAuthInput, bool, error) {

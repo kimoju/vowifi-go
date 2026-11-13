@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 
 	"github.com/kimoju/vowifi-go/runtimehost/carrier"
@@ -111,16 +110,19 @@ func NormalizeProfileWithAD(p Profile, efAD []byte) Profile {
 	p.IMSI = strings.TrimSpace(p.IMSI)
 	p.MCC = normalizeMCC(p.MCC)
 	p.MNC = normalizeProfileMNC(p.MNC)
-	p.IMEI = strings.TrimSpace(p.IMEI)
+	p.IMEI = normalizeProfileIMEI(p.IMEI, p.IMSI)
 	p.SMSC = strings.TrimSpace(p.SMSC)
 	if len(efAD) == 0 && (p.MNCLength == 2 || p.MNCLength == 3) {
 		efAD = []byte{0x00, 0x00, 0x00, byte(p.MNCLength)}
 	}
 	imsiMCC, imsiMNC := plmnFromIMSIWithAD(p.IMSI, efAD)
-	if p.MCC == "" {
+	if imsiMCC != "" && (p.MCC == "" || !strings.HasPrefix(normalizeIMSI(p.IMSI), p.MCC)) {
+		if p.MCC != "" {
+			p.MNC = ""
+		}
 		p.MCC = imsiMCC
 	}
-	if p.MNC == "" {
+	if imsiMNC != "" && (p.MNC == "" || !imsiMatchesPLMN(p.IMSI, p.MCC, p.MNC)) {
 		p.MNC = imsiMNC
 	}
 	return p
@@ -131,14 +133,19 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 	if len(efAD) == 0 && (in.Profile.MNCLength == 2 || in.Profile.MNCLength == 3) {
 		efAD = []byte{0x00, 0x00, 0x00, byte(in.Profile.MNCLength)}
 	}
-	if len(efAD) == 0 && strings.TrimSpace(in.Profile.MNC) == "" {
+	if len(efAD) == 0 && (strings.TrimSpace(in.Profile.MNC) == "" || !imsiMatchesPLMN(in.Profile.IMSI, in.Profile.MCC, in.Profile.MNC)) {
 		if ad, err := accessEFAD(in.Access); err == nil && len(ad) > 0 {
 			efAD = ad
 		}
 	}
+	rawProfileIMEI := strings.TrimSpace(in.Profile.IMEI)
 	profile, fallbacks, err := prepareProfileWithAD(in.Profile, efAD)
 	if err != nil {
 		return PreparedSession{}, err
+	}
+	profileIMEIReason := errors.New("profile IMEI is empty")
+	if rawProfileIMEI != "" && profile.IMEI == "" {
+		profileIMEIReason = fmt.Errorf("profile IMEI %q is invalid", rawProfileIMEI)
 	}
 	effectiveCfg := carrier.ResolveEffectiveCarrierConfig(carrier.EffectiveCarrierConfigInput{
 		IMSI: profile.IMSI,
@@ -161,24 +168,24 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 	imeiSource := IMEISourceProfile
 	modemIMEIErr := error(nil)
 	if profile.IMEI == "" {
-		if imei, attempted, err := accessIMEI(in.Access); err == nil && imei != "" {
+		if imei, attempted, err := accessIMEIForIMSI(in.Access, profile.IMSI); err == nil && imei != "" {
 			profile.IMEI = imei
 			imeiSource = IMEISourceModem
 			fallbacks = append(fallbacks, NewReadFallbackMetadata(
 				IdentityFieldIMEI,
 				IMEISourceProfile,
 				IMEISourceModem,
-				errors.New("profile IMEI is empty"),
+				profileIMEIReason,
 			))
 		} else if attempted {
 			modemIMEIErr = err
 		}
 	}
 	if profile.IMEI == "" {
-		if imei := ExtractIMEI(in.DeviceID); imei != "" {
+		if imei := normalizeProfileIMEI(in.DeviceID, profile.IMSI); imei != "" {
 			profile.IMEI = imei
 			imeiSource = IMEISourceDeviceID
-			reason := errors.New("profile IMEI is empty")
+			reason := profileIMEIReason
 			primary := IMEISourceProfile
 			if modemIMEIErr != nil {
 				reason = fmt.Errorf("modem IMEI unavailable: %w", modemIMEIErr)
@@ -192,7 +199,10 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 			))
 		} else {
 			imeiSource = IMEISourceUnavailable
-			reason := errors.New("profile IMEI is empty and device ID fallback is unavailable")
+			reason := fmt.Errorf("%w and device ID fallback is unavailable", profileIMEIReason)
+			if rawProfileIMEI == "" {
+				reason = errors.New("profile IMEI is empty and device ID fallback is unavailable")
+			}
 			primary := IMEISourceProfile
 			if modemIMEIErr != nil {
 				reason = fmt.Errorf("modem IMEI unavailable and device ID fallback is unavailable: %w", modemIMEIErr)
@@ -264,6 +274,10 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 }
 
 func accessIMEI(access interface{}) (string, bool, error) {
+	return accessIMEIForIMSI(access, "")
+}
+
+func accessIMEIForIMSI(access interface{}, imsi string) (string, bool, error) {
 	if access == nil {
 		return "", false, nil
 	}
@@ -275,7 +289,7 @@ func accessIMEI(access interface{}) (string, bool, error) {
 	if err != nil {
 		return "", true, err
 	}
-	if imei = ExtractIMEI(imei); imei != "" {
+	if imei = normalizeProfileIMEI(imei, imsi); imei != "" {
 		return imei, true, nil
 	}
 	return "", true, errors.New("modem IMEI is empty or invalid")
@@ -336,23 +350,79 @@ func ReadUSIMSMSCCRSM(access interface {
 	return "", errors.New("EF_SMSP has no valid SMSC record")
 }
 
+// ComputeIMEILuhn computes the 3GPP TS 23.003 Annex B Luhn check digit for a
+// 14-digit TAC+SNR prefix.
+func ComputeIMEILuhn(tacSnr14 string) (byte, bool) {
+	return simtransport.ComputeIMEILuhn(tacSnr14)
+}
+
+// ValidateIMEI reports whether imei15 is a 15-digit IMEI with a valid 3GPP TS
+// 23.003 Annex B Luhn check digit.
+func ValidateIMEI(imei15 string) bool {
+	return simtransport.ValidateIMEI(imei15)
+}
+
 func ExtractIMEI(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if imei := extractGSMAURNIMEI(value); imei != "" {
+		return imei
+	}
+	if imei, ok := simtransport.ExtractIMEI(value); ok {
+		return imei
+	}
+	return ""
+}
+
+func extractGSMAURNIMEI(value string) string {
+	lower := strings.ToLower(value)
+	idx := strings.Index(lower, "urn:gsma:imei:")
+	if idx < 0 {
+		return ""
+	}
+	rest := value[idx+len("urn:gsma:imei:"):]
 	var digits []byte
-	for i := 0; i < len(value); i++ {
-		b := value[i]
+	for i := 0; i < len(rest); i++ {
+		b := rest[i]
 		if b >= '0' && b <= '9' {
 			digits = append(digits, b)
 			continue
 		}
-		if len(digits) == 15 {
-			return string(digits)
+		if b == '-' {
+			continue
 		}
-		digits = digits[:0]
+		break
 	}
-	if len(digits) == 15 {
-		return string(digits)
+	s := string(digits)
+	switch len(s) {
+	case 14, 16:
+		if luhn, ok := ComputeIMEILuhn(s[:14]); ok {
+			return s[:14] + string(luhn)
+		}
+	case 15:
+		if ValidateIMEI(s) {
+			return s
+		}
+		if s[14] == '0' {
+			if luhn, ok := ComputeIMEILuhn(s[:14]); ok {
+				return s[:14] + string(luhn)
+			}
+		}
 	}
 	return ""
+}
+
+func normalizeProfileIMEI(rawIMEI, imsi string) string {
+	imei := ExtractIMEI(rawIMEI)
+	if imei == "" {
+		return ""
+	}
+	if normalizedIMSI := normalizeIMSI(imsi); normalizedIMSI != "" && imei == normalizedIMSI {
+		return ""
+	}
+	return imei
 }
 
 func ValidateIMSIdentityDomain(domain string, network carrier.NetworkConfig, mcc, mnc string) IMSIdentityDomainValidation {
@@ -403,20 +473,29 @@ func prepareProfileWithAD(p Profile, efAD []byte) (Profile, []FallbackMetadata, 
 	} else {
 		return Profile{}, nil, fmt.Errorf("invalid IMSI %q: must be 5-15 decimal digits", profile.IMSI)
 	}
+	profile.IMEI = normalizeProfileIMEI(profile.IMEI, profile.IMSI)
 
 	imsiMCC, imsiMNC := plmnFromIMSIWithAD(profile.IMSI, efAD)
 	var fallbacks []FallbackMetadata
-	if mcc := normalizeMCC(profile.MCC); mcc != "" {
-		profile.MCC = mcc
-	} else {
+	mccMismatch := false
+	if mcc := normalizeMCC(profile.MCC); mcc == "" {
 		fallbacks = append(fallbacks, profilePLMNFallbackMetadata(IdentityFieldMCC, profile.MCC))
 		profile.MCC = imsiMCC
-	}
-	if mnc := normalizeProfileMNC(profile.MNC); mnc != "" {
-		profile.MNC = mnc
+	} else if !strings.HasPrefix(profile.IMSI, mcc) {
+		mccMismatch = true
+		fallbacks = append(fallbacks, profilePLMNMismatchFallbackMetadata(IdentityFieldMCC, profile.MCC))
+		profile.MCC = imsiMCC
 	} else {
+		profile.MCC = mcc
+	}
+	if mnc := normalizeProfileMNC(profile.MNC); mnc == "" {
 		fallbacks = append(fallbacks, profilePLMNFallbackMetadata(IdentityFieldMNC, profile.MNC))
 		profile.MNC = imsiMNC
+	} else if mccMismatch || !imsiMatchesPLMN(profile.IMSI, profile.MCC, mnc) {
+		fallbacks = append(fallbacks, profilePLMNMismatchFallbackMetadata(IdentityFieldMNC, profile.MNC))
+		profile.MNC = imsiMNC
+	} else {
+		profile.MNC = mnc
 	}
 	return profile, fallbacks, nil
 }
@@ -428,6 +507,28 @@ func profilePLMNFallbackMetadata(field, value string) FallbackMetadata {
 		reason = fmt.Errorf("profile %s %q is invalid; derived from IMSI", strings.ToUpper(field), value)
 	}
 	return NewReadFallbackMetadata(field, IMSISourceProfile, PLMNSourceIMSI, reason)
+}
+
+func profilePLMNMismatchFallbackMetadata(field, value string) FallbackMetadata {
+	reason := fmt.Errorf("profile %s %q does not match IMSI; derived from IMSI", strings.ToUpper(field), strings.TrimSpace(value))
+	return NewReadFallbackMetadata(field, IMSISourceProfile, PLMNSourceIMSI, reason)
+}
+
+func imsiMatchesPLMN(imsi, mcc, mnc string) bool {
+	imsi = normalizeIMSI(imsi)
+	mcc = normalizeMCC(mcc)
+	mnc = normalizeProfileMNC(mnc)
+	if imsi == "" || mcc == "" || mnc == "" || !strings.HasPrefix(imsi, mcc) {
+		return false
+	}
+	rest := imsi[len(mcc):]
+	if strings.HasPrefix(rest, mnc) {
+		return true
+	}
+	if len(mnc) == 3 && mnc[0] == '0' && strings.HasPrefix(rest, mnc[1:]) {
+		return true
+	}
+	return false
 }
 
 func normalizeIMSI(imsi string) string {
@@ -711,19 +812,40 @@ func classifyCRSMEFReadError(context string, resp simtransport.CRSMResult, err e
 func readCRSMTransparentEF(access interface {
 	ReadCRSMBinary(fileID uint16, offset, length int, pathID string) (simtransport.CRSMResult, error)
 }, fid uint16, pathID string) ([]byte, simtransport.CRSMResult, error) {
-	resp, err := access.ReadCRSMBinary(fid, 0, 256, pathID)
-	if err != nil {
-		return nil, resp, err
+	const maxTransparentEFBytes = 4096
+	var out []byte
+	var firstResp simtransport.CRSMResult
+	for offset := 0; offset < maxTransparentEFBytes; {
+		chunk := maxTransparentEFBytes - offset
+		if chunk > 256 {
+			chunk = 256
+		}
+		resp, err := access.ReadCRSMBinary(fid, offset, chunk, pathID)
+		if offset == 0 {
+			firstResp = resp
+		}
+		if err != nil {
+			return nil, resp, err
+		}
+		raw, decodeErr := decodeCRSMHex(resp.Data)
+		eofWarning := resp.SW1 == 0x62 && resp.SW2 == 0x82
+		offsetEOF := offset > 0 && (resp.Status() == 0x6B00 || (eofWarning && len(raw) == 0))
+		if offsetEOF {
+			break
+		}
+		if !resp.Success() && !(eofWarning && decodeErr == nil && (len(raw) > 0 || len(out) > 0)) {
+			return nil, resp, fmt.Errorf("READ BINARY %04X failed: SW=%s", fid, resp.StatusString())
+		}
+		if decodeErr != nil {
+			return nil, resp, decodeErr
+		}
+		out = append(out, raw...)
+		if eofWarning || len(raw) < chunk {
+			break
+		}
+		offset += len(raw)
 	}
-	raw, decodeErr := decodeCRSMHex(resp.Data)
-	eofWithData := resp.SW1 == 0x62 && resp.SW2 == 0x82 && decodeErr == nil && len(raw) > 0
-	if !resp.Success() && !eofWithData {
-		return nil, resp, fmt.Errorf("READ BINARY %04X failed: SW=%s", fid, resp.StatusString())
-	}
-	if decodeErr != nil {
-		return nil, resp, decodeErr
-	}
-	return raw, resp, nil
+	return out, firstResp, nil
 }
 
 func readCRSMLinearFixedEF(access interface {
@@ -775,83 +897,7 @@ func isCRSMRecordNotFound(sw1, sw2 byte) bool {
 }
 
 func decodeISIMString(raw []byte) string {
-	data := trimISIMPadding(raw)
-	if len(data) == 0 {
-		return ""
-	}
-	if data[0] == 0x80 {
-		if v, ok := decodeISIMDataObject(data[1:]); ok {
-			return decodeISIMTextValue(v)
-		}
-	}
-	if v, ok := simauth.FindTLV(data, 0x80); ok {
-		if s := decodeISIMTextValue(v); s != "" {
-			return s
-		}
-	}
-	return decodeISIMStringValue(data)
-}
-
-func decodeISIMDataObject(data []byte) ([]byte, bool) {
-	l, rest, ok := readISIMStringLength(data)
-	if !ok || len(rest) < l {
-		return nil, false
-	}
-	return rest[:l], true
-}
-
-func decodeISIMStringValue(data []byte) string {
-	data = trimISIMPadding(data)
-	if len(data) == 0 {
-		return ""
-	}
-	if l, rest, ok := readISIMStringLength(data); ok && l > 0 && len(rest) >= l {
-		return strings.TrimSpace(string(trimISIMPadding(rest[:l])))
-	}
-	return strings.TrimSpace(string(data))
-}
-
-func decodeISIMTextValue(data []byte) string {
-	data = trimISIMPadding(data)
-	if len(data) == 0 {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-func readISIMStringLength(data []byte) (int, []byte, bool) {
-	if len(data) == 0 {
-		return 0, nil, false
-	}
-	first := data[0]
-	data = data[1:]
-	if first&0x80 == 0 {
-		return int(first), data, true
-	}
-	n := int(first & 0x7F)
-	if n == 0 || n > 4 || len(data) < n {
-		return 0, nil, false
-	}
-	length := 0
-	for _, part := range data[:n] {
-		if length > (math.MaxInt-int(part))/256 {
-			return 0, nil, false
-		}
-		length = (length << 8) | int(part)
-	}
-	return length, data[n:], true
-}
-
-func trimISIMPadding(data []byte) []byte {
-	start := 0
-	for start < len(data) && (data[start] == 0x00 || data[start] == 0xFF) {
-		start++
-	}
-	end := len(data)
-	for end > start && (data[end-1] == 0x00 || data[end-1] == 0xFF) {
-		end--
-	}
-	return data[start:end]
+	return simauth.DecodeISIMIdentityString(raw)
 }
 
 func containsString(items []string, want string) bool {

@@ -763,6 +763,7 @@ func readIMSCPIMMultipartParts(body []byte, boundary string) ([]imsCPIMMultipart
 func imsCPIMMultipartContentPriorities() []string {
 	return []string{
 		IMS3GPPSMSContentType,
+		IMSMessageSummaryContentType,
 		imsIMDNContentType,
 		"text/plain",
 	}

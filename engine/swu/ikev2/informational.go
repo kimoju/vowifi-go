@@ -10,14 +10,15 @@ import (
 var ErrInvalidInformational = errors.New("invalid ikev2 informational exchange")
 
 type InformationalConfig struct {
-	Transport     InitTransport
-	Init          InitResult
-	Keys          IKEKeys
-	MessageID     uint32
-	FromResponder bool
-	Payloads      []Payload
-	Random        io.Reader
-	IV            []byte
+	Transport       InitTransport
+	Init            InitResult
+	Keys            IKEKeys
+	MessageID       uint32
+	FromResponder   bool
+	Payloads        []Payload
+	Random          io.Reader
+	IV              []byte
+	MaxFragmentSize int
 }
 
 type InformationalResult struct {
@@ -54,16 +55,24 @@ func RunInformationalExchange(ctx context.Context, cfg InformationalConfig) (Inf
 	if err != nil {
 		return InformationalResult{}, err
 	}
-	requestFromInitiator := !cfg.FromResponder
-	_, reqBytes, err := BuildInformationalRequestFrom(cfg.Init, keys, cfg.MessageID, requestFromInitiator, cfg.Payloads, iv)
+	requestFromInitiator := !cfg.FromResponder && !cfg.Init.LocalIsResponder
+	reqBytes, respBytes, respMsg, respInner, err := exchangeProtectedIKE(ctx, protectedExchangeConfig{
+		Transport:              cfg.Transport,
+		Header:                 informationalHeader(cfg.Init, cfg.MessageID, requestFromInitiator, false),
+		Keys:                   keys,
+		FromInitiator:          requestFromInitiator,
+		Inner:                  cfg.Payloads,
+		IV:                     iv,
+		FragmentationSupported: cfg.Init.FragmentationSupported,
+		MaxFragmentSize:        cfg.MaxFragmentSize,
+	})
 	if err != nil {
 		return InformationalResult{}, err
 	}
-	respBytes, err := cfg.Transport.ExchangeIKE(ctx, reqBytes)
-	if err != nil {
+	if err := validateInformationalHeader(respMsg.Header, cfg.Init, cfg.MessageID, !requestFromInitiator, true); err != nil {
 		return InformationalResult{}, err
 	}
-	_, response, err := ParseInformationalResponseContentFrom(respBytes, cfg.Init, keys, cfg.MessageID, !requestFromInitiator)
+	response, err := ParseInformationalContent(respInner)
 	if err != nil {
 		return InformationalResult{}, err
 	}
@@ -227,6 +236,9 @@ func informationalIV(random io.Reader, profile KeyMaterialProfile, override []by
 			return nil, fmt.Errorf("%w: IV length %d != %d", ErrInvalidInformational, len(override), profile.EncryptionBlockSize)
 		}
 		return append([]byte(nil), override...), nil
+	}
+	if profile.EncryptionID == ENCR_AES_GCM_16 {
+		return nil, nil
 	}
 	return RandomIV(random, profile)
 }

@@ -314,6 +314,7 @@ func PlanIMSSMSSubmitRetry(req SMSSendRequest, result SMSSendResult, err error, 
 		StatusCode: result.SIPCode,
 		Reason:     result.ErrorText,
 		RetryAfter: result.RetryAfter,
+		Headers:    result.Headers,
 	}
 	return PlanIMSMessagingRetry(IMSMessagingRetryInput{
 		Operation:      IMSMessagingRetryOperationSMSSubmit,
@@ -336,6 +337,7 @@ func PlanIMSUSSDSessionRetry(req USSDRequest, result USSDResult, err error, opts
 	resp := voiceclient.SIPResponse{
 		StatusCode: result.Status,
 		RetryAfter: result.RetryAfter,
+		Headers:    result.Headers,
 	}
 	method := firstNonEmpty(opts.Method, defaultUSSDRetryMethod(req))
 	return PlanIMSMessagingRetry(IMSMessagingRetryInput{

@@ -12,7 +12,11 @@ import (
 	"time"
 )
 
-const defaultSWUCleanupTimeout = 5 * time.Second
+const (
+	defaultSWUCleanupTimeout = 5 * time.Second
+	DefaultTunnelInnerMTU    = 1360
+	MinIPv6TunnelInnerMTU    = 1280
+)
 
 func independentCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx != nil && ctx.Err() == nil {
@@ -66,6 +70,8 @@ type TUNRoute struct {
 	Source      string
 	Table       string
 	Metric      int
+	MTU         int
+	AdvMSS      int
 }
 
 type TUNRule struct {
@@ -123,12 +129,7 @@ func (m LinuxTUNRoutingManager) Apply(ctx context.Context, cfg TUNRoutingConfig)
 	}
 	state := TUNRoutingState{InterfaceName: strings.TrimSpace(cfg.InterfaceName)}
 	for _, command := range commands {
-		var applyErr error
-		if command.sharedKey != "" {
-			applyErr = acquireSharedIPCommand(ctx, runner, command)
-		} else {
-			applyErr = runner.RunIP(ctx, command.args...)
-		}
+		applyErr := runIPApplyCommand(ctx, runner, command)
 		if applyErr != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), defaultSWUCleanupTimeout)
 			rollbackErr := runIPUndo(cleanupCtx, runner, state.undo)
@@ -145,6 +146,25 @@ func (m LinuxTUNRoutingManager) Apply(ctx context.Context, cfg TUNRoutingConfig)
 	return state, nil
 }
 
+func runIPApplyCommand(ctx context.Context, runner IPCommandRunner, command ipCommand) error {
+	if len(command.preClean) > 0 {
+		_ = runner.RunIP(ctx, command.preClean...)
+	}
+	if command.sharedKey != "" {
+		return acquireSharedIPCommand(ctx, runner, command)
+	}
+	err := runner.RunIP(ctx, command.args...)
+	if err != nil && len(command.retryAfter) > 0 {
+		for _, cleanup := range command.retryAfter {
+			if len(cleanup) > 0 {
+				_ = runner.RunIP(ctx, cleanup...)
+			}
+		}
+		err = runner.RunIP(ctx, command.args...)
+	}
+	return err
+}
+
 func (m LinuxTUNRoutingManager) Cleanup(ctx context.Context, state TUNRoutingState) error {
 	cleanupCtx, cancel := independentCleanupContext(ctx)
 	defer cancel()
@@ -156,9 +176,11 @@ func (m LinuxTUNRoutingManager) Cleanup(ctx context.Context, state TUNRoutingSta
 }
 
 type ipCommand struct {
-	args      []string
-	undo      []string
-	sharedKey string
+	args       []string
+	undo       []string
+	preClean   []string
+	retryAfter [][]string
+	sharedKey  string
 }
 
 func buildTUNRoutingCommands(cfg TUNRoutingConfig) ([]ipCommand, error) {
@@ -175,12 +197,12 @@ func buildTUNRoutingCommands(cfg TUNRoutingConfig) ([]ipCommand, error) {
 	}
 	commands = append(commands, ipCommand{args: []string{"link", "set", "dev", iface, "up"}})
 	for _, address := range cfg.Addresses {
-		addr, err := normalizeIPPrefix(address, "address")
+		addr, err := normalizeInterfaceAddress(address, "address")
 		if err != nil {
 			return nil, err
 		}
 		commands = append(commands, ipCommand{
-			args: []string{"addr", "add", addr, "dev", iface},
+			args: []string{"addr", "replace", addr, "dev", iface},
 			undo: []string{"addr", "del", addr, "dev", iface},
 		})
 	}
@@ -203,7 +225,7 @@ func buildTUNRoutingCommands(cfg TUNRoutingConfig) ([]ipCommand, error) {
 		if err != nil {
 			return nil, err
 		}
-		commands = append(commands, ipCommand{args: args, undo: undo})
+		commands = append(commands, ipCommand{args: args, undo: undo, preClean: append([]string(nil), undo...)})
 	}
 	return commands, nil
 }
@@ -271,7 +293,7 @@ func routeCommands(iface string, route TUNRoute) ([]string, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	args := []string{"route", "add", dst, "dev", iface}
+	args := []string{"route", "replace", dst, "dev", iface}
 	undo := []string{"route", "del", dst, "dev", iface}
 	familyValues := []string{dst}
 	if strings.TrimSpace(route.Via) != "" {
@@ -299,6 +321,18 @@ func routeCommands(iface string, route TUNRoute) ([]string, []string, error) {
 		metric := strconv.Itoa(route.Metric)
 		args = append(args, "metric", metric)
 		undo = append(undo, "metric", metric)
+	}
+	if route.MTU < 0 {
+		return nil, nil, fmt.Errorf("%w: route mtu must be positive", ErrInvalidTUNRouting)
+	}
+	if route.MTU > 0 {
+		args = append(args, "mtu", strconv.Itoa(route.MTU))
+	}
+	if route.AdvMSS < 0 {
+		return nil, nil, fmt.Errorf("%w: route advmss must be positive", ErrInvalidTUNRouting)
+	}
+	if route.AdvMSS > 0 {
+		args = append(args, "advmss", strconv.Itoa(route.AdvMSS))
 	}
 	if strings.TrimSpace(route.Table) != "" {
 		table, err := normalizeRoutingToken(route.Table, "route table")
@@ -469,6 +503,24 @@ func normalizeRouteDestination(value string) (string, error) {
 		return value, nil
 	}
 	return normalizeIPPrefix(value, "route destination")
+}
+
+func normalizeInterfaceAddress(value, field string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("%w: %s is empty", ErrInvalidTUNRouting, field)
+	}
+	if prefix, err := netip.ParsePrefix(value); err == nil {
+		return netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()).String(), nil
+	}
+	if addr, err := netip.ParseAddr(value); err == nil {
+		addr = addr.Unmap()
+		if addr.Is4() {
+			return netip.PrefixFrom(addr, 32).String(), nil
+		}
+		return netip.PrefixFrom(addr, 128).String(), nil
+	}
+	return "", fmt.Errorf("%w: invalid %s %q", ErrInvalidTUNRouting, field, value)
 }
 
 func normalizeIPPrefix(value, field string) (string, error) {

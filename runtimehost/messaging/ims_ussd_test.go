@@ -60,7 +60,7 @@ func TestIMSUSSDTransportExecuteAndContinue(t *testing.T) {
 		t.Fatalf("invite headers=%+v", invite.Headers)
 	}
 	payload, ok, err := DecodeIMSUSSDDocument(invite.Headers["Content-Type"], invite.Body)
-	if err != nil || !ok || payload.Text != "*100#" || payload.Operation != IMSUSSDOperationRequest {
+	if err != nil || !ok || payload.Text != "*100#" || payload.Operation != "" {
 		t.Fatalf("payload=%+v ok=%v err=%v", payload, ok, err)
 	}
 	if len(transport.writes) != 1 || transport.writes[0].Method != "ACK" || transport.writes[0].Headers["CSeq"] != "1 ACK" {
@@ -322,11 +322,14 @@ func TestIMSUSSDTransportACKsRejectedInvite(t *testing.T) {
 	if ack.Headers["CSeq"] != "1 ACK" || !strings.Contains(ack.Headers["To"], "busy-tag") {
 		t.Fatalf("ACK=%+v", ack)
 	}
-	if ack.URI != "sip:ussd-as@ims.example" {
+	if ack.URI != "sip:*100%23@ims.example;user=dialstring" {
 		t.Fatalf("ACK URI=%q", ack.URI)
 	}
-	if route := ack.Headers["Route"]; route != "<sip:reject-proxy2.ims.example;lr>, <sip:reject-proxy1.ims.example;lr>" {
+	if route := ack.Headers["Route"]; route != "" {
 		t.Fatalf("ACK Route=%q", route)
+	}
+	if ack.Headers["Via"] == "" || ack.Headers["Via"] != transport.requests[0].Headers["Via"] {
+		t.Fatalf("ACK Via=%q want %q", ack.Headers["Via"], transport.requests[0].Headers["Via"])
 	}
 	if _, ok := ussd.session("session-reject"); ok {
 		t.Fatal("rejected USSD INVITE must not leave an active session")
@@ -498,7 +501,7 @@ func TestIMSUSSDTransportAcceptsNetworkInitiatedInfo(t *testing.T) {
 		state.cfg.LocalTag != "ue-tag" || state.cfg.RemoteTag != "as-tag" {
 		t.Fatalf("state=%+v", state)
 	}
-	if len(state.cfg.RouteSet) != 2 || state.cfg.RouteSet[0] != "<sip:edge2.ims.example;lr>" || state.cfg.RouteSet[1] != "<sip:edge1.ims.example;lr>" {
+	if len(state.cfg.RouteSet) != 2 || state.cfg.RouteSet[0] != "<sip:edge1.ims.example;lr>" || state.cfg.RouteSet[1] != "<sip:edge2.ims.example;lr>" {
 		t.Fatalf("route set=%+v", state.cfg.RouteSet)
 	}
 
@@ -520,7 +523,7 @@ func TestIMSUSSDTransportAcceptsNetworkInitiatedInfo(t *testing.T) {
 	if !strings.Contains(out.Headers["From"], "tag=ue-tag") || !strings.Contains(out.Headers["To"], "tag=as-tag") {
 		t.Fatalf("dialog headers=%+v", out.Headers)
 	}
-	if route := out.Headers["Route"]; route != "<sip:edge2.ims.example;lr>, <sip:edge1.ims.example;lr>" {
+	if route := out.Headers["Route"]; route != "<sip:edge1.ims.example;lr>, <sip:edge2.ims.example;lr>" {
 		t.Fatalf("Route=%q", route)
 	}
 

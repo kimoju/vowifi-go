@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
@@ -118,6 +119,7 @@ func (t *IMSUSSDTransport) HandleIMSInfo(ctx context.Context, req IMSUSSDDialogR
 	if result.Done {
 		t.clearSession(sessionID)
 	} else {
+		state.updatedAt = time.Now()
 		t.storeSession(sessionID, state)
 	}
 	return IMSUSSDDialogResult{Handled: true, StatusCode: 200, Reason: "OK", USSD: result}, nil
@@ -154,6 +156,7 @@ func (t *IMSUSSDTransport) sessionByCallID(callID string) (string, imsUSSDSessio
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.pruneExpiredSessionsLocked(time.Now())
 	for sessionID, state := range t.sessions {
 		if strings.EqualFold(strings.TrimSpace(state.cfg.CallID), callID) {
 			return sessionID, state, true
@@ -190,17 +193,17 @@ func (t *IMSUSSDTransport) inboundUSSDSession(req IMSUSSDDialogRequest) (string,
 		RemoteURI:       from,
 		RemoteTargetURI: firstNonEmpty(sipHeaderURIValue(firstHeaderValue(req.Headers, "Contact")), from),
 		CallID:          callID,
-		LocalTag:        firstNonEmpty(sipHeaderTagValue(firstHeaderValue(req.Headers, "To")), t.LocalTag, "ussd"),
+		LocalTag:        firstNonEmpty(sipHeaderTagValue(firstHeaderValue(req.Headers, "To")), t.LocalTag, randomUSSDSIPTag("ussd")),
 		RemoteTag:       sipHeaderTagValue(firstHeaderValue(req.Headers, "From")),
 		CSeq:            cseq,
 		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
 		SessionExpires:  t.SessionExpires,
 	}
-	if routeSet := ussdRecordRouteSet(req.Headers); len(routeSet) > 0 {
+	if routeSet := ussdInboundRecordRouteSet(req.Headers); len(routeSet) > 0 {
 		cfg.RouteSet = routeSet
 	}
 	sessionID := "ims-ussd-" + smsToken(callID)
-	return sessionID, imsUSSDSession{cfg: cfg, cseq: cseq}, nil
+	return sessionID, imsUSSDSession{cfg: cfg, cseq: cseq, updatedAt: time.Now()}, nil
 }
 
 func isIMSUSSDDialogRequest(req IMSUSSDDialogRequest) bool {

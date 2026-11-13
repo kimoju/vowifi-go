@@ -2600,6 +2600,9 @@ func (t *cancelAwareInboundTransport) RoundTripInvite(ctx context.Context, msg v
 	if msg.Headers != nil && msg.Headers["Via"] == "" {
 		msg.Headers["Via"] = "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-inbound-invite;rport"
 	}
+	if onProvisional != nil {
+		_ = onProvisional(ctx, msg, voiceclient.SIPResponse{StatusCode: 100, Reason: "Trying"})
+	}
 	t.invites <- msg
 	select {
 	case resp := <-t.inviteResps:

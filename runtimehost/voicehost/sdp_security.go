@@ -58,6 +58,7 @@ func ParseSDPSecurity(body []byte) (SDPSecurityInfo, error) {
 	lines := sdpSecurityLines(body)
 	var session SDPSecurityInfo
 	var out SDPSecurityInfo
+	var unsupportedCryptoErr error
 	beforeFirstMedia := true
 	inAudio := false
 	sawAudio := false
@@ -106,8 +107,14 @@ func ParseSDPSecurity(body []byte) (SDPSecurityInfo, error) {
 				session.RTCPFeedback = append(session.RTCPFeedback, feedback)
 			}
 		case inAudio:
-			if crypto, ok, err := parseSDPCryptoLine(line); ok || err != nil {
+			if crypto, ok, unsupportedSuite, err := parseSDPCryptoLineWithSuiteFlag(line); ok || err != nil {
 				if err != nil {
+					if unsupportedSuite {
+						if unsupportedCryptoErr == nil {
+							unsupportedCryptoErr = err
+						}
+						continue
+					}
 					return SDPSecurityInfo{}, err
 				}
 				out.Crypto = append(out.Crypto, crypto)
@@ -153,6 +160,9 @@ func ParseSDPSecurity(body []byte) (SDPSecurityInfo, error) {
 	}
 	if !sawAudio {
 		return SDPSecurityInfo{}, fmt.Errorf("%w: missing SDP audio media", ErrInvalidSDPSecurity)
+	}
+	if len(out.Crypto) == 0 && unsupportedCryptoErr != nil {
+		return SDPSecurityInfo{}, unsupportedCryptoErr
 	}
 	if len(out.Fingerprints) == 0 {
 		out.Fingerprints = session.Fingerprints
@@ -421,21 +431,26 @@ func (s SDPSecurityInfo) sdpAttributeLines() []string {
 }
 
 func parseSDPCryptoLine(line string) (SDPCryptoAttribute, bool, error) {
+	attr, ok, _, err := parseSDPCryptoLineWithSuiteFlag(line)
+	return attr, ok, err
+}
+
+func parseSDPCryptoLineWithSuiteFlag(line string) (SDPCryptoAttribute, bool, bool, error) {
 	value, ok := cutSDPAttributeValue(line, "a=crypto:")
 	if !ok {
-		return SDPCryptoAttribute{}, false, nil
+		return SDPCryptoAttribute{}, false, false, nil
 	}
 	tag, rest, ok := cutSDPField(value)
 	if !ok {
-		return SDPCryptoAttribute{}, true, fmt.Errorf("%w: malformed crypto attribute", ErrInvalidSDPSecurity)
+		return SDPCryptoAttribute{}, true, false, fmt.Errorf("%w: malformed crypto attribute", ErrInvalidSDPSecurity)
 	}
 	suite, rest, ok := cutSDPField(rest)
 	if !ok {
-		return SDPCryptoAttribute{}, true, fmt.Errorf("%w: malformed crypto attribute", ErrInvalidSDPSecurity)
+		return SDPCryptoAttribute{}, true, false, fmt.Errorf("%w: malformed crypto attribute", ErrInvalidSDPSecurity)
 	}
 	keyParams, sessionParams, ok := cutSDPField(rest)
 	if !ok {
-		return SDPCryptoAttribute{}, true, fmt.Errorf("%w: malformed crypto attribute", ErrInvalidSDPSecurity)
+		return SDPCryptoAttribute{}, true, false, fmt.Errorf("%w: malformed crypto attribute", ErrInvalidSDPSecurity)
 	}
 	attr := SDPCryptoAttribute{
 		Tag:           tag,
@@ -443,10 +458,16 @@ func parseSDPCryptoLine(line string) (SDPCryptoAttribute, bool, error) {
 		KeyParams:     keyParams,
 		SessionParams: strings.TrimSpace(sessionParams),
 	}
-	if err := ValidateSDPCryptoAttribute(attr); err != nil {
-		return SDPCryptoAttribute{}, true, fmt.Errorf("%w: %w", ErrInvalidSDPSecurity, err)
+	if err := validateSDPCryptoTag(attr.Tag); err != nil {
+		return SDPCryptoAttribute{}, true, false, fmt.Errorf("%w: %w", ErrInvalidSDPSecurity, err)
 	}
-	return attr, true, nil
+	if _, err := SRTPProtectionProfileFromSDPCryptoSuite(attr.Suite); err != nil {
+		return SDPCryptoAttribute{}, true, true, fmt.Errorf("%w: %w", ErrInvalidSDPSecurity, err)
+	}
+	if err := ValidateSDPCryptoAttribute(attr); err != nil {
+		return SDPCryptoAttribute{}, true, false, fmt.Errorf("%w: %w", ErrInvalidSDPSecurity, err)
+	}
+	return attr, true, false, nil
 }
 
 func parseSDPFingerprintLine(line string) (SDPFingerprintAttribute, bool, error) {
@@ -650,8 +671,8 @@ func selectSDPCryptoAnswer(offer SDPSecurityInfo, options SDPSecurityAnswerOptio
 	if len(offer.Crypto) == 0 || len(options.Crypto) == 0 {
 		return SDPSecurityInfo{}, false
 	}
-	for _, local := range options.Crypto {
-		for _, remote := range offer.Crypto {
+	for _, remote := range offer.Crypto {
+		for _, local := range options.Crypto {
 			if !strings.EqualFold(strings.TrimSpace(local.Suite), strings.TrimSpace(remote.Suite)) {
 				continue
 			}

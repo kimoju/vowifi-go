@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -232,6 +233,7 @@ type IMSIdentityDomainCandidate struct {
 type EffectiveCarrierConfig struct {
 	MCC       string        `json:"mcc"`
 	MNC       string        `json:"mnc"`
+	MNCDigits int           `json:"mnc_digits,omitempty"`
 	PresetID  string        `json:"preset_id"`
 	E911      E911Config    `json:"e911"`
 	Network   NetworkConfig `json:"network"`
@@ -240,11 +242,12 @@ type EffectiveCarrierConfig struct {
 
 func (cfg *EffectiveCarrierConfig) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		MCC      string        `json:"mcc"`
-		MNC      string        `json:"mnc"`
-		PresetID string        `json:"preset_id"`
-		E911     E911Config    `json:"e911"`
-		Network  NetworkConfig `json:"network"`
+		MCC       string        `json:"mcc"`
+		MNC       string        `json:"mnc"`
+		MNCDigits int           `json:"mnc_digits"`
+		PresetID  string        `json:"preset_id"`
+		E911      E911Config    `json:"e911"`
+		Network   NetworkConfig `json:"network"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -257,13 +260,15 @@ func (cfg *EffectiveCarrierConfig) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
+	digits := inferConfigMNCDigits(raw.MCC, raw.MNC, raw.MNCDigits)
 	*cfg = EffectiveCarrierConfig{
 		MCC:       raw.MCC,
 		MNC:       raw.MNC,
+		MNCDigits: digits,
 		PresetID:  raw.PresetID,
 		E911:      raw.E911,
 		Network:   mergeNetworkAliasConfig(raw.Network, aliasNetwork),
-		mncDigits: rawMNCDigits(raw.MNC),
+		mncDigits: digits,
 	}
 	return nil
 }
@@ -282,14 +287,16 @@ type LoadResult struct {
 }
 
 var (
-	overridesMu sync.RWMutex
-	overrides   = map[string]EffectiveCarrierConfig{}
+	overridesMu    sync.RWMutex
+	overrides      = map[string]EffectiveCarrierConfig{}
+	exactOverrides = map[string]EffectiveCarrierConfig{}
 )
 
 var builtinCarriers = map[string]EffectiveCarrierConfig{
 	"310280": {
 		MCC:       "310",
 		MNC:       "280",
+		MNCDigits: 3,
 		PresetID:  "310280",
 		mncDigits: 3,
 		E911: E911Config{
@@ -302,6 +309,7 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 	"310410": {
 		MCC:       "310",
 		MNC:       "410",
+		MNCDigits: 3,
 		PresetID:  "310410",
 		mncDigits: 3,
 		E911: E911Config{
@@ -311,6 +319,11 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 			EntitlementEndpoint: "https://sentitlement2.mobile.att.net/WFC",
 		},
 	},
+}
+
+type rawCarrierOverrideEntry struct {
+	key string
+	cfg EffectiveCarrierConfig
 }
 
 func LoadCarrierOverrides(path string) (LoadResult, error) {
@@ -326,43 +339,64 @@ func LoadCarrierOverrides(path string) (LoadResult, error) {
 		}
 		return result, err
 	}
+	var entries []rawCarrierOverrideEntry
 	var decoded map[string]EffectiveCarrierConfig
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		var list []EffectiveCarrierConfig
 		if err2 := json.Unmarshal(raw, &list); err2 != nil {
 			return result, err
 		}
-		decoded = make(map[string]EffectiveCarrierConfig, len(list))
+		entries = make([]rawCarrierOverrideEntry, 0, len(list))
 		for _, cfg := range list {
-			if cfg.mncDigits == 0 {
-				cfg.mncDigits = rawMNCDigits(cfg.MNC)
-			}
-			if key := presetKey(cfg.MCC, cfg.MNC); key != "" {
-				decoded[key] = normalizeConfig(cfg)
-			}
+			entries = append(entries, rawCarrierOverrideEntry{
+				key: presetKey(cfg.MCC, cfg.MNC),
+				cfg: cfg,
+			})
+		}
+	} else {
+		rawKeys := make([]string, 0, len(decoded))
+		for key := range decoded {
+			rawKeys = append(rawKeys, key)
+		}
+		sort.Strings(rawKeys)
+		entries = make([]rawCarrierOverrideEntry, 0, len(rawKeys))
+		for _, key := range rawKeys {
+			entries = append(entries, rawCarrierOverrideEntry{
+				key: key,
+				cfg: decoded[key],
+			})
 		}
 	}
-	next := make(map[string]EffectiveCarrierConfig, len(decoded))
+	next := make(map[string]EffectiveCarrierConfig, len(entries))
+	nextExact := make(map[string]EffectiveCarrierConfig, len(entries))
 	count := 0
-	for key, cfg := range decoded {
-		if cfg.mncDigits == 0 {
-			cfg.mncDigits = rawMNCDigits(cfg.MNC)
+	for _, entry := range entries {
+		key := entry.key
+		cfg := entry.cfg
+		rawMNC := strings.TrimSpace(cfg.MNC)
+		rawMCC := strings.TrimSpace(cfg.MCC)
+		keyMCC, keyMNC := splitPresetKey(key)
+		if normalizeMCC(rawMCC) == "" && normalizeMCC(keyMCC) != "" {
+			rawMCC = keyMCC
 		}
+		if rawMNCDigits(rawMNC) == 0 && rawMNCDigits(keyMNC) != 0 {
+			rawMNC = keyMNC
+		} else if len(rawMNC) == 3 && rawMNC[0] == '0' && len(strings.TrimSpace(keyMNC)) == 2 && cfg.MNCDigits == 0 {
+			rawMNC = strings.TrimSpace(keyMNC)
+		}
+		digits := inferConfigMNCDigits(rawMCC, rawMNC, cfg.MNCDigits)
+		cfg.MCC = rawMCC
+		cfg.MNC = rawMNC
+		cfg.MNCDigits = digits
+		cfg.mncDigits = digits
 		cfg = normalizeConfig(cfg)
-		if cfg.MCC == "" || cfg.MNC == "" {
-			keyMCC, keyMNC := splitPresetKey(key)
-			if cfg.mncDigits == 0 {
-				cfg.mncDigits = rawMNCDigits(keyMNC)
-			}
-			cfg.MCC, cfg.MNC = keyMCC, keyMNC
-			cfg = normalizeConfig(cfg)
-		}
-		if storeCarrierOverride(next, key, cfg) {
+		if storeCarrierOverride(next, nextExact, key, rawMNC, cfg) {
 			count++
 		}
 	}
 	overridesMu.Lock()
 	overrides = next
+	exactOverrides = nextExact
 	overridesMu.Unlock()
 	result.Missing = false
 	result.Count = count
@@ -372,10 +406,12 @@ func LoadCarrierOverrides(path string) (LoadResult, error) {
 func ClearCarrierOverrides() {
 	overridesMu.Lock()
 	overrides = map[string]EffectiveCarrierConfig{}
+	exactOverrides = map[string]EffectiveCarrierConfig{}
 	overridesMu.Unlock()
 }
 
 func ResolveEffectiveCarrierConfig(in EffectiveCarrierConfigInput) EffectiveCarrierConfig {
+	exactMCC, exactMNC := exactRequestedPLMN(in)
 	profile := NormalizeSubscriberProfile(SubscriberProfileInput{
 		IMSI: in.IMSI,
 		MCC:  in.MCC,
@@ -386,18 +422,29 @@ func ResolveEffectiveCarrierConfig(in EffectiveCarrierConfigInput) EffectiveCarr
 	mnc := profile.MNC
 	key := presetKey(mcc, mnc)
 	overridesMu.RLock()
+	if exactMCC != "" && exactMNC != "" {
+		if cfg, ok := exactOverrides[exactPLMNKey(exactMCC, exactMNC)]; ok {
+			overridesMu.RUnlock()
+			return normalizeConfig(cfg)
+		}
+	}
 	if cfg, ok := overrides[key]; ok {
 		overridesMu.RUnlock()
 		return normalizeConfig(cfg)
 	}
 	overridesMu.RUnlock()
 	if cfg, ok := builtinCarriers[key]; ok {
-		return normalizeConfig(cfg)
+		if exactMNC == "" || cfg.mncDigits == 0 || len(exactMNC) == cfg.mncDigits {
+			return normalizeConfig(cfg)
+		}
 	}
+	digits := rawMNCDigits(exactMNC)
 	return normalizeConfig(EffectiveCarrierConfig{
-		MCC:      mcc,
-		MNC:      mnc,
-		PresetID: mcc + mnc,
+		MCC:       mcc,
+		MNC:       mnc,
+		MNCDigits: digits,
+		PresetID:  mcc + mnc,
+		mncDigits: digits,
 		E911: E911Config{
 			Enabled:  false,
 			Provider: "",
@@ -652,20 +699,31 @@ func appendMissingRegistrationField(missing []string, field, value string) []str
 func sipUserFromIdentity(identity string) string {
 	identity = strings.TrimSpace(identity)
 	lower := strings.ToLower(identity)
+	isTel := false
 	switch {
 	case strings.HasPrefix(lower, "sip:"):
 		identity = identity[len("sip:"):]
 	case strings.HasPrefix(lower, "sips:"):
 		identity = identity[len("sips:"):]
+	case strings.HasPrefix(lower, "tel:"):
+		identity = identity[len("tel:"):]
+		isTel = true
 	}
-	if user, _, ok := strings.Cut(identity, "@"); ok {
-		identity = user
+	if !isTel {
+		if user, _, ok := strings.Cut(identity, "@"); ok {
+			identity = user
+		}
 	}
 	if user, _, ok := strings.Cut(identity, ";"); ok {
 		identity = user
 	}
 	if user, _, ok := strings.Cut(identity, "?"); ok {
 		identity = user
+	}
+	if isTel {
+		if user, _, ok := strings.Cut(identity, "@"); ok {
+			identity = user
+		}
 	}
 	return strings.TrimSpace(identity)
 }
@@ -686,10 +744,77 @@ func formatVisitedNetworkIDHeader(value string) string {
 	if value == "" || strings.ContainsAny(value, "\r\n") {
 		return ""
 	}
-	if strings.Contains(value, ",") || (strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)) {
+	parts := splitVisitedNetworkHeaderItems(value)
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		return formatSingleVisitedNetworkID(parts[0])
+	}
+	formatted := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if item := formatSingleVisitedNetworkID(part); item != "" {
+			formatted = append(formatted, item)
+		}
+	}
+	return strings.Join(formatted, ", ")
+}
+
+func formatSingleVisitedNetworkID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return ""
+	}
+	if isValidSIPQuotedString(value) {
 		return value
 	}
 	return quoteSIPQuotedString(value)
+}
+
+func isValidSIPQuotedString(value string) bool {
+	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+		return false
+	}
+	for i := 1; i < len(value)-1; i++ {
+		if value[i] == '\\' {
+			if i+1 >= len(value)-1 {
+				return false
+			}
+			i++
+			continue
+		}
+		if value[i] == '"' {
+			return false
+		}
+	}
+	return true
+}
+
+func splitVisitedNetworkHeaderItems(value string) []string {
+	var items []string
+	inQuotes := false
+	start := 0
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\\':
+			if inQuotes && i+1 < len(value) {
+				i++
+			}
+		case '"':
+			inQuotes = !inQuotes
+		case ',':
+			if !inQuotes {
+				if part := strings.TrimSpace(value[start:i]); part != "" {
+					items = append(items, part)
+				}
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(value[start:]); tail != "" {
+		items = append(items, tail)
+	}
+	return items
 }
 
 func quoteSIPQuotedString(value string) string {
@@ -734,6 +859,14 @@ func IsVoWiFiPolicyBlockedError(err error) bool {
 func normalizeConfig(cfg EffectiveCarrierConfig) EffectiveCarrierConfig {
 	cfg.MCC = normalizeMCC(cfg.MCC)
 	cfg.MNC = normalizeMNC(cfg.MNC)
+	if cfg.MNCDigits == 2 || cfg.MNCDigits == 3 {
+		cfg.mncDigits = cfg.MNCDigits
+	} else if cfg.mncDigits == 2 || cfg.mncDigits == 3 {
+		cfg.MNCDigits = cfg.mncDigits
+	} else {
+		cfg.MNCDigits = 0
+		cfg.mncDigits = 0
+	}
 	if cfg.PresetID == "" {
 		cfg.PresetID = presetKey(cfg.MCC, cfg.MNC)
 	} else {
@@ -947,12 +1080,80 @@ func stringsFromNetworkJSON(raw json.RawMessage, strict bool) ([]string, error) 
 	return nil, errors.New("network P-CSCF candidates must be a string or string array")
 }
 
-func storeCarrierOverride(overrides map[string]EffectiveCarrierConfig, rawKey string, cfg EffectiveCarrierConfig) bool {
+func storeCarrierOverride(overrides, exact map[string]EffectiveCarrierConfig, rawKey, rawMNC string, cfg EffectiveCarrierConfig) bool {
 	keys := carrierOverrideKeys(rawKey, cfg)
 	for _, key := range keys {
 		overrides[key] = cfg
 	}
+	if cfg.MCC != "" {
+		exactMNC := exactMNCForDigits(cfg.MNC, rawMNC, cfg.mncDigits)
+		if exactMNC != "" {
+			exact[exactPLMNKey(cfg.MCC, exactMNC)] = cfg
+		}
+	}
 	return len(keys) > 0
+}
+
+func exactPLMNKey(mcc, exactMNC string) string {
+	return mcc + ":" + exactMNC
+}
+
+func exactMNCForDigits(normalizedMNC, rawMNC string, digits int) string {
+	rawMNC = strings.TrimSpace(rawMNC)
+	switch digits {
+	case 2:
+		if len(rawMNC) == 2 && isDecimalString(rawMNC) {
+			return rawMNC
+		}
+		if len(normalizedMNC) == 3 && normalizedMNC[0] == '0' {
+			return normalizedMNC[1:]
+		}
+	case 3:
+		if len(normalizedMNC) == 3 && isDecimalString(normalizedMNC) {
+			return normalizedMNC
+		}
+	}
+	return ""
+}
+
+func exactRequestedPLMN(in EffectiveCarrierConfigInput) (string, string) {
+	mcc := normalizeMCC(in.MCC)
+	rawMNC := strings.TrimSpace(in.MNC)
+	if mcc != "" && rawMNCDigits(rawMNC) != 0 {
+		return mcc, rawMNC
+	}
+	if imsi := normalizeIMSI(in.IMSI); imsi != "" {
+		derivedMCC, derivedMNC := DerivePLMNFromIMSIWithAD(imsi, in.EFAD)
+		if mcc == "" {
+			mcc = derivedMCC
+		}
+		if rawMNCDigits(rawMNC) == 0 {
+			rawMNC = derivedMNC
+		}
+		if mcc != "" && rawMNCDigits(rawMNC) != 0 {
+			return mcc, rawMNC
+		}
+	}
+	return "", ""
+}
+
+func inferConfigMNCDigits(mcc, rawMNC string, explicitDigits int) int {
+	if explicitDigits == 2 || explicitDigits == 3 {
+		return explicitDigits
+	}
+	rawMNC = strings.TrimSpace(rawMNC)
+	if !isDecimalString(rawMNC) {
+		return 0
+	}
+	if len(rawMNC) == 2 {
+		return 2
+	}
+	if len(rawMNC) == 3 {
+		if rawMNC[0] != '0' || isDefaultThreeDigitMNCMCC(normalizeMCC(mcc)) {
+			return 3
+		}
+	}
+	return 0
 }
 
 func carrierOverrideKeys(rawKey string, cfg EffectiveCarrierConfig) []string {
@@ -1235,37 +1436,52 @@ func lookupKnownCarrierMNC(mcc, mnc2, mnc3 string) (string, bool) {
 	key3 := mcc + mnc3
 
 	overridesMu.RLock()
+	_, exact2 := exactOverrides[exactPLMNKey(mcc, mnc2)]
+	_, exact3 := exactOverrides[exactPLMNKey(mcc, mnc3)]
 	cfg2, ok2 := overrides[key2]
 	cfg3, ok3 := overrides[key3]
 	overridesMu.RUnlock()
 
-	if mnc, ok := selectKnownCarrierMNC(mnc2, mnc3, key2, key3, cfg2, ok2, cfg3, ok3); ok {
+	if exact2 && exact3 {
+		if isDefaultThreeDigitMNCMCC(mcc) {
+			return mnc3, true
+		}
+		return mnc2, true
+	}
+	if exact2 {
+		return mnc2, true
+	}
+	if exact3 {
+		return mnc3, true
+	}
+
+	if mnc, ok := selectKnownCarrierMNC(mcc, mnc2, mnc3, key2, key3, cfg2, ok2, cfg3, ok3); ok {
 		return mnc, true
 	}
 
 	bcfg2, bok2 := builtinCarriers[key2]
 	bcfg3, bok3 := builtinCarriers[key3]
-	return selectKnownCarrierMNC(mnc2, mnc3, key2, key3, bcfg2, bok2, bcfg3, bok3)
+	return selectKnownCarrierMNC(mcc, mnc2, mnc3, key2, key3, bcfg2, bok2, bcfg3, bok3)
 }
 
 func selectKnownCarrierMNC(
-	mnc2, mnc3, key2, key3 string,
+	mcc, mnc2, mnc3, key2, key3 string,
 	cfg2 EffectiveCarrierConfig, ok2 bool,
 	cfg3 EffectiveCarrierConfig, ok3 bool,
 ) (string, bool) {
 	if ok2 && cfg2.mncDigits == 2 {
 		return mnc2, true
 	}
-	if ok3 && key3 != key2 && cfg3.mncDigits != 2 {
+	if ok3 && key3 != key2 && cfg3.mncDigits == 3 {
 		return mnc3, true
 	}
 	if ok3 && key3 == key2 && cfg3.mncDigits == 3 {
 		return mnc3, true
 	}
-	if ok2 {
+	if ok2 && cfg2.mncDigits != 3 {
 		return mnc2, true
 	}
-	if ok3 {
+	if ok3 && isDefaultThreeDigitMNCMCC(mcc) {
 		return mnc3, true
 	}
 	return "", false

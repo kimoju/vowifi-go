@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -48,7 +50,7 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	network := sipNetworkForRequest(t.Network, msg.URI)
+	network, explicitURI := sipNetworkForMethodWithHeaders(msg.Method, t.Network, msg.URI, msg.Headers)
 	targets, err := sipTargetsForRequest(ctx, t.Resolver, network, t.ServerAddr, msg.URI)
 	if err != nil {
 		return SIPResponse{}, err
@@ -59,13 +61,28 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 	}
 	var lastErr error
 	redirects := 0
+	targetNetworks := make(map[string]string)
 	for idx := 0; idx < len(targets); idx++ {
 		target := targets[idx]
-		resp, err := t.roundTripTarget(ctx, network, target, timeout, msg, onProvisional)
+		reqMsg := cloneSIPRequestMessage(msg)
+		if idx > 0 || redirects > 0 {
+			refreshHeaderViaBranch(reqMsg.Headers)
+		}
+		targetNet := network
+		targetExplicit := explicitURI
+		if override, ok := targetNetworks[target]; ok && override != "" {
+			targetNet = applyNetworkFamilySuffix(override, network)
+			targetExplicit = true
+		}
+		resp, sentVia, err := t.roundTripTarget(ctx, targetNet, targetExplicit, target, timeout, reqMsg, onProvisional)
 		if err == nil {
 			if !strings.EqualFold(strings.TrimSpace(msg.Method), "INVITE") &&
 				redirects < maxSIPRedirectTargets && sipRedirectStatus(resp.StatusCode) {
-				if nextTargets, nextIndex, ok := sipTargetsWithRedirects(targets, idx, sipRedirectTargets(resp)); ok {
+				redirectTargets, redirectTransports := sipRedirectTargetsWithTransports(resp)
+				if nextTargets, nextIndex, ok := sipTargetsWithRedirects(targets, idx, redirectTargets); ok {
+					for k, v := range redirectTransports {
+						targetNetworks[k] = v
+					}
 					targets = nextTargets
 					idx = nextIndex - 1
 					redirects++
@@ -75,6 +92,7 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 			if sipDialogTargetFailoverStatus(resp.StatusCode) && idx+1 < len(targets) && ctx.Err() == nil {
 				continue
 			}
+			writeBackGeneratedSIPVia(msg.Headers, sentVia)
 			return resp, nil
 		}
 		if ctx.Err() != nil {
@@ -91,27 +109,40 @@ func (t WireSIPTransport) roundTripRequest(ctx context.Context, msg SIPRequestMe
 	return SIPResponse{}, errSIPDNSResolverEmpty()
 }
 
-func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target string, timeout time.Duration, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, error) {
+func (t WireSIPTransport) roundTripTarget(ctx context.Context, network string, explicitUDP bool, target string, timeout time.Duration, msg SIPRequestMessage, onProvisional ProvisionalResponseHandler) (SIPResponse, string, error) {
 	conn, err := t.dialTarget(ctx, network, target, timeout, msg.URI)
 	if err != nil {
-		return SIPResponse{}, err
+		return SIPResponse{}, "", err
 	}
 	defer conn.Close()
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return SIPResponse{}, err
+		return SIPResponse{}, "", err
 	}
-	attempt := msg
+	attempt := cloneSIPRequestMessage(msg)
 	ensureSIPRequestVia(&attempt, transportName(network), conn.LocalAddr())
+	sentVia := firstHeaderValue(attempt.Headers, "Via")
 	wire, err := buildSIPRequestWire(attempt, transportName(network), conn.LocalAddr())
 	if err != nil {
-		return SIPResponse{}, err
+		return SIPResponse{}, "", err
+	}
+	if isSIPUDPNetwork(network) && !explicitUDP && len(wire) > sipUDPMaxPayloadSize &&
+		!strings.EqualFold(strings.TrimSpace(attempt.Method), "CANCEL") {
+		tcpMsg := cloneSIPRequestMessage(msg)
+		if via := firstHeaderValue(tcpMsg.Headers, "Via"); via != "" {
+			setSIPHeader(tcpMsg.Headers, "Via", rewriteSIPViaTransport(via, "TCP"))
+		}
+		resp, tcpVia, tcpErr := t.roundTripTarget(ctx, sipTCPFallbackNetwork(network), true, target, timeout, tcpMsg, onProvisional)
+		if tcpErr == nil || !errors.Is(tcpErr, syscall.ECONNREFUSED) {
+			return resp, tcpVia, tcpErr
+		}
 	}
 	if _, err := conn.Write(wire); err != nil {
-		return SIPResponse{}, err
+		return SIPResponse{}, "", err
 	}
 	if isSIPStreamNetwork(network) {
 		reader := bufio.NewReader(conn)
-		return readFinalSIPResponse(ctx, reader, attempt, onProvisional)
+		resp, err := readFinalSIPResponse(ctx, reader, attempt, onProvisional)
+		return resp, sentVia, err
 	}
 	buf := make([]byte, 65535)
 	interval := sipRetransmitInterval(attempt.Method, timeout, t.RetransmitInterval)
@@ -126,19 +157,19 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 			readInterval = time.Until(deadline)
 		}
 		if err := conn.SetReadDeadline(nextSIPReadDeadline(deadline, readInterval)); err != nil {
-			return SIPResponse{}, err
+			return SIPResponse{}, "", err
 		}
 		n, err := conn.Read(buf)
 		if err != nil {
 			if ctx.Err() != nil {
-				return SIPResponse{}, ctx.Err()
+				return SIPResponse{}, "", ctx.Err()
 			}
 			if !isSIPTimeout(err) || !time.Now().Before(deadline) {
-				return SIPResponse{}, err
+				return SIPResponse{}, "", err
 			}
 			if !gotResponse && !retransmitExhausted && shouldSIPRetransmit(retransmits, t.MaxRetransmits) {
 				if _, writeErr := conn.Write(wire); writeErr != nil {
-					return SIPResponse{}, writeErr
+					return SIPResponse{}, "", writeErr
 				}
 				retransmits++
 				interval = nextSIPRetransmitInterval(interval, maxInterval)
@@ -148,25 +179,33 @@ func (t WireSIPTransport) roundTripTarget(ctx context.Context, network, target s
 				retransmitExhausted = true
 				continue
 			}
-			return SIPResponse{}, err
+			return SIPResponse{}, "", err
 		}
 		if !isSIPResponseWire(buf[:n]) {
 			continue
 		}
 		resp, err := ParseSIPResponse(buf[:n])
 		if err != nil {
-			return SIPResponse{}, err
+			return SIPResponse{}, "", err
 		}
 		if !sipResponseMatchesRequest(resp, attempt) {
 			continue
 		}
 		if !isSIPProvisionalResponse(resp.StatusCode) {
 			drainSIPUDPFinalResponses(ctx, conn, attempt, sipFinalResponseDrainDuration(attempt.Method, t.FinalResponseDrain))
-			return resp, nil
+			if resp.StatusCode == 513 && !explicitUDP {
+				tcpMsg := cloneSIPRequestMessage(msg)
+				refreshHeaderViaBranch(tcpMsg.Headers)
+				if via := firstHeaderValue(tcpMsg.Headers, "Via"); via != "" {
+					setSIPHeader(tcpMsg.Headers, "Via", rewriteSIPViaTransport(via, "TCP"))
+				}
+				return t.roundTripTarget(ctx, sipTCPFallbackNetwork(network), true, target, timeout, tcpMsg, onProvisional)
+			}
+			return resp, sentVia, nil
 		}
 		if onProvisional != nil && shouldReportSIPProvisionalResponse(attempt.Method) {
 			if err := onProvisional(ctx, attempt, resp); err != nil {
-				return SIPResponse{}, err
+				return SIPResponse{}, "", err
 			}
 		}
 		gotResponse = true
@@ -177,7 +216,7 @@ func (t WireSIPTransport) WriteRequest(ctx context.Context, msg SIPRequestMessag
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	network := sipNetworkForRequest(t.Network, msg.URI)
+	network, explicitURI := sipNetworkForMethodWithHeaders(msg.Method, t.Network, msg.URI, msg.Headers)
 	targets, err := sipTargetsForRequest(ctx, t.Resolver, network, t.ServerAddr, msg.URI)
 	if err != nil {
 		return err
@@ -187,8 +226,12 @@ func (t WireSIPTransport) WriteRequest(ctx context.Context, msg SIPRequestMessag
 		timeout = 5 * time.Second
 	}
 	var lastErr error
-	for _, target := range targets {
-		err := t.writeTarget(ctx, network, target, timeout, msg)
+	for idx, target := range targets {
+		reqMsg := cloneSIPRequestMessage(msg)
+		if idx > 0 && !strings.EqualFold(strings.TrimSpace(reqMsg.Method), "CANCEL") && !strings.EqualFold(strings.TrimSpace(reqMsg.Method), "ACK") {
+			refreshHeaderViaBranch(reqMsg.Headers)
+		}
+		err := t.writeTarget(ctx, network, explicitURI, target, timeout, reqMsg)
 		if err == nil {
 			return nil
 		}
@@ -206,7 +249,7 @@ func (t WireSIPTransport) WriteRequest(ctx context.Context, msg SIPRequestMessag
 	return errSIPDNSResolverEmpty()
 }
 
-func (t WireSIPTransport) writeTarget(ctx context.Context, network, target string, timeout time.Duration, msg SIPRequestMessage) error {
+func (t WireSIPTransport) writeTarget(ctx context.Context, network string, explicitUDP bool, target string, timeout time.Duration, msg SIPRequestMessage) error {
 	conn, err := t.dialTarget(ctx, network, target, timeout, msg.URI)
 	if err != nil {
 		return err
@@ -215,11 +258,22 @@ func (t WireSIPTransport) writeTarget(ctx context.Context, network, target strin
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
-	attempt := msg
+	attempt := cloneSIPRequestMessage(msg)
 	ensureSIPRequestVia(&attempt, transportName(network), conn.LocalAddr())
 	wire, err := buildSIPRequestWire(attempt, transportName(network), conn.LocalAddr())
 	if err != nil {
 		return err
+	}
+	if isSIPUDPNetwork(network) && !explicitUDP && len(wire) > sipUDPMaxPayloadSize &&
+		!strings.EqualFold(strings.TrimSpace(attempt.Method), "CANCEL") {
+		tcpMsg := cloneSIPRequestMessage(msg)
+		if via := firstHeaderValue(tcpMsg.Headers, "Via"); via != "" {
+			setSIPHeader(tcpMsg.Headers, "Via", rewriteSIPViaTransport(via, "TCP"))
+		}
+		tcpErr := t.writeTarget(ctx, sipTCPFallbackNetwork(network), true, target, timeout, tcpMsg)
+		if tcpErr == nil || !errors.Is(tcpErr, syscall.ECONNREFUSED) {
+			return tcpErr
+		}
 	}
 	_, err = conn.Write(wire)
 	return err

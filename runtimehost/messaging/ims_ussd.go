@@ -3,6 +3,8 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -13,26 +15,31 @@ import (
 	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
 
+const defaultUSSDSessionTTL = 2 * time.Minute
+
 type IMSUSSDTransport struct {
-	Transport       voiceclient.SIPRequestTransport
-	Profile         voiceclient.IMSProfile
-	Registration    voiceclient.RegistrationBinding
-	Domain          string
-	LocalURI        string
-	ContactURI      string
-	RemoteTargetURI string
-	UserAgent       string
-	LocalTag        string
-	Language        string
-	SessionExpires  int
+	Transport         voiceclient.SIPRequestTransport
+	Profile           voiceclient.IMSProfile
+	Registration      voiceclient.RegistrationBinding
+	Domain            string
+	LocalURI          string
+	ContactURI        string
+	RemoteTargetURI   string
+	UserAgent         string
+	LocalTag          string
+	Language          string
+	SessionExpires    int
+	InactivityTimeout time.Duration
 
 	mu       sync.Mutex
 	sessions map[string]imsUSSDSession
 }
 
 type imsUSSDSession struct {
-	cfg  voiceclient.DialogRequestConfig
-	cseq int
+	cfg       voiceclient.DialogRequestConfig
+	cseq      int
+	updatedAt time.Time
+	timer     *time.Timer
 }
 
 func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (USSDResult, error) {
@@ -46,15 +53,14 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 	if command == "" {
 		return USSDResult{SessionID: req.SessionID, Done: true}, errors.New("ussd command is empty")
 	}
-	sessionID := firstNonEmpty(req.SessionID, fmt.Sprintf("ussd-%d", len(command)))
+	sessionID := firstNonEmpty(req.SessionID, randomUSSDSIPTag("ussd"))
 	cfg, err := t.dialogConfig(command, sessionID, 1)
 	if err != nil {
 		return USSDResult{SessionID: sessionID, Done: true}, err
 	}
 	xmlBody, err := BuildIMSUSSDXML(IMSUSSDPayload{
-		Language:  firstNonEmpty(t.Language, "en"),
-		Text:      command,
-		Operation: IMSUSSDOperationRequest,
+		Language: firstNonEmpty(t.Language, "en"),
+		Text:     command,
 	})
 	if err != nil {
 		return USSDResult{SessionID: sessionID, Done: true}, err
@@ -62,6 +68,7 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 	boundary := "vowifi-ussd-" + smsToken(sessionID)
 	body := buildIMSUSSDMultipartBody(firstNonEmpty(t.Profile.LocalIP, "0.0.0.0"), boundary, xmlBody)
 	var resp voiceclient.SIPResponse
+	var sentInvite voiceclient.SIPRequestMessage
 	redirectRetries := 0
 	for {
 		invite, err := voiceclient.BuildInviteRequest(cfg, body)
@@ -69,15 +76,32 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 			return USSDResult{SessionID: sessionID, Done: true}, err
 		}
 		prepareUSSDInvite(&invite, boundary)
-		resp, err = voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, invite)
+		voiceclient.EnsureDialogRequestVia(&invite, cfg)
+		resp, sentInvite, err = voiceclient.RoundTripRequestWithDigestAuthResult(ctx, t.Transport, invite)
+		if sentCSeq := voiceclient.ParseSIPCSeqNumber(sentInvite.Headers["CSeq"]); sentCSeq > cfg.CSeq {
+			cfg.CSeq = sentCSeq
+		}
 		if err != nil {
-			return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
+			return USSDResult{
+				SessionID:                  sessionID,
+				Done:                       true,
+				Status:                     resp.StatusCode,
+				Headers:                    resp.Headers,
+				RegistrationRecoveryNeeded: !errors.Is(err, context.Canceled),
+				RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+			}, err
 		}
 		if redirectRetries < maxIMSMessagingRedirects {
 			if retryCfg, ok := retryMessagingDialogConfigForRedirect(cfg, resp, nextMessagingCSeq(cfg.CSeq)); ok {
-				ackCfg := ussdDialogConfigFromResponse(cfg, resp)
-				if err := t.writeUSSDACK(ctx, ackCfg); err != nil {
-					return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
+				if err := t.writeRejectedUSSDInviteACK(ctx, sentInvite, resp); err != nil {
+					return USSDResult{
+						SessionID:                  sessionID,
+						Status:                     resp.StatusCode,
+						Headers:                    resp.Headers,
+						Done:                       true,
+						RegistrationRecoveryNeeded: !errors.Is(err, context.Canceled),
+						RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+					}, err
 				}
 				cfg = retryCfg
 				redirectRetries++
@@ -86,16 +110,38 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 		}
 		break
 	}
-	cfg = ussdDialogConfigFromResponse(cfg, resp)
-	if resp.StatusCode >= 200 {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		cfg = ussdDialogConfigFromResponse(cfg, resp)
 		if err := t.writeUSSDACK(ctx, cfg); err != nil {
-			return USSDResult{SessionID: sessionID, Status: resp.StatusCode, Done: true, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
+			return USSDResult{
+				SessionID:                  sessionID,
+				Status:                     resp.StatusCode,
+				Headers:                    resp.Headers,
+				Done:                       true,
+				RegistrationRecoveryNeeded: !errors.Is(err, context.Canceled),
+				RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+			}, err
+		}
+	} else if resp.StatusCode >= 300 {
+		if err := t.writeRejectedUSSDInviteACK(ctx, sentInvite, resp); err != nil {
+			return USSDResult{
+				SessionID:                  sessionID,
+				Status:                     resp.StatusCode,
+				Headers:                    resp.Headers,
+				Done:                       true,
+				RegistrationRecoveryNeeded: !errors.Is(err, context.Canceled),
+				RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+			}, err
 		}
 	}
 	result, err := ussdResultFromSIPResponse(sessionID, resp, false)
 	result = ussdResultWithSIPRecovery("INVITE", resp, result)
+	result.Headers = resp.Headers
 	if err != nil {
 		result.Done = true
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			t.sendBestEffortUSSDBye(ctx, cfg)
+		}
 		return result, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -103,7 +149,7 @@ func (t *IMSUSSDTransport) ExecuteUSSD(ctx context.Context, req USSDRequest) (US
 		return result, fmt.Errorf("IMS USSD INVITE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
 	if !result.Done {
-		t.storeSession(sessionID, imsUSSDSession{cfg: cfg, cseq: cfg.CSeq})
+		t.storeSession(sessionID, imsUSSDSession{cfg: cfg, cseq: cfg.CSeq, updatedAt: time.Now()})
 	} else {
 		t.clearSession(sessionID)
 	}
@@ -125,22 +171,20 @@ func (t *IMSUSSDTransport) ContinueUSSD(ctx context.Context, req USSDRequest) (U
 	if input == "" {
 		return USSDResult{SessionID: sessionID}, errors.New("ussd input is empty")
 	}
-	state, ok := t.session(sessionID)
+	state, ok := t.allocateSessionCSeq(sessionID)
 	if !ok {
 		return USSDResult{SessionID: sessionID, Done: true}, fmt.Errorf("ussd session %s is not active", sessionID)
 	}
-	state.cseq++
-	state.cfg.CSeq = state.cseq
 	xmlBody, err := BuildIMSUSSDXML(IMSUSSDPayload{
-		Language:  firstNonEmpty(t.Language, "en"),
-		Text:      input,
-		Operation: IMSUSSDOperationRequest,
+		Language: firstNonEmpty(t.Language, "en"),
+		Text:     input,
 	})
 	if err != nil {
 		return USSDResult{SessionID: sessionID, Done: true}, err
 	}
 	cfg := state.cfg
 	var resp voiceclient.SIPResponse
+	var sentInfo voiceclient.SIPRequestMessage
 	redirectRetries := 0
 	for {
 		info, err := voiceclient.BuildInfoRequest(cfg, IMSUSSDContentType, xmlBody)
@@ -148,16 +192,42 @@ func (t *IMSUSSDTransport) ContinueUSSD(ctx context.Context, req USSDRequest) (U
 			return USSDResult{SessionID: sessionID, Done: true}, err
 		}
 		prepareUSSDInfo(&info)
-		resp, err = voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, info)
+		voiceclient.EnsureDialogRequestVia(&info, cfg)
+		resp, sentInfo, err = voiceclient.RoundTripRequestWithDigestAuthResult(ctx, t.Transport, info)
+		if sentCSeq := voiceclient.ParseSIPCSeqNumber(sentInfo.Headers["CSeq"]); sentCSeq > cfg.CSeq {
+			cfg.CSeq = sentCSeq
+			t.bumpSessionCSeqFloor(sessionID, sentCSeq)
+		}
 		if err != nil {
-			return USSDResult{SessionID: sessionID, Done: true, Status: resp.StatusCode, RegistrationRecoveryNeeded: true, RetryAfter: voiceclient.SIPResponseRetryAfter(resp)}, err
+			t.clearSession(sessionID)
+			if !errors.Is(err, context.Canceled) {
+				t.sendBestEffortUSSDBye(ctx, cfg)
+			}
+			return USSDResult{
+				SessionID:                  sessionID,
+				Done:                       true,
+				Status:                     resp.StatusCode,
+				Headers:                    resp.Headers,
+				RegistrationRecoveryNeeded: !errors.Is(err, context.Canceled),
+				RetryAfter:                 voiceclient.SIPResponseRetryAfter(resp),
+			}, err
 		}
 		if redirectRetries < maxIMSMessagingRedirects {
 			if retryCfg, ok := retryMessagingDialogConfigForRedirect(cfg, resp, nextMessagingCSeq(cfg.CSeq)); ok {
+				nextState, active := t.allocateSessionCSeq(sessionID)
+				if !active {
+					return USSDResult{SessionID: sessionID, Done: true}, fmt.Errorf("ussd session %s is not active", sessionID)
+				}
+				if nextState.cseq > retryCfg.CSeq {
+					retryCfg.CSeq = nextState.cseq
+				} else {
+					t.bumpSessionCSeqFloor(sessionID, retryCfg.CSeq)
+				}
 				cfg = retryCfg
 				state.cfg = cfg
 				state.cseq = cfg.CSeq
-				t.storeSession(sessionID, state)
+				state.updatedAt = time.Now()
+				t.updateActiveSession(sessionID, state)
 				redirectRetries++
 				continue
 			}
@@ -169,22 +239,28 @@ func (t *IMSUSSDTransport) ContinueUSSD(ctx context.Context, req USSDRequest) (U
 	}
 	state.cfg = cfg
 	state.cseq = cfg.CSeq
+	state.updatedAt = time.Now()
 	result, parseErr := ussdResultFromSIPResponse(sessionID, resp, false)
 	result = ussdResultWithSIPRecovery("INFO", resp, result)
+	result.Headers = resp.Headers
 	if parseErr != nil {
 		result.Done = true
 		t.clearSession(sessionID)
+		t.sendBestEffortUSSDBye(ctx, cfg)
 		return result, parseErr
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		result.Done = true
 		t.clearSession(sessionID)
+		if resp.StatusCode != 481 {
+			t.sendBestEffortUSSDBye(ctx, cfg)
+		}
 		return result, fmt.Errorf("IMS USSD INFO rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
 	if result.Done {
 		t.clearSession(sessionID)
-	} else {
-		t.storeSession(sessionID, state)
+	} else if !t.updateActiveSession(sessionID, state) {
+		result.Done = true
 	}
 	return result, nil
 }
@@ -200,19 +276,21 @@ func (t *IMSUSSDTransport) CancelUSSD(ctx context.Context, req USSDRequest) erro
 	if sessionID == "" {
 		return errors.New("ussd session_id is empty")
 	}
-	state, ok := t.session(sessionID)
+	state, ok := t.allocateSessionCSeq(sessionID)
 	if !ok {
 		return nil
 	}
-	state.cseq++
-	state.cfg.CSeq = state.cseq
+	t.clearSession(sessionID)
 	bye, err := voiceclient.BuildByeRequest(state.cfg)
 	if err != nil {
 		return err
 	}
+	voiceclient.EnsureDialogRequestVia(&bye, state.cfg)
 	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, bye)
-	t.clearSession(sessionID)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
 		recovery := ClassifyIMSMessagingSIPResponseRecovery("BYE", resp)
 		return IMSRegistrationRecoveryError{Err: err, StatusCode: resp.StatusCode, RetryAfter: recovery.RetryAfter}
 	}
@@ -277,7 +355,7 @@ func (t *IMSUSSDTransport) dialogConfig(command, sessionID string, cseq int) (vo
 		RemoteURI:       remoteURI,
 		RemoteTargetURI: firstNonEmpty(t.RemoteTargetURI, remoteURI),
 		CallID:          "ussd-" + smsToken(sessionID) + "@vowifi-go",
-		LocalTag:        firstNonEmpty(t.LocalTag, "ussd"),
+		LocalTag:        firstNonEmpty(t.LocalTag, randomUSSDSIPTag("ussd")),
 		CSeq:            cseq,
 		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
 		SessionExpires:  t.SessionExpires,
@@ -306,7 +384,34 @@ func (t *IMSUSSDTransport) writeUSSDACK(ctx context.Context, cfg voiceclient.Dia
 	if err != nil {
 		return err
 	}
+	voiceclient.EnsureDialogRequestVia(&ack, cfg)
 	return t.Transport.WriteRequest(ctx, ack)
+}
+
+func (t *IMSUSSDTransport) writeRejectedUSSDInviteACK(ctx context.Context, sentInvite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
+	ack, err := voiceclient.BuildNon2xxInviteAck(sentInvite, resp)
+	if err != nil {
+		return err
+	}
+	return t.Transport.WriteRequest(ctx, ack)
+}
+
+func (t *IMSUSSDTransport) sendBestEffortUSSDBye(ctx context.Context, cfg voiceclient.DialogRequestConfig) {
+	if t == nil || t.Transport == nil {
+		return
+	}
+	if ctx == nil || ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
+	cfg.CSeq = nextMessagingCSeq(cfg.CSeq)
+	bye, err := voiceclient.BuildByeRequest(cfg)
+	if err != nil {
+		return
+	}
+	voiceclient.EnsureDialogRequestVia(&bye, cfg)
+	_, _, _ = voiceclient.RoundTripRequestWithDigestAuthResult(ctx, t.Transport, bye)
 }
 
 func ussdDialogConfigFromResponse(cfg voiceclient.DialogRequestConfig, resp voiceclient.SIPResponse) voiceclient.DialogRequestConfig {
@@ -322,29 +427,174 @@ func ussdDialogConfigFromResponse(cfg voiceclient.DialogRequestConfig, resp voic
 	return cfg
 }
 
+func (t *IMSUSSDTransport) sessionTTL() time.Duration {
+	if t != nil && t.InactivityTimeout > 0 {
+		return t.InactivityTimeout
+	}
+	return defaultUSSDSessionTTL
+}
+
+func (t *IMSUSSDTransport) pruneExpiredSessionsLocked(now time.Time) {
+	if t == nil || len(t.sessions) == 0 {
+		return
+	}
+	ttl := t.sessionTTL()
+	for id, state := range t.sessions {
+		if !state.updatedAt.IsZero() && now.Sub(state.updatedAt) >= ttl {
+			if state.timer != nil {
+				state.timer.Stop()
+			}
+			delete(t.sessions, id)
+		}
+	}
+}
+
+func (t *IMSUSSDTransport) armSessionTimerLocked(sessionID string, state *imsUSSDSession) {
+	ttl := t.sessionTTL()
+	if ttl <= 0 {
+		return
+	}
+	updatedAt := state.updatedAt
+	state.timer = time.AfterFunc(ttl, func() {
+		t.expireSession(sessionID, updatedAt)
+	})
+}
+
+func (t *IMSUSSDTransport) expireSession(sessionID string, expectedUpdatedAt time.Time) {
+	if t == nil {
+		return
+	}
+	var cfg voiceclient.DialogRequestConfig
+	var expired bool
+	t.mu.Lock()
+	if t.sessions != nil {
+		if state, ok := t.sessions[sessionID]; ok && state.updatedAt.Equal(expectedUpdatedAt) {
+			if state.timer != nil {
+				state.timer.Stop()
+			}
+			state.cseq++
+			state.cfg.CSeq = state.cseq
+			cfg = state.cfg
+			delete(t.sessions, sessionID)
+			expired = true
+		}
+	}
+	t.mu.Unlock()
+	if !expired || t.Transport == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	bye, err := voiceclient.BuildByeRequest(cfg)
+	if err != nil {
+		return
+	}
+	voiceclient.EnsureDialogRequestVia(&bye, cfg)
+	_, _, _ = voiceclient.RoundTripRequestWithDigestAuthResult(ctx, t.Transport, bye)
+}
+
 func (t *IMSUSSDTransport) session(sessionID string) (imsUSSDSession, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.sessions == nil {
 		return imsUSSDSession{}, false
 	}
+	t.pruneExpiredSessionsLocked(time.Now())
 	state, ok := t.sessions[strings.TrimSpace(sessionID)]
 	return state, ok
 }
 
+func (t *IMSUSSDTransport) allocateSessionCSeq(sessionID string) (imsUSSDSession, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sessions == nil {
+		return imsUSSDSession{}, false
+	}
+	now := time.Now()
+	t.pruneExpiredSessionsLocked(now)
+	state, ok := t.sessions[sessionID]
+	if !ok {
+		return imsUSSDSession{}, false
+	}
+	if state.timer != nil {
+		state.timer.Stop()
+	}
+	state.cseq++
+	state.cfg.CSeq = state.cseq
+	state.updatedAt = now
+	t.armSessionTimerLocked(sessionID, &state)
+	t.sessions[sessionID] = state
+	return state, true
+}
+
+func (t *IMSUSSDTransport) bumpSessionCSeqFloor(sessionID string, cseq int) {
+	sessionID = strings.TrimSpace(sessionID)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sessions == nil {
+		return
+	}
+	state, ok := t.sessions[sessionID]
+	if !ok || cseq <= state.cseq {
+		return
+	}
+	state.cseq = cseq
+	state.cfg.CSeq = cseq
+	t.sessions[sessionID] = state
+}
+
 func (t *IMSUSSDTransport) storeSession(sessionID string, state imsUSSDSession) {
+	sessionID = strings.TrimSpace(sessionID)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.sessions == nil {
 		t.sessions = make(map[string]imsUSSDSession)
 	}
-	t.sessions[strings.TrimSpace(sessionID)] = state
+	if prev, ok := t.sessions[sessionID]; ok && prev.timer != nil {
+		prev.timer.Stop()
+	}
+	if state.updatedAt.IsZero() {
+		state.updatedAt = time.Now()
+	}
+	t.armSessionTimerLocked(sessionID, &state)
+	t.sessions[sessionID] = state
+}
+
+func (t *IMSUSSDTransport) updateActiveSession(sessionID string, state imsUSSDSession) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sessions == nil {
+		return false
+	}
+	prev, ok := t.sessions[sessionID]
+	if !ok {
+		return false
+	}
+	if prev.timer != nil {
+		prev.timer.Stop()
+	}
+	if prev.cseq > state.cseq {
+		state.cseq = prev.cseq
+		state.cfg.CSeq = prev.cseq
+	}
+	if state.updatedAt.IsZero() {
+		state.updatedAt = time.Now()
+	}
+	t.armSessionTimerLocked(sessionID, &state)
+	t.sessions[sessionID] = state
+	return true
 }
 
 func (t *IMSUSSDTransport) clearSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.sessions, strings.TrimSpace(sessionID))
+	if prev, ok := t.sessions[sessionID]; ok && prev.timer != nil {
+		prev.timer.Stop()
+	}
+	delete(t.sessions, sessionID)
 }
 
 func prepareUSSDInvite(msg *voiceclient.SIPRequestMessage, boundary string) {
@@ -396,7 +646,7 @@ func buildIMSUSSDMultipartBody(localIP, boundary string, ussdBody []byte) []byte
 	out.WriteString("t=0 0\r\n")
 	out.WriteString("m=message 0 TCP/MSRP *\r\n")
 	out.WriteString("a=recvonly\r\n")
-	out.WriteString("--")
+	out.WriteString("\r\n--")
 	out.WriteString(boundary)
 	out.WriteString("\r\nContent-Type: ")
 	out.WriteString(IMSUSSDContentType)
@@ -463,6 +713,14 @@ func firstHeaderValue(headers map[string][]string, name string) string {
 }
 
 func ussdRecordRouteSet(headers map[string][]string) []string {
+	routes := ussdInboundRecordRouteSet(headers)
+	for i, j := 0, len(routes)-1; i < j; i, j = i+1, j-1 {
+		routes[i], routes[j] = routes[j], routes[i]
+	}
+	return routes
+}
+
+func ussdInboundRecordRouteSet(headers map[string][]string) []string {
 	var routes []string
 	for key, values := range headers {
 		if !strings.EqualFold(key, "Record-Route") {
@@ -476,10 +734,15 @@ func ussdRecordRouteSet(headers map[string][]string) []string {
 			}
 		}
 	}
-	for i, j := 0, len(routes)-1; i < j; i, j = i+1, j-1 {
-		routes[i], routes[j] = routes[j], routes[i]
-	}
 	return routes
+}
+
+func randomUSSDSIPTag(prefix string) string {
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	}
+	return prefix + "-" + hex.EncodeToString(raw[:])
 }
 
 func splitUSSDHeaderValues(value string) []string {

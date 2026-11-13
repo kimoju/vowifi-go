@@ -2,6 +2,8 @@ package voicehost
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -85,15 +87,59 @@ func (a *IMSOutboundAgent) UpdateIMSRegistration(update IMSRegistrationUpdate) {
 }
 
 type imsDialogState struct {
-	cfg             voiceclient.DialogRequestConfig
-	invite          voiceclient.SIPRequestMessage
-	relay           *RTPRelaySession
-	srtpNegotiation *outboundSDESRelayNegotiation
-	localSDPBody    []byte
-	early           bool
-	terminating     bool
-	refreshTimer    *time.Timer
-	refreshSeq      uint64
+	cfg                voiceclient.DialogRequestConfig
+	invite             voiceclient.SIPRequestMessage
+	relay              *RTPRelaySession
+	srtpNegotiation    *outboundSDESRelayNegotiation
+	localSDPBody       []byte
+	early              bool
+	terminating        bool
+	inviteInFlight     bool
+	provisionalSeen    bool
+	cancelRequested    bool
+	cancelSent         bool
+	canceled           bool
+	pendingCancel      DialogInfo
+	pendingAckCfg      voiceclient.DialogRequestConfig
+	hasPendingAck      bool
+	awaitingInboundAck bool
+	lastRemoteCSeq     int
+	sessionDeadline    time.Time
+	refreshTimer       *time.Timer
+	expiryTimer        *time.Timer
+	refreshSeq         uint64
+}
+
+func randomVoiceSIPTag() string {
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err == nil {
+		return hex.EncodeToString(raw[:])
+	}
+	return strconv.FormatUint(uint64(time.Now().UnixNano()), 16)
+}
+
+func cloneDialogInfo(in DialogInfo) DialogInfo {
+	out := in
+	out.Body = append([]byte(nil), in.Body...)
+	out.Headers = copyVoiceHeaderMap(in.Headers)
+	return out
+}
+
+func cloneDialogRequestConfig(cfg voiceclient.DialogRequestConfig) voiceclient.DialogRequestConfig {
+	out := cfg
+	out.RouteSet = copyStringSlice(cfg.RouteSet)
+	out.InviteHeaders = copyVoiceHeaderMap(cfg.InviteHeaders)
+	return out
+}
+
+func cloneDialogStateSnapshot(state imsDialogState) imsDialogState {
+	out := state
+	out.cfg = cloneDialogRequestConfig(state.cfg)
+	out.invite = cloneSIPRequestMessage(state.invite)
+	out.localSDPBody = append([]byte(nil), state.localSDPBody...)
+	out.pendingCancel = cloneDialogInfo(state.pendingCancel)
+	out.pendingAckCfg = cloneDialogRequestConfig(state.pendingAckCfg)
+	return out
 }
 
 func (a *IMSOutboundAgent) currentTransport() voiceclient.SIPRequestTransport {
@@ -128,6 +174,15 @@ func effectiveMediaRelayForLocalIP(base *RTPRelayConfig, localIP string) *RTPRel
 			}
 		}
 	}
+	if !cfg.RTCPReportSchedule.Enabled && cfg.RTCPReportSchedule.Interval == 0 {
+		cfg.RTCPReportSchedule = RTPRelayRTCPReportScheduleConfig{
+			Enabled:     true,
+			Interval:    5 * time.Second,
+			Kind:        RTCPReportKindSender,
+			ClientToIMS: true,
+			IMSToClient: true,
+		}
+	}
 	return &cfg
 }
 
@@ -138,7 +193,8 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if a == nil || a.currentTransport() == nil {
 		return OutboundCallResult{Accepted: false, Reason: "IMS voice transport unavailable"}, ErrIMSVoiceAgentNotReady
 	}
-	if strings.TrimSpace(req.CallID) == "" {
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
 		return OutboundCallResult{Accepted: false, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
 	}
 	a.mu.Lock()
@@ -163,8 +219,8 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		ContactURI:       registration.ContactURI,
 		RemoteURI:        remoteURI,
 		RemoteTargetURI:  firstVoiceNonEmpty(req.RequestURI, remoteTargetURI, remoteURI),
-		CallID:           strings.TrimSpace(req.CallID),
-		LocalTag:         firstVoiceNonEmpty(localTag, "vowifi-go"),
+		CallID:           callID,
+		LocalTag:         firstVoiceNonEmpty(localTag, randomVoiceSIPTag()),
 		CSeq:             1,
 		RouteSet:         copyStringSlice(req.RouteSet),
 		UserAgent:        firstVoiceNonEmpty(userAgent, profile.UserAgent, "vowifi-go"),
@@ -211,6 +267,10 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	var provisionalSDP SDPInfo
 	var provisionalAnswer []byte
 	for {
+		if a.isOutboundCancelRequested(callID) {
+			a.deleteDialog(callID)
+			return OutboundCallResult{Accepted: false, StatusCode: 487, Reason: "Request Terminated"}, nil
+		}
 		cfg.CSeq = inviteCSeq
 		if pendingInvite != nil {
 			invite = *pendingInvite
@@ -221,38 +281,151 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 				return OutboundCallResult{Accepted: false, Reason: "build IMS INVITE failed"}, err
 			}
 		}
-		a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: cfg, invite: invite, relay: relay, srtpNegotiation: srtpNegotiation, localSDPBody: localSDPBody, early: true})
+		ensureHeaderOptionTag(invite.Headers, "Supported", "precondition")
+		voiceclient.EnsureDialogRequestVia(&invite, cfg)
+		a.storeInFlightEarlyDialog(callID, cfg, invite, relay, srtpNegotiation, localSDPBody, nextCSeq)
 		provisionalSDP = SDPInfo{}
 		provisionalAnswer = nil
-		resp, err = a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
+		var sentInvite voiceclient.SIPRequestMessage
+		resp, sentInvite, err = a.roundTripInvite(ctx, invite, func(provisional voiceclient.SIPResponse) error {
+			if provisional.StatusCode < 100 || provisional.StatusCode >= 200 {
+				return nil
+			}
+			var (
+				sendDeferredCancel bool
+				deferredCancelInfo DialogInfo
+				deferredCancelCfg  voiceclient.DialogRequestConfig
+				deferredCancelInv  voiceclient.SIPRequestMessage
+			)
+			a.mu.Lock()
+			if latest, ok := a.dialogs[callID]; ok {
+				latest.provisionalSeen = true
+				if provisional.StatusCode > 100 {
+					if tag := sipHeaderTag(firstVoiceHeader(provisional.Headers, "To")); tag != "" {
+						latest.cfg.RemoteTag = tag
+						cfg.RemoteTag = tag
+					}
+					if contact := sipHeaderURI(firstVoiceHeader(provisional.Headers, "Contact")); contact != "" {
+						latest.cfg.RemoteTargetURI = contact
+						cfg.RemoteTargetURI = contact
+					}
+					if routeSet := recordRouteSet(provisional.Headers); len(routeSet) > 0 {
+						latest.cfg.RouteSet = routeSet
+						cfg.RouteSet = copyStringSlice(routeSet)
+					}
+				}
+				if latest.cancelRequested && !latest.cancelSent {
+					latest.cancelSent = true
+					sendDeferredCancel = true
+					deferredCancelInfo = cloneDialogInfo(latest.pendingCancel)
+					deferredCancelCfg = cloneDialogRequestConfig(latest.cfg)
+					deferredCancelCfg.CSeq = inviteCSeq
+					deferredCancelInv = cloneSIPRequestMessage(latest.invite)
+				}
+				a.dialogs[callID] = latest
+			}
+			a.mu.Unlock()
+			if sendDeferredCancel {
+				_, _ = a.sendOutboundCancelWire(ctx, callID, deferredCancelCfg, deferredCancelInv, deferredCancelInfo, true)
+				return nil
+			}
+			if provisional.StatusCode <= 100 {
+				return nil
+			}
+			var currentProvBody []byte
 			if body, info, ok, err := a.provisionalAnswer(provisional, relay, srtpNegotiation); err != nil {
 				return err
 			} else if ok {
+				currentProvBody = body
 				provisionalAnswer = body
 				provisionalSDP = info
 			}
-			prack, ok, err := buildReliableProvisionalPRACK(cfg, provisional, nextCSeq)
+			if req.OnProvisional != nil {
+				req.OnProvisional(OutboundProvisionalResponse{
+					StatusCode:  provisional.StatusCode,
+					Reason:      provisional.Reason,
+					ContentType: firstVoiceHeader(provisional.Headers, "Content-Type"),
+					Body:        append([]byte(nil), currentProvBody...),
+					Headers:     firstValueSIPHeaders(provisional.Headers),
+				})
+			}
+			rseq := firstVoiceHeader(provisional.Headers, "RSeq")
+			if strings.TrimSpace(rseq) == "" || !headerHasToken(provisional.Headers, "Require", "100rel") {
+				return nil
+			}
+			prackCSeq, earlyCfg := a.reserveEarlyDialogCSeq(callID, cfg, &nextCSeq)
+			earlyCfg.CSeq = inviteCSeq
+			prack, ok, err := buildReliableProvisionalPRACK(earlyCfg, provisional, prackCSeq)
 			if err != nil || !ok {
 				return err
 			}
-			prackResp, err := a.roundTripRequest(ctx, prack)
+			prackResp, sentPrack, err := a.roundTripRequestWithResult(ctx, prack)
 			if err != nil {
 				return fmt.Errorf("IMS PRACK failed: %w", err)
 			}
+			a.syncSentDialogCSeq(callID, sentPrack, &nextCSeq)
 			if prackResp.StatusCode < 200 || prackResp.StatusCode >= 300 {
 				return fmt.Errorf("IMS PRACK rejected: %d %s", prackResp.StatusCode, strings.TrimSpace(prackResp.Reason))
 			}
-			nextCSeq++
+			if pre := ParseSDPPreconditions(provisional.Body); pre.Present && !pre.Satisfied() {
+				baseOffer := localSDPBody
+				if len(baseOffer) == 0 {
+					baseOffer = inviteBody
+				}
+				confirmBody := BuildSDPPreconditionConfirmOffer(baseOffer, provisional.Body)
+				localSDPBody = append([]byte(nil), confirmBody...)
+				if relay != nil {
+					confirmBody = RewriteSDPMediaEndpoint(confirmBody, relay.IMSEndpoint())
+					if srtpNegotiation != nil {
+						confirmBody, err = srtpNegotiation.RewriteIMSMidDialogOffer(relay, confirmBody)
+						if err != nil {
+							return fmt.Errorf("IMS precondition UPDATE SRTP offer failed: %w", err)
+						}
+					}
+				}
+				updCSeq, updCfg := a.reserveEarlyDialogCSeq(callID, cfg, &nextCSeq)
+				updCfg.CSeq = updCSeq
+				updCfg.InviteHeaders = nil
+				updReq, err := voiceclient.BuildUpdateRequest(updCfg, confirmBody)
+				if err != nil {
+					return fmt.Errorf("build IMS precondition UPDATE failed: %w", err)
+				}
+				updResp, sentUpd, err := a.roundTripRequestWithResult(ctx, updReq)
+				if err != nil {
+					return fmt.Errorf("IMS precondition UPDATE failed: %w", err)
+				}
+				a.syncSentDialogCSeq(callID, sentUpd, &nextCSeq)
+				if updResp.StatusCode < 200 || updResp.StatusCode >= 300 {
+					return fmt.Errorf("IMS precondition UPDATE rejected: %d %s", updResp.StatusCode, strings.TrimSpace(updResp.Reason))
+				}
+				if body, info, ok, err := a.provisionalAnswer(updResp, relay, srtpNegotiation); err != nil {
+					return err
+				} else if ok {
+					provisionalAnswer = body
+					provisionalSDP = info
+				}
+			}
 			return nil
 		})
 		if err != nil {
-			a.deleteDialog(strings.TrimSpace(req.CallID))
+			a.deleteDialog(callID)
 			return OutboundCallResult{Accepted: false, Reason: "IMS INVITE failed", RegistrationRecoveryNeeded: true}, err
+		}
+		invite = sentInvite
+		if sentCSeq := voiceclient.ParseSIPCSeqNumber(sentInvite.Headers["CSeq"]); sentCSeq > 0 {
+			inviteCSeq = sentCSeq
+			cfg.CSeq = sentCSeq
+			if next := outboundNextCSeq(sentCSeq); next > nextCSeq {
+				nextCSeq = next
+			}
+		}
+		if a.isOutboundCancelRequested(callID) {
+			break
 		}
 		if isInviteDigestChallenge(resp) && invite.AuthSession != nil && allowDigestChallengeRetry && digestChallengeRetries < 2 {
 			retryCfg, retryInvite, retryResult, ok, err := a.buildInviteDigestChallengeRetry(ctx, cfg, invite, resp, nextCSeq, inviteBody)
 			if err != nil {
-				a.deleteDialog(strings.TrimSpace(req.CallID))
+				a.deleteDialog(callID)
 				return OutboundCallResult{Accepted: false, Reason: "IMS INVITE digest challenge failed", RegistrationRecoveryNeeded: true}, err
 			}
 			if ok {
@@ -268,7 +441,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		if resp.StatusCode == 422 && !retriedSessionInterval {
 			if retryCfg, ok := retryDialogConfigForMinSE(cfg, invite.Headers, resp.Headers); ok {
 				if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
-					a.deleteDialog(strings.TrimSpace(req.CallID))
+					a.deleteDialog(callID)
 					return OutboundCallResult{Accepted: false, Reason: "IMS INVITE session interval ACK failed"}, err
 				}
 				retryCfg.CSeq = nextCSeq
@@ -282,7 +455,7 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		if redirectRetries < maxIMSInviteRedirects {
 			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextCSeq); ok {
 				if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
-					a.deleteDialog(strings.TrimSpace(req.CallID))
+					a.deleteDialog(callID)
 					return OutboundCallResult{Accepted: false, Reason: "IMS INVITE redirect ACK failed"}, err
 				}
 				cfg = retryCfg
@@ -297,11 +470,19 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp.StatusCode >= 300 {
 			if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
-				a.deleteDialog(strings.TrimSpace(req.CallID))
+				a.deleteDialog(callID)
 				return OutboundCallResult{Accepted: false, Reason: "IMS INVITE rejected ACK failed"}, err
 			}
 		}
-		a.deleteDialog(strings.TrimSpace(req.CallID))
+		canceled := a.isOutboundCancelRequested(callID)
+		a.deleteDialog(callID)
+		if canceled {
+			return OutboundCallResult{
+				Accepted:   false,
+				StatusCode: 487,
+				Reason:     "Request Terminated",
+			}, nil
+		}
 		return OutboundCallResult{
 			Accepted:                   false,
 			StatusCode:                 outboundStatusCode(resp.StatusCode, 486),
@@ -313,20 +494,48 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if routeSet := recordRouteSet(resp.Headers); len(routeSet) > 0 {
 		cfg.RouteSet = routeSet
 	}
-	cfg.RemoteTag = sipHeaderTag(firstVoiceHeader(resp.Headers, "To"))
+	cfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		cfg.RemoteTargetURI = contact
 	}
-	applyNegotiatedSessionInterval(&cfg, resp.Headers)
+	defaultRefresher := firstVoiceNonEmpty(normalizeSessionRefresher(cfg.SessionRefresher), "uac")
+	applyNegotiatedSessionIntervalWithDefault(&cfg, resp.Headers, defaultRefresher)
 	cfg.InviteHeaders = nil
 	ack, err := voiceclient.BuildAckRequest(cfg)
 	if err != nil {
-		a.deleteDialog(strings.TrimSpace(req.CallID))
+		a.deleteDialog(callID)
 		return OutboundCallResult{Accepted: false, Reason: "build IMS ACK failed"}, err
 	}
 	if err := a.writeRequest(ctx, ack); err != nil {
-		a.deleteDialog(strings.TrimSpace(req.CallID))
+		a.deleteDialog(callID)
 		return OutboundCallResult{Accepted: false, Reason: "IMS ACK failed"}, err
+	}
+	a.mu.Lock()
+	cancelGlare := false
+	if latest, ok := a.dialogs[callID]; ok {
+		if latest.cfg.CSeq > nextCSeq {
+			nextCSeq = latest.cfg.CSeq
+		}
+		if len(latest.localSDPBody) > 0 {
+			localSDPBody = append([]byte(nil), latest.localSDPBody...)
+		}
+		cancelGlare = latest.cancelRequested || latest.canceled
+	}
+	a.mu.Unlock()
+	if cancelGlare {
+		byeCfg := cfg
+		byeCfg.CSeq = nextCSeq
+		if byeReq, buildErr := voiceclient.BuildByeRequestWithBody(byeCfg, "", nil); buildErr == nil {
+			termCtx, cancelTerm := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			_, _, _ = a.roundTripRequestWithResult(termCtx, byeReq)
+			cancelTerm()
+		}
+		a.deleteDialog(callID)
+		return OutboundCallResult{
+			Accepted:   false,
+			StatusCode: 487,
+			Reason:     "Request Terminated",
+		}, nil
 	}
 	answerBody := append([]byte(nil), resp.Body...)
 	localSDP := provisionalSDP
@@ -336,27 +545,27 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if len(resp.Body) > 0 {
 		parsed, err := ParseSDP(resp.Body)
 		if err != nil {
-			a.deleteDialog(strings.TrimSpace(req.CallID))
+			a.deleteDialog(callID)
 			return OutboundCallResult{Accepted: false, Reason: "invalid IMS SDP answer"}, err
 		}
 		localSDP = parsed
 	}
 	if relay != nil && len(resp.Body) > 0 {
 		if err := relay.SetIMSRemote(localSDP); err != nil {
-			a.deleteDialog(strings.TrimSpace(req.CallID))
+			a.deleteDialog(callID)
 			return OutboundCallResult{Accepted: false, Reason: "RTP relay remote setup failed"}, err
 		}
 		if srtpNegotiation != nil {
 			answerBody, localSDP, err = srtpNegotiation.RewriteClientAnswer(relay, resp.Body, localSDP)
 			if err != nil {
-				a.deleteDialog(strings.TrimSpace(req.CallID))
+				a.deleteDialog(callID)
 				return OutboundCallResult{Accepted: false, Reason: "invalid RTP relay SRTP SDP answer"}, err
 			}
 		} else {
 			answerBody = RewriteSDPMediaEndpoint(resp.Body, relay.ClientEndpoint())
 			localSDP, err = ParseSDP(answerBody)
 			if err != nil {
-				a.deleteDialog(strings.TrimSpace(req.CallID))
+				a.deleteDialog(callID)
 				return OutboundCallResult{Accepted: false, Reason: "invalid RTP relay SDP answer"}, err
 			}
 		}
@@ -364,15 +573,25 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 	if localSDP.MediaPort <= 0 || strings.TrimSpace(localSDP.ConnectionIP) == "" {
 		parsed, err := ParseSDP(answerBody)
 		if err != nil {
-			a.deleteDialog(strings.TrimSpace(req.CallID))
+			a.deleteDialog(callID)
 			return OutboundCallResult{Accepted: false, Reason: "invalid IMS SDP answer"}, err
 		}
 		localSDP = parsed
 	}
 	byeCfg := cfg
 	byeCfg.CSeq = nextCSeq
-	a.storeDialog(strings.TrimSpace(req.CallID), imsDialogState{cfg: byeCfg, relay: relay, srtpNegotiation: srtpNegotiation, localSDPBody: localSDPBody})
-	a.scheduleDialogSessionRefresh(strings.TrimSpace(req.CallID))
+	var sessionDeadline time.Time
+	if byeCfg.SessionExpires > 0 {
+		sessionDeadline = time.Now().Add(sessionExpirationTimeout(byeCfg.SessionExpires))
+	}
+	a.storeDialog(callID, imsDialogState{
+		cfg:             byeCfg,
+		relay:           relay,
+		srtpNegotiation: srtpNegotiation,
+		localSDPBody:    localSDPBody,
+		sessionDeadline: sessionDeadline,
+	})
+	a.scheduleDialogSessionRefresh(callID)
 	closeRelayOnError = false
 	return OutboundCallResult{
 		Accepted:   true,
@@ -382,6 +601,103 @@ func (a *IMSOutboundAgent) StartOutboundCall(ctx context.Context, req OutboundCa
 		RawSDP:     answerBody,
 		Headers:    firstValueSIPHeaders(resp.Headers),
 	}, nil
+}
+
+func (a *IMSOutboundAgent) storeInFlightEarlyDialog(callID string, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, relay *RTPRelaySession, srtpNegotiation *outboundSDESRelayNegotiation, localSDPBody []byte, nextCSeq int) {
+	if a == nil || strings.TrimSpace(callID) == "" {
+		return
+	}
+	callID = strings.TrimSpace(callID)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.dialogs == nil {
+		a.dialogs = make(map[string]imsDialogState)
+	}
+	prev, hadPrev := a.dialogs[callID]
+	if hadPrev && prev.refreshTimer != nil {
+		prev.refreshTimer.Stop()
+	}
+	storedCfg := cloneDialogRequestConfig(cfg)
+	if nextCSeq > storedCfg.CSeq {
+		storedCfg.CSeq = nextCSeq
+	}
+	state := imsDialogState{
+		cfg:             storedCfg,
+		invite:          cloneSIPRequestMessage(invite),
+		relay:           relay,
+		srtpNegotiation: srtpNegotiation,
+		localSDPBody:    append([]byte(nil), localSDPBody...),
+		early:           true,
+		inviteInFlight:  true,
+	}
+	if hadPrev {
+		state.cancelRequested = prev.cancelRequested
+		state.canceled = prev.canceled
+		state.pendingCancel = cloneDialogInfo(prev.pendingCancel)
+	}
+	a.dialogs[callID] = state
+}
+
+func (a *IMSOutboundAgent) isOutboundCancelRequested(callID string) bool {
+	if a == nil || strings.TrimSpace(callID) == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state, ok := a.dialogs[strings.TrimSpace(callID)]
+	return ok && (state.cancelRequested || state.canceled)
+}
+
+func (a *IMSOutboundAgent) reserveEarlyDialogCSeq(callID string, fallback voiceclient.DialogRequestConfig, nextCSeq *int) (int, voiceclient.DialogRequestConfig) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cseq := 2
+	if nextCSeq != nil && *nextCSeq > cseq {
+		cseq = *nextCSeq
+	}
+	cfg := cloneDialogRequestConfig(fallback)
+	if latest, ok := a.dialogs[callID]; ok {
+		if latest.cfg.CSeq > cseq {
+			cseq = latest.cfg.CSeq
+		}
+		cfg = cloneDialogRequestConfig(latest.cfg)
+		latest.cfg.CSeq = outboundNextCSeq(cseq)
+		a.dialogs[callID] = latest
+	}
+	if nextCSeq != nil {
+		*nextCSeq = outboundNextCSeq(cseq)
+	}
+	return cseq, cfg
+}
+
+func (a *IMSOutboundAgent) syncSentDialogCSeq(callID string, sent voiceclient.SIPRequestMessage, nextCSeq *int) {
+	sentCSeq := voiceclient.ParseSIPCSeqNumber(sent.Headers["CSeq"])
+	if sentCSeq <= 0 {
+		return
+	}
+	after := outboundNextCSeq(sentCSeq)
+	if nextCSeq != nil && after > *nextCSeq {
+		*nextCSeq = after
+	}
+	a.mu.Lock()
+	if latest, ok := a.dialogs[callID]; ok && after > latest.cfg.CSeq {
+		latest.cfg.CSeq = after
+		a.dialogs[callID] = latest
+	}
+	a.mu.Unlock()
+}
+
+func (a *IMSOutboundAgent) allocateDialogCSeq(callID string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	latest, ok := a.dialogs[callID]
+	if !ok {
+		return 2
+	}
+	cseq := outboundInviteCSeq(latest.cfg.CSeq)
+	latest.cfg.CSeq = outboundNextCSeq(cseq)
+	a.dialogs[callID] = latest
+	return cseq
 }
 
 func (a *IMSOutboundAgent) EndVoiceCall(ctx context.Context, info DialogInfo) error {
@@ -425,7 +741,7 @@ func (a *IMSOutboundAgent) EndVoiceCallWithResult(ctx context.Context, info Dial
 		a.mu.Unlock()
 		return DialogInfoResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cfg := state.cfg
+	cfg := cloneDialogRequestConfig(state.cfg)
 	bye, err := voiceclient.BuildByeRequestWithBody(cfg, info.ContentType, info.Body)
 	if err != nil {
 		a.mu.Unlock()
@@ -436,8 +752,10 @@ func (a *IMSOutboundAgent) EndVoiceCallWithResult(ctx context.Context, info Dial
 	state.terminating = true
 	stopDialogSessionRefresh(&state)
 	a.dialogs[callID] = state
+	relay := state.relay
 	a.mu.Unlock()
-	resp, err := a.roundTripRequest(ctx, bye)
+	resp, sentBye, err := a.roundTripRequestWithResult(ctx, bye)
+	a.syncSentDialogCSeq(callID, sentBye, nil)
 	if err != nil {
 		a.resumeDialogSessionRefreshAfterTerminating(callID)
 		return DialogInfoResult{Accepted: false, Reason: "IMS BYE failed", RegistrationRecoveryNeeded: true}, err
@@ -457,11 +775,20 @@ func (a *IMSOutboundAgent) EndVoiceCallWithResult(ctx context.Context, info Dial
 		Headers:                    firstValueSIPHeaders(resp.Headers),
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == 481 {
+			if relay != nil {
+				_ = relay.Close()
+			}
+			a.mu.Lock()
+			delete(a.dialogs, callID)
+			a.mu.Unlock()
+			return result, fmt.Errorf("IMS BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
+		}
 		a.resumeDialogSessionRefreshAfterTerminating(callID)
 		return result, fmt.Errorf("IMS BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
-	if state.relay != nil {
-		_ = state.relay.Close()
+	if relay != nil {
+		_ = relay.Close()
 	}
 	a.mu.Lock()
 	delete(a.dialogs, callID)
@@ -486,7 +813,9 @@ func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoReq
 		a.mu.Unlock()
 		return DialogInfoResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cfg := state.cfg
+	cfg := cloneDialogRequestConfig(state.cfg)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
 	a.mu.Unlock()
 
 	var resp voiceclient.SIPResponse
@@ -497,14 +826,17 @@ func (a *IMSOutboundAgent) SendDialogInfo(ctx context.Context, req DialogInfoReq
 			return DialogInfoResult{Accepted: false, StatusCode: 500, Reason: "build IMS INFO failed"}, err
 		}
 		applyDialogInfoHeaders(info.Headers, req.InfoPackage, req.Headers)
-		a.storeOutboundDialogAttempt(callID, cfg)
-		resp, err = a.roundTripRequest(ctx, info)
+		var sent voiceclient.SIPRequestMessage
+		resp, sent, err = a.roundTripRequestWithResult(ctx, info)
+		a.syncSentDialogCSeq(callID, sent, nil)
 		if err != nil {
 			return DialogInfoResult{Accepted: false, Reason: "IMS INFO failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if redirectRetries < maxIMSInviteRedirects {
-			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
-				cfg = retryCfg
+			if target := firstIMSRedirectContactURI(resp); target != "" {
+				cfg.RemoteTargetURI = target
+				cfg.CSeq = a.allocateDialogCSeq(callID)
+				a.storeOutboundDialogTarget(callID, target)
 				redirectRetries++
 				continue
 			}
@@ -544,7 +876,9 @@ func (a *IMSOutboundAgent) SendDialogMessage(ctx context.Context, req DialogMess
 		a.mu.Unlock()
 		return DialogMessageResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cfg := state.cfg
+	cfg := cloneDialogRequestConfig(state.cfg)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
 	a.mu.Unlock()
 
 	var resp voiceclient.SIPResponse
@@ -555,14 +889,17 @@ func (a *IMSOutboundAgent) SendDialogMessage(ctx context.Context, req DialogMess
 			return DialogMessageResult{Accepted: false, StatusCode: 500, Reason: "build IMS MESSAGE failed"}, err
 		}
 		applyDialogUpdateHeaders(msg.Headers, req.Headers)
-		a.storeOutboundDialogAttempt(callID, cfg)
-		resp, err = a.roundTripRequest(ctx, msg)
+		var sent voiceclient.SIPRequestMessage
+		resp, sent, err = a.roundTripRequestWithResult(ctx, msg)
+		a.syncSentDialogCSeq(callID, sent, nil)
 		if err != nil {
 			return DialogMessageResult{Accepted: false, Reason: "IMS MESSAGE failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if redirectRetries < maxIMSInviteRedirects {
-			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
-				cfg = retryCfg
+			if target := firstIMSRedirectContactURI(resp); target != "" {
+				cfg.RemoteTargetURI = target
+				cfg.CSeq = a.allocateDialogCSeq(callID)
+				a.storeOutboundDialogTarget(callID, target)
 				redirectRetries++
 				continue
 			}
@@ -608,19 +945,31 @@ func (a *IMSOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrackR
 		a.mu.Unlock()
 		return DialogPrackResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cfg := state.cfg
-	if len(body) > 0 && state.relay != nil {
+	relay := state.relay
+	srtpNeg := state.srtpNegotiation
+	if len(body) > 0 && relay != nil {
 		clientSDP, err := ParseSDP(body)
 		if err != nil {
 			a.mu.Unlock()
 			return DialogPrackResult{Accepted: false, StatusCode: 488, Reason: "invalid client PRACK SDP"}, err
 		}
-		if err := state.relay.SetClientRemote(clientSDP); err != nil {
+		if err := relay.SetClientRemote(clientSDP); err != nil {
 			a.mu.Unlock()
 			return DialogPrackResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client PRACK failed"}, err
 		}
-		body = RewriteSDPMediaEndpoint(body, state.relay.IMSEndpoint())
+		body = RewriteSDPMediaEndpoint(body, relay.IMSEndpoint())
+		if srtpNeg != nil {
+			rewritten, err := srtpNeg.RewriteIMSMidDialogOffer(relay, body)
+			if err != nil {
+				a.mu.Unlock()
+				return DialogPrackResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP PRACK SDP"}, err
+			}
+			body = rewritten
+		}
 	}
+	cfg := cloneDialogRequestConfig(state.cfg)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
 	a.mu.Unlock()
 
 	var resp voiceclient.SIPResponse
@@ -631,14 +980,17 @@ func (a *IMSOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrackR
 			return DialogPrackResult{Accepted: false, StatusCode: 500, Reason: "build IMS PRACK failed"}, err
 		}
 		applyDialogUpdateHeaders(prack.Headers, req.Headers)
-		a.storeOutboundDialogAttempt(callID, cfg)
-		resp, err = a.roundTripRequest(ctx, prack)
+		var sent voiceclient.SIPRequestMessage
+		resp, sent, err = a.roundTripRequestWithResult(ctx, prack)
+		a.syncSentDialogCSeq(callID, sent, nil)
 		if err != nil {
 			return DialogPrackResult{Accepted: false, Reason: "IMS PRACK failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if redirectRetries < maxIMSInviteRedirects {
-			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
-				cfg = retryCfg
+			if target := firstIMSRedirectContactURI(resp); target != "" {
+				cfg.RemoteTargetURI = target
+				cfg.CSeq = a.allocateDialogCSeq(callID)
+				a.storeOutboundDialogTarget(callID, target)
 				redirectRetries++
 				continue
 			}
@@ -647,15 +999,22 @@ func (a *IMSOutboundAgent) SendDialogPrack(ctx context.Context, req DialogPrackR
 	}
 	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
 	resultBody := append([]byte(nil), resp.Body...)
-	if accepted && len(resultBody) > 0 && state.relay != nil {
+	if accepted && len(resultBody) > 0 && relay != nil {
 		imsSDP, err := ParseSDP(resultBody)
 		if err != nil {
 			return DialogPrackResult{Accepted: false, StatusCode: 488, Reason: "invalid IMS PRACK SDP answer"}, err
 		}
-		if err := state.relay.SetIMSRemote(imsSDP); err != nil {
+		if err := relay.SetIMSRemote(imsSDP); err != nil {
 			return DialogPrackResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS PRACK failed"}, err
 		}
-		resultBody = RewriteSDPMediaEndpoint(resultBody, state.relay.ClientEndpoint())
+		if srtpNeg != nil {
+			resultBody, _, err = srtpNeg.RewriteClientAnswer(relay, resp.Body, imsSDP)
+			if err != nil {
+				return DialogPrackResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP PRACK SDP answer"}, err
+			}
+		} else {
+			resultBody = RewriteSDPMediaEndpoint(resultBody, relay.ClientEndpoint())
+		}
 	}
 	if accepted {
 		a.mu.Lock()
@@ -699,7 +1058,9 @@ func (a *IMSOutboundAgent) SendDialogOptions(ctx context.Context, req DialogOpti
 		a.mu.Unlock()
 		return DialogOptionsResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cfg := state.cfg
+	cfg := cloneDialogRequestConfig(state.cfg)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
 	a.mu.Unlock()
 
 	var resp voiceclient.SIPResponse
@@ -710,14 +1071,17 @@ func (a *IMSOutboundAgent) SendDialogOptions(ctx context.Context, req DialogOpti
 			return DialogOptionsResult{Accepted: false, StatusCode: 500, Reason: "build IMS OPTIONS failed"}, err
 		}
 		applyDialogUpdateHeaders(options.Headers, req.Headers)
-		a.storeOutboundDialogAttempt(callID, cfg)
-		resp, err = a.roundTripRequest(ctx, options)
+		var sent voiceclient.SIPRequestMessage
+		resp, sent, err = a.roundTripRequestWithResult(ctx, options)
+		a.syncSentDialogCSeq(callID, sent, nil)
 		if err != nil {
 			return DialogOptionsResult{Accepted: false, Reason: "IMS OPTIONS failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if redirectRetries < maxIMSInviteRedirects {
-			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
-				cfg = retryCfg
+			if target := firstIMSRedirectContactURI(resp); target != "" {
+				cfg.RemoteTargetURI = target
+				cfg.CSeq = a.allocateDialogCSeq(callID)
+				a.storeOutboundDialogTarget(callID, target)
 				redirectRetries++
 				continue
 			}
@@ -766,7 +1130,9 @@ func (a *IMSOutboundAgent) SendDialogRefer(ctx context.Context, req DialogReferR
 		a.mu.Unlock()
 		return DialogReferResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cfg := state.cfg
+	cfg := cloneDialogRequestConfig(state.cfg)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
 	a.mu.Unlock()
 
 	var resp voiceclient.SIPResponse
@@ -781,14 +1147,17 @@ func (a *IMSOutboundAgent) SendDialogRefer(ctx context.Context, req DialogReferR
 		}
 		applyDialogUpdateHeaders(refer.Headers, req.Headers)
 		refer.Headers["Refer-Sub"] = effectiveReferSub
-		a.storeOutboundDialogAttempt(callID, cfg)
-		resp, err = a.roundTripRequest(ctx, refer)
+		var sent voiceclient.SIPRequestMessage
+		resp, sent, err = a.roundTripRequestWithResult(ctx, refer)
+		a.syncSentDialogCSeq(callID, sent, nil)
 		if err != nil {
 			return DialogReferResult{Accepted: false, Reason: "IMS REFER failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if redirectRetries < maxIMSInviteRedirects {
-			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
-				cfg = retryCfg
+			if target := firstIMSRedirectContactURI(resp); target != "" {
+				cfg.RemoteTargetURI = target
+				cfg.CSeq = a.allocateDialogCSeq(callID)
+				a.storeOutboundDialogTarget(callID, target)
 				redirectRetries++
 				continue
 			}
@@ -836,7 +1205,9 @@ func (a *IMSOutboundAgent) SendDialogNotify(ctx context.Context, req DialogNotif
 		a.mu.Unlock()
 		return DialogNotifyResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cfg := state.cfg
+	cfg := cloneDialogRequestConfig(state.cfg)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
 	a.mu.Unlock()
 
 	var resp voiceclient.SIPResponse
@@ -847,14 +1218,17 @@ func (a *IMSOutboundAgent) SendDialogNotify(ctx context.Context, req DialogNotif
 			return DialogNotifyResult{Accepted: false, StatusCode: 500, Reason: "build IMS NOTIFY failed"}, err
 		}
 		applyDialogUpdateHeaders(notify.Headers, req.Headers)
-		a.storeOutboundDialogAttempt(callID, cfg)
-		resp, err = a.roundTripRequest(ctx, notify)
+		var sent voiceclient.SIPRequestMessage
+		resp, sent, err = a.roundTripRequestWithResult(ctx, notify)
+		a.syncSentDialogCSeq(callID, sent, nil)
 		if err != nil {
 			return DialogNotifyResult{Accepted: false, Reason: "IMS NOTIFY failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if redirectRetries < maxIMSInviteRedirects {
-			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
-				cfg = retryCfg
+			if target := firstIMSRedirectContactURI(resp); target != "" {
+				cfg.RemoteTargetURI = target
+				cfg.CSeq = a.allocateDialogCSeq(callID)
+				a.storeOutboundDialogTarget(callID, target)
 				redirectRetries++
 				continue
 			}
@@ -898,7 +1272,9 @@ func (a *IMSOutboundAgent) SendDialogSubscribe(ctx context.Context, req DialogSu
 		a.mu.Unlock()
 		return DialogSubscribeResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cfg := state.cfg
+	cfg := cloneDialogRequestConfig(state.cfg)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
 	a.mu.Unlock()
 
 	var resp voiceclient.SIPResponse
@@ -915,22 +1291,27 @@ func (a *IMSOutboundAgent) SendDialogSubscribe(ctx context.Context, req DialogSu
 		if subscribeExpires != "" {
 			subscribe.Headers["Expires"] = subscribeExpires
 		}
-		a.storeOutboundDialogAttempt(callID, cfg)
-		resp, err = a.roundTripRequest(ctx, subscribe)
+		var sent voiceclient.SIPRequestMessage
+		resp, sent, err = a.roundTripRequestWithResult(ctx, subscribe)
+		a.syncSentDialogCSeq(callID, sent, nil)
 		if err != nil {
 			return DialogSubscribeResult{Accepted: false, Reason: "IMS SUBSCRIBE failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if resp.StatusCode == 423 && !retriedMinExpires {
 			if retryCfg, retryExpires, ok := retryDialogConfigForMinExpires(cfg, subscribe.Headers, resp.Headers); ok {
+				retryCfg.CSeq = a.allocateDialogCSeq(callID)
 				cfg = retryCfg
 				subscribeExpires = retryExpires
+				a.storeOutboundDialogTarget(callID, cfg.RemoteTargetURI)
 				retriedMinExpires = true
 				continue
 			}
 		}
 		if redirectRetries < maxIMSInviteRedirects {
-			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
-				cfg = retryCfg
+			if target := firstIMSRedirectContactURI(resp); target != "" {
+				cfg.RemoteTargetURI = target
+				cfg.CSeq = a.allocateDialogCSeq(callID)
+				a.storeOutboundDialogTarget(callID, target)
 				redirectRetries++
 				continue
 			}
@@ -976,19 +1357,31 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 		a.mu.Unlock()
 		return DialogUpdateResult{Accepted: false, StatusCode: 481, Reason: "dialog terminating"}, nil
 	}
-	cfg := state.cfg
-	if len(body) > 0 && state.relay != nil {
+	relay := state.relay
+	srtpNeg := state.srtpNegotiation
+	if len(body) > 0 && relay != nil {
 		clientSDP, err := ParseSDP(body)
 		if err != nil {
 			a.mu.Unlock()
 			return DialogUpdateResult{Accepted: false, StatusCode: 488, Reason: "invalid client UPDATE SDP"}, err
 		}
-		if err := state.relay.SetClientRemote(clientSDP); err != nil {
+		if err := relay.SetClientRemote(clientSDP); err != nil {
 			a.mu.Unlock()
 			return DialogUpdateResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client update failed"}, err
 		}
-		body = RewriteSDPMediaEndpoint(body, state.relay.IMSEndpoint())
+		body = RewriteSDPMediaEndpoint(body, relay.IMSEndpoint())
+		if srtpNeg != nil {
+			rewritten, err := srtpNeg.RewriteIMSMidDialogOffer(relay, body)
+			if err != nil {
+				a.mu.Unlock()
+				return DialogUpdateResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP UPDATE SDP"}, err
+			}
+			body = rewritten
+		}
 	}
+	cfg := cloneDialogRequestConfig(state.cfg)
+	state.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
+	a.dialogs[callID] = state
 	a.mu.Unlock()
 
 	buildUpdate := func(sendCfg voiceclient.DialogRequestConfig, forceSessionHeaders bool) (voiceclient.SIPRequestMessage, error) {
@@ -1008,10 +1401,9 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 		}
 		return update, nil
 	}
-	storeAttempt := func(sendCfg voiceclient.DialogRequestConfig) {
+	storeSessionFields := func(sendCfg voiceclient.DialogRequestConfig) {
 		a.mu.Lock()
 		if latest, ok := a.dialogs[callID]; ok {
-			latest.cfg.CSeq = outboundNextCSeq(sendCfg.CSeq)
 			latest.cfg.RemoteTargetURI = sendCfg.RemoteTargetURI
 			latest.cfg.SessionExpires = sendCfg.SessionExpires
 			latest.cfg.SessionRefresher = sendCfg.SessionRefresher
@@ -1033,13 +1425,16 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 		if err != nil {
 			return DialogUpdateResult{Accepted: false, StatusCode: 500, Reason: "build IMS UPDATE failed"}, err
 		}
-		storeAttempt(cfg)
-		resp, err = a.roundTripRequest(ctx, update)
+		storeSessionFields(cfg)
+		var sent voiceclient.SIPRequestMessage
+		resp, sent, err = a.roundTripRequestWithResult(ctx, update)
+		a.syncSentDialogCSeq(callID, sent, nil)
 		if err != nil {
 			return DialogUpdateResult{Accepted: false, Reason: "IMS UPDATE failed", RegistrationRecoveryNeeded: true}, err
 		}
 		if resp.StatusCode == 422 && !retriedSessionInterval {
 			if retryCfg, ok := retryDialogConfigForMinSE(cfg, update.Headers, resp.Headers); ok {
+				retryCfg.CSeq = a.allocateDialogCSeq(callID)
 				cfg = retryCfg
 				retriedSessionInterval = true
 				forceSessionHeaders = true
@@ -1047,7 +1442,7 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 			}
 		}
 		if glareRetries < maxIMSDialogGlareRetries {
-			if retryCfg, delay, ok := retryDialogConfigForGlare(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
+			if retryCfg, delay, ok := retryDialogConfigForGlare(cfg, resp, 0); ok {
 				if err := waitForIMSDialogRetry(ctx, delay); err != nil {
 					return DialogUpdateResult{
 						Accepted:                   false,
@@ -1060,14 +1455,16 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 						Headers:                    firstValueSIPHeaders(resp.Headers),
 					}, err
 				}
+				retryCfg.CSeq = a.allocateDialogCSeq(callID)
 				cfg = retryCfg
 				glareRetries++
 				continue
 			}
 		}
 		if redirectRetries < maxIMSInviteRedirects {
-			if retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, outboundNextCSeq(cfg.CSeq)); ok {
-				cfg = retryCfg
+			if target := firstIMSRedirectContactURI(resp); target != "" {
+				cfg.RemoteTargetURI = target
+				cfg.CSeq = a.allocateDialogCSeq(callID)
 				redirectRetries++
 				continue
 			}
@@ -1076,15 +1473,22 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 	}
 	accepted := resp.StatusCode >= 200 && resp.StatusCode < 300
 	resultBody := append([]byte(nil), resp.Body...)
-	if accepted && len(resultBody) > 0 && state.relay != nil {
+	if accepted && len(resultBody) > 0 && relay != nil {
 		imsSDP, err := ParseSDP(resultBody)
 		if err != nil {
 			return DialogUpdateResult{Accepted: false, StatusCode: 488, Reason: "invalid IMS UPDATE SDP answer"}, err
 		}
-		if err := state.relay.SetIMSRemote(imsSDP); err != nil {
+		if err := relay.SetIMSRemote(imsSDP); err != nil {
 			return DialogUpdateResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS update failed"}, err
 		}
-		resultBody = RewriteSDPMediaEndpoint(resultBody, state.relay.ClientEndpoint())
+		if srtpNeg != nil {
+			resultBody, _, err = srtpNeg.RewriteClientAnswer(relay, resp.Body, imsSDP)
+			if err != nil {
+				return DialogUpdateResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP UPDATE SDP answer"}, err
+			}
+		} else {
+			resultBody = RewriteSDPMediaEndpoint(resultBody, relay.ClientEndpoint())
+		}
 	}
 	if accepted {
 		a.mu.Lock()
@@ -1095,7 +1499,13 @@ func (a *IMSOutboundAgent) SendDialogUpdate(ctx context.Context, req DialogUpdat
 			if len(localSDPBody) > 0 {
 				latest.localSDPBody = append([]byte(nil), localSDPBody...)
 			}
-			applyNegotiatedSessionInterval(&latest.cfg, resp.Headers)
+			defaultRef := firstVoiceNonEmpty(normalizeSessionRefresher(latest.cfg.SessionRefresher), "uac")
+			applyNegotiatedSessionIntervalWithDefault(&latest.cfg, resp.Headers, defaultRef)
+			if latest.cfg.SessionExpires > 0 {
+				latest.sessionDeadline = time.Now().Add(sessionExpirationTimeout(latest.cfg.SessionExpires))
+			} else {
+				latest.sessionDeadline = time.Time{}
+			}
 			a.dialogs[callID] = latest
 		}
 		a.mu.Unlock()
@@ -1144,19 +1554,29 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 		a.mu.Unlock()
 		return DialogReinviteResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cfg := state.cfg
+	relay := state.relay
+	srtpNeg := state.srtpNegotiation
+	cfg := cloneDialogRequestConfig(state.cfg)
 	nextCSeq := outboundNextCSeq(cfg.CSeq)
-	if len(body) > 0 && state.relay != nil {
+	if len(body) > 0 && relay != nil {
 		clientSDP, err := ParseSDP(body)
 		if err != nil {
 			a.mu.Unlock()
 			return DialogReinviteResult{Accepted: false, StatusCode: 488, Reason: "invalid client re-INVITE SDP"}, err
 		}
-		if err := state.relay.SetClientRemote(clientSDP); err != nil {
+		if err := relay.SetClientRemote(clientSDP); err != nil {
 			a.mu.Unlock()
 			return DialogReinviteResult{Accepted: false, StatusCode: 503, Reason: "RTP relay client re-INVITE failed"}, err
 		}
-		body = RewriteSDPMediaEndpoint(body, state.relay.IMSEndpoint())
+		body = RewriteSDPMediaEndpoint(body, relay.IMSEndpoint())
+		if srtpNeg != nil {
+			rewritten, err := srtpNeg.RewriteIMSMidDialogOffer(relay, body)
+			if err != nil {
+				a.mu.Unlock()
+				return DialogReinviteResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP re-INVITE SDP"}, err
+			}
+			body = rewritten
+		}
 	}
 	invite, err := voiceclient.BuildInviteRequest(cfg, body)
 	if err != nil {
@@ -1167,38 +1587,55 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 		invite.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
 	}
 	applyDialogUpdateHeaders(invite.Headers, req.Headers)
+	voiceclient.EnsureDialogRequestVia(&invite, cfg)
 	state.cfg.CSeq = nextCSeq
 	a.dialogs[callID] = state
 	a.mu.Unlock()
 	activeCfg := cfg
 	activeInvite := invite
-	sendReinvite := func(sendCfg voiceclient.DialogRequestConfig, sendInvite voiceclient.SIPRequestMessage, label string) (voiceclient.SIPResponse, error) {
+	sendReinvite := func(sendCfg voiceclient.DialogRequestConfig, sendInvite voiceclient.SIPRequestMessage, label string) (voiceclient.SIPResponse, voiceclient.SIPRequestMessage, error) {
+		voiceclient.EnsureDialogRequestVia(&sendInvite, sendCfg)
 		return a.roundTripInvite(ctx, sendInvite, func(provisional voiceclient.SIPResponse) error {
-			prack, ok, err := buildReliableProvisionalPRACK(sendCfg, provisional, nextCSeq)
+			rseq := firstVoiceHeader(provisional.Headers, "RSeq")
+			if strings.TrimSpace(rseq) == "" || !headerHasToken(provisional.Headers, "Require", "100rel") || provisional.StatusCode <= 100 || provisional.StatusCode >= 200 {
+				return nil
+			}
+			prackCSeq := a.allocateDialogCSeq(callID)
+			if outboundNextCSeq(prackCSeq) > nextCSeq {
+				nextCSeq = outboundNextCSeq(prackCSeq)
+			}
+			prack, ok, err := buildReliableProvisionalPRACK(sendCfg, provisional, prackCSeq)
 			if err != nil || !ok {
 				return err
 			}
-			prackResp, err := a.roundTripRequest(ctx, prack)
+			prackResp, sentPrack, err := a.roundTripRequestWithResult(ctx, prack)
 			if err != nil {
 				return fmt.Errorf("%s PRACK failed: %w", label, err)
 			}
+			a.syncSentDialogCSeq(callID, sentPrack, &nextCSeq)
 			if prackResp.StatusCode < 200 || prackResp.StatusCode >= 300 {
 				return fmt.Errorf("%s PRACK rejected: %d %s", label, prackResp.StatusCode, strings.TrimSpace(prackResp.Reason))
 			}
-			nextCSeq++
-			a.mu.Lock()
-			if latest, ok := a.dialogs[callID]; ok {
-				latest.cfg.CSeq = nextCSeq
-				a.dialogs[callID] = latest
-			}
-			a.mu.Unlock()
 			return nil
 		})
 	}
-	resp, err := sendReinvite(cfg, invite, "IMS re-INVITE")
+	resp, sentInvite, err := sendReinvite(cfg, invite, "IMS re-INVITE")
 	if err != nil {
 		return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE failed", RegistrationRecoveryNeeded: true}, err
 	}
+	syncSentInvite := func(sent voiceclient.SIPRequestMessage) {
+		activeInvite = sent
+		invite = sent
+		if sentCSeq := voiceclient.ParseSIPCSeqNumber(sent.Headers["CSeq"]); sentCSeq > 0 {
+			cfg.CSeq = sentCSeq
+			activeCfg.CSeq = sentCSeq
+			if after := outboundNextCSeq(sentCSeq); after > nextCSeq {
+				nextCSeq = after
+			}
+			a.syncSentDialogCSeq(callID, sent, &nextCSeq)
+		}
+	}
+	syncSentInvite(sentInvite)
 	digestChallengeRetries := 0
 	allowDigestChallengeRetry := true
 	retriedSessionInterval := false
@@ -1206,7 +1643,8 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 	glareRetries := 0
 	for {
 		if isInviteDigestChallenge(resp) && invite.AuthSession != nil && allowDigestChallengeRetry && digestChallengeRetries < 2 {
-			retryCfg, retryInvite, retryResult, ok, err := a.buildInviteDigestChallengeRetry(ctx, cfg, invite, resp, nextCSeq, body)
+			cseqForRetry := a.allocateDialogCSeq(callID)
+			retryCfg, retryInvite, retryResult, ok, err := a.buildInviteDigestChallengeRetry(ctx, cfg, invite, resp, cseqForRetry, body)
 			if err != nil {
 				return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "IMS re-INVITE digest challenge failed"}, err
 			}
@@ -1217,6 +1655,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 				retryInvite.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
 			}
 			applyDialogUpdateHeaders(retryInvite.Headers, req.Headers)
+			voiceclient.EnsureDialogRequestVia(&retryInvite, retryCfg)
 			cfg = retryCfg
 			invite = retryInvite
 			activeCfg = retryCfg
@@ -1224,16 +1663,11 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			nextCSeq = outboundNextCSeq(retryCfg.CSeq)
 			digestChallengeRetries++
 			allowDigestChallengeRetry = retryResult.Authorization.SyncFailure
-			a.mu.Lock()
-			if latest, ok := a.dialogs[callID]; ok {
-				latest.cfg.CSeq = nextCSeq
-				a.dialogs[callID] = latest
-			}
-			a.mu.Unlock()
-			resp, err = sendReinvite(retryCfg, retryInvite, "IMS re-INVITE digest retry")
+			resp, sentInvite, err = sendReinvite(retryCfg, retryInvite, "IMS re-INVITE digest retry")
 			if err != nil {
 				return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE digest retry failed", RegistrationRecoveryNeeded: true}, err
 			}
+			syncSentInvite(sentInvite)
 			continue
 		}
 		if resp.StatusCode == 422 && !retriedSessionInterval {
@@ -1244,7 +1678,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
 				return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "IMS re-INVITE session interval ACK failed"}, err
 			}
-			retryCfg.CSeq = nextCSeq
+			retryCfg.CSeq = a.allocateDialogCSeq(callID)
 			retryInvite, err := voiceclient.BuildInviteRequest(retryCfg, body)
 			if err != nil {
 				return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "build IMS re-INVITE retry failed"}, err
@@ -1254,6 +1688,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			}
 			applyDialogUpdateHeaders(retryInvite.Headers, req.Headers)
 			applySessionIntervalHeaders(retryInvite.Headers, retryCfg)
+			voiceclient.EnsureDialogRequestVia(&retryInvite, retryCfg)
 			cfg = retryCfg
 			invite = retryInvite
 			activeCfg = retryCfg
@@ -1262,21 +1697,21 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			retriedSessionInterval = true
 			a.mu.Lock()
 			if latest, ok := a.dialogs[callID]; ok {
-				latest.cfg.CSeq = nextCSeq
 				latest.cfg.SessionExpires = retryCfg.SessionExpires
 				latest.cfg.SessionRefresher = retryCfg.SessionRefresher
 				latest.cfg.MinSE = retryCfg.MinSE
 				a.dialogs[callID] = latest
 			}
 			a.mu.Unlock()
-			resp, err = sendReinvite(retryCfg, retryInvite, "IMS re-INVITE retry")
+			resp, sentInvite, err = sendReinvite(retryCfg, retryInvite, "IMS re-INVITE retry")
 			if err != nil {
 				return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE retry failed", RegistrationRecoveryNeeded: true}, err
 			}
+			syncSentInvite(sentInvite)
 			continue
 		}
 		if glareRetries < maxIMSDialogGlareRetries {
-			retryCfg, delay, ok := retryDialogConfigForGlare(cfg, resp, nextCSeq)
+			retryCfg, delay, ok := retryDialogConfigForGlare(cfg, resp, 0)
 			if ok {
 				if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
 					return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "IMS re-INVITE glare ACK failed"}, err
@@ -1293,6 +1728,7 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 						Headers:                    firstValueSIPHeaders(resp.Headers),
 					}, err
 				}
+				retryCfg.CSeq = a.allocateDialogCSeq(callID)
 				retryInvite, err := voiceclient.BuildInviteRequest(retryCfg, body)
 				if err != nil {
 					return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "build IMS re-INVITE glare retry failed"}, err
@@ -1301,33 +1737,30 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 					retryInvite.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
 				}
 				applyDialogUpdateHeaders(retryInvite.Headers, req.Headers)
+				voiceclient.EnsureDialogRequestVia(&retryInvite, retryCfg)
 				cfg = retryCfg
 				invite = retryInvite
 				activeCfg = retryCfg
 				activeInvite = retryInvite
 				nextCSeq = outboundNextCSeq(retryCfg.CSeq)
 				glareRetries++
-				a.mu.Lock()
-				if latest, ok := a.dialogs[callID]; ok {
-					latest.cfg.CSeq = nextCSeq
-					a.dialogs[callID] = latest
-				}
-				a.mu.Unlock()
-				resp, err = sendReinvite(retryCfg, retryInvite, "IMS re-INVITE glare retry")
+				resp, sentInvite, err = sendReinvite(retryCfg, retryInvite, "IMS re-INVITE glare retry")
 				if err != nil {
 					return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE glare retry failed", RegistrationRecoveryNeeded: true}, err
 				}
+				syncSentInvite(sentInvite)
 				continue
 			}
 		}
 		if redirectRetries < maxIMSInviteRedirects {
-			retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, nextCSeq)
+			retryCfg, ok := retryDialogConfigForRedirect(cfg, resp, 0)
 			if !ok {
 				break
 			}
 			if err := a.ackRejectedInvite(ctx, cfg, invite, resp); err != nil {
 				return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "IMS re-INVITE redirect ACK failed"}, err
 			}
+			retryCfg.CSeq = a.allocateDialogCSeq(callID)
 			retryInvite, err := voiceclient.BuildInviteRequest(retryCfg, body)
 			if err != nil {
 				return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "build IMS re-INVITE redirect failed"}, err
@@ -1336,23 +1769,19 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 				retryInvite.Headers["Content-Type"] = strings.TrimSpace(req.ContentType)
 			}
 			applyDialogUpdateHeaders(retryInvite.Headers, req.Headers)
+			voiceclient.EnsureDialogRequestVia(&retryInvite, retryCfg)
 			cfg = retryCfg
 			invite = retryInvite
 			activeCfg = retryCfg
 			activeInvite = retryInvite
 			nextCSeq = outboundNextCSeq(retryCfg.CSeq)
 			redirectRetries++
-			a.mu.Lock()
-			if latest, ok := a.dialogs[callID]; ok {
-				latest.cfg.CSeq = nextCSeq
-				latest.cfg.RemoteTargetURI = retryCfg.RemoteTargetURI
-				a.dialogs[callID] = latest
-			}
-			a.mu.Unlock()
-			resp, err = sendReinvite(retryCfg, retryInvite, "IMS re-INVITE redirect")
+			a.storeOutboundDialogTarget(callID, retryCfg.RemoteTargetURI)
+			resp, sentInvite, err = sendReinvite(retryCfg, retryInvite, "IMS re-INVITE redirect")
 			if err != nil {
 				return DialogReinviteResult{Accepted: false, Reason: "IMS re-INVITE redirect failed", RegistrationRecoveryNeeded: true}, err
 			}
+			syncSentInvite(sentInvite)
 			continue
 		}
 		break
@@ -1378,23 +1807,50 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 	if contact := sipHeaderURI(firstVoiceHeader(resp.Headers, "Contact")); contact != "" {
 		ackCfg.RemoteTargetURI = contact
 	}
-	ack, err := voiceclient.BuildAckRequest(ackCfg)
-	if err != nil {
-		return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "build IMS re-INVITE ACK failed"}, err
-	}
-	if err := a.writeRequest(ctx, ack); err != nil {
-		return DialogReinviteResult{Accepted: false, StatusCode: 503, Reason: "IMS re-INVITE ACK failed"}, err
+	lateOffer200 := len(req.Body) == 0 && len(resp.Body) > 0
+	deferAck := req.DeferAck && lateOffer200
+	if !deferAck {
+		var ackBody []byte
+		if lateOffer200 {
+			a.mu.Lock()
+			if latest, ok := a.dialogs[callID]; ok && len(latest.localSDPBody) > 0 {
+				ackBody = append([]byte(nil), latest.localSDPBody...)
+			}
+			a.mu.Unlock()
+			if len(ackBody) > 0 && relay != nil {
+				ackBody = RewriteSDPMediaEndpoint(ackBody, relay.IMSEndpoint())
+				if srtpNeg != nil {
+					if rewritten, rwErr := srtpNeg.RewriteIMSMidDialogAnswer(relay, resp.Body, ackBody); rwErr == nil {
+						ackBody = rewritten
+					}
+				}
+			}
+		}
+		ack, err := buildDialogAckWithOptionalSDP(ackCfg, ackBody)
+		if err != nil {
+			return DialogReinviteResult{Accepted: false, StatusCode: 500, Reason: "build IMS re-INVITE ACK failed"}, err
+		}
+		if err := a.writeRequest(ctx, ack); err != nil {
+			return DialogReinviteResult{Accepted: false, StatusCode: 503, Reason: "IMS re-INVITE ACK failed"}, err
+		}
 	}
 	resultBody := append([]byte(nil), resp.Body...)
-	if len(resultBody) > 0 && state.relay != nil {
+	if len(resultBody) > 0 && relay != nil {
 		imsSDP, err := ParseSDP(resultBody)
 		if err != nil {
 			return DialogReinviteResult{Accepted: false, StatusCode: 488, Reason: "invalid IMS re-INVITE SDP answer"}, err
 		}
-		if err := state.relay.SetIMSRemote(imsSDP); err != nil {
+		if err := relay.SetIMSRemote(imsSDP); err != nil {
 			return DialogReinviteResult{Accepted: false, StatusCode: 503, Reason: "RTP relay IMS re-INVITE failed"}, err
 		}
-		resultBody = RewriteSDPMediaEndpoint(resultBody, state.relay.ClientEndpoint())
+		if srtpNeg != nil {
+			resultBody, _, err = srtpNeg.RewriteClientAnswer(relay, resp.Body, imsSDP)
+			if err != nil {
+				return DialogReinviteResult{Accepted: false, StatusCode: 488, Reason: "invalid RTP relay SRTP re-INVITE SDP answer"}, err
+			}
+		} else {
+			resultBody = RewriteSDPMediaEndpoint(resultBody, relay.ClientEndpoint())
+		}
 	}
 	a.mu.Lock()
 	if latest, ok := a.dialogs[callID]; ok {
@@ -1402,10 +1858,25 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 			latest.cfg.RemoteTargetURI = ackCfg.RemoteTargetURI
 			latest.cfg.RemoteTag = ackCfg.RemoteTag
 		}
+		if nextCSeq > latest.cfg.CSeq {
+			latest.cfg.CSeq = nextCSeq
+		}
 		if len(localSDPBody) > 0 {
 			latest.localSDPBody = append([]byte(nil), localSDPBody...)
 		}
-		applyNegotiatedSessionInterval(&latest.cfg, resp.Headers)
+		if deferAck {
+			latest.pendingAckCfg = cloneDialogRequestConfig(ackCfg)
+			latest.hasPendingAck = true
+		} else {
+			latest.hasPendingAck = false
+		}
+		defaultRef := firstVoiceNonEmpty(normalizeSessionRefresher(latest.cfg.SessionRefresher), "uac")
+		applyNegotiatedSessionIntervalWithDefault(&latest.cfg, resp.Headers, defaultRef)
+		if latest.cfg.SessionExpires > 0 {
+			latest.sessionDeadline = time.Now().Add(sessionExpirationTimeout(latest.cfg.SessionExpires))
+		} else {
+			latest.sessionDeadline = time.Time{}
+		}
 		a.dialogs[callID] = latest
 	}
 	a.mu.Unlock()
@@ -1418,6 +1889,71 @@ func (a *IMSOutboundAgent) SendDialogReinvite(ctx context.Context, req DialogRei
 		Body:        resultBody,
 		Headers:     firstValueSIPHeaders(resp.Headers),
 	}, nil
+}
+
+func (a *IMSOutboundAgent) AckDialog(ctx context.Context, req DialogAckRequest) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.currentTransport() == nil {
+		return ErrIMSVoiceAgentNotReady
+	}
+	callID := strings.TrimSpace(req.CallID)
+	if callID == "" {
+		return nil
+	}
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok || !state.hasPendingAck {
+		a.mu.Unlock()
+		return nil
+	}
+	ackCfg := cloneDialogRequestConfig(state.pendingAckCfg)
+	relay := state.relay
+	srtpNeg := state.srtpNegotiation
+	state.hasPendingAck = false
+	if len(req.Body) > 0 {
+		state.localSDPBody = append([]byte(nil), req.Body...)
+	}
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+
+	ackBody := append([]byte(nil), req.Body...)
+	if len(ackBody) > 0 && relay != nil {
+		clientSDP, err := ParseSDP(ackBody)
+		if err != nil {
+			return err
+		}
+		if err := relay.SetClientRemote(clientSDP); err != nil {
+			return err
+		}
+		ackBody = RewriteSDPMediaEndpoint(ackBody, relay.IMSEndpoint())
+		if srtpNeg != nil {
+			ackBody, err = srtpNeg.RewriteIMSMidDialogOffer(relay, ackBody)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	ack, err := buildDialogAckWithOptionalSDP(ackCfg, ackBody)
+	if err != nil {
+		return err
+	}
+	applyDialogUpdateHeaders(ack.Headers, req.Headers)
+	return a.writeRequest(ctx, ack)
+}
+
+func buildDialogAckWithOptionalSDP(cfg voiceclient.DialogRequestConfig, sdpBody []byte) (voiceclient.SIPRequestMessage, error) {
+	ack, err := voiceclient.BuildAckRequest(cfg)
+	if err != nil {
+		return voiceclient.SIPRequestMessage{}, err
+	}
+	if len(sdpBody) > 0 {
+		ack.Body = append([]byte(nil), sdpBody...)
+		ack.Headers["Content-Type"] = "application/sdp"
+		ack.Headers["Content-Length"] = strconv.Itoa(len(ack.Body))
+	}
+	return ack, nil
 }
 
 func (a *IMSOutboundAgent) sendDialogDirectionUpdate(ctx context.Context, callID, direction, contentType string, headers map[string]string) (DialogUpdateResult, error) {
@@ -1459,6 +1995,11 @@ func (a *IMSOutboundAgent) sendDialogDirectionUpdate(ctx context.Context, callID
 }
 
 func (a *IMSOutboundAgent) ackRejectedInvite(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
+	if strings.TrimSpace(invite.URI) != "" && len(invite.Headers) > 0 {
+		if ack, err := voiceclient.BuildNon2xxInviteAck(invite, resp); err == nil {
+			return a.writeRequest(ctx, ack)
+		}
+	}
 	ackCfg := cfg
 	ackCfg.RemoteTag = firstVoiceNonEmpty(sipHeaderTag(firstVoiceHeader(resp.Headers, "To")), cfg.RemoteTag)
 	ack, err := voiceclient.BuildAckRequest(ackCfg)
@@ -1491,6 +2032,8 @@ func (a *IMSOutboundAgent) buildInviteDigestChallengeRetry(ctx context.Context, 
 	if err != nil {
 		return voiceclient.DialogRequestConfig{}, voiceclient.SIPRequestMessage{}, voiceclient.DigestChallengeRetryResult{Authorization: authz}, false, err
 	}
+	ensureHeaderOptionTag(retryInvite.Headers, "Supported", "precondition")
+	voiceclient.EnsureDialogRequestVia(&retryInvite, retryCfg)
 	retryInvite.AuthSession = invite.AuthSession
 	return retryCfg, retryInvite, voiceclient.DigestChallengeRetryResult{Authorization: authz}, true, nil
 }
@@ -1669,18 +2212,55 @@ func (a *IMSOutboundAgent) CancelVoiceCallWithResult(ctx context.Context, info D
 	if callID == "" {
 		return DialogInfoResult{Accepted: false, StatusCode: 400, Reason: "Call-ID empty"}, errors.New("Call-ID is empty")
 	}
-	state, ok := a.dialog(callID)
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
 	if !ok || !state.early {
+		a.mu.Unlock()
 		return DialogInfoResult{Accepted: false, StatusCode: 481, Reason: "dialog not found"}, nil
 	}
-	cancel, err := voiceclient.BuildCancelRequestWithBody(state.cfg, info.ContentType, info.Body)
+	if state.canceled {
+		a.mu.Unlock()
+		return DialogInfoResult{Accepted: true, StatusCode: 200, Reason: "OK"}, nil
+	}
+	if state.inviteInFlight && !state.provisionalSeen {
+		state.cancelRequested = true
+		state.pendingCancel = cloneDialogInfo(info)
+		a.dialogs[callID] = state
+		a.mu.Unlock()
+		return DialogInfoResult{Accepted: true, StatusCode: 200, Reason: "OK"}, nil
+	}
+	inFlight := state.inviteInFlight
+	cancelCfg := cloneDialogRequestConfig(state.cfg)
+	cancelInv := cloneSIPRequestMessage(state.invite)
+	if sentCSeq := voiceclient.ParseSIPCSeqNumber(cancelInv.Headers["CSeq"]); sentCSeq > 0 {
+		cancelCfg.CSeq = sentCSeq
+	}
+	state.cancelRequested = true
+	state.cancelSent = true
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+	return a.sendOutboundCancelWire(ctx, callID, cancelCfg, cancelInv, info, inFlight)
+}
+
+func (a *IMSOutboundAgent) sendOutboundCancelWire(ctx context.Context, callID string, cancelCfg voiceclient.DialogRequestConfig, cancelInv voiceclient.SIPRequestMessage, info DialogInfo, inFlight bool) (DialogInfoResult, error) {
+	cancel, err := voiceclient.BuildCancelRequestWithBody(cancelCfg, info.ContentType, info.Body)
 	if err != nil {
 		return DialogInfoResult{Accepted: false, StatusCode: 500, Reason: "build IMS CANCEL failed"}, err
 	}
 	applyDialogUpdateHeaders(cancel.Headers, info.Headers)
-	copyDialogHeader(cancel.Headers, state.invite.Headers, "Via")
-	resp, err := a.roundTripRequest(ctx, cancel)
+	copyDialogHeader(cancel.Headers, cancelInv.Headers, "Via")
+	resp, sentCancel, err := a.roundTripRequestWithResult(ctx, cancel)
+	_ = sentCancel
 	if err != nil {
+		if !inFlight {
+			a.mu.Lock()
+			if st, ok := a.dialogs[callID]; ok {
+				st.cancelRequested = false
+				st.cancelSent = false
+				a.dialogs[callID] = st
+			}
+			a.mu.Unlock()
+		}
 		return DialogInfoResult{Accepted: false, Reason: "IMS CANCEL failed", RegistrationRecoveryNeeded: true}, err
 	}
 	defaultReason := "OK"
@@ -1698,12 +2278,30 @@ func (a *IMSOutboundAgent) CancelVoiceCallWithResult(ctx context.Context, info D
 		Headers:                    firstValueSIPHeaders(resp.Headers),
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if resp.StatusCode == 481 {
+		if resp.StatusCode == 481 && !inFlight {
 			a.deleteDialog(callID)
+		} else if !inFlight {
+			a.mu.Lock()
+			if st, ok := a.dialogs[callID]; ok {
+				st.cancelRequested = false
+				st.cancelSent = false
+				a.dialogs[callID] = st
+			}
+			a.mu.Unlock()
 		}
 		return result, fmt.Errorf("IMS CANCEL rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
-	a.deleteDialog(callID)
+	if !inFlight {
+		a.deleteDialog(callID)
+		return result, nil
+	}
+	a.mu.Lock()
+	if st, ok := a.dialogs[callID]; ok {
+		st.canceled = true
+		st.cancelRequested = true
+		a.dialogs[callID] = st
+	}
+	a.mu.Unlock()
 	return result, nil
 }
 
@@ -1746,21 +2344,25 @@ func (a *IMSOutboundAgent) storeDialog(callID string, state imsDialogState) {
 		a.dialogs = make(map[string]imsDialogState)
 	}
 	callID = strings.TrimSpace(callID)
-	if previous, ok := a.dialogs[callID]; ok && previous.refreshTimer != nil && previous.refreshTimer != state.refreshTimer {
-		previous.refreshTimer.Stop()
+	if previous, ok := a.dialogs[callID]; ok {
+		if previous.refreshTimer != nil && previous.refreshTimer != state.refreshTimer {
+			previous.refreshTimer.Stop()
+		}
+		if previous.expiryTimer != nil && previous.expiryTimer != state.expiryTimer {
+			previous.expiryTimer.Stop()
+		}
 	}
-	a.dialogs[callID] = state
+	a.dialogs[callID] = cloneDialogStateSnapshot(state)
 	a.mu.Unlock()
 }
 
-func (a *IMSOutboundAgent) storeOutboundDialogAttempt(callID string, cfg voiceclient.DialogRequestConfig) {
-	if a == nil || strings.TrimSpace(callID) == "" {
+func (a *IMSOutboundAgent) storeOutboundDialogTarget(callID string, target string) {
+	if a == nil || strings.TrimSpace(callID) == "" || strings.TrimSpace(target) == "" {
 		return
 	}
 	a.mu.Lock()
 	if latest, ok := a.dialogs[strings.TrimSpace(callID)]; ok {
-		latest.cfg.CSeq = outboundNextCSeq(cfg.CSeq)
-		latest.cfg.RemoteTargetURI = cfg.RemoteTargetURI
+		latest.cfg.RemoteTargetURI = strings.TrimSpace(target)
 		a.dialogs[strings.TrimSpace(callID)] = latest
 	}
 	a.mu.Unlock()
@@ -1789,7 +2391,22 @@ func (a *IMSOutboundAgent) dialog(callID string) (imsDialogState, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	state, ok := a.dialogs[strings.TrimSpace(callID)]
-	return state, ok
+	if !ok {
+		return imsDialogState{}, false
+	}
+	return cloneDialogStateSnapshot(state), true
+}
+
+func (a *IMSOutboundAgent) OutboundDialogLocalTag(callID string) string {
+	if a == nil || strings.TrimSpace(callID) == "" {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if state, ok := a.dialogs[strings.TrimSpace(callID)]; ok {
+		return strings.TrimSpace(state.cfg.LocalTag)
+	}
+	return ""
 }
 
 func (a *IMSOutboundAgent) deleteDialog(callID string) {
@@ -1801,6 +2418,9 @@ func (a *IMSOutboundAgent) deleteDialog(callID string) {
 	if ok {
 		if state.refreshTimer != nil {
 			state.refreshTimer.Stop()
+		}
+		if state.expiryTimer != nil {
+			state.expiryTimer.Stop()
 		}
 		delete(a.dialogs, strings.TrimSpace(callID))
 	}
@@ -1835,19 +2455,25 @@ func (a *IMSOutboundAgent) TerminateAllDialogs(ctx context.Context) error {
 	snapshots := make(map[string]imsDialogState, len(a.dialogs))
 	for callID, state := range a.dialogs {
 		stopDialogSessionRefresh(&state)
-		snapshots[callID] = state
+		snapshots[callID] = cloneDialogStateSnapshot(state)
 	}
 	a.dialogs = nil
 	a.mu.Unlock()
 
 	var errs []error
 	for callID, state := range snapshots {
-		if transport != nil && !state.terminating {
+		if transport != nil && !state.terminating && !state.canceled {
 			termCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			if state.early {
-				if cancelReq, buildErr := voiceclient.BuildCancelRequestWithBody(state.cfg, "", nil); buildErr == nil {
-					copyDialogHeader(cancelReq.Headers, state.invite.Headers, "Via")
-					_, _ = voiceclient.RoundTripRequestWithDigestAuth(termCtx, transport, cancelReq)
+				if !state.inviteInFlight || state.provisionalSeen {
+					cancelCfg := state.cfg
+					if sentCSeq := voiceclient.ParseSIPCSeqNumber(state.invite.Headers["CSeq"]); sentCSeq > 0 {
+						cancelCfg.CSeq = sentCSeq
+					}
+					if cancelReq, buildErr := voiceclient.BuildCancelRequestWithBody(cancelCfg, "", nil); buildErr == nil {
+						copyDialogHeader(cancelReq.Headers, state.invite.Headers, "Via")
+						_, _ = voiceclient.RoundTripRequestWithDigestAuth(termCtx, transport, cancelReq)
+					}
 				}
 			} else {
 				if byeReq, buildErr := voiceclient.BuildByeRequestWithBody(state.cfg, "", nil); buildErr == nil {
@@ -1891,12 +2517,24 @@ func outboundDialogTagsMatch(cfg voiceclient.DialogRequestConfig, headers map[st
 	remoteTag := strings.TrimSpace(cfg.RemoteTag)
 	toTag := sipHeaderTag(firstVoiceHeader(headers, "To"))
 	fromTag := sipHeaderTag(firstVoiceHeader(headers, "From"))
-	if localTag != "" && toTag != "" && localTag != toTag {
+	if localTag != "" && toTag != localTag {
 		return false
 	}
-	if remoteTag != "" && fromTag != "" && remoteTag != fromTag {
+	if remoteTag != "" && fromTag != remoteTag {
 		return false
 	}
+	return true
+}
+
+func (a *IMSOutboundAgent) validateInboundRemoteCSeqLocked(callID string, state *imsDialogState, cseq int) bool {
+	if cseq <= 0 {
+		return true
+	}
+	if state.lastRemoteCSeq > 0 && cseq <= state.lastRemoteCSeq {
+		return false
+	}
+	state.lastRemoteCSeq = cseq
+	a.dialogs[callID] = *state
 	return true
 }
 
@@ -1920,6 +2558,10 @@ func (a *IMSOutboundAgent) HandleOutboundBye(ctx context.Context, req IMSByeRequ
 	if !outboundDialogTagsMatch(state.cfg, req.Headers) {
 		a.mu.Unlock()
 		return IMSByeResult{Handled: true, StatusCode: 481, Reason: "Call/Transaction Does Not Exist"}, true, nil
+	}
+	if !a.validateInboundRemoteCSeqLocked(callID, &state, req.CSeq) {
+		a.mu.Unlock()
+		return IMSByeResult{Handled: true, StatusCode: 500, Reason: "CSeq Out of Order"}, true, nil
 	}
 	stopDialogSessionRefresh(&state)
 	delete(a.dialogs, callID)
@@ -1956,9 +2598,13 @@ func (a *IMSOutboundAgent) HandleOutboundUpdate(ctx context.Context, req Inbound
 		a.mu.Unlock()
 		return InboundCallResult{Accepted: false, StatusCode: 481, Reason: "Call/Transaction Does Not Exist"}, true, nil
 	}
+	if !a.validateInboundRemoteCSeqLocked(callID, &state, req.CSeq) {
+		a.mu.Unlock()
+		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "CSeq Out of Order"}, true, nil
+	}
 	a.mu.Unlock()
 
-	return a.handleInboundOutboundMediaUpdate(callID, inboundDialogBody(req), req.Headers)
+	return a.handleInboundOutboundMediaUpdate(callID, inboundDialogBody(req), req.Headers, false)
 }
 
 func (a *IMSOutboundAgent) HandleOutboundReinvite(ctx context.Context, req InboundCallRequest) (InboundCallResult, bool, error) {
@@ -1982,28 +2628,61 @@ func (a *IMSOutboundAgent) HandleOutboundReinvite(ctx context.Context, req Inbou
 		a.mu.Unlock()
 		return InboundCallResult{Accepted: false, StatusCode: 481, Reason: "Call/Transaction Does Not Exist"}, true, nil
 	}
+	if !a.validateInboundRemoteCSeqLocked(callID, &state, req.CSeq) {
+		a.mu.Unlock()
+		return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "CSeq Out of Order"}, true, nil
+	}
 	a.mu.Unlock()
 
 	body := append([]byte(nil), req.RawSDP...)
 	if len(body) == 0 && inboundSDPInfoPresent(req.RemoteSDP) {
 		body = BuildSDPAnswer(req.RemoteSDP)
 	}
-	return a.handleInboundOutboundMediaUpdate(callID, body, req.Headers)
+	return a.handleInboundOutboundMediaUpdate(callID, body, req.Headers, true)
 }
 
-func (a *IMSOutboundAgent) AckOutboundReinvite(_ context.Context, callID string) bool {
-	return a.HasOutboundDialog(callID)
+func (a *IMSOutboundAgent) AckOutboundReinvite(ctx context.Context, callID string) bool {
+	return a.AckOutboundReinviteWithBody(ctx, callID, nil)
 }
 
-func (a *IMSOutboundAgent) handleInboundOutboundMediaUpdate(callID string, rawOffer []byte, headers map[string][]string) (InboundCallResult, bool, error) {
+func (a *IMSOutboundAgent) AckOutboundReinviteWithBody(_ context.Context, callID string, body []byte) bool {
+	if a == nil || strings.TrimSpace(callID) == "" {
+		return false
+	}
+	callID = strings.TrimSpace(callID)
+	a.mu.Lock()
+	state, ok := a.dialogs[callID]
+	if !ok {
+		a.mu.Unlock()
+		return false
+	}
+	awaiting := state.awaitingInboundAck
+	relay := state.relay
+	srtpNeg := state.srtpNegotiation
+	state.awaitingInboundAck = false
+	a.dialogs[callID] = state
+	a.mu.Unlock()
+	if awaiting && len(body) > 0 && relay != nil {
+		if remoteSDP, err := ParseSDP(body); err == nil {
+			_ = relay.SetIMSRemote(remoteSDP)
+			if srtpNeg != nil {
+				_, _, _ = srtpNeg.RewriteClientAnswer(relay, body, remoteSDP)
+			}
+		}
+	}
+	return true
+}
+
+func (a *IMSOutboundAgent) handleInboundOutboundMediaUpdate(callID string, rawOffer []byte, headers map[string][]string, isReinvite bool) (InboundCallResult, bool, error) {
 	a.mu.Lock()
 	state, ok := a.dialogs[callID]
 	if !ok {
 		a.mu.Unlock()
 		return InboundCallResult{}, false, nil
 	}
-	cfg := state.cfg
+	cfg := cloneDialogRequestConfig(state.cfg)
 	relay := state.relay
+	srtpNeg := state.srtpNegotiation
 	localSDPBody := append([]byte(nil), state.localSDPBody...)
 	a.mu.Unlock()
 
@@ -2021,7 +2700,6 @@ func (a *IMSOutboundAgent) handleInboundOutboundMediaUpdate(callID string, rawOf
 		if refresher == "" {
 			refresher = "uac"
 		}
-		// In an inbound request from peer, peer's "uac" means peer refreshes; from our local outbound dialog perspective that is "uas".
 		switch refresher {
 		case "uac":
 			cfg.SessionRefresher = "uas"
@@ -2034,6 +2712,7 @@ func (a *IMSOutboundAgent) handleInboundOutboundMediaUpdate(callID string, rawOf
 
 	var answerSDP []byte
 	var parsedAnswer SDPInfo
+	awaitingAck := false
 	if len(rawOffer) > 0 {
 		remoteSDP, err := ParseSDP(rawOffer)
 		if err != nil {
@@ -2055,8 +2734,16 @@ func (a *IMSOutboundAgent) handleInboundOutboundMediaUpdate(callID string, rawOf
 		} else if rewrittenDir, dirErr := RewriteSDPMediaDirection(baseSDP, outboundAnswerDirection(remoteSDP.Direction)); dirErr == nil {
 			baseSDP = rewrittenDir
 		}
+		baseSDP = RewriteSDPPreconditionsForAnswer(rawOffer, baseSDP)
 		if relay != nil {
 			baseSDP = RewriteSDPMediaEndpoint(baseSDP, relay.IMSEndpoint())
+			if srtpNeg != nil {
+				rewritten, rwErr := srtpNeg.RewriteIMSMidDialogAnswer(relay, rawOffer, baseSDP)
+				if rwErr != nil {
+					return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "Invalid SRTP SDP"}, true, rwErr
+				}
+				baseSDP = rewritten
+			}
 		}
 		parsed, parseErr := ParseSDP(baseSDP)
 		if parseErr != nil {
@@ -2064,6 +2751,24 @@ func (a *IMSOutboundAgent) handleInboundOutboundMediaUpdate(callID string, rawOf
 		}
 		answerSDP = baseSDP
 		parsedAnswer = parsed
+	} else if isReinvite {
+		// RFC 3261 §13.2.1 late-offer re-INVITE: supply local SDP offer in 200 OK and await answer in ACK.
+		baseSDP := localSDPBody
+		if len(baseSDP) > 0 {
+			if relay != nil {
+				baseSDP = RewriteSDPMediaEndpoint(baseSDP, relay.IMSEndpoint())
+				if srtpNeg != nil {
+					if rewritten, rwErr := srtpNeg.RewriteIMSMidDialogOffer(relay, baseSDP); rwErr == nil {
+						baseSDP = rewritten
+					}
+				}
+			}
+			if parsed, parseErr := ParseSDP(baseSDP); parseErr == nil {
+				answerSDP = baseSDP
+				parsedAnswer = parsed
+				awaitingAck = true
+			}
+		}
 	}
 
 	a.mu.Lock()
@@ -2071,6 +2776,10 @@ func (a *IMSOutboundAgent) handleInboundOutboundMediaUpdate(callID string, rawOf
 		latest.cfg.RemoteTargetURI = cfg.RemoteTargetURI
 		latest.cfg.SessionExpires = cfg.SessionExpires
 		latest.cfg.SessionRefresher = cfg.SessionRefresher
+		latest.awaitingInboundAck = awaitingAck
+		if latest.cfg.SessionExpires > 0 {
+			latest.sessionDeadline = time.Now().Add(sessionExpirationTimeout(latest.cfg.SessionExpires))
+		}
 		a.dialogs[callID] = latest
 	}
 	a.mu.Unlock()
@@ -2120,6 +2829,10 @@ func (a *IMSOutboundAgent) HandleOutboundNotify(ctx context.Context, req Inbound
 		a.mu.Unlock()
 		return IMSInfoResult{Handled: true, StatusCode: 481, Reason: "Call/Transaction Does Not Exist"}, true, nil
 	}
+	if !a.validateInboundRemoteCSeqLocked(callID, &state, req.CSeq) {
+		a.mu.Unlock()
+		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "CSeq Out of Order"}, true, nil
+	}
 	a.mu.Unlock()
 
 	event := firstVoiceNonEmpty(req.Event, firstVoiceHeader(req.Headers, "Event"))
@@ -2155,6 +2868,10 @@ func (a *IMSOutboundAgent) HandleOutboundInfo(ctx context.Context, req IMSInfoRe
 		a.mu.Unlock()
 		return IMSInfoResult{Handled: true, StatusCode: 481, Reason: "Call/Transaction Does Not Exist"}, true, nil
 	}
+	if !a.validateInboundRemoteCSeqLocked(callID, &state, req.CSeq) {
+		a.mu.Unlock()
+		return IMSInfoResult{Handled: true, StatusCode: 500, Reason: "CSeq Out of Order"}, true, nil
+	}
 	a.mu.Unlock()
 
 	if isDTMFRelayContentType(req.ContentType) || strings.EqualFold(strings.TrimSpace(req.InfoPackage), DTMFInfoPackage) {
@@ -2167,6 +2884,10 @@ func (a *IMSOutboundAgent) HandleOutboundInfo(ctx context.Context, req IMSInfoRe
 }
 
 func (a *IMSOutboundAgent) scheduleDialogSessionRefresh(callID string) {
+	a.scheduleDialogSessionRefreshAfter(callID, 0)
+}
+
+func (a *IMSOutboundAgent) scheduleDialogSessionRefreshAfter(callID string, customDelay time.Duration) {
 	callID = strings.TrimSpace(callID)
 	if a == nil || callID == "" {
 		return
@@ -2179,15 +2900,30 @@ func (a *IMSOutboundAgent) scheduleDialogSessionRefresh(callID string) {
 	}
 	stopDialogSessionRefresh(&state)
 	seq := state.refreshSeq
-	delay := sessionRefreshDelay(state.cfg.SessionExpires, state.cfg.SessionRefresher, a.SessionRefreshLead)
-	if delay <= 0 || state.early || state.terminating {
+	refresher := normalizeSessionRefresher(state.cfg.SessionRefresher)
+	delay := customDelay
+	if delay <= 0 {
+		switch refresher {
+		case "uac":
+			delay = sessionRefreshDelay(state.cfg.SessionExpires, "uac", a.SessionRefreshLead)
+		case "uas":
+			delay = sessionExpirationTimeout(state.cfg.SessionExpires)
+		}
+	}
+	if delay <= 0 || state.early || state.terminating || state.cfg.SessionExpires <= 0 {
 		a.dialogs[callID] = state
 		a.mu.Unlock()
 		return
 	}
-	state.refreshTimer = time.AfterFunc(delay, func() {
-		a.runDialogSessionRefresh(callID, seq)
-	})
+	if refresher == "uas" && customDelay <= 0 {
+		state.expiryTimer = time.AfterFunc(delay, func() {
+			a.runDialogSessionRefresh(callID, seq)
+		})
+	} else {
+		state.refreshTimer = time.AfterFunc(delay, func() {
+			a.runDialogSessionRefresh(callID, seq)
+		})
+	}
 	a.dialogs[callID] = state
 	a.mu.Unlock()
 }
@@ -2199,14 +2935,77 @@ func (a *IMSOutboundAgent) runDialogSessionRefresh(callID string, seq uint64) {
 	callID = strings.TrimSpace(callID)
 	a.mu.Lock()
 	state, ok := a.dialogs[callID]
-	if !ok || state.refreshSeq != seq || state.early ||
-		state.terminating ||
-		state.cfg.SessionExpires <= 0 || normalizeSessionRefresher(state.cfg.SessionRefresher) != "uac" {
+	if !ok || state.refreshSeq != seq || state.early || state.terminating || state.cfg.SessionExpires <= 0 {
 		a.mu.Unlock()
 		return
 	}
+	refresher := normalizeSessionRefresher(state.cfg.SessionRefresher)
+	localSDPBody := append([]byte(nil), state.localSDPBody...)
+	deadline := state.sessionDeadline
+	expires := state.cfg.SessionExpires
 	a.mu.Unlock()
-	_, _ = a.SendDialogUpdate(context.Background(), DialogUpdateRequest{CallID: callID})
+
+	if refresher == "uas" {
+		a.terminateExpiredSession(callID, "session expired")
+		return
+	}
+	if refresher != "uac" {
+		return
+	}
+	updRes, updErr := a.SendDialogUpdate(context.Background(), DialogUpdateRequest{CallID: callID})
+	if updErr == nil && updRes.Accepted {
+		return
+	}
+	if updRes.StatusCode == 405 || updRes.StatusCode == 501 {
+		reReq := DialogReinviteRequest{CallID: callID}
+		if len(localSDPBody) > 0 {
+			reReq.ContentType = "application/sdp"
+			reReq.Body = localSDPBody
+		}
+		reRes, reErr := a.SendDialogReinvite(context.Background(), reReq)
+		if reErr == nil && reRes.Accepted {
+			return
+		}
+		if reRes.StatusCode == 481 {
+			a.terminateExpiredSession(callID, "session refresh 481")
+			return
+		}
+	}
+	if updRes.StatusCode == 481 {
+		a.terminateExpiredSession(callID, "session refresh 481")
+		return
+	}
+	now := time.Now()
+	if deadline.IsZero() && expires > 0 {
+		deadline = now.Add(sessionExpirationTimeout(expires) / 2)
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		a.terminateExpiredSession(callID, "session expired")
+		return
+	}
+	retryDelay := remaining / 2
+	if retryDelay > 10*time.Second {
+		retryDelay = 10 * time.Second
+	}
+	if retryDelay < 50*time.Millisecond {
+		retryDelay = 50 * time.Millisecond
+	}
+	a.scheduleDialogSessionRefreshAfter(callID, retryDelay)
+}
+
+func (a *IMSOutboundAgent) terminateExpiredSession(callID string, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = a.EndVoiceCallWithResult(ctx, DialogInfo{CallID: callID})
+	// Ensure local cleanup even if BYE transport call failed.
+	a.deleteDialog(callID)
+	a.mu.Lock()
+	onTerminated := a.OnDialogTerminated
+	a.mu.Unlock()
+	if onTerminated != nil {
+		onTerminated(context.Background(), callID, reason)
+	}
 }
 
 func stopDialogSessionRefresh(state *imsDialogState) {
@@ -2216,6 +3015,10 @@ func stopDialogSessionRefresh(state *imsDialogState) {
 	if state.refreshTimer != nil {
 		state.refreshTimer.Stop()
 		state.refreshTimer = nil
+	}
+	if state.expiryTimer != nil {
+		state.expiryTimer.Stop()
+		state.expiryTimer = nil
 	}
 	state.refreshSeq++
 }
@@ -2255,10 +3058,28 @@ func sessionRefreshDelay(expires int, refresher string, lead time.Duration) time
 	return delay
 }
 
-func (a *IMSOutboundAgent) roundTripInvite(ctx context.Context, invite voiceclient.SIPRequestMessage, onProvisional func(voiceclient.SIPResponse) error) (voiceclient.SIPResponse, error) {
+func sessionExpirationTimeout(expires int) time.Duration {
+	if expires <= 0 {
+		return 0
+	}
+	interval := time.Duration(expires) * time.Second
+	if expires <= 3 {
+		return interval
+	}
+	grace := interval / 3
+	if grace > 32*time.Second {
+		grace = 32 * time.Second
+	}
+	if interval > grace {
+		return interval - grace
+	}
+	return interval
+}
+
+func (a *IMSOutboundAgent) roundTripInvite(ctx context.Context, invite voiceclient.SIPRequestMessage, onProvisional func(voiceclient.SIPResponse) error) (voiceclient.SIPResponse, voiceclient.SIPRequestMessage, error) {
 	transport := a.currentTransport()
 	if a == nil || transport == nil {
-		return voiceclient.SIPResponse{}, ErrIMSVoiceAgentNotReady
+		return voiceclient.SIPResponse{}, invite, ErrIMSVoiceAgentNotReady
 	}
 	if inviteTransport, ok := transport.(voiceclient.SIPInviteTransport); ok {
 		resp, err := inviteTransport.RoundTripInvite(ctx, invite, func(_ context.Context, _ voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
@@ -2268,22 +3089,27 @@ func (a *IMSOutboundAgent) roundTripInvite(ctx context.Context, invite voiceclie
 			return onProvisional(resp)
 		})
 		if err != nil {
-			return resp, err
+			return resp, invite, err
 		}
 		if err := voiceclient.ApplyDigestAuthenticationInfo(invite, resp); err != nil {
-			return resp, err
+			return resp, invite, err
 		}
-		return resp, nil
+		return resp, invite, nil
 	}
-	return a.roundTripRequest(ctx, invite)
+	return a.roundTripRequestWithResult(ctx, invite)
 }
 
 func (a *IMSOutboundAgent) roundTripRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	resp, _, err := a.roundTripRequestWithResult(ctx, msg)
+	return resp, err
+}
+
+func (a *IMSOutboundAgent) roundTripRequestWithResult(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, voiceclient.SIPRequestMessage, error) {
 	transport := a.currentTransport()
 	if a == nil || transport == nil {
-		return voiceclient.SIPResponse{}, ErrIMSVoiceAgentNotReady
+		return voiceclient.SIPResponse{}, msg, ErrIMSVoiceAgentNotReady
 	}
-	return voiceclient.RoundTripRequestWithDigestAuth(ctx, transport, msg)
+	return voiceclient.RoundTripRequestWithDigestAuthResult(ctx, transport, msg)
 }
 
 func buildReliableProvisionalPRACK(cfg voiceclient.DialogRequestConfig, resp voiceclient.SIPResponse, cseq int) (voiceclient.SIPRequestMessage, bool, error) {
@@ -2492,6 +3318,10 @@ func parseSessionExpiresHeaderValue(value string) sessionIntervalHeader {
 }
 
 func applyNegotiatedSessionInterval(cfg *voiceclient.DialogRequestConfig, headers map[string][]string) bool {
+	return applyNegotiatedSessionIntervalWithDefault(cfg, headers, "uac")
+}
+
+func applyNegotiatedSessionIntervalWithDefault(cfg *voiceclient.DialogRequestConfig, headers map[string][]string, defaultRefresher string) bool {
 	if cfg == nil {
 		return false
 	}
@@ -2502,7 +3332,11 @@ func applyNegotiatedSessionInterval(cfg *voiceclient.DialogRequestConfig, header
 		return false
 	}
 	cfg.SessionExpires = interval.Expires
-	cfg.SessionRefresher = interval.Refresher
+	refresher := normalizeSessionRefresher(interval.Refresher)
+	if refresher == "" {
+		refresher = firstVoiceNonEmpty(normalizeSessionRefresher(cfg.SessionRefresher), normalizeSessionRefresher(defaultRefresher), "uac")
+	}
+	cfg.SessionRefresher = refresher
 	return true
 }
 
@@ -2549,6 +3383,32 @@ func headerHasToken(headers map[string][]string, name, token string) bool {
 		}
 	}
 	return false
+}
+
+func ensureHeaderOptionTag(headers map[string]string, name string, tag string) {
+	if headers == nil || strings.TrimSpace(name) == "" || strings.TrimSpace(tag) == "" {
+		return
+	}
+	tag = strings.TrimSpace(tag)
+	existingKey := name
+	existingVal := ""
+	for k, v := range headers {
+		if strings.EqualFold(strings.TrimSpace(k), name) {
+			existingKey = k
+			existingVal = strings.TrimSpace(v)
+			break
+		}
+	}
+	if existingVal == "" {
+		headers[existingKey] = tag
+		return
+	}
+	for _, part := range strings.Split(existingVal, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), tag) {
+			return
+		}
+	}
+	headers[existingKey] = existingVal + ", " + tag
 }
 
 func copyDialogHeader(dst, src map[string]string, name string) {
@@ -2662,7 +3522,7 @@ func copyStringSlice(values []string) []string {
 	return append([]string(nil), values...)
 }
 
-func recordRouteSet(headers map[string][]string) []string {
+func uasRecordRouteSet(headers map[string][]string) []string {
 	var routes []string
 	for key, values := range headers {
 		if !strings.EqualFold(key, "Record-Route") {
@@ -2676,6 +3536,11 @@ func recordRouteSet(headers map[string][]string) []string {
 			}
 		}
 	}
+	return routes
+}
+
+func recordRouteSet(headers map[string][]string) []string {
+	routes := uasRecordRouteSet(headers)
 	for i, j := 0, len(routes)-1; i < j; i, j = i+1, j-1 {
 		routes[i], routes[j] = routes[j], routes[i]
 	}
@@ -2785,8 +3650,12 @@ func sipHeaderTag(value string) string {
 
 func domainFromURI(uri string) string {
 	uri = strings.TrimSpace(uri)
-	if strings.HasPrefix(strings.ToLower(uri), "sip:") {
+	lower := strings.ToLower(uri)
+	switch {
+	case strings.HasPrefix(lower, "sip:"):
 		uri = uri[4:]
+	case strings.HasPrefix(lower, "sips:"):
+		uri = uri[5:]
 	}
 	if _, host, ok := strings.Cut(uri, "@"); ok {
 		if semi := strings.IndexByte(host, ';'); semi >= 0 {

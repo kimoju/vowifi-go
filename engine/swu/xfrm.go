@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/kimoju/vowifi-go/engine/swu/ikev2"
 )
@@ -19,10 +20,21 @@ import (
 var ErrInvalidXFRMConfig = errors.New("invalid swu xfrm config")
 
 const (
-	xfrmAeadAESGCMRFC4106 = "rfc4106(gcm(aes))"
-	xfrmAESGCMSaltLength  = 4
-	xfrmAESGCMICVBits     = 128
+	xfrmAeadAESGCMRFC4106   = "rfc4106(gcm(aes))"
+	xfrmAESGCMSaltLength    = 4
+	xfrmAESGCMICVBits       = 128
+	DefaultXFRMReplayWindow = 64
 )
+
+var (
+	nextKernelXFRMReqID atomic.Uint32
+	nextKernelXFRMIfID  atomic.Uint32
+)
+
+type XFRMPolicyPair struct {
+	LocalPrefix  string
+	RemotePrefix string
+}
 
 type XFRMInterfaceConfig struct {
 	Name           string
@@ -45,6 +57,10 @@ type KernelXFRMConfig struct {
 	OuterRemoteIP        string
 	InnerLocalPrefix     string
 	InnerRemotePrefix    string
+	InnerLocalPrefixes   []string
+	InnerRemotePrefixes  []string
+	PolicyPairs          []XFRMPolicyPair
+	ReplayWindow         int
 	ReqID                int
 	Mark                 string
 	InterfaceID          uint32
@@ -61,6 +77,9 @@ type KernelXFRMConfigFromIKEConfig struct {
 	ChildSA              ikev2.ChildSAResult
 	InnerLocalPrefix     string
 	InnerRemotePrefix    string
+	InnerLocalPrefixes   []string
+	InnerRemotePrefixes  []string
+	ReplayWindow         int
 	ReqID                int
 	Mark                 string
 	InterfaceID          uint32
@@ -96,7 +115,7 @@ func (m LinuxXFRMManager) Apply(ctx context.Context, cfg KernelXFRMConfig) (Kern
 	}
 	var state KernelXFRMState
 	for _, command := range commands {
-		if err := runner.RunIP(ctx, command.args...); err != nil {
+		if err := runIPApplyCommand(ctx, runner, command); err != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), defaultSWUCleanupTimeout)
 			rollbackErr := runIPUndo(cleanupCtx, runner, state.undo)
 			cancel()
@@ -133,25 +152,39 @@ func KernelXFRMConfigFromIKE(cfg KernelXFRMConfigFromIKEConfig) (KernelXFRMConfi
 	if outerRemote == "" {
 		return KernelXFRMConfig{}, fmt.Errorf("%w: outer remote ip is empty", ErrInvalidXFRMConfig)
 	}
-	innerLocal := firstPacketNonEmpty(
-		cfg.InnerLocalPrefix,
-		cfg.Tunnel.InnerLocalIP,
-		childConfigurationAddress(cfg.ChildSA, ikev2.ConfigInternalIPv4Address),
-		childConfigurationAddress(cfg.ChildSA, ikev2.ConfigInternalIPv6Address),
-	)
-	if innerLocal == "" {
-		innerLocal = firstXFRMTrafficSelectorPrefix(cfg.ChildSA.TSi)
+
+	localPrefixes, remotePrefixes, pairs, err := deriveXFRMSelectorPairsFromIKE(cfg)
+	if err != nil {
+		return KernelXFRMConfig{}, err
 	}
-	if innerLocal == "" {
-		return KernelXFRMConfig{}, fmt.Errorf("%w: inner local prefix is empty", ErrInvalidXFRMConfig)
-	}
-	innerRemote := firstPacketNonEmpty(cfg.InnerRemotePrefix, cfg.Tunnel.RemoteInnerIP)
-	if innerRemote == "" {
-		innerRemote = firstXFRMTrafficSelectorPrefix(cfg.ChildSA.TSr)
-	}
-	if innerRemote == "" {
+	if len(pairs) == 0 {
+		if len(localPrefixes) == 0 {
+			return KernelXFRMConfig{}, fmt.Errorf("%w: inner local prefix is empty", ErrInvalidXFRMConfig)
+		}
 		return KernelXFRMConfig{}, fmt.Errorf("%w: inner remote prefix is empty", ErrInvalidXFRMConfig)
 	}
+
+	reqID := cfg.ReqID
+	if reqID == 0 {
+		reqID = int(nextKernelXFRMReqID.Add(1))
+	}
+	xfrmi := cfg.XFRMInterface
+	ifID := cfg.InterfaceID
+	if strings.TrimSpace(xfrmi.Name) != "" {
+		if xfrmi.IfID == 0 && ifID == 0 {
+			allocated := nextKernelXFRMIfID.Add(1)
+			xfrmi.IfID = allocated
+			ifID = allocated
+		}
+		if xfrmi.MTU == 0 {
+			if addr, parseErr := netip.ParseAddr(outerRemote); parseErr == nil && addr.Is6() {
+				xfrmi.MTU = MinIPv6TunnelInnerMTU
+			} else {
+				xfrmi.MTU = DefaultTunnelInnerMTU
+			}
+		}
+	}
+
 	natt := cfg.NATTraversal
 	if natt.Enabled || cfg.Init.NATDetected {
 		natt.Enabled = true
@@ -166,13 +199,17 @@ func KernelXFRMConfigFromIKE(cfg KernelXFRMConfigFromIKEConfig) (KernelXFRMConfi
 		ChildSA:              cfg.ChildSA,
 		OuterLocalIP:         outerLocal,
 		OuterRemoteIP:        outerRemote,
-		InnerLocalPrefix:     innerLocal,
-		InnerRemotePrefix:    innerRemote,
-		ReqID:                cfg.ReqID,
+		InnerLocalPrefix:     pairs[0].LocalPrefix,
+		InnerRemotePrefix:    pairs[0].RemotePrefix,
+		InnerLocalPrefixes:   localPrefixes,
+		InnerRemotePrefixes:  remotePrefixes,
+		PolicyPairs:          pairs,
+		ReplayWindow:         cfg.ReplayWindow,
+		ReqID:                reqID,
 		Mark:                 cfg.Mark,
-		InterfaceID:          cfg.InterfaceID,
+		InterfaceID:          ifID,
 		IncludeForwardPolicy: cfg.IncludeForwardPolicy,
-		XFRMInterface:        cfg.XFRMInterface,
+		XFRMInterface:        xfrmi,
 		NATTraversal:         natt,
 	}
 	params, err := normalizeKernelXFRMConfig(out)
@@ -183,6 +220,7 @@ func KernelXFRMConfigFromIKE(cfg KernelXFRMConfigFromIKEConfig) (KernelXFRMConfi
 	out.OuterRemoteIP = params.outerRemote
 	out.InnerLocalPrefix = params.innerLocal
 	out.InnerRemotePrefix = params.innerRemote
+	out.PolicyPairs = append([]XFRMPolicyPair(nil), params.policyPairs...)
 	if params.natt.enabled {
 		out.NATTraversal.Enabled = true
 		out.NATTraversal.LocalPort = xfrmPortUint16(params.natt.localPort)
@@ -190,6 +228,131 @@ func KernelXFRMConfigFromIKE(cfg KernelXFRMConfigFromIKEConfig) (KernelXFRMConfi
 		out.NATTraversal.OriginalAddress = params.natt.originalAddress
 	}
 	return out, nil
+}
+
+func deriveXFRMSelectorPairsFromIKE(cfg KernelXFRMConfigFromIKEConfig) ([]string, []string, []XFRMPolicyPair, error) {
+	var localCandidates []string
+	if strings.TrimSpace(cfg.InnerLocalPrefix) != "" {
+		localCandidates = append(localCandidates, cfg.InnerLocalPrefix)
+	}
+	localCandidates = append(localCandidates, cfg.InnerLocalPrefixes...)
+	if len(localCandidates) == 0 {
+		if strings.TrimSpace(cfg.Tunnel.InnerLocalIP) != "" {
+			localCandidates = append(localCandidates, cfg.Tunnel.InnerLocalIP)
+		}
+		localCandidates = append(localCandidates, childConfigurationIPStrings(cfg.ChildSA, ikev2.ConfigInternalIPv4Address)...)
+		localCandidates = append(localCandidates, childConfigurationIPv6Prefixes(cfg.ChildSA)...)
+		if len(localCandidates) == 0 {
+			localCandidates = append(localCandidates, xfrmTrafficSelectorPrefixes(cfg.ChildSA.TSi)...)
+		} else {
+			// Also include any negotiated address family from TSi not yet covered by CFG_REPLY.
+			hasV4, hasV6 := addressFamiliesForTUN(localCandidates)
+			for _, p := range xfrmTrafficSelectorPrefixes(cfg.ChildSA.TSi) {
+				if is4, err := xfrmPrefixIs4(p); err == nil {
+					if (is4 && !hasV4) || (!is4 && !hasV6) {
+						localCandidates = append(localCandidates, p)
+					}
+				}
+			}
+		}
+	}
+
+	var remoteCandidates []string
+	if strings.TrimSpace(cfg.InnerRemotePrefix) != "" {
+		remoteCandidates = append(remoteCandidates, cfg.InnerRemotePrefix)
+	}
+	remoteCandidates = append(remoteCandidates, cfg.InnerRemotePrefixes...)
+	if len(remoteCandidates) == 0 {
+		if strings.TrimSpace(cfg.Tunnel.RemoteInnerIP) != "" {
+			remoteCandidates = append(remoteCandidates, cfg.Tunnel.RemoteInnerIP)
+		}
+		if len(remoteCandidates) == 0 {
+			remoteCandidates = append(remoteCandidates, xfrmTrafficSelectorPrefixes(cfg.ChildSA.TSr)...)
+		} else {
+			hasV4, hasV6 := addressFamiliesForTUN(remoteCandidates)
+			for _, p := range xfrmTrafficSelectorPrefixes(cfg.ChildSA.TSr) {
+				if is4, err := xfrmPrefixIs4(p); err == nil {
+					if (is4 && !hasV4) || (!is4 && !hasV6) {
+						remoteCandidates = append(remoteCandidates, p)
+					}
+				}
+			}
+		}
+	}
+
+	normLocals, err := normalizeUniqueXFRMPrefixes(localCandidates, "inner local prefix")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	normRemotes, err := normalizeUniqueXFRMPrefixes(remoteCandidates, "inner remote prefix")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	pairs, err := pairXFRMPrefixesByFamily(normLocals, normRemotes)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return normLocals, normRemotes, pairs, nil
+}
+
+func normalizeUniqueXFRMPrefixes(values []string, field string) ([]string, error) {
+	seen := make(map[string]bool, len(values))
+	var out []string
+	for _, raw := range values {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		norm, err := normalizeIPPrefix(raw, field)
+		if err != nil {
+			return nil, wrapXFRMError(err)
+		}
+		if !seen[norm] {
+			seen[norm] = true
+			out = append(out, norm)
+		}
+	}
+	return out, nil
+}
+
+func pairXFRMPrefixesByFamily(locals, remotes []string) ([]XFRMPolicyPair, error) {
+	var local4, local6, remote4, remote6 []string
+	for _, l := range locals {
+		is4, err := xfrmPrefixIs4(l)
+		if err != nil {
+			return nil, err
+		}
+		if is4 {
+			local4 = append(local4, l)
+		} else {
+			local6 = append(local6, l)
+		}
+	}
+	for _, r := range remotes {
+		is4, err := xfrmPrefixIs4(r)
+		if err != nil {
+			return nil, err
+		}
+		if is4 {
+			remote4 = append(remote4, r)
+		} else {
+			remote6 = append(remote6, r)
+		}
+	}
+	var pairs []XFRMPolicyPair
+	for _, l := range local4 {
+		for _, r := range remote4 {
+			pairs = append(pairs, XFRMPolicyPair{LocalPrefix: l, RemotePrefix: r})
+		}
+	}
+	for _, l := range local6 {
+		for _, r := range remote6 {
+			pairs = append(pairs, XFRMPolicyPair{LocalPrefix: l, RemotePrefix: r})
+		}
+	}
+	if len(pairs) == 0 && len(locals) > 0 && len(remotes) > 0 {
+		return nil, fmt.Errorf("%w: inner local and remote prefix families differ", ErrInvalidXFRMConfig)
+	}
+	return pairs, nil
 }
 
 func buildKernelXFRMCommands(cfg KernelXFRMConfig) ([]ipCommand, error) {
@@ -201,9 +364,11 @@ func buildKernelXFRMCommands(cfg KernelXFRMConfig) ([]ipCommand, error) {
 	if params.xfrmiName != "" {
 		if !cfg.XFRMInterface.SkipCreateLink {
 			args := []string{"link", "add", params.xfrmiName, "type", "xfrm", "dev", params.xfrmiOuterDev, "if_id", params.ifID}
+			delArgs := []string{"link", "del", params.xfrmiName}
 			commands = append(commands, ipCommand{
-				args: args,
-				undo: []string{"link", "del", params.xfrmiName},
+				args:     args,
+				undo:     delArgs,
+				preClean: append([]string(nil), delArgs...),
 			})
 		}
 		if params.xfrmiMTU > 0 {
@@ -214,11 +379,15 @@ func buildKernelXFRMCommands(cfg KernelXFRMConfig) ([]ipCommand, error) {
 	commands = append(commands,
 		ipCommand{args: xfrmStateAddArgs(params, true), undo: xfrmStateDelArgs(params, true)},
 		ipCommand{args: xfrmStateAddArgs(params, false), undo: xfrmStateDelArgs(params, false)},
-		ipCommand{args: xfrmPolicyAddArgs(params, "out"), undo: xfrmPolicyDelArgs(params, "out")},
-		ipCommand{args: xfrmPolicyAddArgs(params, "in"), undo: xfrmPolicyDelArgs(params, "in")},
 	)
-	if params.includeForward {
-		commands = append(commands, ipCommand{args: xfrmPolicyAddArgs(params, "fwd"), undo: xfrmPolicyDelArgs(params, "fwd")})
+	for _, pair := range params.policyPairs {
+		commands = append(commands,
+			ipCommand{args: xfrmPolicyAddArgsForPair(params, pair, "out"), undo: xfrmPolicyDelArgsForPair(params, pair, "out")},
+			ipCommand{args: xfrmPolicyAddArgsForPair(params, pair, "in"), undo: xfrmPolicyDelArgsForPair(params, pair, "in")},
+		)
+		if params.includeForward {
+			commands = append(commands, ipCommand{args: xfrmPolicyAddArgsForPair(params, pair, "fwd"), undo: xfrmPolicyDelArgsForPair(params, pair, "fwd")})
+		}
 	}
 	return commands, nil
 }
@@ -229,6 +398,8 @@ type kernelXFRMParams struct {
 	outerRemote    string
 	innerLocal     string
 	innerRemote    string
+	policyPairs    []XFRMPolicyPair
+	replayWindow   int
 	reqID          string
 	mark           string
 	ifID           string
@@ -255,19 +426,93 @@ func normalizeKernelXFRMConfig(cfg KernelXFRMConfig) (kernelXFRMParams, error) {
 	if err != nil {
 		return kernelXFRMParams{}, wrapXFRMError(err)
 	}
-	innerLocal, err := normalizeIPPrefix(cfg.InnerLocalPrefix, "inner local prefix")
+	outerLocalIs4, err := xfrmAddressIs4(outerLocal)
 	if err != nil {
 		return kernelXFRMParams{}, wrapXFRMError(err)
 	}
-	innerRemote, err := normalizeIPPrefix(cfg.InnerRemotePrefix, "inner remote prefix")
+	outerRemoteIs4, err := xfrmAddressIs4(outerRemote)
 	if err != nil {
 		return kernelXFRMParams{}, wrapXFRMError(err)
 	}
-	if err := validateKernelXFRMFamilies(outerLocal, outerRemote, innerLocal, innerRemote); err != nil {
-		return kernelXFRMParams{}, err
+	if outerLocalIs4 != outerRemoteIs4 {
+		return kernelXFRMParams{}, fmt.Errorf("%w: outer local and remote address families differ", ErrInvalidXFRMConfig)
 	}
+
+	var policyPairs []XFRMPolicyPair
+	if len(cfg.PolicyPairs) > 0 {
+		seen := make(map[XFRMPolicyPair]bool, len(cfg.PolicyPairs))
+		for _, pair := range cfg.PolicyPairs {
+			localNorm, lErr := normalizeIPPrefix(pair.LocalPrefix, "inner local prefix")
+			if lErr != nil {
+				return kernelXFRMParams{}, wrapXFRMError(lErr)
+			}
+			remoteNorm, rErr := normalizeIPPrefix(pair.RemotePrefix, "inner remote prefix")
+			if rErr != nil {
+				return kernelXFRMParams{}, wrapXFRMError(rErr)
+			}
+			if fErr := validateKernelXFRMInnerPair(localNorm, remoteNorm); fErr != nil {
+				return kernelXFRMParams{}, fErr
+			}
+			normPair := XFRMPolicyPair{LocalPrefix: localNorm, RemotePrefix: remoteNorm}
+			if !seen[normPair] {
+				seen[normPair] = true
+				policyPairs = append(policyPairs, normPair)
+			}
+		}
+	} else if len(cfg.InnerLocalPrefixes) > 0 || len(cfg.InnerRemotePrefixes) > 0 {
+		localIn := cfg.InnerLocalPrefixes
+		if len(localIn) == 0 && strings.TrimSpace(cfg.InnerLocalPrefix) != "" {
+			localIn = []string{cfg.InnerLocalPrefix}
+		}
+		remoteIn := cfg.InnerRemotePrefixes
+		if len(remoteIn) == 0 && strings.TrimSpace(cfg.InnerRemotePrefix) != "" {
+			remoteIn = []string{cfg.InnerRemotePrefix}
+		}
+		normLocals, lErr := normalizeUniqueXFRMPrefixes(localIn, "inner local prefix")
+		if lErr != nil {
+			return kernelXFRMParams{}, lErr
+		}
+		normRemotes, rErr := normalizeUniqueXFRMPrefixes(remoteIn, "inner remote prefix")
+		if rErr != nil {
+			return kernelXFRMParams{}, rErr
+		}
+		if len(normLocals) == 0 {
+			return kernelXFRMParams{}, fmt.Errorf("%w: inner local prefix is empty", ErrInvalidXFRMConfig)
+		}
+		if len(normRemotes) == 0 {
+			return kernelXFRMParams{}, fmt.Errorf("%w: inner remote prefix is empty", ErrInvalidXFRMConfig)
+		}
+		policyPairs, err = pairXFRMPrefixesByFamily(normLocals, normRemotes)
+		if err != nil {
+			return kernelXFRMParams{}, err
+		}
+	} else {
+		innerLocal, lErr := normalizeIPPrefix(cfg.InnerLocalPrefix, "inner local prefix")
+		if lErr != nil {
+			return kernelXFRMParams{}, wrapXFRMError(lErr)
+		}
+		innerRemote, rErr := normalizeIPPrefix(cfg.InnerRemotePrefix, "inner remote prefix")
+		if rErr != nil {
+			return kernelXFRMParams{}, wrapXFRMError(rErr)
+		}
+		if fErr := validateKernelXFRMInnerPair(innerLocal, innerRemote); fErr != nil {
+			return kernelXFRMParams{}, fErr
+		}
+		policyPairs = []XFRMPolicyPair{{LocalPrefix: innerLocal, RemotePrefix: innerRemote}}
+	}
+	if len(policyPairs) == 0 {
+		return kernelXFRMParams{}, fmt.Errorf("%w: inner policy pairs are empty", ErrInvalidXFRMConfig)
+	}
+
 	if err := validateChildSAForXFRM(cfg.ChildSA); err != nil {
 		return kernelXFRMParams{}, err
+	}
+	replayWindow := cfg.ReplayWindow
+	if replayWindow < 0 {
+		return kernelXFRMParams{}, fmt.Errorf("%w: replay window must be non-negative", ErrInvalidXFRMConfig)
+	}
+	if replayWindow == 0 {
+		replayWindow = DefaultXFRMReplayWindow
 	}
 	reqID := cfg.ReqID
 	if reqID < 0 {
@@ -314,8 +559,10 @@ func normalizeKernelXFRMConfig(cfg KernelXFRMConfig) (kernelXFRMParams, error) {
 		child:          cfg.ChildSA,
 		outerLocal:     outerLocal,
 		outerRemote:    outerRemote,
-		innerLocal:     innerLocal,
-		innerRemote:    innerRemote,
+		innerLocal:     policyPairs[0].LocalPrefix,
+		innerRemote:    policyPairs[0].RemotePrefix,
+		policyPairs:    policyPairs,
+		replayWindow:   replayWindow,
 		reqID:          strconv.Itoa(reqID),
 		mark:           mark,
 		ifID:           xfrmID(ifID),
@@ -392,18 +639,7 @@ func validateChildSAForXFRM(child ikev2.ChildSAResult) error {
 	return nil
 }
 
-func validateKernelXFRMFamilies(outerLocal, outerRemote, innerLocal, innerRemote string) error {
-	outerLocalIs4, err := xfrmAddressIs4(outerLocal)
-	if err != nil {
-		return wrapXFRMError(err)
-	}
-	outerRemoteIs4, err := xfrmAddressIs4(outerRemote)
-	if err != nil {
-		return wrapXFRMError(err)
-	}
-	if outerLocalIs4 != outerRemoteIs4 {
-		return fmt.Errorf("%w: outer local and remote address families differ", ErrInvalidXFRMConfig)
-	}
+func validateKernelXFRMInnerPair(innerLocal, innerRemote string) error {
 	innerLocalIs4, err := xfrmPrefixIs4(innerLocal)
 	if err != nil {
 		return wrapXFRMError(err)
@@ -416,6 +652,21 @@ func validateKernelXFRMFamilies(outerLocal, outerRemote, innerLocal, innerRemote
 		return fmt.Errorf("%w: inner local and remote prefix families differ", ErrInvalidXFRMConfig)
 	}
 	return nil
+}
+
+func validateKernelXFRMFamilies(outerLocal, outerRemote, innerLocal, innerRemote string) error {
+	outerLocalIs4, err := xfrmAddressIs4(outerLocal)
+	if err != nil {
+		return wrapXFRMError(err)
+	}
+	outerRemoteIs4, err := xfrmAddressIs4(outerRemote)
+	if err != nil {
+		return wrapXFRMError(err)
+	}
+	if outerLocalIs4 != outerRemoteIs4 {
+		return fmt.Errorf("%w: outer local and remote address families differ", ErrInvalidXFRMConfig)
+	}
+	return validateKernelXFRMInnerPair(innerLocal, innerRemote)
 }
 
 func xfrmAddressIs4(value string) (bool, error) {
@@ -466,7 +717,7 @@ func validateXFRMAEADKeys(profile ikev2.ESPKeyProfile, keys ikev2.ESPKeys, direc
 func xfrmStateAddArgs(params kernelXFRMParams, outbound bool) []string {
 	src, dst, spi, keys := xfrmDirection(params, outbound)
 	args := []string{
-		"xfrm", "state", "add",
+		"xfrm", "state", "update",
 		"src", src,
 		"dst", dst,
 		"proto", "esp",
@@ -475,6 +726,10 @@ func xfrmStateAddArgs(params kernelXFRMParams, outbound bool) []string {
 		"mode", "tunnel",
 	}
 	args = append(args, xfrmStateCryptoArgs(params.child.Keys.Profile, keys)...)
+	args = append(args, "replay-window", strconv.Itoa(params.replayWindow))
+	if params.child.Keys.Profile.ESN {
+		args = append(args, "flag", "esn")
+	}
 	args = appendXFRMCommonSelectors(args, params)
 	args = appendXFRMNATTraversal(args, params, outbound)
 	return args
@@ -501,9 +756,13 @@ func xfrmStateDelArgs(params kernelXFRMParams, outbound bool) []string {
 }
 
 func xfrmPolicyAddArgs(params kernelXFRMParams, dir string) []string {
-	src, dst, tmplSrc, tmplDst := xfrmPolicyDirection(params, dir)
+	return xfrmPolicyAddArgsForPair(params, XFRMPolicyPair{LocalPrefix: params.innerLocal, RemotePrefix: params.innerRemote}, dir)
+}
+
+func xfrmPolicyAddArgsForPair(params kernelXFRMParams, pair XFRMPolicyPair, dir string) []string {
+	src, dst, tmplSrc, tmplDst := xfrmPolicyDirectionForPair(params, pair, dir)
 	args := []string{
-		"xfrm", "policy", "add",
+		"xfrm", "policy", "update",
 		"src", src,
 		"dst", dst,
 		"dir", dir,
@@ -521,7 +780,11 @@ func xfrmPolicyAddArgs(params kernelXFRMParams, dir string) []string {
 }
 
 func xfrmPolicyDelArgs(params kernelXFRMParams, dir string) []string {
-	src, dst, _, _ := xfrmPolicyDirection(params, dir)
+	return xfrmPolicyDelArgsForPair(params, XFRMPolicyPair{LocalPrefix: params.innerLocal, RemotePrefix: params.innerRemote}, dir)
+}
+
+func xfrmPolicyDelArgsForPair(params kernelXFRMParams, pair XFRMPolicyPair, dir string) []string {
+	src, dst, _, _ := xfrmPolicyDirectionForPair(params, pair, dir)
 	args := []string{
 		"xfrm", "policy", "delete",
 		"src", src,
@@ -542,10 +805,14 @@ func xfrmDirection(params kernelXFRMParams, outbound bool) (src, dst, spi string
 }
 
 func xfrmPolicyDirection(params kernelXFRMParams, dir string) (src, dst, tmplSrc, tmplDst string) {
+	return xfrmPolicyDirectionForPair(params, XFRMPolicyPair{LocalPrefix: params.innerLocal, RemotePrefix: params.innerRemote}, dir)
+}
+
+func xfrmPolicyDirectionForPair(params kernelXFRMParams, pair XFRMPolicyPair, dir string) (src, dst, tmplSrc, tmplDst string) {
 	if dir == "out" {
-		return params.innerLocal, params.innerRemote, params.outerLocal, params.outerRemote
+		return pair.LocalPrefix, pair.RemotePrefix, params.outerLocal, params.outerRemote
 	}
-	return params.innerRemote, params.innerLocal, params.outerRemote, params.outerLocal
+	return pair.RemotePrefix, pair.LocalPrefix, params.outerRemote, params.outerLocal
 }
 
 func appendXFRMCommonSelectors(args []string, params kernelXFRMParams) []string {
@@ -590,6 +857,10 @@ func xfrmAuthAlgorithm(integrity uint16) (name string, truncBits int, err error)
 		return "hmac(sha1)", 96, nil
 	case ikev2.INTEG_HMAC_SHA2_256_128:
 		return "hmac(sha256)", 128, nil
+	case ikev2.INTEG_HMAC_SHA2_384_192:
+		return "hmac(sha384)", 192, nil
+	case ikev2.INTEG_HMAC_SHA2_512_256:
+		return "hmac(sha512)", 256, nil
 	default:
 		return "", 0, fmt.Errorf("%w: unsupported ESP integrity %d", ErrInvalidXFRMConfig, integrity)
 	}
@@ -612,35 +883,185 @@ func xfrmIPString(primary net.IP, fallbacks ...string) string {
 }
 
 func firstXFRMTrafficSelectorPrefix(ts ikev2.TrafficSelectors) string {
+	prefixes := xfrmTrafficSelectorPrefixes(ts)
+	if len(prefixes) == 0 {
+		return ""
+	}
+	return prefixes[0]
+}
+
+func xfrmTrafficSelectorPrefixes(ts ikev2.TrafficSelectors) []string {
+	var out []string
+	seen := make(map[string]bool)
 	for _, selector := range ts.Selectors {
-		if prefix, ok := xfrmTrafficSelectorPrefix(selector); ok {
-			return prefix
+		for _, prefix := range xfrmTrafficSelectorRangePrefixes(selector) {
+			if !seen[prefix] {
+				seen[prefix] = true
+				out = append(out, prefix)
+			}
 		}
 	}
-	return ""
+	return out
 }
 
 func xfrmTrafficSelectorPrefix(selector ikev2.TrafficSelector) (string, bool) {
-	var start, end net.IP
+	prefixes := xfrmTrafficSelectorRangePrefixes(selector)
+	if len(prefixes) != 1 {
+		return "", false
+	}
+	return prefixes[0], true
+}
+
+func xfrmTrafficSelectorRangePrefixes(selector ikev2.TrafficSelector) []string {
 	switch selector.Type {
 	case ikev2.TSIPv4AddressRange:
-		start, end = selector.StartAddr.To4(), selector.EndAddr.To4()
+		start, end := selector.StartAddr.To4(), selector.EndAddr.To4()
+		if start == nil || end == nil {
+			return nil
+		}
+		return xfrmIPv4RangeToCIDRs(start, end)
 	case ikev2.TSIPv6AddressRange:
 		if selector.StartAddr.To4() != nil || selector.EndAddr.To4() != nil {
-			return "", false
+			return nil
 		}
-		start, end = selector.StartAddr.To16(), selector.EndAddr.To16()
+		start, end := selector.StartAddr.To16(), selector.EndAddr.To16()
+		if start == nil || end == nil {
+			return nil
+		}
+		return xfrmIPv6RangeToCIDRs(start, end)
 	default:
-		return "", false
+		return nil
 	}
-	if start == nil || end == nil {
-		return "", false
+}
+
+func xfrmIPv4RangeToCIDRs(startBytes, endBytes []byte) []string {
+	if len(startBytes) != 4 || len(endBytes) != 4 {
+		return nil
 	}
-	prefixLen, ok := xfrmSinglePrefixRange(start, end)
-	if !ok {
-		return "", false
+	cur := binary.BigEndian.Uint32(startBytes)
+	end := binary.BigEndian.Uint32(endBytes)
+	if cur > end {
+		return nil
 	}
-	return fmt.Sprintf("%s/%d", net.IP(start).String(), prefixLen), true
+	var out []string
+	for {
+		tz := bits.TrailingZeros32(cur)
+		if cur == 0 {
+			tz = 32
+		}
+		rem := uint64(end) - uint64(cur) + 1
+		maxLog2 := 63 - bits.LeadingZeros64(rem)
+		stepBits := tz
+		if maxLog2 < stepBits {
+			stepBits = maxLog2
+		}
+		prefixLen := 32 - stepBits
+		var ipBuf [4]byte
+		binary.BigEndian.PutUint32(ipBuf[:], cur)
+		out = append(out, fmt.Sprintf("%s/%d", netip.AddrFrom4(ipBuf).String(), prefixLen))
+		if stepBits == 32 {
+			break
+		}
+		blockLast := cur + (uint32(1)<<uint(stepBits) - 1)
+		if blockLast >= end {
+			break
+		}
+		cur = blockLast + 1
+	}
+	return out
+}
+
+type xfrmUint128 struct {
+	hi uint64
+	lo uint64
+}
+
+func xfrmIPv6RangeToCIDRs(startBytes, endBytes []byte) []string {
+	if len(startBytes) != 16 || len(endBytes) != 16 {
+		return nil
+	}
+	cur := xfrmUint128{
+		hi: binary.BigEndian.Uint64(startBytes[:8]),
+		lo: binary.BigEndian.Uint64(startBytes[8:16]),
+	}
+	end := xfrmUint128{
+		hi: binary.BigEndian.Uint64(endBytes[:8]),
+		lo: binary.BigEndian.Uint64(endBytes[8:16]),
+	}
+	if cur.hi > end.hi || (cur.hi == end.hi && cur.lo > end.lo) {
+		return nil
+	}
+	var out []string
+	for {
+		tz := cur.trailingZeros()
+		stepBits := tz
+		maxLog2 := xfrmUint128SpanLog2(cur, end)
+		if maxLog2 < stepBits {
+			stepBits = maxLog2
+		}
+		prefixLen := 128 - stepBits
+		var ipBuf [16]byte
+		binary.BigEndian.PutUint64(ipBuf[:8], cur.hi)
+		binary.BigEndian.PutUint64(ipBuf[8:16], cur.lo)
+		out = append(out, fmt.Sprintf("%s/%d", netip.AddrFrom16(ipBuf).String(), prefixLen))
+		if stepBits == 128 {
+			break
+		}
+		blockLast := cur.blockLast(stepBits)
+		if blockLast.hi > end.hi || (blockLast.hi == end.hi && blockLast.lo >= end.lo) {
+			break
+		}
+		cur = blockLast.inc()
+	}
+	return out
+}
+
+func (u xfrmUint128) trailingZeros() int {
+	if u.lo != 0 {
+		return bits.TrailingZeros64(u.lo)
+	}
+	if u.hi != 0 {
+		return 64 + bits.TrailingZeros64(u.hi)
+	}
+	return 128
+}
+
+func (u xfrmUint128) blockLast(stepBits int) xfrmUint128 {
+	if stepBits <= 0 {
+		return u
+	}
+	if stepBits >= 128 {
+		return xfrmUint128{hi: ^uint64(0), lo: ^uint64(0)}
+	}
+	if stepBits < 64 {
+		mask := (uint64(1) << uint(stepBits)) - 1
+		return xfrmUint128{hi: u.hi, lo: u.lo | mask}
+	}
+	if stepBits == 64 {
+		return xfrmUint128{hi: u.hi, lo: ^uint64(0)}
+	}
+	hiMask := (uint64(1) << uint(stepBits-64)) - 1
+	return xfrmUint128{hi: u.hi | hiMask, lo: ^uint64(0)}
+}
+
+func (u xfrmUint128) inc() xfrmUint128 {
+	lo, carry := bits.Add64(u.lo, 1, 0)
+	hi, _ := bits.Add64(u.hi, 0, carry)
+	return xfrmUint128{hi: hi, lo: lo}
+}
+
+func xfrmUint128SpanLog2(cur, end xfrmUint128) int {
+	diffLo, borrow := bits.Sub64(end.lo, cur.lo, 0)
+	diffHi, _ := bits.Sub64(end.hi, cur.hi, borrow)
+	if diffHi == ^uint64(0) && diffLo == ^uint64(0) {
+		return 128
+	}
+	remLo, carry := bits.Add64(diffLo, 1, 0)
+	remHi, _ := bits.Add64(diffHi, 0, carry)
+	if remHi != 0 {
+		return 64 + (63 - bits.LeadingZeros64(remHi))
+	}
+	return 63 - bits.LeadingZeros64(remLo)
 }
 
 func xfrmSinglePrefixRange(start, end []byte) (int, bool) {

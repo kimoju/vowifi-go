@@ -13,6 +13,7 @@ const (
 	APDUStatusClassWarning        APDUStatusClass = "warning"
 	APDUStatusClassExecutionError APDUStatusClass = "execution_error"
 	APDUStatusClassCheckingError  APDUStatusClass = "checking_error"
+	APDUStatusClassSecurityError  APDUStatusClass = "security_error"
 	APDUStatusClassUnknown        APDUStatusClass = "unknown"
 )
 
@@ -138,6 +139,9 @@ var exactAPDUStatusMeanings = map[uint16]string{
 	0x6D00: "instruction code not supported or invalid",
 	0x6E00: "class not supported",
 	0x6F00: "technical problem with no precise diagnosis",
+	0x9850: "increase cannot be performed, max value reached",
+	0x9862: "authentication error, application specific",
+	0x9864: "authentication error, security context not supported",
 }
 
 func classForAPDUStatusSW1(sw1 byte) APDUStatusClass {
@@ -148,6 +152,8 @@ func classForAPDUStatusSW1(sw1 byte) APDUStatusClass {
 		return APDUStatusClassExecutionError
 	case 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6D, 0x6E:
 		return APDUStatusClassCheckingError
+	case 0x98:
+		return APDUStatusClassSecurityError
 	default:
 		return APDUStatusClassUnknown
 	}
@@ -179,6 +185,8 @@ func genericAPDUStatusMeaning(sw1, sw2 byte) (APDUStatusClass, string) {
 		return APDUStatusClassCheckingError, "class not supported"
 	case 0x6F:
 		return APDUStatusClassExecutionError, "technical problem with no precise diagnosis"
+	case 0x98:
+		return APDUStatusClassSecurityError, "security management error"
 	default:
 		return APDUStatusClassUnknown, fmt.Sprintf("unknown APDU status %02X%02X", sw1, sw2)
 	}

@@ -2,9 +2,12 @@ package ikev2
 
 import (
 	"crypto"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 )
 
 var ErrUnsupportedTransform = errors.New("unsupported ikev2 transform")
@@ -39,6 +42,55 @@ type IKEKeys struct {
 	SKEr    []byte
 	SKPi    []byte
 	SKPr    []byte
+
+	gcmIV *aesGCMIVGenerator
+}
+
+type aesGCMIVGenerator struct {
+	initSalt uint64
+	initNext atomic.Uint64
+	respSalt uint64
+	respNext atomic.Uint64
+}
+
+var (
+	fallbackGCMIVOnce sync.Once
+	fallbackGCMIVGen  *aesGCMIVGenerator
+)
+
+func newAESGCMIVGenerator() *aesGCMIVGenerator {
+	var raw [16]byte
+	_, _ = rand.Read(raw[:])
+	return &aesGCMIVGenerator{
+		initSalt: binary.BigEndian.Uint64(raw[0:8]),
+		respSalt: binary.BigEndian.Uint64(raw[8:16]),
+	}
+}
+
+func fallbackAESGCMIVGenerator() *aesGCMIVGenerator {
+	fallbackGCMIVOnce.Do(func() {
+		fallbackGCMIVGen = newAESGCMIVGenerator()
+	})
+	return fallbackGCMIVGen
+}
+
+func (g *aesGCMIVGenerator) next(fromInitiator bool) []byte {
+	var v uint64
+	if fromInitiator {
+		v = g.initSalt ^ g.initNext.Add(1)
+	} else {
+		v = g.respSalt ^ g.respNext.Add(1)
+	}
+	var out [aesGCMExplicitIVLength]byte
+	binary.BigEndian.PutUint64(out[:], v)
+	return out[:]
+}
+
+func (k IKEKeys) nextAESGCMExplicitIV(fromInitiator bool) []byte {
+	if k.gcmIV != nil {
+		return k.gcmIV.next(fromInitiator)
+	}
+	return fallbackAESGCMIVGenerator().next(fromInitiator)
 }
 
 func KeyMaterialProfileFromSA(sa SecurityAssociation) (KeyMaterialProfile, error) {
@@ -109,6 +161,10 @@ func SplitIKEKeys(profile KeyMaterialProfile, keyMaterial []byte) (IKEKeys, erro
 		rest = rest[n:]
 		return out
 	}
+	var gcmGen *aesGCMIVGenerator
+	if profile.EncryptionID == ENCR_AES_GCM_16 {
+		gcmGen = newAESGCMIVGenerator()
+	}
 	return IKEKeys{
 		Profile: profile,
 		SKD:     take(profile.PRFKeyLength),
@@ -118,6 +174,7 @@ func SplitIKEKeys(profile KeyMaterialProfile, keyMaterial []byte) (IKEKeys, erro
 		SKEr:    take(profile.EncryptionKeyLength),
 		SKPi:    take(profile.PRFKeyLength),
 		SKPr:    take(profile.PRFKeyLength),
+		gcmIV:   gcmGen,
 	}, nil
 }
 
@@ -148,18 +205,18 @@ func findTransform(p Proposal, transformType uint8) (Transform, bool) {
 func encryptionProfile(t Transform) (keyLen int, blockSize int, err error) {
 	switch t.ID {
 	case ENCR_AES_CBC:
-		bits := transformKeyLength(t)
-		if bits == 0 {
-			bits = 128
+		bits, err := transformKeyLength(t)
+		if err != nil {
+			return 0, 0, err
 		}
 		if bits != 128 && bits != 192 && bits != 256 {
 			return 0, 0, fmt.Errorf("%w: AES-CBC key length %d", ErrUnsupportedTransform, bits)
 		}
 		return int(bits / 8), 16, nil
 	case ENCR_AES_GCM_16:
-		bits := transformKeyLength(t)
-		if bits == 0 {
-			bits = 128
+		bits, err := transformKeyLength(t)
+		if err != nil {
+			return 0, 0, err
 		}
 		if bits != 128 && bits != 192 && bits != 256 {
 			return 0, 0, fmt.Errorf("%w: AES-GCM key length %d", ErrUnsupportedTransform, bits)
@@ -194,11 +251,21 @@ func integrityProfile(id uint16) (keyLen int, checksumLen int, err error) {
 	}
 }
 
-func transformKeyLength(t Transform) uint16 {
+func transformKeyLength(t Transform) (uint16, error) {
+	var bits uint16
+	var seen bool
 	for _, attr := range t.Attributes {
-		if attr.Type == AttributeKeyLength && len(attr.Value) >= 2 {
-			return binary.BigEndian.Uint16(attr.Value[:2])
+		if attr.Type != AttributeKeyLength {
+			continue
 		}
+		if seen {
+			return 0, fmt.Errorf("%w: duplicate key length attribute", ErrUnsupportedTransform)
+		}
+		if len(attr.Value) != 2 {
+			return 0, fmt.Errorf("%w: invalid key length attribute size %d", ErrUnsupportedTransform, len(attr.Value))
+		}
+		bits = binary.BigEndian.Uint16(attr.Value)
+		seen = true
 	}
-	return 0
+	return bits, nil
 }

@@ -82,21 +82,23 @@ type DigestAuthState struct {
 }
 
 type RegistrationBinding struct {
-	ContactURI        string
-	PublicIdentity    string
-	AssociatedURIs    []string
-	ServiceRoutes     []string
-	Paths             []string
-	SecurityClient    string
-	SecurityServer    []string
-	SecurityVerify    []string
-	SecurityAgreement SecurityAgreement
-	SecurityPlan      IMSSecurityAssociationPlan
-	Expires           int
-	RegistrarContact  string
-	AuthHeader        string
-	AuthHeaderName    string
-	AuthSession       *DigestAuthSession
+	ContactURI          string
+	PublicIdentity      string
+	AssociatedURIs      []string
+	ServiceRoutes       []string
+	Paths               []string
+	SecurityClient      string
+	SecurityServer      []string
+	SecurityVerify      []string
+	SecurityAgreement   SecurityAgreement
+	SecurityPlan        IMSSecurityAssociationPlan
+	Expires             int
+	RegistrarContact    string
+	KeepaliveNegotiated bool
+	FlowTimer           int
+	AuthHeader          string
+	AuthHeaderName      string
+	AuthSession         *DigestAuthSession
 }
 
 type RegisterMessage struct {
@@ -417,9 +419,15 @@ func VerifyDigestAuthorization(header string, ch DigestChallenge, in DigestAuthI
 		(ch.Opaque != "" && auth.Opaque != ch.Opaque) {
 		return auth, false, nil
 	}
-	qop := firstQOP(ch.QOP)
-	if qop != auth.QOP {
-		return auth, false, nil
+	qop := strings.ToLower(strings.TrimSpace(auth.QOP))
+	if strings.TrimSpace(ch.QOP) == "" {
+		if qop != "" {
+			return auth, false, nil
+		}
+	} else {
+		if qop == "" || !digestSupportedSingleQOP(qop) || !digestQOPListContains(ch.QOP, qop) {
+			return auth, false, nil
+		}
 	}
 	if expected := strings.TrimSpace(in.Username); expected != "" && expected != auth.Username {
 		return auth, false, nil
@@ -454,7 +462,9 @@ func VerifyDigestAuthorization(header string, ch DigestChallenge, in DigestAuthI
 	input.CNonce = auth.CNonce
 	input.NC = auth.NC
 	input.AUTS = append([]byte(nil), auth.AUTS...)
-	expected, err := BuildDigestAuthorization(ch, input)
+	verifyChallenge := ch
+	verifyChallenge.QOP = qop
+	expected, err := BuildDigestAuthorization(verifyChallenge, input)
 	if err != nil {
 		return auth, false, err
 	}
@@ -616,7 +626,7 @@ func cloneDigestAuthInput(input DigestAuthInput) DigestAuthInput {
 
 func BuildAKADigestPassword(algorithm string, aka sim.AKAResult) (string, error) {
 	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
-	case "AKAV1-MD5":
+	case "AKAV1-MD5", "AKAV1-SHA-256":
 		if len(aka.RES) == 0 {
 			return "", errors.New("AKA RES is empty")
 		}
@@ -630,6 +640,17 @@ func BuildAKADigestPassword(algorithm string, aka sim.AKAResult) (string, error)
 		key = append(key, aka.IK...)
 		key = append(key, aka.CK...)
 		mac := hmac.New(md5.New, key)
+		_, _ = mac.Write([]byte("http-digest-akav2-password"))
+		return base64.StdEncoding.EncodeToString(mac.Sum(nil)), nil
+	case "AKAV2-SHA-256":
+		if len(aka.RES) == 0 || len(aka.CK) == 0 || len(aka.IK) == 0 {
+			return "", errors.New("AKA RES/CK/IK required for AKAv2-SHA-256")
+		}
+		key := make([]byte, 0, len(aka.RES)+len(aka.IK)+len(aka.CK))
+		key = append(key, aka.RES...)
+		key = append(key, aka.IK...)
+		key = append(key, aka.CK...)
+		mac := hmac.New(sha256.New, key)
 		_, _ = mac.Write([]byte("http-digest-akav2-password"))
 		return base64.StdEncoding.EncodeToString(mac.Sum(nil)), nil
 	default:
@@ -1128,7 +1149,16 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 		attempts++
 		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
 	}
-	authHeaderName, authz, _, err := nextDigestAuthorization(req.AuthState, "REGISTER", registrarURI, req.AuthHeaderName, req.AuthHeader)
+	var (
+		authHeaderName string
+		authz          string
+		err            error
+	)
+	if req.Binding.AuthSession != nil && req.Binding.AuthSession.Usable() {
+		authHeaderName, authz, err = req.Binding.AuthSession.Next("REGISTER", registrarURI)
+	} else {
+		authHeaderName, authz, _, err = nextDigestAuthorization(req.AuthState, "REGISTER", registrarURI, req.AuthHeaderName, req.AuthHeader)
+	}
 	if err != nil {
 		return DeregisterResult{Attempts: attempts}, err
 	}
@@ -1137,6 +1167,9 @@ func (s RegisterSession) Deregister(ctx context.Context, req DeregisterRequest) 
 		return DeregisterResult{Attempts: attempts}, err
 	}
 	if isSIPSuccess(resp.StatusCode) {
+		if req.Binding.AuthSession != nil {
+			_ = req.Binding.AuthSession.UpdateFromResponse(resp)
+		}
 		return DeregisterResult{Deregistered: true, StatusCode: resp.StatusCode, Reason: resp.Reason, Attempts: attempts}, nil
 	}
 	if !isRegisterDigestChallengeResponse(resp) {
@@ -1260,7 +1293,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		attempts++
 		return s.Transport.RoundTripRegister(ctx, cloneRegisterMessage(msg))
 	}
-	retryMinExpires := func(resp RegisterResponse, authHeaderName, authz string, authState DigestAuthState, challengeHeaders map[string][]string) (RegisterResponse, string, string, DigestAuthState, bool, error) {
+	retryMinExpires := func(resp RegisterResponse, authHeaderName, authz string, authState DigestAuthState, challengeHeaders map[string][]string, useSharedSession bool) (RegisterResponse, string, string, DigestAuthState, bool, error) {
 		if resp.StatusCode != 423 {
 			return resp, authHeaderName, authz, authState, false, nil
 		}
@@ -1272,7 +1305,14 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		nextAuthHeaderName := authHeaderName
 		nextAuthz := authz
 		nextAuthState := authState
-		if authState.Usable() {
+		if useSharedSession && req.Binding.AuthSession != nil && req.Binding.AuthSession.Usable() {
+			var err error
+			nextAuthHeaderName, nextAuthz, err = req.Binding.AuthSession.Next("REGISTER", registrarURI)
+			if err != nil {
+				return resp, authHeaderName, authz, authState, true, err
+			}
+			_, _, nextAuthState = req.Binding.AuthSession.Snapshot()
+		} else if authState.Usable() {
 			var err error
 			nextAuthHeaderName, nextAuthz, nextAuthState, err = nextDigestAuthorization(authState, "REGISTER", registrarURI, authHeaderName, "")
 			if err != nil {
@@ -1283,7 +1323,18 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		nextResp, err := sendRefresh(cseq, nextAuthHeaderName, nextAuthz, challengeHeaders)
 		return nextResp, nextAuthHeaderName, nextAuthz, nextAuthState, true, err
 	}
-	authHeaderName, authz, authState, err := nextDigestAuthorization(req.AuthState, "REGISTER", registrarURI, req.AuthHeaderName, req.AuthHeader)
+	var (
+		authHeaderName string
+		authz          string
+		authState      DigestAuthState
+		err            error
+	)
+	if req.Binding.AuthSession != nil && req.Binding.AuthSession.Usable() {
+		authHeaderName, authz, err = req.Binding.AuthSession.Next("REGISTER", registrarURI)
+		_, _, authState = req.Binding.AuthSession.Snapshot()
+	} else {
+		authHeaderName, authz, authState, err = nextDigestAuthorization(req.AuthState, "REGISTER", registrarURI, req.AuthHeaderName, req.AuthHeader)
+	}
 	if err != nil {
 		return RefreshResult{Attempts: attempts}, err
 	}
@@ -1291,14 +1342,19 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if err != nil {
 		return RefreshResult{Attempts: attempts}, err
 	}
-	resp, authHeaderName, authz, authState, _, err = retryMinExpires(resp, authHeaderName, authz, authState, nil)
+	resp, authHeaderName, authz, authState, _, err = retryMinExpires(resp, authHeaderName, authz, authState, nil, true)
 	if err != nil {
 		return RefreshResult{Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 	}
 	if isSIPSuccess(resp.StatusCode) {
 		binding := mergeRefreshBinding(req.Binding, buildRegistrationBindingForClients(s.Profile, activeContactURI, resp, expires, securityClientsFromBinding(req.Binding), nil))
 		authState, err = updateDigestAuthStateFromInfo(authState, resp.Headers, authHeaderName, resp.Body)
-		binding = bindDigestAuthWithChallengeInput(binding, authHeaderName, authz, authState, s.digestChallengeInputFunc())
+		if err == nil {
+			binding = bindDigestAuthWithChallengeInput(binding, authHeaderName, authz, authState, s.digestChallengeInputFunc())
+			if binding.AuthSession != nil {
+				_, _, authState = binding.AuthSession.Snapshot()
+			}
+		}
 		result := RefreshResult{
 			Refreshed:      true,
 			StatusCode:     resp.StatusCode,
@@ -1388,7 +1444,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 			return RefreshResult{Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 		}
 	}
-	resp2, authHeaderName, authz, authState, _, err = retryMinExpires(resp2, authHeaderName, authz, authState, challengeHeaders)
+	resp2, authHeaderName, authz, authState, _, err = retryMinExpires(resp2, authHeaderName, authz, authState, challengeHeaders, false)
 	if err != nil {
 		return RefreshResult{Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 	}
@@ -1414,7 +1470,13 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		result.Refreshed = false
 		return result, err
 	}
-	result.Binding = bindDigestAuthWithChallengeInput(result.Binding, authHeaderName, authz, result.AuthState, s.digestChallengeInputFunc())
+	if result.Binding.AuthSession != nil {
+		// Force replacement onto the fresh challenge state so nc resets to 2.
+		result.Binding.AuthSession.SetChallengeInput(s.digestChallengeInputFunc())
+		result.Binding.AuthSession.forceReplaceState(authHeaderName, authz, result.AuthState)
+	} else {
+		result.Binding = bindDigestAuthWithChallengeInput(result.Binding, authHeaderName, authz, result.AuthState, s.digestChallengeInputFunc())
+	}
 	return result, nil
 }
 
@@ -1719,15 +1781,8 @@ func mergeRefreshBinding(previous, next RegistrationBinding) RegistrationBinding
 	if strings.TrimSpace(next.PublicIdentity) == "" {
 		next.PublicIdentity = previous.PublicIdentity
 	}
-	if len(next.AssociatedURIs) == 0 {
-		next.AssociatedURIs = append([]string(nil), previous.AssociatedURIs...)
-	}
-	if len(next.ServiceRoutes) == 0 {
-		next.ServiceRoutes = append([]string(nil), previous.ServiceRoutes...)
-	}
-	if len(next.Paths) == 0 {
-		next.Paths = append([]string(nil), previous.Paths...)
-	}
+	// Per RFC 3608 §6.1 / 3GPP TS 24.229 §5.1.1.4, a REGISTER refresh 200 OK
+	// authoritatively replaces Service-Route, P-Associated-URI, and Path.
 	if strings.TrimSpace(next.SecurityClient) == "" {
 		next.SecurityClient = previous.SecurityClient
 	}
@@ -1932,17 +1987,20 @@ func buildRegistrationBindingForClients(profile IMSProfile, contactURI string, r
 		securityClientHeader = BuildSecurityClientHeaderList(securityClients)
 	}
 	registrarContact := registrationContactHeader(resp.Headers, contactURI)
+	keepaliveNegotiated, flowTimer := parseRegistrationKeepaliveNegotiation(resp.Headers)
 	binding := RegistrationBinding{
-		ContactURI:       strings.TrimSpace(contactURI),
-		PublicIdentity:   defaultPublicIdentity(profile, associated),
-		AssociatedURIs:   associated,
-		ServiceRoutes:    trimHeaderValues(headerListValues(resp.Headers, "Service-Route")),
-		Paths:            trimHeaderValues(headerListValues(resp.Headers, "Path")),
-		SecurityClient:   securityClientHeader,
-		SecurityServer:   securityServer,
-		SecurityVerify:   securityVerify,
-		Expires:          registrationExpires(resp.Headers, contactURI, requestedExpires),
-		RegistrarContact: registrarContact,
+		ContactURI:          strings.TrimSpace(contactURI),
+		PublicIdentity:      defaultPublicIdentity(profile, associated),
+		AssociatedURIs:      associated,
+		ServiceRoutes:       trimHeaderValues(headerListValues(resp.Headers, "Service-Route")),
+		Paths:               trimHeaderValues(headerListValues(resp.Headers, "Path")),
+		SecurityClient:      securityClientHeader,
+		SecurityServer:      securityServer,
+		SecurityVerify:      securityVerify,
+		Expires:             registrationExpires(resp.Headers, contactURI, requestedExpires),
+		RegistrarContact:    registrarContact,
+		KeepaliveNegotiated: keepaliveNegotiated,
+		FlowTimer:           flowTimer,
 	}
 	if selected, client, ok := selectSecurityAgreementPair(binding.SecurityServer, securityClients); ok {
 		binding.SecurityAgreement = selected
@@ -1957,6 +2015,50 @@ func buildRegistrationBindingForClients(profile IMSProfile, contactURI string, r
 		binding.AssociatedURIs = []string{binding.PublicIdentity}
 	}
 	return binding
+}
+
+func parseRegistrationKeepaliveNegotiation(headers map[string][]string) (bool, int) {
+	var negotiated bool
+	var flowTimer int
+	for _, value := range rawHeaderValues(headers, "Flow-Timer") {
+		if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && n > 0 {
+			negotiated = true
+			flowTimer = n
+			break
+		}
+	}
+	for _, token := range headerListValues(headers, "Require") {
+		if strings.EqualFold(strings.TrimSpace(token), "outbound") {
+			negotiated = true
+			break
+		}
+	}
+	if vias := headerListValues(headers, "Via"); len(vias) > 0 {
+		for _, param := range splitSemicolonParams(vias[0])[1:] {
+			param = strings.TrimSpace(param)
+			if param == "" {
+				continue
+			}
+			key, val, hasEq := strings.Cut(param, "=")
+			if !strings.EqualFold(strings.TrimSpace(key), "keep") {
+				continue
+			}
+			if !hasEq {
+				negotiated = true
+				break
+			}
+			if n, err := strconv.Atoi(strings.TrimSpace(unquote(strings.TrimSpace(val)))); err == nil {
+				if n > 0 {
+					negotiated = true
+					if flowTimer == 0 {
+						flowTimer = n
+					}
+				}
+				break
+			}
+		}
+	}
+	return negotiated, flowTimer
 }
 
 func splitAuthParams(s string) []string {
@@ -2111,13 +2213,39 @@ func decodeDigestAUTS(value string) ([]byte, error) {
 	if value == "" {
 		return nil, fmt.Errorf("%w: invalid auts", ErrInvalidAuthorization)
 	}
-	if raw, err := base64.StdEncoding.DecodeString(value); err == nil {
-		return raw, nil
-	}
-	if raw, err := base64.RawStdEncoding.DecodeString(value); err == nil {
-		return raw, nil
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if raw, err := enc.DecodeString(value); err == nil {
+			return raw, nil
+		}
 	}
 	return nil, fmt.Errorf("%w: invalid auts", ErrInvalidAuthorization)
+}
+
+func digestSupportedSingleQOP(qop string) bool {
+	switch strings.ToLower(strings.TrimSpace(qop)) {
+	case "auth", "auth-int", "auth-init":
+		return true
+	default:
+		return false
+	}
+}
+
+func digestQOPListContains(list, target string) bool {
+	target = strings.ToLower(strings.TrimSpace(target))
+	if target == "" {
+		return false
+	}
+	for _, part := range strings.Split(list, ",") {
+		if strings.ToLower(strings.TrimSpace(part)) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func firstQOP(qop string) string {
@@ -2139,7 +2267,8 @@ func firstQOP(qop string) string {
 			return p
 		}
 	}
-	return strings.ToLower(strings.TrimSpace(qop))
+	first, _, _ := strings.Cut(qop, ",")
+	return strings.ToLower(strings.TrimSpace(first))
 }
 
 func isRegisterDigestChallengeResponse(resp RegisterResponse) bool {
@@ -2209,26 +2338,48 @@ func decodeNonceBytes(nonce string) ([]byte, bool) {
 		return nil, false
 	}
 	clean := strings.NewReplacer(":", "", "-", "", " ", "").Replace(nonce)
-	if raw, err := hex.DecodeString(clean); err == nil {
-		return raw, true
+	hasNonHexBase64 := strings.ContainsAny(nonce, "+/_=")
+	if !hasNonHexBase64 && len(clean) >= 64 && len(clean)%2 == 0 {
+		if raw, err := hex.DecodeString(clean); err == nil {
+			return raw, true
+		}
 	}
-	if raw, err := base64.StdEncoding.DecodeString(nonce); err == nil {
-		return raw, true
+	base64Encodings := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
 	}
-	if raw, err := base64.RawStdEncoding.DecodeString(nonce); err == nil {
-		return raw, true
+	for _, enc := range base64Encodings {
+		if raw, err := enc.DecodeString(nonce); err == nil && len(raw) >= 32 {
+			return raw, true
+		}
+	}
+	if !hasNonHexBase64 && len(clean)%2 == 0 {
+		if raw, err := hex.DecodeString(clean); err == nil {
+			return raw, true
+		}
+	}
+	for _, enc := range base64Encodings {
+		if raw, err := enc.DecodeString(nonce); err == nil {
+			return raw, true
+		}
 	}
 	return nil, false
 }
 
 func isAKADigestAlgorithm(algorithm string) bool {
-	alg := strings.ToUpper(strings.TrimSpace(algorithm))
-	return alg == "AKAV1-MD5" || alg == "AKAV2-MD5"
+	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
+	case "AKAV1-MD5", "AKAV2-MD5", "AKAV1-SHA-256", "AKAV2-SHA-256":
+		return true
+	default:
+		return false
+	}
 }
 
 func digestAlgorithmBuildSupported(algorithm string) bool {
 	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
-	case "MD5", "MD5-SESS", "AKAV1-MD5", "AKAV2-MD5", "SHA-256", "SHA-256-SESS", "SHA-512-256", "SHA-512-256-SESS":
+	case "MD5", "MD5-SESS", "AKAV1-MD5", "AKAV2-MD5", "AKAV1-SHA-256", "AKAV2-SHA-256", "SHA-256", "SHA-256-SESS", "SHA-512-256", "SHA-512-256-SESS":
 		return true
 	default:
 		return false
@@ -2260,6 +2411,10 @@ func digestHA1(algorithm, username, realm, password, nonce, cnonce string) (stri
 
 func digestAlgorithmScore(algorithm string) int {
 	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
+	case "AKAV2-SHA-256":
+		return 40
+	case "AKAV1-SHA-256":
+		return 35
 	case "AKAV2-MD5":
 		return 30
 	case "AKAV1-MD5":
@@ -2314,7 +2469,9 @@ func digestBaseAlgorithm(algorithm string) string {
 		algorithm = strings.TrimSuffix(algorithm, "-SESS")
 	}
 	switch algorithm {
-	case "SHA-256", "SHA-512-256":
+	case "SHA-256", "AKAV1-SHA-256", "AKAV2-SHA-256":
+		return "SHA-256"
+	case "SHA-512-256":
 		return algorithm
 	default:
 		return "MD5"
@@ -2420,10 +2577,19 @@ func extractAddressURI(value string) string {
 }
 
 func defaultPublicIdentity(profile IMSProfile, associated []string) string {
-	if len(associated) > 0 {
-		return associated[0]
+	for _, raw := range associated {
+		uri := extractAddressURI(raw)
+		lower := strings.ToLower(uri)
+		if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") {
+			return uri
+		}
 	}
-	if impu := strings.TrimSpace(profile.IMPU); impu != "" {
+	if len(associated) > 0 {
+		if uri := extractAddressURI(associated[0]); uri != "" {
+			return uri
+		}
+	}
+	if impu := extractAddressURI(profile.IMPU); impu != "" {
 		return impu
 	}
 	if strings.TrimSpace(profile.IMPI) != "" && strings.TrimSpace(profile.Domain) != "" {
@@ -2512,11 +2678,23 @@ func normalizeSIPURIUserHostForContactMatch(uri string) string {
 }
 
 func normalizeSIPURIForContactMatch(uri string) string {
+	uri = extractAddressURI(uri)
 	uri = strings.TrimSpace(strings.Trim(uri, "<>"))
 	if uri == "" || uri == "*" {
 		return ""
 	}
-	if semi := strings.IndexByte(uri, ';'); semi >= 0 {
+	if q := indexOutsideBrackets(uri, '?'); q >= 0 {
+		uri = uri[:q]
+	}
+	if at := strings.LastIndexByte(uri, '@'); at >= 0 {
+		userPart := uri[:at+1]
+		hostPart := uri[at+1:]
+		if semi := indexOutsideBrackets(hostPart, ';'); semi >= 0 {
+			hostPart = hostPart[:semi]
+		}
+		return strings.ToLower(strings.TrimSpace(userPart + hostPart))
+	}
+	if semi := indexOutsideBrackets(uri, ';'); semi >= 0 {
 		uri = uri[:semi]
 	}
 	return strings.ToLower(strings.TrimSpace(uri))

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 )
 
 const (
@@ -32,6 +33,12 @@ const (
 	NotifyInvalidSelectors           uint16 = 39
 	NotifyUnacceptableAddresses      uint16 = 40
 	NotifyUnexpectedNATDetected      uint16 = 41
+	NotifyTemporaryFailure           uint16 = 43
+	NotifyChildSANotFound            uint16 = 44
+	Notify3GPPRATDisallowed          uint16 = 9001
+	Notify3GPPNoAPNSubscription      uint16 = 9002
+	Notify3GPPNetworkFailure         uint16 = 10500
+	Notify3GPPCongestion             uint16 = 15500
 	NotifyNATDetectionSourceIP       uint16 = 16388
 	NotifyNATDetectionDestinationIP  uint16 = 16389
 	NotifyCookie                     uint16 = 16390
@@ -43,6 +50,17 @@ const (
 	NotifyUpdateSAAddresses          uint16 = 16400
 	NotifyCookie2                    uint16 = 16401
 	NotifyNoNATsAllowed              uint16 = 16402
+	NotifyEAPOnlyAuthentication      uint16 = 16417
+	NotifyFragmentationSupported     uint16 = 16430
+	NotifySignatureHashAlgorithms    uint16 = 16431
+	Notify3GPPBackoffTimer           uint16 = 41041
+)
+
+const (
+	SigHashSHA1     uint16 = 1
+	SigHashSHA2_256 uint16 = 2
+	SigHashSHA2_384 uint16 = 3
+	SigHashSHA2_512 uint16 = 4
 )
 
 const (
@@ -74,6 +92,12 @@ var (
 	ErrNotifyInvalidSelectors           = errors.New("ikev2 invalid selectors notify")
 	ErrNotifyUnacceptableAddresses      = errors.New("ikev2 unacceptable addresses notify")
 	ErrNotifyUnexpectedNATDetected      = errors.New("ikev2 unexpected nat detected notify")
+	ErrNotifyTemporaryFailure           = errors.New("ikev2 temporary failure notify")
+	ErrNotifyChildSANotFound            = errors.New("ikev2 child sa not found notify")
+	ErrNotify3GPPRATDisallowed          = errors.New("ikev2 3gpp rat disallowed notify")
+	ErrNotify3GPPNoAPNSubscription      = errors.New("ikev2 3gpp no apn subscription notify")
+	ErrNotify3GPPNetworkFailure         = errors.New("ikev2 3gpp network failure notify")
+	ErrNotify3GPPCongestion             = errors.New("ikev2 3gpp congestion notify")
 	ErrInvalidDelete                    = errors.New("invalid ikev2 delete payload")
 	ErrInvalidAddress                   = errors.New("invalid ikev2 address")
 )
@@ -92,8 +116,9 @@ type InvalidSelectorReport struct {
 }
 
 type NotifyError struct {
-	Notify Notify
-	Err    error
+	Notify          Notify
+	Err             error
+	BackoffDuration time.Duration
 }
 
 func (e *NotifyError) Error() string {
@@ -245,6 +270,8 @@ func NotifyErrorFor(n Notify) error {
 }
 
 func FirstNotifyError(payloads []Payload) error {
+	var firstErr *NotifyError
+	var backoff time.Duration
 	for _, payload := range payloads {
 		if payload.Type != PayloadNotify {
 			continue
@@ -253,11 +280,86 @@ func FirstNotifyError(payloads []Payload) error {
 		if err != nil {
 			return err
 		}
-		if err := NotifyErrorFor(notify); err != nil {
-			return err
+		if d, ok, bErr := notify.BackoffTimer(); bErr == nil && ok {
+			backoff = d
+		}
+		if firstErr == nil {
+			if err := NotifyErrorFor(notify); err != nil {
+				var ne *NotifyError
+				if errors.As(err, &ne) {
+					firstErr = ne
+				} else {
+					return err
+				}
+			}
 		}
 	}
+	if firstErr != nil {
+		firstErr.BackoffDuration = backoff
+		return firstErr
+	}
 	return nil
+}
+
+// ParseGPRSTimer3 decodes a 3GPP TS 24.008 Table 10.5.163 GPRS Timer 3 value
+// carried in a 3GPP TS 24.302 §8.2.9.1 BACKOFF_TIMER (41041) notification.
+func ParseGPRSTimer3(data []byte) (time.Duration, error) {
+	var octet byte
+	switch len(data) {
+	case 1:
+		octet = data[0]
+	case 2:
+		if data[0] != 1 {
+			return 0, fmt.Errorf("%w: BACKOFF_TIMER length byte %d != 1", ErrInvalidNotify, data[0])
+		}
+		octet = data[1]
+	default:
+		return 0, fmt.Errorf("%w: BACKOFF_TIMER data length %d", ErrInvalidNotify, len(data))
+	}
+	unit := (octet >> 5) & 0x07
+	value := time.Duration(octet & 0x1f)
+	switch unit {
+	case 0x00:
+		return value * 10 * time.Minute, nil
+	case 0x01:
+		return value * time.Hour, nil
+	case 0x02:
+		return value * 10 * time.Hour, nil
+	case 0x03:
+		return value * 2 * time.Second, nil
+	case 0x04:
+		return value * 30 * time.Second, nil
+	case 0x05:
+		return value * time.Minute, nil
+	case 0x06:
+		return value * 320 * time.Hour, nil
+	case 0x07:
+		return 0, nil
+	default:
+		return 0, nil
+	}
+}
+
+func (n Notify) BackoffTimer() (time.Duration, bool, error) {
+	if n.NotifyType != Notify3GPPBackoffTimer {
+		return 0, false, nil
+	}
+	d, err := ParseGPRSTimer3(n.NotificationData)
+	if err != nil {
+		return 0, true, err
+	}
+	return d, true, nil
+}
+
+func BackoffDurationFromError(err error) (time.Duration, bool) {
+	if err == nil {
+		return 0, false
+	}
+	var notifyErr *NotifyError
+	if !errors.As(err, &notifyErr) || notifyErr.BackoffDuration <= 0 {
+		return 0, false
+	}
+	return notifyErr.BackoffDuration, true
 }
 
 func NotifyTypeName(notifyType uint16) string {
@@ -296,6 +398,18 @@ func NotifyTypeName(notifyType uint16) string {
 		return "UNACCEPTABLE_ADDRESSES"
 	case NotifyUnexpectedNATDetected:
 		return "UNEXPECTED_NAT_DETECTED"
+	case NotifyTemporaryFailure:
+		return "TEMPORARY_FAILURE"
+	case NotifyChildSANotFound:
+		return "CHILD_SA_NOT_FOUND"
+	case Notify3GPPRATDisallowed:
+		return "3GPP_RAT_DISALLOWED"
+	case Notify3GPPNoAPNSubscription:
+		return "3GPP_NO_APN_SUBSCRIPTION"
+	case Notify3GPPNetworkFailure:
+		return "3GPP_NETWORK_FAILURE"
+	case Notify3GPPCongestion:
+		return "3GPP_CONGESTION"
 	case NotifyNATDetectionSourceIP:
 		return "NAT_DETECTION_SOURCE_IP"
 	case NotifyNATDetectionDestinationIP:
@@ -318,6 +432,14 @@ func NotifyTypeName(notifyType uint16) string {
 		return "COOKIE2"
 	case NotifyNoNATsAllowed:
 		return "NO_NATS_ALLOWED"
+	case NotifyEAPOnlyAuthentication:
+		return "EAP_ONLY_AUTHENTICATION"
+	case NotifyFragmentationSupported:
+		return "IKEV2_FRAGMENTATION_SUPPORTED"
+	case NotifySignatureHashAlgorithms:
+		return "SIGNATURE_HASH_ALGORITHMS"
+	case Notify3GPPBackoffTimer:
+		return "3GPP_BACKOFF_TIMER"
 	default:
 		return fmt.Sprintf("notify %d", notifyType)
 	}
@@ -359,6 +481,18 @@ func notifyErrorClass(notifyType uint16) error {
 		return ErrNotifyUnacceptableAddresses
 	case NotifyUnexpectedNATDetected:
 		return ErrNotifyUnexpectedNATDetected
+	case NotifyTemporaryFailure:
+		return ErrNotifyTemporaryFailure
+	case NotifyChildSANotFound:
+		return ErrNotifyChildSANotFound
+	case Notify3GPPRATDisallowed:
+		return ErrNotify3GPPRATDisallowed
+	case Notify3GPPNoAPNSubscription:
+		return ErrNotify3GPPNoAPNSubscription
+	case Notify3GPPNetworkFailure:
+		return ErrNotify3GPPNetworkFailure
+	case Notify3GPPCongestion:
+		return ErrNotify3GPPCongestion
 	default:
 		if notifyType < 16384 {
 			return ErrIKEv2NotifyError
@@ -557,6 +691,28 @@ func NATDetectionNotify(notifyType uint16, spiI, spiR uint64, ip net.IP, port ui
 
 func MOBIKESupportedNotify() Payload {
 	body, _ := (Notify{NotifyType: NotifyMOBIKESupported}).MarshalBinary()
+	return Payload{Type: PayloadNotify, Body: body}
+}
+
+func FragmentationSupportedNotify() Payload {
+	body, _ := (Notify{NotifyType: NotifyFragmentationSupported}).MarshalBinary()
+	return Payload{Type: PayloadNotify, Body: body}
+}
+
+func EAPOnlyAuthenticationNotify() Payload {
+	body, _ := (Notify{NotifyType: NotifyEAPOnlyAuthentication}).MarshalBinary()
+	return Payload{Type: PayloadNotify, Body: body}
+}
+
+func SignatureHashAlgorithmsNotify(hashIDs ...uint16) Payload {
+	if len(hashIDs) == 0 {
+		hashIDs = []uint16{SigHashSHA2_256, SigHashSHA2_384, SigHashSHA2_512}
+	}
+	data := make([]byte, 2*len(hashIDs))
+	for i, id := range hashIDs {
+		binary.BigEndian.PutUint16(data[i*2:(i+1)*2], id)
+	}
+	body, _ := (Notify{NotifyType: NotifySignatureHashAlgorithms, NotificationData: data}).MarshalBinary()
 	return Payload{Type: PayloadNotify, Body: body}
 }
 

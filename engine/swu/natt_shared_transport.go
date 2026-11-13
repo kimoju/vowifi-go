@@ -86,6 +86,34 @@ func (t *sharedNATTIKETransport) ExchangeIKE(ctx context.Context, request []byte
 	return t.core.exchangeIKE(ctx, request)
 }
 
+func (t *sharedNATTIKETransport) ExchangeIKEFragments(ctx context.Context, requests [][]byte, acceptResponse func(raw []byte) (done bool, err error)) error {
+	if t == nil || t.core == nil {
+		return ErrInvalidPacketTunnel
+	}
+	return t.core.exchangeIKEFragments(ctx, requests, acceptResponse)
+}
+
+func (t *sharedNATTIKETransport) RebindLocalIP(ctx context.Context, newLocalIP net.IP) (net.Addr, error) {
+	if t == nil || t.core == nil {
+		return nil, ErrInvalidPacketTunnel
+	}
+	return t.core.rebindLocalIP(ctx, newLocalIP)
+}
+
+func (t *sharedNATTIKETransport) SendNATTKeepalive(ctx context.Context) error {
+	if t == nil || t.core == nil {
+		return ErrInvalidPacketTunnel
+	}
+	return t.core.write(ctx, []byte{0xff})
+}
+
+func (t *sharedNATTIKETransport) underlyingUDPConn() *net.UDPConn {
+	if t == nil || t.core == nil {
+		return nil
+	}
+	return t.core.underlyingUDPConn()
+}
+
 func (t *sharedNATTIKETransport) SendIKEMessage(ctx context.Context, payload []byte) error {
 	if t == nil || t.core == nil {
 		return ErrInvalidPacketTunnel
@@ -174,6 +202,13 @@ func (t *sharedNATTESPTransport) LocalNetworkAddr() net.Addr {
 		return nil
 	}
 	return t.core.localNetworkAddr()
+}
+
+func (t *sharedNATTESPTransport) RebindLocalIP(ctx context.Context, newLocalIP net.IP) (net.Addr, error) {
+	if t == nil || t.core == nil {
+		return nil, ErrInvalidPacketTunnel
+	}
+	return t.core.rebindLocalIP(ctx, newLocalIP)
 }
 
 func (t *sharedNATTESPTransport) proxyRouteIPs() []net.IP {
@@ -265,6 +300,143 @@ func (c *sharedNATTUDPConn) exchangeIKE(ctx context.Context, request []byte) ([]
 	}
 }
 
+func (c *sharedNATTUDPConn) exchangeIKEFragments(ctx context.Context, requests [][]byte, acceptResponse func(raw []byte) (done bool, err error)) error {
+	if c == nil || len(requests) == 0 || acceptResponse == nil {
+		return ErrInvalidPacketTunnel
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.ikeMu.Lock()
+	defer c.ikeMu.Unlock()
+	reqMsgID, hasReqHeader := parseWireIKEMessageID(requests[0])
+	for _, req := range requests {
+		wire := append([]byte{0, 0, 0, 0}, req...)
+		if err := c.write(ctx, wire); err != nil {
+			return err
+		}
+	}
+	timer, timerCh := c.responseTimer()
+	if timer != nil {
+		defer timer.Stop()
+	}
+	for {
+		select {
+		case packet := <-c.ikeRespCh:
+			if hasReqHeader {
+				if respMsgID, ok := parseWireIKEMessageID(packet); ok && respMsgID != reqMsgID {
+					continue
+				}
+			}
+			done, err := acceptResponse(packet)
+			if err != nil {
+				return err
+			}
+			if done {
+				return nil
+			}
+			if timer != nil {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(c.timeout)
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timerCh:
+			return &sharedNATTTimeoutError{op: "read"}
+		case <-c.failedCh:
+			return c.failure()
+		case <-c.closedCh:
+			return ErrPacketTunnelClosed
+		}
+	}
+}
+
+func (c *sharedNATTUDPConn) rebindLocalIP(ctx context.Context, newLocalIP net.IP) (net.Addr, error) {
+	if c == nil {
+		return nil, ErrInvalidPacketTunnel
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ip := normalizedMOBIKEIP(newLocalIP)
+	if ip == nil {
+		return nil, fmt.Errorf("%w: invalid MOBIKE local IP", ErrInvalidPacketTunnel)
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, ErrPacketTunnelClosed
+	}
+	proxy := cloneProxyConfig(c.proxy)
+	remoteAddr := c.remoteAddr
+	timeout := c.timeout
+	c.mu.Unlock()
+
+	newLocalAddr := net.JoinHostPort(ip.String(), "0")
+	var newConn net.Conn
+	var err error
+	if proxy.IsActive() {
+		newConn, err = dialSOCKS5UDPConn(ctx, proxy, remoteAddr, newLocalAddr, timeout)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		remote, resolveErr := udpAddrWithDefaultPort(remoteAddr, DefaultNATTUDPPort)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		localUDP, resolveErr := net.ResolveUDPAddr("udp", newLocalAddr)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		dialer := net.Dialer{LocalAddr: localUDP}
+		newConn, err = dialer.DialContext(ctx, "udp", remote)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	c.writeMu.Lock()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		c.writeMu.Unlock()
+		_ = newConn.Close()
+		return nil, ErrPacketTunnelClosed
+	}
+	oldConn := c.conn
+	c.conn = newConn
+	if la := newConn.LocalAddr(); la != nil {
+		c.localAddr = la.String()
+	} else {
+		c.localAddr = newLocalAddr
+	}
+	localNetAddr := newConn.LocalAddr()
+	go c.readLoop(newConn)
+	c.mu.Unlock()
+	c.writeMu.Unlock()
+
+	if oldConn != nil && oldConn != newConn {
+		_ = oldConn.Close()
+	}
+	return localNetAddr, nil
+}
+
+func (c *sharedNATTUDPConn) underlyingUDPConn() *net.UDPConn {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	u, _ := c.conn.(*net.UDPConn)
+	return u
+}
+
 func (c *sharedNATTUDPConn) readIKERequest(ctx context.Context) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -325,13 +497,17 @@ func (c *sharedNATTUDPConn) readLoop(conn net.Conn) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
 			select {
 			case <-c.closedCh:
 				return
 			default:
+			}
+			c.mu.Lock()
+			closed := c.closed
+			staleConn := c.conn != conn
+			c.mu.Unlock()
+			if closed || staleConn {
+				return
 			}
 			if isTransientUDPReadError(err) {
 				continue
@@ -503,5 +679,9 @@ func (e *sharedNATTTimeoutError) Timeout() bool   { return true }
 func (e *sharedNATTTimeoutError) Temporary() bool { return true }
 
 var _ net.Error = (*sharedNATTTimeoutError)(nil)
+var _ ikev2.FragmentInitTransport = (*sharedNATTIKETransport)(nil)
+var _ localIPRebinder = (*sharedNATTIKETransport)(nil)
+var _ NATTKeepaliveSender = (*sharedNATTIKETransport)(nil)
 var _ ESPPacketReadWriteTransport = (*sharedNATTESPTransport)(nil)
 var _ ESPPacketTransportCloser = (*sharedNATTESPTransport)(nil)
+var _ localIPRebinder = (*sharedNATTESPTransport)(nil)

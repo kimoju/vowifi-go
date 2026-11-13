@@ -390,12 +390,20 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 			if err := eapaka.VerifyMAC(eapKeys.KAut, raw, nil); err != nil {
 				return nil, err
 			}
-			payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xde, 0xad, 0xbe, 0xef})
+			success, err := (eapaka.Packet{Code: eapaka.CodeSuccess, Identifier: pkt.Identifier}).MarshalBinary()
 			if err != nil {
 				return nil, err
 			}
 			exchanges++
-			_, rawResp, err := ProtectMessage(authHeader(init, 4, false), init.Keys, false, payloads, bytes.Repeat([]byte{0x94}, init.Keys.Profile.EncryptionBlockSize))
+			_, rawResp, err := ProtectMessage(authHeader(init, 4, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0x94}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 4:
+			payloads, err := authFinalMSKResponderPayloads(t, init, Identity{Type: IDRFC822Addr, Data: []byte(identity)}, eapKeys.MSK, inner, []byte{0xde, 0xad, 0xbe, 0xef})
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 5, false), init.Keys, false, payloads, bytes.Repeat([]byte{0x95}, init.Keys.Profile.EncryptionBlockSize))
 			return rawResp, err
 		default:
 			return nil, errors.New("unexpected extra exchange")
@@ -413,8 +421,8 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunIKE_AUTH_Full() error = %v", err)
 	}
-	if exchanges != 4 {
-		t.Fatalf("exchanges=%d, want 4", exchanges)
+	if exchanges != 5 {
+		t.Fatalf("exchanges=%d, want 5", exchanges)
 	}
 	if len(res.IdentityExchanges) != 0 || len(res.AKAChallenges) != 1 || len(res.EAPNotifications) != 1 {
 		t.Fatalf("identity exchanges=%d aka=%d notifications=%d", len(res.IdentityExchanges), len(res.AKAChallenges), len(res.EAPNotifications))
@@ -422,7 +430,7 @@ func TestRunIKEAuthFullCompletesAKAWithNotification(t *testing.T) {
 	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.LocalSPI, localSPI) || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xbe, 0xef}) {
 		t.Fatalf("child SA=%+v", res.ChildSA)
 	}
-	if len(res.EAPKeys.KAut) != eapaka.KeyLengthKAut || res.EAPLast == nil || res.EAPLast.Code != eapaka.CodeSuccess || res.NextMessageID != 5 {
+	if len(res.EAPKeys.KAut) != eapaka.KeyLengthKAut || res.EAPLast == nil || res.EAPLast.Code != eapaka.CodeSuccess || res.NextMessageID != 6 {
 		t.Fatalf("result=%+v", res)
 	}
 }
@@ -530,12 +538,20 @@ func TestRunIKEAuthFullUsesPseudonymForFullAuthChallengeKeys(t *testing.T) {
 			if err := eapaka.VerifyCheckcodeAttribute(checkcodeAttr, identityTranscript); err != nil {
 				return nil, err
 			}
-			payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xde, 0xad, 0xbe, 0xef})
+			success, err := (eapaka.Packet{Code: eapaka.CodeSuccess, Identifier: pkt.Identifier}).MarshalBinary()
 			if err != nil {
 				return nil, err
 			}
 			exchanges++
-			_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, payloads, bytes.Repeat([]byte{0xa5}, init.Keys.Profile.EncryptionBlockSize))
+			_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0xa5}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 3:
+			payloads, err := authFinalMSKResponderPayloads(t, init, Identity{Type: IDRFC822Addr, Data: []byte(permanent)}, expectedKeys.MSK, inner, []byte{0xde, 0xad, 0xbe, 0xef})
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 4, false), init.Keys, false, payloads, bytes.Repeat([]byte{0xa6}, init.Keys.Profile.EncryptionBlockSize))
 			return rawResp, err
 		default:
 			return nil, errors.New("unexpected extra exchange")
@@ -555,8 +571,8 @@ func TestRunIKEAuthFullUsesPseudonymForFullAuthChallengeKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunIKE_AUTH_Full() error = %v", err)
 	}
-	if exchanges != 3 {
-		t.Fatalf("exchanges=%d, want 3", exchanges)
+	if exchanges != 4 {
+		t.Fatalf("exchanges=%d, want 4", exchanges)
 	}
 	if res.Auth.EAPIdentityUsed != pseudonym || len(res.IdentityExchanges) != 0 || len(res.AKAChallenges) != 1 {
 		t.Fatalf("identity used=%q identity exchanges=%d aka=%d", res.Auth.EAPIdentityUsed, len(res.IdentityExchanges), len(res.AKAChallenges))
@@ -659,12 +675,24 @@ func TestRunIKEAuthFullNegotiatesAKAPrimeKDF(t *testing.T) {
 			if err := eapaka.VerifyAKAPrimeMAC(keys.KAut, raw, nil); err != nil {
 				return nil, err
 			}
-			payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xde, 0xad, 0xca, 0xfe})
+			success, err := (eapaka.Packet{Code: eapaka.CodeSuccess, Identifier: pkt.Identifier}).MarshalBinary()
 			if err != nil {
 				return nil, err
 			}
 			exchanges++
-			_, rawResp, err := ProtectMessage(authHeader(init, 4, false), init.Keys, false, payloads, bytes.Repeat([]byte{0x98}, init.Keys.Profile.EncryptionBlockSize))
+			_, rawResp, err := ProtectMessage(authHeader(init, 4, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0x98}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 4:
+			keys, err := eapaka.DeriveAKAPrimeKeys(identity, networkName, bytes.Repeat([]byte{0xb2}, 16), aka)
+			if err != nil {
+				return nil, err
+			}
+			payloads, err := authFinalMSKResponderPayloads(t, init, Identity{Type: IDRFC822Addr, Data: []byte(identity)}, keys.MSK, inner, []byte{0xde, 0xad, 0xca, 0xfe})
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 5, false), init.Keys, false, payloads, bytes.Repeat([]byte{0x99}, init.Keys.Profile.EncryptionBlockSize))
 			return rawResp, err
 		default:
 			return nil, errors.New("unexpected extra exchange")
@@ -682,13 +710,13 @@ func TestRunIKEAuthFullNegotiatesAKAPrimeKDF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunIKE_AUTH_Full(AKA') error = %v", err)
 	}
-	if exchanges != 4 || res.KDFNegotiations != 1 || len(res.AKAChallenges) != 2 {
+	if exchanges != 5 || res.KDFNegotiations != 1 || len(res.AKAChallenges) != 2 {
 		t.Fatalf("exchanges=%d kdf=%d aka=%d", exchanges, res.KDFNegotiations, len(res.AKAChallenges))
 	}
 	if len(res.EAPKeys.KAut) != eapaka.KeyLengthAKAPrimeKAut || len(res.EAPKeys.KRe) != eapaka.KeyLengthKRe {
 		t.Fatalf("EAP keys=%+v", res.EAPKeys)
 	}
-	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xca, 0xfe}) || res.NextMessageID != 5 {
+	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xca, 0xfe}) || res.NextMessageID != 6 {
 		t.Fatalf("result=%+v", res)
 	}
 }
@@ -840,12 +868,24 @@ func TestRunIKEAuthFullHandlesInitialReauthentication(t *testing.T) {
 			if counter != 3 {
 				t.Fatalf("counter=%d", counter)
 			}
-			payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xde, 0xad, 0xda, 0x7a})
+			success, err := (eapaka.Packet{Code: eapaka.CodeSuccess, Identifier: pkt.Identifier}).MarshalBinary()
 			if err != nil {
 				return nil, err
 			}
 			exchanges++
-			_, rawResp, err := ProtectMessage(authHeader(init, 2, false), init.Keys, false, payloads, bytes.Repeat([]byte{0xa2}, init.Keys.Profile.EncryptionBlockSize))
+			_, rawResp, err := ProtectMessage(authHeader(init, 2, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0xa2}, init.Keys.Profile.EncryptionBlockSize))
+			return rawResp, err
+		case 2:
+			reauthKeys, err := eapaka.DeriveReauthenticationKeys(reauthIdentity, eapKeys, 3, nonceS)
+			if err != nil {
+				return nil, err
+			}
+			payloads, err := authFinalMSKResponderPayloads(t, init, Identity{Type: IDRFC822Addr, Data: []byte(fullIdentity)}, reauthKeys.MSK, inner, []byte{0xde, 0xad, 0xda, 0x7a})
+			if err != nil {
+				return nil, err
+			}
+			exchanges++
+			_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, payloads, bytes.Repeat([]byte{0xa3}, init.Keys.Profile.EncryptionBlockSize))
 			return rawResp, err
 		default:
 			return nil, errors.New("unexpected extra exchange")
@@ -865,7 +905,7 @@ func TestRunIKEAuthFullHandlesInitialReauthentication(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunIKE_AUTH_Full(reauth) error = %v", err)
 	}
-	if exchanges != 2 || len(res.IdentityExchanges) != 0 || len(res.AKAChallenges) != 1 {
+	if exchanges != 3 || len(res.IdentityExchanges) != 0 || len(res.AKAChallenges) != 1 {
 		t.Fatalf("exchanges=%d identity=%d aka=%d", exchanges, len(res.IdentityExchanges), len(res.AKAChallenges))
 	}
 	if !res.EAPReauthenticated || res.EAPReauthCounterTooSmall || res.EAPReauthCounter != 3 || res.EAPNextReauthID != "reauth-3" {
@@ -878,7 +918,7 @@ func TestRunIKEAuthFullHandlesInitialReauthentication(t *testing.T) {
 	if !bytes.Equal(res.EAPKeys.MSK, expectedKeys.MSK) || !bytes.Equal(res.EAPKeys.EMSK, expectedKeys.EMSK) {
 		t.Fatalf("EAP keys=%+v expected=%+v", res.EAPKeys, expectedKeys)
 	}
-	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xda, 0x7a}) || res.NextMessageID != 3 {
+	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xda, 0x7a}) || res.NextMessageID != 4 {
 		t.Fatalf("result=%+v", res)
 	}
 }
@@ -937,23 +977,7 @@ func TestRunIKEAuthAKAChallenge(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		saPayload, err := SecurityAssociationPayload(DefaultESPProposal([]byte{0xde, 0xad, 0xbe, 0xef}))
-		if err != nil {
-			return nil, err
-		}
-		tsiPayload, err := TrafficSelectorsPayload(PayloadTSi, IPv4AnyTrafficSelectors())
-		if err != nil {
-			return nil, err
-		}
-		tsrPayload, err := TrafficSelectorsPayload(PayloadTSr, IPv4AnyTrafficSelectors())
-		if err != nil {
-			return nil, err
-		}
-		cpPayload, err := ConfigurationPayload(Configuration{Type: CFGReply, Attributes: []ConfigurationAttribute{{Type: ConfigInternalIPv4Address, Value: []byte{10, 0, 0, 2}}}})
-		if err != nil {
-			return nil, err
-		}
-		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(success), saPayload, tsiPayload, tsrPayload, cpPayload}, bytes.Repeat([]byte{0x42}, init.Keys.Profile.EncryptionBlockSize))
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0x42}, init.Keys.Profile.EncryptionBlockSize))
 		return rawResp, err
 	})
 	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
@@ -982,11 +1006,8 @@ func TestRunIKEAuthAKAChallenge(t *testing.T) {
 	if res.EAPNextPseudonym != "pseudo-2" || res.EAPNextReauthID != "reauth-2" {
 		t.Fatalf("EAP identity state pseudonym=%q reauth=%q", res.EAPNextPseudonym, res.EAPNextReauthID)
 	}
-	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.LocalSPI, localSPI) || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xbe, 0xef}) {
-		t.Fatalf("child SA=%+v", res.ChildSA)
-	}
-	if len(res.ChildSA.Keys.Outbound.EncryptionKey) != 16 || len(res.ChildSA.Keys.Inbound.IntegrityKey) != 32 {
-		t.Fatalf("child keys=%+v", res.ChildSA.Keys)
+	if res.ChildSA != nil {
+		t.Fatalf("child SA must not be accepted before MSK AUTH: %+v", res.ChildSA)
 	}
 }
 
@@ -1047,20 +1068,8 @@ func TestRunIKEAuthAKAChallengeHandlesNotificationBeforeSuccess(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			saPayload, err := SecurityAssociationPayload(DefaultESPProposal([]byte{0xde, 0xad, 0xfa, 0xce}))
-			if err != nil {
-				return nil, err
-			}
-			tsiPayload, err := TrafficSelectorsPayload(PayloadTSi, IPv4AnyTrafficSelectors())
-			if err != nil {
-				return nil, err
-			}
-			tsrPayload, err := TrafficSelectorsPayload(PayloadTSr, IPv4AnyTrafficSelectors())
-			if err != nil {
-				return nil, err
-			}
 			exchanges++
-			_, rawResp, err := ProtectMessage(authHeader(init, 4, false), init.Keys, false, []Payload{EAPPayload(success), saPayload, tsiPayload, tsrPayload}, bytes.Repeat([]byte{0x83}, init.Keys.Profile.EncryptionBlockSize))
+			_, rawResp, err := ProtectMessage(authHeader(init, 4, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0x83}, init.Keys.Profile.EncryptionBlockSize))
 			return rawResp, err
 		default:
 			return nil, errors.New("unexpected extra exchange")
@@ -1092,8 +1101,8 @@ func TestRunIKEAuthAKAChallengeHandlesNotificationBeforeSuccess(t *testing.T) {
 	if res.EAPNext == nil || res.EAPNext.Code != eapaka.CodeSuccess || res.NextMessageID != 5 {
 		t.Fatalf("result=%+v", res)
 	}
-	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.LocalSPI, localSPI) || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xde, 0xad, 0xfa, 0xce}) {
-		t.Fatalf("child SA=%+v", res.ChildSA)
+	if res.ChildSA != nil {
+		t.Fatalf("child SA must not be accepted before MSK AUTH: %+v", res.ChildSA)
 	}
 }
 
@@ -1256,11 +1265,11 @@ func TestRunIKEAuthAKAChallengeHandlesReauthentication(t *testing.T) {
 		if counter != 3 {
 			t.Fatalf("counter=%d", counter)
 		}
-		payloads, err := authSuccessChildPayloads(t, pkt.Identifier, []byte{0xfa, 0xce, 0xfe, 0xed})
+		success, err := (eapaka.Packet{Code: eapaka.CodeSuccess, Identifier: pkt.Identifier}).MarshalBinary()
 		if err != nil {
 			return nil, err
 		}
-		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, payloads, bytes.Repeat([]byte{0x8a}, init.Keys.Profile.EncryptionBlockSize))
+		_, rawResp, err := ProtectMessage(authHeader(init, 3, false), init.Keys, false, []Payload{EAPPayload(success)}, bytes.Repeat([]byte{0x8a}, init.Keys.Profile.EncryptionBlockSize))
 		return rawResp, err
 	})
 	localSPI := []byte{0xca, 0xfe, 0xba, 0xbe}
@@ -1296,8 +1305,8 @@ func TestRunIKEAuthAKAChallengeHandlesReauthentication(t *testing.T) {
 	if !bytes.Equal(res.EAPKeys.MSK, expectedKeys.MSK) || !bytes.Equal(res.EAPKeys.EMSK, expectedKeys.EMSK) || !bytes.Equal(res.EAPKeys.KAut, eapKeys.KAut) {
 		t.Fatalf("reauth keys=%+v expected=%+v", res.EAPKeys, expectedKeys)
 	}
-	if res.ChildSA == nil || !bytes.Equal(res.ChildSA.LocalSPI, localSPI) || !bytes.Equal(res.ChildSA.RemoteSPI, []byte{0xfa, 0xce, 0xfe, 0xed}) {
-		t.Fatalf("child SA=%+v", res.ChildSA)
+	if res.ChildSA != nil {
+		t.Fatalf("child SA must not be accepted before MSK AUTH: %+v", res.ChildSA)
 	}
 }
 
@@ -2045,6 +2054,34 @@ func signedAKAPrimeChallenge(t *testing.T, identity, networkName string, aka sim
 	}
 	challenge.Attributes[len(challenge.Attributes)-1] = eapaka.MACAttribute(mac)
 	return challenge
+}
+
+func authFinalMSKResponderPayloads(t *testing.T, init InitResult, initiatorID Identity, msk []byte, reqInner []Payload, remoteSPI []byte) ([]Payload, error) {
+	t.Helper()
+	if len(reqInner) != 1 || reqInner[0].Type != PayloadAUTH {
+		t.Fatalf("final AUTH request inner=%+v", reqInner)
+	}
+	if err := verifyEAPSharedKeyAUTH(init, init.Keys, initiatorID, msk, reqInner[0], true); err != nil {
+		return nil, err
+	}
+	responderID := Identity{Type: IDFQDN, Data: []byte("epdg.epc.mnc280.mcc310.pub.3gppnetwork.org")}
+	idrPayload, err := IdentityPayload(PayloadIDr, responderID)
+	if err != nil {
+		return nil, err
+	}
+	respAUTHBytes, err := eapSharedKeyAUTH(init, init.Keys, responderID, msk, false)
+	if err != nil {
+		return nil, err
+	}
+	respAUTHPayload, err := AuthenticationPayload(AuthMethodSharedKeyMIC, respAUTHBytes)
+	if err != nil {
+		return nil, err
+	}
+	childPayloads, err := authSuccessChildPayloads(t, 1, remoteSPI)
+	if err != nil {
+		return nil, err
+	}
+	return append([]Payload{idrPayload, respAUTHPayload}, childPayloads[1:]...), nil
 }
 
 func authSuccessChildPayloads(t *testing.T, identifier uint8, remoteSPI []byte) ([]Payload, error) {

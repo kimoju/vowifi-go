@@ -14,13 +14,15 @@ import (
 const defaultTimeout = 10 * time.Second
 
 var (
-	hexTokenRE = regexp.MustCompile(`(?i)"([0-9a-f]+)"`)
-	apduLineRE = regexp.MustCompile(`(?im)^\s*\+(?:CGLA|CSIM):\s*\d+\s*,\s*(?:"([0-9a-fA-F]*)"|([0-9a-fA-F]+))\s*$`)
-	cmeErrorRE = regexp.MustCompile(`(?i)\+CME ERROR:\s*([^\r\n]+)`)
-	cchoLineRE = regexp.MustCompile(`(?im)^\s*\+CCHO:\s*(\d+)\b`)
-	crsmLineRE = regexp.MustCompile(`(?im)^\s*\+CRSM:\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(?:"([0-9a-fA-F]*)"|([0-9a-fA-F]+)))?\s*$`)
-	cscaLineRE = regexp.MustCompile(`(?im)^\s*\+CSCA:\s*"([^"]+)"(?:\s*,\s*(\d+))?\s*$`)
-	intTokenRE = regexp.MustCompile(`[-+]?\d+`)
+	hexTokenRE   = regexp.MustCompile(`(?i)"([0-9a-f]+)"`)
+	apduLineRE   = regexp.MustCompile(`(?im)^\s*\+(?:CGLA|CSIM):\s*\d+\s*,\s*(?:"([0-9a-fA-F]*)"|([0-9a-fA-F]+))\s*$`)
+	cmeErrorRE   = regexp.MustCompile(`(?i)\+CME ERROR:\s*([^\r\n]+)`)
+	cmsErrorRE   = regexp.MustCompile(`(?i)\+CMS ERROR:\s*([^\r\n]+)`)
+	cchoLineRE   = regexp.MustCompile(`(?im)^\s*\+CCHO:\s*(\d+)\b`)
+	crsmLineRE   = regexp.MustCompile(`(?im)^\s*\+CRSM:\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(?:"([0-9a-fA-F]*)"|([0-9a-fA-F]+)))?\s*$`)
+	cscaLineRE   = regexp.MustCompile(`(?im)^\s*\+CSCA:\s*"([^"]+)"(?:\s*,\s*(\d+))?\s*$`)
+	intTokenRE   = regexp.MustCompile(`[-+]?\d+`)
+	hyphenIMEIRE = regexp.MustCompile(`\b\d{2}-?\d{6}-?\d{6}-?\d{1,2}\b`)
 )
 
 type ATCommander interface {
@@ -197,7 +199,13 @@ func (a *Adapter) recoverAPDUStatus(channel int, apdu string, resp APDUResult) (
 				return mergeAPDUResult(bodyPrefix, resp), nil
 			}
 			bodyPrefix += resp.Body
-			getResponse, err := GetResponseAPDUWithCLA(apduCLA(apdu), plan.Le)
+			getRespCLA := apduCLA(apdu)
+			if resp.SW1 == 0x9F {
+				getRespCLA = 0xA0
+			} else if (getRespCLA&0xF0) == 0x80 || (getRespCLA&0xF0) == 0xC0 {
+				getRespCLA &^= 0x80
+			}
+			getResponse, err := GetResponseAPDUWithCLA(getRespCLA, plan.Le)
 			if err != nil {
 				return mergeAPDUResult(bodyPrefix, resp), nil
 			}
@@ -214,11 +222,15 @@ func (a *Adapter) recoverAPDUStatus(channel int, apdu string, resp APDUResult) (
 }
 
 func (a *Adapter) ReadCRSMBinary(fileID uint16, offset, length int, pathID string) (CRSMResult, error) {
-	if offset < 0 || offset > 0xffff {
+	if offset < 0 || offset > 0x7fff {
 		return CRSMResult{}, fmt.Errorf("invalid CRSM offset: %d", offset)
 	}
 	p3 := crsmLengthByte(length)
-	return a.runCRSM(176, int(fileID), offset>>8, offset&0xff, p3, "", pathID)
+	res, err := a.runCRSM(176, int(fileID), offset>>8, offset&0xff, p3, "", pathID)
+	if err != nil {
+		return CRSMResult{}, err
+	}
+	return a.recoverCRSMRead(176, int(fileID), offset>>8, offset&0xff, pathID, res)
 }
 
 func (a *Adapter) ReadCRSMRecord(fileID uint16, record, length int, pathID string) (CRSMResult, error) {
@@ -226,7 +238,57 @@ func (a *Adapter) ReadCRSMRecord(fileID uint16, record, length int, pathID strin
 		return CRSMResult{}, fmt.Errorf("invalid CRSM record: %d", record)
 	}
 	p3 := crsmLengthByte(length)
-	return a.runCRSM(178, int(fileID), record, 4, p3, "", pathID)
+	res, err := a.runCRSM(178, int(fileID), record, 4, p3, "", pathID)
+	if err != nil {
+		return CRSMResult{}, err
+	}
+	return a.recoverCRSMRead(178, int(fileID), record, 4, pathID, res)
+}
+
+func (a *Adapter) recoverCRSMRead(command, fileID, p1, p2 int, pathID string, res CRSMResult) (CRSMResult, error) {
+	dataPrefix := ""
+	usedCorrectLe := false
+	getResponses := 0
+
+	for {
+		plan := PlanAPDUStatusRecovery(res.SW1, res.SW2)
+		switch plan.Action {
+		case APDURecoveryCorrectLe:
+			if usedCorrectLe {
+				return mergeCRSMResult(dataPrefix, res), nil
+			}
+			var err error
+			res, err = a.runCRSM(command, fileID, p1, p2, crsmLengthByte(plan.Le), "", pathID)
+			if err != nil {
+				return CRSMResult{}, err
+			}
+			usedCorrectLe = true
+		case APDURecoveryGetResponse:
+			if getResponses >= 4 {
+				return mergeCRSMResult(dataPrefix, res), nil
+			}
+			dataPrefix += res.Data
+			var err error
+			res, err = a.runCRSM(192, fileID, 0, 0, crsmLengthByte(plan.Le), "", pathID)
+			if err != nil {
+				return CRSMResult{}, err
+			}
+			getResponses++
+		default:
+			return mergeCRSMResult(dataPrefix, res), nil
+		}
+	}
+}
+
+func mergeCRSMResult(dataPrefix string, res CRSMResult) CRSMResult {
+	if dataPrefix == "" {
+		return res
+	}
+	return CRSMResult{
+		Data: dataPrefix + res.Data,
+		SW1:  res.SW1,
+		SW2:  res.SW2,
+	}
 }
 
 // ReadIMEI queries the modem identity through common AT commands.
@@ -435,12 +497,67 @@ func parseATError(out string) error {
 	if m := cmeErrorRE.FindStringSubmatch(trimmed); len(m) == 2 {
 		return fmt.Errorf("AT CME ERROR: %s", strings.TrimSpace(m[1]))
 	}
+	if m := cmsErrorRE.FindStringSubmatch(trimmed); len(m) == 2 {
+		return fmt.Errorf("AT CMS ERROR: %s", strings.TrimSpace(m[1]))
+	}
 	for _, line := range strings.FieldsFunc(trimmed, func(r rune) bool { return r == '\r' || r == '\n' }) {
 		if strings.EqualFold(strings.TrimSpace(line), "ERROR") {
 			return errors.New("AT ERROR")
 		}
 	}
 	return nil
+}
+
+// ComputeIMEILuhn computes the 3GPP TS 23.003 Annex B Luhn check digit for a
+// 14-digit TAC+SNR prefix.
+func ComputeIMEILuhn(tacSnr14 string) (byte, bool) {
+	if len(tacSnr14) != 14 {
+		return 0, false
+	}
+	sum := 0
+	for i := 0; i < 14; i++ {
+		c := tacSnr14[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := int(c - '0')
+		if i%2 == 1 {
+			d *= 2
+			if d >= 10 {
+				d = d/10 + d%10
+			}
+		}
+		sum += d
+	}
+	check := (10 - (sum % 10)) % 10
+	return byte('0' + check), true
+}
+
+// ValidateIMEI reports whether imei15 is a 15-digit IMEI with a valid 3GPP TS
+// 23.003 Annex B Luhn check digit.
+func ValidateIMEI(imei15 string) bool {
+	if len(imei15) != 15 {
+		return false
+	}
+	if imei15[14] < '0' || imei15[14] > '9' {
+		return false
+	}
+	want, ok := ComputeIMEILuhn(imei15[:14])
+	return ok && imei15[14] == want
+}
+
+func normalizeIMEIDigitRun(run string) string {
+	switch len(run) {
+	case 15:
+		if ValidateIMEI(run) {
+			return run
+		}
+	case 16:
+		if luhn, ok := ComputeIMEILuhn(run[:14]); ok {
+			return run[:14] + string(luhn)
+		}
+	}
+	return ""
 }
 
 func ExtractIMEI(out string) (string, bool) {
@@ -460,17 +577,32 @@ func ExtractIMEI(out string) (string, bool) {
 }
 
 func firstIMEIDigits(value string) string {
-	digits := make([]byte, 0, 15)
+	start := -1
 	for i := 0; i < len(value); i++ {
 		b := value[i]
 		if b >= '0' && b <= '9' {
-			digits = append(digits, b)
-			if len(digits) == 15 {
-				return string(digits)
+			if start < 0 {
+				start = i
 			}
 			continue
 		}
-		digits = digits[:0]
+		if start >= 0 {
+			if imei := normalizeIMEIDigitRun(value[start:i]); imei != "" {
+				return imei
+			}
+			start = -1
+		}
+	}
+	if start >= 0 {
+		if imei := normalizeIMEIDigitRun(value[start:]); imei != "" {
+			return imei
+		}
+	}
+	for _, candidate := range hyphenIMEIRE.FindAllString(value, -1) {
+		clean := strings.ReplaceAll(candidate, "-", "")
+		if imei := normalizeIMEIDigitRun(clean); imei != "" {
+			return imei
+		}
 	}
 	return ""
 }

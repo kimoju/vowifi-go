@@ -69,9 +69,6 @@ type ussdAnyExtXML struct {
 
 func BuildIMSUSSDXML(payload IMSUSSDPayload) ([]byte, error) {
 	op := payload.Operation
-	if op == "" {
-		op = IMSUSSDOperationRequest
-	}
 	text := strings.TrimSpace(payload.Text)
 	if text == "" && !payload.HasError && op != IMSUSSDOperationRelease {
 		return nil, errors.New("USSD text is empty")
@@ -93,15 +90,25 @@ func BuildIMSUSSDXML(payload IMSUSSDPayload) ([]byte, error) {
 		}
 		data.ErrorCode = strconv.Itoa(payload.ErrorCode)
 	}
+	var anyExt ussdAnyExtXML
+	hasAnyExt := false
 	switch op {
+	case "":
+		// 3GPP TS 24.390 §5.1.2: standard UE-originated USSD XML contains
+		// <language>, <ussd-string>, and optional <error-code> without
+		// non-schema root operation tags.
 	case IMSUSSDOperationRequest:
-		data.UnstructuredSSRequest = &struct{}{}
+		anyExt.UnstructuredSSRequest = &struct{}{}
+		hasAnyExt = true
 	case IMSUSSDOperationResponse:
-		data.UnstructuredSSResponse = &struct{}{}
+		anyExt.UnstructuredSSResponse = &struct{}{}
+		hasAnyExt = true
 	case IMSUSSDOperationNotify:
-		data.UnstructuredSSNotify = &struct{}{}
+		anyExt.UnstructuredSSNotify = &struct{}{}
+		hasAnyExt = true
 	case IMSUSSDOperationRelease:
-		data.UnstructuredSSRelease = &struct{}{}
+		anyExt.UnstructuredSSRelease = &struct{}{}
+		hasAnyExt = true
 	default:
 		return nil, fmt.Errorf("unsupported USSD operation: %s", op)
 	}
@@ -109,7 +116,11 @@ func BuildIMSUSSDXML(payload IMSUSSDPayload) ([]byte, error) {
 		if payload.AlertingPattern < 0 || payload.AlertingPattern > 255 {
 			return nil, fmt.Errorf("USSD alerting pattern out of range: %d", payload.AlertingPattern)
 		}
-		data.AlertingPattern = strconv.Itoa(payload.AlertingPattern)
+		anyExt.AlertingPattern = strconv.Itoa(payload.AlertingPattern)
+		hasAnyExt = true
+	}
+	if hasAnyExt {
+		data.AnyExt = &anyExt
 	}
 	out, err := xml.Marshal(data)
 	if err != nil {
@@ -208,9 +219,6 @@ func ParseIMSUSSDXML(body []byte) (IMSUSSDPayload, error) {
 		}
 		payload.AlertingPattern = pattern
 		payload.HasAlertingPattern = true
-	}
-	if payload.Operation == "" {
-		payload.Operation = IMSUSSDOperationNotify
 	}
 	return payload, nil
 }

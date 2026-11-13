@@ -227,12 +227,25 @@ func ValidateSelectedSA(offered, selected SecurityAssociation) error {
 }
 
 func validateSelectedProposalRequiredTransforms(proposal Proposal) error {
+	seen := make(map[uint8]bool, len(proposal.Transforms))
+	for _, tr := range proposal.Transforms {
+		if seen[tr.Type] {
+			return fmt.Errorf("%w: duplicate transform type %d", ErrUnsupportedSASelection, tr.Type)
+		}
+		seen[tr.Type] = true
+	}
 	var required []uint8
 	encr, hasENCR := findTransform(proposal, TransformENCR)
 	switch proposal.ProtocolID {
 	case ProtocolIKE:
+		if len(proposal.SPI) != 0 && len(proposal.SPI) != 8 {
+			return fmt.Errorf("%w: IKE SPI length %d", ErrUnsupportedSASelection, len(proposal.SPI))
+		}
 		required = []uint8{TransformENCR, TransformPRF, TransformDHRGroup}
 	case ProtocolESP:
+		if len(proposal.SPI) != 4 {
+			return fmt.Errorf("%w: ESP SPI length %d", ErrUnsupportedSASelection, len(proposal.SPI))
+		}
 		required = []uint8{TransformENCR, TransformESN}
 	default:
 		return fmt.Errorf("%w: protocol %d", ErrUnsupportedSASelection, proposal.ProtocolID)
@@ -256,6 +269,9 @@ func isCombinedModeEncryption(id uint16) bool {
 
 func proposalSupportsSelection(offered, selected Proposal) bool {
 	if offered.ProtocolID != selected.ProtocolID {
+		return false
+	}
+	if offered.ProtocolID == ProtocolIKE && len(offered.SPI) != len(selected.SPI) {
 		return false
 	}
 	for _, selectedTransform := range selected.Transforms {

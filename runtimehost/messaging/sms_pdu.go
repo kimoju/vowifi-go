@@ -10,7 +10,12 @@ import (
 )
 
 const IMS3GPPSMSContentType = "application/vnd.3gpp.sms"
-const SMSRPCauseTemporaryFailure byte = 41
+
+const (
+	SMSRPCauseTemporaryFailure       byte = 41
+	SMSRPCauseInvalidMandatoryInfo   byte = 96
+	SMSRPCauseMessageTypeNonExistent byte = 97
+)
 
 type SMSRPDUKind string
 
@@ -253,6 +258,12 @@ func BuildSMSSubmitTPDU(to string, part SMSPart, mr byte) ([]byte, error) {
 	}
 	if hasDCSOverride {
 		dcs = dcsOverride
+	}
+	if len(userData) > 140 {
+		return nil, fmt.Errorf("SMS-SUBMIT user data length %d octets exceeds 140-octet limit", len(userData))
+	}
+	if smsDCSAlphabet(dcs) == "gsm7" && udl > 160 {
+		return nil, fmt.Errorf("SMS-SUBMIT user data length %d septets exceeds 160-septet limit", udl)
 	}
 	out := make([]byte, 0, 7+len(bcd)+len(vp)+len(userData))
 	out = append(out, firstOctet, mr, byte(digits), toa)
@@ -1163,7 +1174,7 @@ var gsm7BasicAlphabet = []rune{
 	'@', '£', '$', '¥', 'è', 'é', 'ù', 'ì',
 	'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å',
 	'Δ', '_', 'Φ', 'Γ', 'Λ', 'Ω', 'Π', 'Ψ',
-	'Σ', 'Θ', 'Ξ', '\x1b', 'Æ', 'æ', 'ß', 'É',
+	'Σ', 'Θ', 'Ξ', '\uffff', 'Æ', 'æ', 'ß', 'É',
 	' ', '!', '"', '#', '¤', '%', '&', '\'',
 	'(', ')', '*', '+', ',', '-', '.', '/',
 	'0', '1', '2', '3', '4', '5', '6', '7',
@@ -1226,7 +1237,7 @@ func encodeRPAddress(number string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(bcd) > 254 {
+	if len(bcd) > 10 {
 		return nil, fmt.Errorf("SMS RP address too long: %d octets", len(bcd)+1)
 	}
 	out := make([]byte, 0, 2+len(bcd))
@@ -1243,13 +1254,32 @@ func decodeRPAddressValue(value []byte) (string, error) {
 }
 
 func smsAddressOctets(digits int, toa byte) (int, error) {
+	_ = toa
 	if digits < 0 {
 		return 0, errors.New("sms address digit count is invalid")
 	}
-	if toa&0x70 == 0x50 {
-		return (digits*7 + 7) / 8, nil
-	}
+	// Per 3GPP TS 23.040 §9.1.2.5, Address-Length is ALWAYS the number of useful
+	// semi-octets (nibbles) in Address-Value, including when TON == 0x50 (Alphanumeric).
 	return (digits + 1) / 2, nil
+}
+
+// EncodeSMSAlphanumericAddress encodes a GSM 7-bit alphanumeric TP-OA/TP-DA/TP-RA
+// address per 3GPP TS 23.040 §9.1.2.5, returning the Address-Length in useful
+// semi-octets ((len(septets)*7 + 3) / 4), Type-of-Address 0xD0, and packed bytes.
+func EncodeSMSAlphanumericAddress(sender string) (digits int, toa byte, packed []byte, err error) {
+	sender = strings.TrimSpace(sender)
+	if sender == "" {
+		return 0, 0, nil, errors.New("sms alphanumeric address is empty")
+	}
+	septets, err := encodeGSM7(sender)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("sms alphanumeric address: %w", err)
+	}
+	digits = (len(septets)*7 + 3) / 4
+	if digits > 20 {
+		return 0, 0, nil, fmt.Errorf("sms alphanumeric address exceeds 20 semi-octets (%d septets): %d semi-octets", len(septets), digits)
+	}
+	return digits, 0xd0, packSeptets(septets, 0), nil
 }
 
 func encodeSMSAddress(number string) (digits int, toa byte, bcd []byte, err error) {
@@ -1271,6 +1301,9 @@ func encodeSMSAddress(number string) (digits int, toa byte, bcd []byte, err erro
 		}
 	}
 	digits = len(number)
+	if digits > 20 {
+		return 0, 0, nil, fmt.Errorf("sms address exceeds 20 semi-octets: %d", digits)
+	}
 	bcd = make([]byte, (digits+1)/2)
 	for i := 0; i < digits; i++ {
 		d, _ := smsAddressSemiOctet(rune(number[i]))
@@ -1329,7 +1362,8 @@ func decodeSMSAddress(digits int, toa byte, bcd []byte) (string, error) {
 		return "", errors.New("sms address digit count is invalid")
 	}
 	if toa&0x70 == 0x50 {
-		return decodeGSM7(unpackSeptets(bcd, digits, 0)), nil
+		septetCount := (digits * 4) / 7
+		return decodeGSM7(unpackSeptets(bcd, septetCount, 0)), nil
 	}
 	var b strings.Builder
 	if toa&0x70 == 0x10 {
@@ -1360,6 +1394,15 @@ func decodeSMSAddress(digits int, toa byte, bcd []byte) (string, error) {
 
 func normalizeSMSNumber(value string) string {
 	value = strings.TrimSpace(value)
+	if start := strings.IndexByte(value, '<'); start >= 0 {
+		if end := strings.IndexByte(value[start+1:], '>'); end >= 0 {
+			value = strings.TrimSpace(value[start+1 : start+1+end])
+		}
+	}
+	value = strings.Trim(value, "<>")
+	if q := strings.IndexByte(value, '?'); q >= 0 {
+		value = value[:q]
+	}
 	lower := strings.ToLower(value)
 	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") {
 		if _, rest, ok := strings.Cut(value, ":"); ok {
@@ -1375,7 +1418,7 @@ func normalizeSMSNumber(value string) string {
 	if semi := strings.IndexByte(value, ';'); semi >= 0 {
 		value = value[:semi]
 	}
-	value = strings.Trim(value, "<>")
+	value = strings.TrimSpace(strings.Trim(value, "<>"))
 	var b strings.Builder
 	for i, r := range value {
 		switch {
@@ -1383,7 +1426,7 @@ func normalizeSMSNumber(value string) string {
 			b.WriteRune(r)
 		case r == '+' && i == 0:
 			b.WriteRune(r)
-		case r == ' ' || r == '-' || r == '(' || r == ')':
+		case r == ' ' || r == '-' || r == '(' || r == ')' || r == '.':
 			continue
 		default:
 			return strings.TrimSpace(value)
@@ -1690,20 +1733,26 @@ func decodeGSM7WithLanguage(septets []byte, lockingLang, singleLang int) string 
 	var b strings.Builder
 	for i := 0; i < len(septets); i++ {
 		code := septets[i] & 0x7f
-		if code == 0x1b && i+1 < len(septets) {
-			shiftCode := septets[i+1] & 0x7f
-			if r, ok := gsm7SingleShiftRune(shiftCode, singleLang); ok {
-				b.WriteRune(r)
-				i++
-				continue
-			}
-			if lockingLang != 0 || singleLang != 0 {
-				if r, ok := gsm7LockingRune(shiftCode, lockingLang); ok {
+		if code == 0x1b {
+			if i+1 < len(septets) {
+				shiftCode := septets[i+1] & 0x7f
+				if r, ok := gsm7SingleShiftRune(shiftCode, singleLang); ok {
 					b.WriteRune(r)
 					i++
 					continue
 				}
+				if lockingLang != 0 || singleLang != 0 {
+					if r, ok := gsm7LockingRune(shiftCode, lockingLang); ok {
+						b.WriteRune(r)
+						i++
+						continue
+					}
+				}
 			}
+			// Per 3GPP TS 23.038 §6.2.1.1, an escape to a reserved/unmapped extension
+			// entry (or trailing 0x1B) renders as a space without consuming the next septet.
+			b.WriteByte(' ')
+			continue
 		}
 		if r, ok := gsm7LockingRune(code, lockingLang); ok {
 			b.WriteRune(r)

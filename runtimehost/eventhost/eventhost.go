@@ -155,6 +155,16 @@ func NewFallbackRecovery(devID, component, operation, field, primarySource, fall
 
 func NewControlPortHangRecovery(devID, component, portType, operation string, err error) RuntimeRecovery {
 	ev := NewRuntimeRecovery(devID, component, operation, err)
+	if err != nil && errors.Is(err, context.Canceled) {
+		ev.Class = simtransport.RecoveryClassNone
+		ev.Recoverable = false
+		ev.Hint = &ControlPortHint{
+			PortType:        normalizeControlPort(portType),
+			Operation:       strings.TrimSpace(operation),
+			SuggestedAction: "",
+		}
+		return ev
+	}
 	if ev.Class == simtransport.RecoveryClassNone {
 		ev.Class = simtransport.RecoveryClassControlPortHung
 		ev.Recoverable = true
@@ -176,6 +186,10 @@ func DispatchRecovery(ctx context.Context, dispatcher Dispatcher, ev RuntimeReco
 	}
 	if !ev.Recoverable {
 		ev.Recoverable = ev.Class.Recoverable()
+	}
+	if ev.Hint != nil {
+		hintCopy := *ev.Hint
+		ev.Hint = &hintCopy
 	}
 	dispatcher.Dispatch(ctx, ev)
 	return true

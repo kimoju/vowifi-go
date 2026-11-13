@@ -31,11 +31,13 @@ func TestLinuxTUNRoutingManagerApplyAndCleanup(t *testing.T) {
 	wantApply := [][]string{
 		{"link", "set", "dev", "vohive0", "mtu", "1400"},
 		{"link", "set", "dev", "vohive0", "up"},
-		{"addr", "add", "10.10.0.2/32", "dev", "vohive0"},
-		{"addr", "add", "2001:db8::2/128", "dev", "vohive0"},
-		{"route", "add", "10.20.0.0/24", "dev", "vohive0", "src", "10.10.0.2", "metric", "50", "table", "200"},
-		{"route", "add", "default", "dev", "vohive0", "via", "10.10.0.1", "table", "200"},
+		{"addr", "replace", "10.10.0.2/32", "dev", "vohive0"},
+		{"addr", "replace", "2001:db8::2/128", "dev", "vohive0"},
+		{"route", "replace", "10.20.0.0/24", "dev", "vohive0", "src", "10.10.0.2", "metric", "50", "table", "200"},
+		{"route", "replace", "default", "dev", "vohive0", "via", "10.10.0.1", "table", "200"},
+		{"rule", "del", "priority", "1000", "fwmark", "0x1/0xffffffff", "table", "200"},
 		{"rule", "add", "priority", "1000", "fwmark", "0x1/0xffffffff", "table", "200"},
+		{"rule", "del", "priority", "1001", "from", "10.10.0.2/32", "table", "200"},
 		{"rule", "add", "priority", "1001", "from", "10.10.0.2/32", "table", "200"},
 	}
 	if !reflect.DeepEqual(runner.commands, wantApply) {
@@ -72,8 +74,8 @@ func TestLinuxTUNRoutingManagerRollsBackOnFailure(t *testing.T) {
 	}
 	want := [][]string{
 		{"link", "set", "dev", "vohive0", "up"},
-		{"addr", "add", "10.10.0.2/32", "dev", "vohive0"},
-		{"route", "add", "10.20.0.0/24", "dev", "vohive0", "table", "200"},
+		{"addr", "replace", "10.10.0.2/32", "dev", "vohive0"},
+		{"route", "replace", "10.20.0.0/24", "dev", "vohive0", "table", "200"},
 		{"addr", "del", "10.10.0.2/32", "dev", "vohive0"},
 	}
 	if !reflect.DeepEqual(runner.commands, want) {
@@ -104,10 +106,11 @@ func TestLinuxTUNRoutingManagerInstallsEPDGExclusionsBeforeTunnelRoutes(t *testi
 	}
 	wantApply := [][]string{
 		{"link", "set", "dev", "vohive0", "up"},
-		{"addr", "add", "10.10.0.2/32", "dev", "vohive0"},
+		{"addr", "replace", "10.10.0.2/32", "dev", "vohive0"},
 		{"route", "replace", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "main"},
 		{"route", "replace", "198.51.100.7/32", "dev", "wwan0", "via", "192.0.2.1", "src", "192.0.2.23", "metric", "5", "table", "200"},
-		{"route", "add", "default", "dev", "vohive0", "table", "200"},
+		{"route", "replace", "default", "dev", "vohive0", "table", "200"},
+		{"rule", "del", "priority", "1000", "from", "10.10.0.2/32", "table", "200"},
 		{"rule", "add", "priority", "1000", "from", "10.10.0.2/32", "table", "200"},
 	}
 	if !reflect.DeepEqual(runner.commands, wantApply) {
@@ -200,8 +203,9 @@ func TestLinuxTUNRoutingManagerUsesIPv6CommandFamilyForRoutesAndRules(t *testing
 	}
 	wantApply := [][]string{
 		{"link", "set", "dev", "vohive0", "up"},
-		{"addr", "add", "2001:db8::2/128", "dev", "vohive0"},
-		{"-6", "route", "add", "::/0", "dev", "vohive0", "table", "200"},
+		{"addr", "replace", "2001:db8::2/128", "dev", "vohive0"},
+		{"-6", "route", "replace", "::/0", "dev", "vohive0", "table", "200"},
+		{"-6", "rule", "del", "priority", "1001", "from", "2001:db8::2/128", "table", "200"},
 		{"-6", "rule", "add", "priority", "1001", "from", "2001:db8::2/128", "table", "200"},
 	}
 	if !reflect.DeepEqual(runner.commands, wantApply) {

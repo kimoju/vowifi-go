@@ -79,6 +79,29 @@ func (t *PersistentUDPTransport) ExchangeIKE(ctx context.Context, request []byte
 	return resp, nil
 }
 
+func (t *PersistentUDPTransport) ExchangeIKEFragments(ctx context.Context, requests [][]byte, acceptResponse func(raw []byte) (done bool, err error)) error {
+	if t == nil {
+		return fmt.Errorf("%w: persistent UDP transport is nil", ErrInvalidInitConfig)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if t.conn == nil {
+		conn, err := dialIKEUDP(ctx, t.Config)
+		if err != nil {
+			return err
+		}
+		t.conn = conn
+	}
+	if err := exchangeIKEFragmentsUDPWithRetransmit(ctx, t.conn, requests, t.Config, acceptResponse); err != nil {
+		t.closeLocked()
+		return err
+	}
+	return nil
+}
+
 func (t *PersistentUDPTransport) Close() error {
 	if t == nil {
 		return nil
@@ -107,6 +130,18 @@ func (t UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, 
 	}
 	defer conn.Close()
 	return exchangeIKEUDPWithRetransmit(ctx, conn, request, t)
+}
+
+func (t UDPTransport) ExchangeIKEFragments(ctx context.Context, requests [][]byte, acceptResponse func(raw []byte) (done bool, err error)) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := dialIKEUDP(ctx, t)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return exchangeIKEFragmentsUDPWithRetransmit(ctx, conn, requests, t, acceptResponse)
 }
 
 func dialIKEUDP(ctx context.Context, config UDPTransport) (net.Conn, error) {
@@ -242,6 +277,121 @@ func exchangeIKEUDP(conn net.Conn, request []byte, config UDPTransport) ([]byte,
 	return resp, nil
 }
 
+func exchangeIKEFragmentsUDPWithRetransmit(ctx context.Context, conn net.Conn, requests [][]byte, config UDPTransport, acceptResponse func(raw []byte) (done bool, err error)) error {
+	if len(requests) == 0 {
+		return fmt.Errorf("%w: no request packets", ErrInvalidInitConfig)
+	}
+	maxRetransmits := config.MaxRetransmits
+	if maxRetransmits == 0 && config.Timeout >= 2*time.Second {
+		maxRetransmits = defaultIKEMaxRetransmits
+	}
+	if maxRetransmits < 0 {
+		maxRetransmits = 0
+	}
+	overallDeadline := time.Time{}
+	if config.Timeout > 0 {
+		overallDeadline = time.Now().Add(config.Timeout)
+	}
+	if ctxDeadline, ok := ctx.Deadline(); ok && (overallDeadline.IsZero() || ctxDeadline.Before(overallDeadline)) {
+		overallDeadline = ctxDeadline
+	}
+	size := config.ReadBufferSize
+	if size <= 0 {
+		size = 64 * 1024
+	}
+	buf := make([]byte, size)
+
+	var lastErr error
+	var lastFragErr error
+	for attempt := 0; attempt <= maxRetransmits; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attemptTimeout := config.RetransmitTimeout
+		if attemptTimeout <= 0 {
+			if !overallDeadline.IsZero() {
+				remaining := time.Until(overallDeadline)
+				if remaining <= 0 {
+					if lastFragErr != nil {
+						return lastFragErr
+					}
+					if lastErr != nil {
+						return lastErr
+					}
+					return context.DeadlineExceeded
+				}
+				slots := maxRetransmits - attempt + 1
+				attemptTimeout = remaining / time.Duration(slots)
+				if attemptTimeout <= 0 {
+					attemptTimeout = remaining
+				}
+			} else {
+				attemptTimeout = config.Timeout
+			}
+		}
+		if !overallDeadline.IsZero() {
+			candidate := time.Now().Add(attemptTimeout)
+			if attemptTimeout <= 0 || candidate.After(overallDeadline) {
+				if err := conn.SetDeadline(overallDeadline); err != nil {
+					return err
+				}
+			} else if err := conn.SetDeadline(candidate); err != nil {
+				return err
+			}
+		} else if err := setIKEUDPDeadline(conn, ctx, attemptTimeout); err != nil {
+			return err
+		}
+		for _, req := range requests {
+			wire := req
+			if config.UseNonESPMarker {
+				wire = append([]byte{0, 0, 0, 0}, req...)
+			}
+			if _, err := conn.Write(wire); err != nil {
+				return err
+			}
+		}
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				lastErr = err
+				if !isTimeoutNetError(err) || ctx.Err() != nil {
+					if lastFragErr != nil {
+						return lastFragErr
+					}
+					return err
+				}
+				break
+			}
+			resp := append([]byte(nil), buf[:n]...)
+			if len(resp) >= 4 && resp[0] == 0 && resp[1] == 0 && resp[2] == 0 && resp[3] == 0 {
+				resp = resp[4:]
+			}
+			done, acceptErr := acceptResponse(resp)
+			if acceptErr == nil && done {
+				return nil
+			}
+			if acceptErr != nil {
+				if done {
+					return acceptErr
+				}
+				// Forged/corrupted SKF datagram on UDP: record error and keep
+				// waiting for genuine peer fragments before deadline expires.
+				lastFragErr = acceptErr
+			}
+		}
+		if !overallDeadline.IsZero() && !time.Now().Before(overallDeadline) {
+			if lastFragErr != nil {
+				return lastFragErr
+			}
+			return lastErr
+		}
+	}
+	if lastFragErr != nil {
+		return lastFragErr
+	}
+	return lastErr
+}
+
 type InitConfig struct {
 	Transport         InitTransport
 	Random            io.Reader
@@ -258,24 +408,28 @@ type InitConfig struct {
 }
 
 type InitResult struct {
-	RequestBytes    []byte
-	ResponseBytes   []byte
-	Request         Message
-	Response        Message
-	SelectedSA      SecurityAssociation
-	InitiatorSPI    uint64
-	ResponderSPI    uint64
-	NonceI          []byte
-	NonceR          []byte
-	PublicKeyI      []byte
-	PublicKeyR      []byte
-	SharedSecret    []byte
-	PRF             crypto.Hash
-	SKEYSEED        []byte
-	KeyMaterial     []byte
-	Keys            IKEKeys
-	MOBIKESupported bool
-	NATDetected     bool
+	RequestBytes            []byte
+	ResponseBytes           []byte
+	Request                 Message
+	Response                Message
+	SelectedSA              SecurityAssociation
+	InitiatorSPI            uint64
+	ResponderSPI            uint64
+	NonceI                  []byte
+	NonceR                  []byte
+	PublicKeyI              []byte
+	PublicKeyR              []byte
+	SharedSecret            []byte
+	PRF                     crypto.Hash
+	SKEYSEED                []byte
+	KeyMaterial             []byte
+	Keys                    IKEKeys
+	MOBIKESupported         bool
+	FragmentationSupported  bool
+	SignatureHashAlgorithms []uint16
+	NATDetected             bool
+	LocalIsResponder        bool
+	Rekeyed                 bool
 }
 
 func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
@@ -338,7 +492,11 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 			NoncePayload(nonceI),
 		}
 		payloads = append(payloads, natPayloads...)
-		payloads = append(payloads, MOBIKESupportedNotify())
+		payloads = append(payloads,
+			MOBIKESupportedNotify(),
+			FragmentationSupportedNotify(),
+			SignatureHashAlgorithmsNotify(),
+		)
 		req, reqBytes, resp, respBytes, activeCookie, err = runIKESAInitRequest(ctx, cfg.Transport, spiI, payloads, activeCookie)
 		if err != nil {
 			altGroup, isInvalidKE, altErr := InvalidKEPayloadAlternativeGroupFromError(err)
@@ -381,39 +539,38 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 		return InitResult{}, err
 	}
 	keyMaterialLength := cfg.KeyMaterialLength
-	if keyMaterialLength <= 0 {
+	if keyMaterialLength < profile.RequiredLength() {
 		keyMaterialLength = profile.RequiredLength()
 	}
 	keyMaterial, err := DeriveIKESAKeyMaterial(prfHash, skeyseed, nonceI, parsed.nonceR, spiI, resp.Header.ResponderSPI, keyMaterialLength)
 	if err != nil {
 		return InitResult{}, err
 	}
-	var keys IKEKeys
-	if len(keyMaterial) >= profile.RequiredLength() {
-		keys, err = SplitIKEKeys(profile, keyMaterial)
-		if err != nil {
-			return InitResult{}, err
-		}
+	keys, err := SplitIKEKeys(profile, keyMaterial)
+	if err != nil {
+		return InitResult{}, err
 	}
 	return InitResult{
-		RequestBytes:    append([]byte(nil), reqBytes...),
-		ResponseBytes:   append([]byte(nil), respBytes...),
-		Request:         req,
-		Response:        resp,
-		SelectedSA:      parsed.sa,
-		InitiatorSPI:    spiI,
-		ResponderSPI:    resp.Header.ResponderSPI,
-		NonceI:          nonceI,
-		NonceR:          parsed.nonceR,
-		PublicKeyI:      pubI,
-		PublicKeyR:      parsed.keyExchange.KeyData,
-		SharedSecret:    shared,
-		PRF:             prfHash,
-		SKEYSEED:        skeyseed,
-		KeyMaterial:     keyMaterial,
-		Keys:            keys,
-		MOBIKESupported: parsed.mobikeSupported,
-		NATDetected:     detectNAT(parsed.notifies, spiI, resp.Header.ResponderSPI, cfg),
+		RequestBytes:            append([]byte(nil), reqBytes...),
+		ResponseBytes:           append([]byte(nil), respBytes...),
+		Request:                 req,
+		Response:                resp,
+		SelectedSA:              parsed.sa,
+		InitiatorSPI:            spiI,
+		ResponderSPI:            resp.Header.ResponderSPI,
+		NonceI:                  nonceI,
+		NonceR:                  parsed.nonceR,
+		PublicKeyI:              pubI,
+		PublicKeyR:              parsed.keyExchange.KeyData,
+		SharedSecret:            shared,
+		PRF:                     prfHash,
+		SKEYSEED:                skeyseed,
+		KeyMaterial:             keyMaterial,
+		Keys:                    keys,
+		MOBIKESupported:         parsed.mobikeSupported,
+		FragmentationSupported:  parsed.fragmentationSupported,
+		SignatureHashAlgorithms: append([]uint16(nil), parsed.signatureHashAlgorithms...),
+		NATDetected:             detectNAT(parsed.notifies, spiI, resp.Header.ResponderSPI, cfg),
 	}, nil
 }
 
@@ -500,6 +657,9 @@ func initResponseCookie(resp Message, spiI uint64) ([]byte, bool, error) {
 	if err := FirstNotifyError(resp.Payloads); err != nil {
 		return nil, false, fmt.Errorf("%w: %w", ErrInvalidInitResponse, err)
 	}
+	if h.ResponderSPI != 0 || hasPayload(resp.Payloads, PayloadSA) {
+		return nil, false, nil
+	}
 	for _, payload := range resp.Payloads {
 		if payload.Type != PayloadNotify {
 			continue
@@ -520,11 +680,13 @@ func initResponseCookie(resp Message, spiI uint64) ([]byte, bool, error) {
 }
 
 type parsedInitResponse struct {
-	sa              SecurityAssociation
-	keyExchange     KeyExchange
-	nonceR          []byte
-	notifies        []Notify
-	mobikeSupported bool
+	sa                      SecurityAssociation
+	keyExchange             KeyExchange
+	nonceR                  []byte
+	notifies                []Notify
+	mobikeSupported         bool
+	fragmentationSupported  bool
+	signatureHashAlgorithms []uint16
 }
 
 func parseInitResponse(resp Message, spiI uint64, expectedDHGroup uint16) (parsedInitResponse, error) {
@@ -567,8 +729,17 @@ func parseInitResponse(resp Message, spiI uint64, expectedDHGroup uint16) (parse
 				return parsedInitResponse{}, err
 			}
 			out.notifies = append(out.notifies, n)
-			if n.NotifyType == NotifyMOBIKESupported {
+			switch n.NotifyType {
+			case NotifyMOBIKESupported:
 				out.mobikeSupported = true
+			case NotifyFragmentationSupported:
+				out.fragmentationSupported = true
+			case NotifySignatureHashAlgorithms:
+				if len(n.NotificationData)%2 == 0 {
+					for i := 0; i < len(n.NotificationData); i += 2 {
+						out.signatureHashAlgorithms = append(out.signatureHashAlgorithms, binary.BigEndian.Uint16(n.NotificationData[i:i+2]))
+					}
+				}
 			}
 		}
 	}

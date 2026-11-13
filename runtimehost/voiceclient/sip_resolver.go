@@ -75,11 +75,12 @@ func (r NetSIPResolver) ResolveSIPServers(ctx context.Context, network, uri stri
 		resolver = DNSResolverForServersFromLocalIPs(r.DNSServers, r.LocalIP, r.LocalIPs, r.Timeout)
 	}
 	service := "sip"
-	if endpoint.Secure {
+	if endpoint.Secure || strings.EqualFold(endpoint.Transport, "tls") {
 		service = "sips"
 	}
+	effectiveNetwork := firstNonEmpty(network, endpoint.Transport)
 	var out []string
-	_, records, err := resolver.LookupSRV(ctx, service, sipResolverProto(network, endpoint.Secure), endpoint.Host)
+	_, records, err := resolver.LookupSRV(ctx, service, sipResolverProto(effectiveNetwork, endpoint.Secure), endpoint.Host)
 	if err == nil && len(records) > 0 {
 		for _, record := range records {
 			target := strings.TrimSuffix(strings.TrimSpace(record.Target), ".")
@@ -343,6 +344,7 @@ type sipURIEndpoint struct {
 	Port         string
 	Secure       bool
 	ExplicitPort bool
+	Transport    string
 }
 
 func (e sipURIEndpoint) addr() string {
@@ -371,12 +373,18 @@ func parseSIPURIEndpoint(uri string) (sipURIEndpoint, error) {
 	if at := strings.LastIndexByte(uri, '@'); at >= 0 {
 		uri = uri[at+1:]
 	}
-	if semi := strings.IndexByte(uri, ';'); semi >= 0 {
+	uriParams := ""
+	if semi := indexOutsideBrackets(uri, ';'); semi >= 0 {
+		uriParams = uri[semi+1:]
 		uri = uri[:semi]
+	}
+	transport := parseSIPURITransportParam(uriParams)
+	if secure {
+		transport = "tls"
 	}
 	rawHostPort := strings.TrimSpace(uri)
 	defaultPort := "5060"
-	if secure {
+	if secure || strings.EqualFold(transport, "tls") {
 		defaultPort = "5061"
 	}
 	host := strings.Trim(rawHostPort, "[] ")
@@ -413,7 +421,25 @@ func parseSIPURIEndpoint(uri string) (sipURIEndpoint, error) {
 	if port == "" {
 		port = defaultPort
 	}
-	return sipURIEndpoint{Host: host, Port: port, Secure: secure, ExplicitPort: explicitPort}, nil
+	return sipURIEndpoint{Host: host, Port: port, Secure: secure, ExplicitPort: explicitPort, Transport: transport}, nil
+}
+
+func parseSIPURITransportParam(params string) string {
+	for _, raw := range strings.Split(params, ";") {
+		key, val, ok := strings.Cut(strings.TrimSpace(raw), "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "transport") {
+			continue
+		}
+		switch strings.ToLower(strings.Trim(strings.TrimSpace(val), `"`)) {
+		case "udp":
+			return "udp"
+		case "tcp":
+			return "tcp"
+		case "tls":
+			return "tls"
+		}
+	}
+	return ""
 }
 
 func extractSIPURIForEndpoint(value string) string {

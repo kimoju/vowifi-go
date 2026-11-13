@@ -816,9 +816,6 @@ func BuildMessageRequest(cfg DialogRequestConfig, contentType string, body []byt
 	msg.Headers["Accept"] = "text/plain, application/vnd.3gpp.sms"
 	msg.Headers["P-Preferred-Service"] = "urn:urn-7:3gpp-service.ims.icsi.sms"
 	msg.Headers["Accept-Contact"] = "*;+g.3gpp.smsip"
-	if contactURI := firstNonEmpty(cfg.ContactURI, cfg.Registration.ContactURI); contactURI != "" {
-		msg.Headers["Contact"] = "<" + contactURI + ">"
-	}
 	return msg, nil
 }
 
@@ -898,8 +895,18 @@ func BuildSubscribeRequest(cfg DialogRequestConfig, event, expires, contentType 
 		return SIPRequestMessage{}, err
 	}
 	msg.Headers["Event"] = event
-	msg.Headers["Accept"] = "message/sipfrag"
-	msg.Headers["Allow-Events"] = "refer"
+	eventBase := strings.ToLower(strings.TrimSpace(strings.SplitN(event, ";", 2)[0]))
+	switch eventBase {
+	case "reg":
+		msg.Headers["Accept"] = "application/reginfo+xml"
+		msg.Headers["Allow-Events"] = "reg, refer, message-summary"
+	case "message-summary":
+		msg.Headers["Accept"] = "application/simple-message-summary"
+		msg.Headers["Allow-Events"] = "message-summary, reg, refer"
+	default:
+		msg.Headers["Accept"] = "message/sipfrag"
+		msg.Headers["Allow-Events"] = "refer"
+	}
 	if expires = strings.TrimSpace(expires); expires == "" {
 		expires = DefaultSubscribeExpires
 	}
@@ -1069,37 +1076,49 @@ func applyDialogRequestHeaders(dst map[string]string, headers map[string]string)
 	for key, value := range headers {
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
-		if key == "" || value == "" || isProtectedDialogRequestHeader(key) {
+		if key == "" || value == "" {
 			continue
 		}
-		setDialogRequestHeader(dst, key, value)
+		canonical := canonicalHeaderName(key)
+		if isProtectedDialogRequestHeader(key) || isProtectedDialogRequestHeader(canonical) {
+			continue
+		}
+		setDialogRequestHeader(dst, canonical, value)
 	}
 }
 
 func setDialogRequestHeader(headers map[string]string, name, value string) {
+	want := canonicalHeaderName(name)
 	for key := range headers {
-		if strings.EqualFold(key, name) {
-			headers[key] = value
+		if strings.EqualFold(key, name) || strings.EqualFold(canonicalHeaderName(key), want) {
+			if key != want {
+				delete(headers, key)
+			}
+			headers[want] = value
 			return
 		}
 	}
-	headers[name] = value
+	headers[want] = value
 }
 
 func setDefaultDialogRequestHeader(headers map[string]string, name, value string) {
+	want := canonicalHeaderName(name)
 	for key, existing := range headers {
-		if strings.EqualFold(key, name) {
+		if strings.EqualFold(key, name) || strings.EqualFold(canonicalHeaderName(key), want) {
 			if strings.TrimSpace(existing) == "" {
-				headers[key] = value
+				if key != want {
+					delete(headers, key)
+				}
+				headers[want] = value
 			}
 			return
 		}
 	}
-	headers[name] = value
+	headers[want] = value
 }
 
 func isProtectedDialogRequestHeader(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	switch strings.ToLower(strings.TrimSpace(canonicalHeaderName(name))) {
 	case "to", "from", "call-id", "cseq", "max-forwards", "route", "record-route", "via", "contact", "content-length", "content-type", "authorization", "proxy-authorization", "p-preferred-identity", "security-verify", "rack", "refer-to", "referred-by", "event", "subscription-state":
 		return true
 	default:

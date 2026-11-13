@@ -2,10 +2,12 @@ package eapaka
 
 import (
 	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 )
 
 const (
@@ -459,14 +461,27 @@ func ResultIndAttribute() Attribute {
 }
 
 func CheckcodeAttributeForPackets(packets [][]byte) Attribute {
+	return CheckcodeAttributeForPacketsAndType(TypeAKA, packets)
+}
+
+func CheckcodeAttributeForPacketsAndType(eapType uint8, packets [][]byte) Attribute {
 	if len(packets) == 0 {
 		return CheckcodeAttribute(nil)
 	}
-	return CheckcodeAttribute(IdentityCheckcode(packets))
+	return CheckcodeAttribute(IdentityCheckcodeForType(eapType, packets))
 }
 
 func IdentityCheckcode(packets [][]byte) []byte {
-	h := sha1.New()
+	return IdentityCheckcodeForType(TypeAKA, packets)
+}
+
+func IdentityCheckcodeForType(eapType uint8, packets [][]byte) []byte {
+	var h hash.Hash
+	if eapType == TypeAKAPrime {
+		h = sha256.New()
+	} else {
+		h = sha1.New()
+	}
 	for _, packet := range packets {
 		_, _ = h.Write(packet)
 	}
@@ -521,12 +536,22 @@ func ParseNotificationRequest(request Packet) (NotificationInfo, error) {
 	if !isAKAType(request.Type) {
 		return NotificationInfo{}, fmt.Errorf("%w: EAP type %d", ErrInvalidPacket, request.Type)
 	}
+	if err := ValidateAttributes(request.Attributes); err != nil {
+		return NotificationInfo{}, err
+	}
 	info, ok, err := NotificationFromAttributes(request.Attributes)
 	if err != nil {
 		return NotificationInfo{}, err
 	}
 	if !ok {
 		return NotificationInfo{}, fmt.Errorf("%w: missing AT_NOTIFICATION", ErrInvalidAttribute)
+	}
+	if info.BeforeAuthentication {
+		for _, attr := range request.Attributes {
+			if attr.Type == AttributeMAC || attr.Type == AttributeIV || attr.Type == AttributeEncrData {
+				return NotificationInfo{}, fmt.Errorf("%w: attribute %d forbidden in pre-auth notification", ErrInvalidAttribute, attr.Type)
+			}
+		}
 	}
 	return info, nil
 }
@@ -586,8 +611,13 @@ func ParseSynchronizationFailureResponse(response Packet) (SynchronizationFailur
 	if err != nil {
 		return SynchronizationFailureInfo{}, err
 	}
-	if response.Type == TypeAKAPrime && len(kdfs) == 0 {
-		return SynchronizationFailureInfo{}, fmt.Errorf("%w: missing AT_KDF", ErrInvalidAttribute)
+	if response.Type == TypeAKAPrime {
+		if len(kdfs) == 0 {
+			return SynchronizationFailureInfo{}, fmt.Errorf("%w: missing AT_KDF", ErrInvalidAttribute)
+		}
+		if len(kdfs) > 1 {
+			return SynchronizationFailureInfo{}, fmt.Errorf("%w: multiple AT_KDF attributes in synchronization failure", ErrInvalidAttribute)
+		}
 	}
 	return SynchronizationFailureInfo{
 		AUTS:       auts,
@@ -1034,7 +1064,7 @@ func (a Attribute) CheckcodeValue() ([]byte, error) {
 			return nil, err
 		}
 		return nil, nil
-	case 22:
+	case 22, 34:
 		if err := requireReservedZero(a.Data, "checkcode reserved bytes"); err != nil {
 			return nil, err
 		}
@@ -1045,6 +1075,10 @@ func (a Attribute) CheckcodeValue() ([]byte, error) {
 }
 
 func VerifyCheckcodeAttribute(attr Attribute, packets [][]byte) error {
+	return VerifyCheckcodeAttributeForType(TypeAKA, attr, packets)
+}
+
+func VerifyCheckcodeAttributeForType(eapType uint8, attr Attribute, packets [][]byte) error {
 	value, err := attr.CheckcodeValue()
 	if err != nil {
 		return err
@@ -1055,7 +1089,14 @@ func VerifyCheckcodeAttribute(attr Attribute, packets [][]byte) error {
 		}
 		return ErrInvalidCheckcode
 	}
-	expected := IdentityCheckcode(packets)
+	expectedLen := sha1.Size
+	if eapType == TypeAKAPrime {
+		expectedLen = sha256.Size
+	}
+	if len(value) != expectedLen {
+		return fmt.Errorf("%w: checkcode digest length %d, want %d", ErrInvalidAttribute, len(value), expectedLen)
+	}
+	expected := IdentityCheckcodeForType(eapType, packets)
 	if subtle.ConstantTimeCompare(value, expected) != 1 {
 		return ErrInvalidCheckcode
 	}

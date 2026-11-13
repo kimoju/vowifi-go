@@ -154,15 +154,38 @@ func (s *rtpRelayRTCPReportScheduler) send(ctx context.Context, cfg RTPRelayRTCP
 func (s *rtpRelayRTCPReportScheduler) sendDirection(ctx context.Context, cfg RTPRelayRTCPReportScheduleConfig, direction RTCPFeedbackDirection) error {
 	switch cfg.Kind {
 	case RTCPReportKindSender:
+		if s.session != nil && !scheduledSenderReportHasExplicitCounters(cfg, direction) && !s.session.takeScheduledSenderIntervalActive(direction) {
+			_, err := s.session.SendReceiverReport(ctx, RTPRelayReceiverReportRequest{
+				Direction:  direction,
+				SenderSSRC: scheduledReceiverReportSSRC(cfg, direction),
+				CNAME:      scheduledReportCNAME(cfg, direction),
+			})
+			return err
+		}
 		_, err := s.session.SendSenderReport(ctx, scheduledSenderReportRequest(s.session, cfg, direction))
 		return err
 	default:
 		_, err := s.session.SendReceiverReport(ctx, RTPRelayReceiverReportRequest{
 			Direction:  direction,
 			SenderSSRC: scheduledReceiverReportSSRC(cfg, direction),
+			CNAME:      scheduledReportCNAME(cfg, direction),
 		})
 		return err
 	}
+}
+
+func scheduledSenderReportHasExplicitCounters(cfg RTPRelayRTCPReportScheduleConfig, direction RTCPFeedbackDirection) bool {
+	if direction == RTCPFeedbackIMSToClient {
+		return cfg.IMSToClientPackets != 0 || cfg.IMSToClientOctets != 0 || cfg.IMSToClientRTPTime != 0
+	}
+	return cfg.ClientToIMSPackets != 0 || cfg.ClientToIMSOctets != 0 || cfg.ClientToIMSRTPTime != 0
+}
+
+func scheduledReportCNAME(cfg RTPRelayRTCPReportScheduleConfig, direction RTCPFeedbackDirection) string {
+	if direction == RTCPFeedbackIMSToClient {
+		return strings.TrimSpace(cfg.IMSToClientCNAME)
+	}
+	return strings.TrimSpace(cfg.ClientToIMSCNAME)
 }
 
 func normalizeRTCPReportScheduleConfig(cfg RTPRelayRTCPReportScheduleConfig) RTPRelayRTCPReportScheduleConfig {
@@ -197,16 +220,21 @@ func scheduledReceiverReportSSRC(cfg RTPRelayRTCPReportScheduleConfig, direction
 }
 
 func scheduledSenderReportRequest(session *RTPRelaySession, cfg RTPRelayRTCPReportScheduleConfig, direction RTCPFeedbackDirection) RTPRelaySenderReportRequest {
+	now := time.Now()
 	packetCount := cfg.ClientToIMSPackets
 	octetCount := cfg.ClientToIMSOctets
 	if packetCount == 0 && octetCount == 0 && session != nil {
 		packetCount, octetCount = session.rtcpSenderReportCounters(direction)
 	}
+	rtpTime := cfg.ClientToIMSRTPTime
+	if rtpTime == 0 && session != nil {
+		rtpTime = session.extrapolatedSenderRTPTime(direction, now)
+	}
 	req := RTPRelaySenderReportRequest{
 		Direction:   direction,
 		SSRC:        scheduledReceiverReportSSRC(cfg, direction),
-		WallClock:   time.Now(),
-		RTPTime:     cfg.ClientToIMSRTPTime,
+		WallClock:   now,
+		RTPTime:     rtpTime,
 		PacketCount: packetCount,
 		OctetCount:  octetCount,
 		CNAME:       strings.TrimSpace(cfg.ClientToIMSCNAME),
@@ -217,7 +245,11 @@ func scheduledSenderReportRequest(session *RTPRelaySession, cfg RTPRelayRTCPRepo
 		if packetCount == 0 && octetCount == 0 && session != nil {
 			packetCount, octetCount = session.rtcpSenderReportCounters(direction)
 		}
-		req.RTPTime = cfg.IMSToClientRTPTime
+		rtpTime = cfg.IMSToClientRTPTime
+		if rtpTime == 0 && session != nil {
+			rtpTime = session.extrapolatedSenderRTPTime(direction, now)
+		}
+		req.RTPTime = rtpTime
 		req.PacketCount = packetCount
 		req.OctetCount = octetCount
 		req.CNAME = strings.TrimSpace(cfg.IMSToClientCNAME)

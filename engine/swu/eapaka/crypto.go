@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
@@ -26,7 +27,10 @@ const (
 	KeyLengthEMSK         = 64
 )
 
-const AKAPrimeKDFDefault uint16 = 1
+const (
+	AKAPrimeKDFDefault uint16 = 1
+	DefaultNetworkName        = "WLAN"
+)
 
 var (
 	ErrInvalidAKAChallenge  = errors.New("invalid eap-aka challenge")
@@ -36,6 +40,7 @@ var (
 	ErrInvalidReauth        = errors.New("invalid eap-aka reauthentication")
 	ErrBiddingDown          = errors.New("eap-aka bidding down detected")
 	ErrUnsupportedKDF       = errors.New("unsupported eap-aka prime kdf")
+	ErrNetworkNameMismatch  = errors.New("eap-aka prime network name mismatch")
 )
 
 type Keys struct {
@@ -49,15 +54,46 @@ type Keys struct {
 	IKPrime []byte
 }
 
+type ChallengeOptions struct {
+	IdentityPackets     [][]byte
+	ExpectedNetworkName string
+}
+
+type NotificationOptions struct {
+	Authenticated   bool
+	Keys            Keys
+	FastReauth      bool
+	ExpectedCounter uint16
+	ResponseIV      []byte
+}
+
 type ChallengeResponseResult struct {
-	Response    Packet
-	Keys        Keys
-	AKA         sim.AKAResult
-	RAND        []byte
-	AUTN        []byte
-	SyncFailure bool
-	AuthFailure bool
-	BiddingDown bool
+	Response            Packet
+	Keys                Keys
+	AKA                 sim.AKAResult
+	RAND                []byte
+	AUTN                []byte
+	SyncFailure         bool
+	AuthFailure         bool
+	BiddingDown         bool
+	ClientError         bool
+	NetworkNameMismatch bool
+}
+
+// ValidateNetworkName compares the received AT_KDF_INPUT network name against
+// the expected network name per RFC 5448 Section 3.1 and 3GPP TS 24.302.
+func ValidateNetworkName(received, expected string) bool {
+	if received == "" || expected == "" {
+		return false
+	}
+	if received == expected {
+		return true
+	}
+	if !strings.Contains(expected, ":") {
+		prefix, suffix, hasColon := strings.Cut(received, ":")
+		return hasColon && prefix == expected && suffix != ""
+	}
+	return strings.HasPrefix(received, expected+":") && len(received) > len(expected)+1
 }
 
 func DeriveKeys(identity string, aka sim.AKAResult) (Keys, error) {
@@ -176,7 +212,7 @@ func BuildChallengeResponseWithCheckcode(identity string, request Packet, aka si
 		responseAttrs = append(responseAttrs, KDFAttribute(selectedKDF))
 	}
 	if includeCheckcode {
-		responseAttrs = append(responseAttrs, CheckcodeAttributeForPackets(identityPackets))
+		responseAttrs = append(responseAttrs, CheckcodeAttributeForPacketsAndType(request.Type, identityPackets))
 	}
 	if _, ok := FindAttribute(request.Attributes, AttributeResultInd); ok {
 		responseAttrs = append(responseAttrs, ResultIndAttribute())
@@ -202,13 +238,105 @@ func BuildChallengeResponseWithCheckcode(identity string, request Packet, aka si
 }
 
 func BuildChallengeResponseFromProvider(identity string, request Packet, provider sim.AKAProvider, identityPackets [][]byte) (ChallengeResponseResult, error) {
+	return BuildChallengeResponseFromProviderWithOptions(identity, request, provider, ChallengeOptions{
+		IdentityPackets:     identityPackets,
+		ExpectedNetworkName: DefaultNetworkName,
+	})
+}
+
+func BuildChallengeResponseFromProviderWithOptions(identity string, request Packet, provider sim.AKAProvider, opts ChallengeOptions) (ChallengeResponseResult, error) {
 	if provider == nil {
 		return ChallengeResponseResult{}, fmt.Errorf("%w: AKA provider is nil", ErrInvalidAKAChallenge)
 	}
-	rand16, autn16, err := ChallengeRANDAndAUTN(request)
-	if err != nil {
-		return ChallengeResponseResult{}, err
+	if request.Code != CodeRequest || request.Subtype != SubtypeChallenge || !isAKAType(request.Type) {
+		return ChallengeResponseResult{}, fmt.Errorf("%w: not an AKA challenge", ErrInvalidAKAChallenge)
 	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return ChallengeResponseResult{}, fmt.Errorf("%w: identity is empty", ErrInvalidKeyMaterial)
+	}
+	clientErr := func() (ChallengeResponseResult, error) {
+		resp, err := BuildClientErrorResponse(request, ClientErrorUnableToProcessPacket)
+		if err != nil {
+			return ChallengeResponseResult{}, err
+		}
+		return ChallengeResponseResult{
+			Response:    resp,
+			ClientError: true,
+		}, nil
+	}
+
+	// Validate all unencrypted challenge attributes, mandatory AT_MAC presence,
+	// AT_KDF / AT_KDF_INPUT network name, AT_BIDDING, and AT_CHECKCODE BEFORE
+	// touching the USIM so malformed/forged challenges cannot advance SQN_MS.
+	challenge, err := ParseChallenge(request)
+	if err != nil || len(challenge.Vectors) != 1 || !challenge.HasMAC {
+		return clientErr()
+	}
+	if request.Type == TypeAKAPrime {
+		if len(challenge.KDFValues) == 0 {
+			return clientErr()
+		}
+		if challenge.KDFValues[0] != AKAPrimeKDFDefault {
+			negResp, negotiated, negErr := BuildAKAPrimeKDFNegotiationResponse(request)
+			if negErr != nil {
+				if errors.Is(negErr, ErrUnsupportedKDF) {
+					rejectResp, rejectErr := BuildAuthenticationRejectResponse(request)
+					if rejectErr != nil {
+						return ChallengeResponseResult{}, rejectErr
+					}
+					return ChallengeResponseResult{
+						Response:    rejectResp,
+						AuthFailure: true,
+					}, nil
+				}
+				return clientErr()
+			}
+			if negotiated {
+				return ChallengeResponseResult{Response: negResp}, nil
+			}
+		}
+		kdfInput, kdfErr := challengeKDFInput(request.Attributes)
+		if kdfErr != nil {
+			return clientErr()
+		}
+		expectedNet := opts.ExpectedNetworkName
+		if expectedNet == "" {
+			expectedNet = DefaultNetworkName
+		}
+		if !ValidateNetworkName(kdfInput, expectedNet) {
+			rejectResp, rejectErr := BuildAuthenticationRejectResponse(request)
+			if rejectErr != nil {
+				return ChallengeResponseResult{}, rejectErr
+			}
+			return ChallengeResponseResult{
+				Response:            rejectResp,
+				AuthFailure:         true,
+				NetworkNameMismatch: true,
+			}, nil
+		}
+	}
+	biddingDown, err := challengeBiddingDown(request)
+	if err != nil {
+		return clientErr()
+	}
+	if biddingDown {
+		rejectResp, rejectErr := BuildAuthenticationRejectResponse(request)
+		if rejectErr != nil {
+			return ChallengeResponseResult{}, rejectErr
+		}
+		return ChallengeResponseResult{
+			Response:    rejectResp,
+			AuthFailure: true,
+			BiddingDown: true,
+		}, nil
+	}
+	if _, err := verifyChallengeCheckcode(request, opts.IdentityPackets); err != nil {
+		return clientErr()
+	}
+
+	rand16 := append([]byte(nil), challenge.RAND...)
+	autn16 := append([]byte(nil), challenge.AUTN...)
 	aka, err := provider.CalculateAKA(rand16, autn16)
 	result := ChallengeResponseResult{
 		AKA:  cloneAKAResult(aka),
@@ -232,11 +360,7 @@ func BuildChallengeResponseFromProvider(identity string, request Packet, provide
 		return result, nil
 	}
 
-	identity = strings.TrimSpace(identity)
-	if identity == "" {
-		return ChallengeResponseResult{}, fmt.Errorf("%w: identity is empty", ErrInvalidKeyMaterial)
-	}
-	response, keys, err := BuildChallengeResponseWithCheckcode(identity, request, aka, identityPackets)
+	response, keys, err := BuildChallengeResponseWithCheckcode(identity, request, aka, opts.IdentityPackets)
 	if errors.Is(err, ErrBiddingDown) {
 		response, rejectErr := BuildAuthenticationRejectResponse(request)
 		if rejectErr != nil {
@@ -248,7 +372,16 @@ func BuildChallengeResponseFromProvider(identity string, request Packet, provide
 		return result, nil
 	}
 	if err != nil {
-		return ChallengeResponseResult{}, err
+		if errors.Is(err, ErrInvalidKeyMaterial) {
+			return ChallengeResponseResult{}, err
+		}
+		resp, clientBuildErr := BuildClientErrorResponse(request, ClientErrorUnableToProcessPacket)
+		if clientBuildErr != nil {
+			return ChallengeResponseResult{}, clientBuildErr
+		}
+		result.Response = resp
+		result.ClientError = true
+		return result, nil
 	}
 	result.Response = response
 	result.Keys = keys
@@ -256,11 +389,14 @@ func BuildChallengeResponseFromProvider(identity string, request Packet, provide
 }
 
 func verifyChallengeCheckcode(request Packet, identityPackets [][]byte) (bool, error) {
-	attr, ok := FindAttribute(request.Attributes, AttributeCheckcode)
+	attr, ok, err := FindSingleAttribute(request.Attributes, AttributeCheckcode)
+	if err != nil {
+		return false, err
+	}
 	if !ok {
 		return false, nil
 	}
-	if err := VerifyCheckcodeAttribute(attr, identityPackets); err != nil {
+	if err := VerifyCheckcodeAttributeForType(request.Type, attr, identityPackets); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -348,11 +484,36 @@ func BuildIdentityResponse(identity string, request Packet) (Packet, error) {
 }
 
 func BuildNotificationResponse(request Packet) (Packet, bool, error) {
-	return buildNotificationResponse(request, nil, false)
+	return BuildNotificationResponseWithOptions(request, NotificationOptions{})
 }
 
 func BuildAuthenticatedNotificationResponse(request Packet, kAut []byte) (Packet, bool, error) {
-	return buildNotificationResponse(request, kAut, true)
+	return BuildNotificationResponseWithOptions(request, NotificationOptions{
+		Authenticated: true,
+		Keys:          Keys{KAut: kAut},
+	})
+}
+
+func BuildNotificationResponseWithOptions(request Packet, opts NotificationOptions) (Packet, bool, error) {
+	return buildNotificationResponse(request, opts)
+}
+
+func BuildNotificationOrClientErrorResponse(request Packet, opts NotificationOptions) (Packet, bool, bool, error) {
+	if request.Subtype != SubtypeNotification {
+		return Packet{}, false, false, nil
+	}
+	resp, handled, err := buildNotificationResponse(request, opts)
+	if err == nil {
+		return resp, handled, false, nil
+	}
+	if request.Code != CodeRequest || !isAKAType(request.Type) {
+		return Packet{}, true, false, err
+	}
+	clientErrResp, buildErr := BuildClientErrorResponse(request, ClientErrorUnableToProcessPacket)
+	if buildErr != nil {
+		return Packet{}, true, false, buildErr
+	}
+	return clientErrResp, true, true, nil
 }
 
 func BuildClientErrorResponse(request Packet, code uint16) (Packet, error) {
@@ -388,7 +549,10 @@ func challengeBiddingDown(request Packet) (bool, error) {
 	if request.Type != 0 && request.Type != TypeAKA {
 		return false, nil
 	}
-	attr, ok := FindAttribute(request.Attributes, AttributeBidding)
+	attr, ok, err := FindSingleAttribute(request.Attributes, AttributeBidding)
+	if err != nil {
+		return false, err
+	}
 	if !ok {
 		return false, nil
 	}
@@ -411,7 +575,10 @@ func BuildSynchronizationFailureResponse(request Packet, auts []byte) (Packet, e
 	}
 	attrs := []Attribute{AUTSAttribute(auts)}
 	if request.Type == TypeAKAPrime {
-		attrs = append(attrs, challengeKDFAttributes(request.Attributes)...)
+		if _, err := kdfValues(request.Attributes); err != nil {
+			return Packet{}, err
+		}
+		attrs = append(attrs, KDFAttribute(AKAPrimeKDFDefault))
 	}
 	return Packet{
 		Code:       CodeResponse,
@@ -842,6 +1009,13 @@ func parseChallenge(request Packet, keys *Keys) (Challenge, error) {
 		if err != nil {
 			return Challenge{}, err
 		}
+		expectedLen := sha1.Size
+		if request.Type == TypeAKAPrime {
+			expectedLen = sha256.Size
+		}
+		if len(checkcode) != 0 && len(checkcode) != expectedLen {
+			return Challenge{}, fmt.Errorf("%w: checkcode digest length %d, want %d", ErrInvalidAttribute, len(checkcode), expectedLen)
+		}
 		out.Checkcode = checkcode
 		out.HasCheckcode = true
 	}
@@ -987,7 +1161,7 @@ func singleChallengeAttribute(attrs []Attribute, typ uint8, name string) (Attrib
 	}
 }
 
-func buildNotificationResponse(request Packet, kAut []byte, authenticated bool) (Packet, bool, error) {
+func buildNotificationResponse(request Packet, opts NotificationOptions) (Packet, bool, error) {
 	if request.Subtype != SubtypeNotification {
 		return Packet{}, false, nil
 	}
@@ -997,7 +1171,13 @@ func buildNotificationResponse(request Packet, kAut []byte, authenticated bool) 
 	if !isAKAType(request.Type) {
 		return Packet{}, true, fmt.Errorf("%w: EAP type %d", ErrInvalidAKAChallenge, request.Type)
 	}
-	attr, ok := FindAttribute(request.Attributes, AttributeNotification)
+	if err := ValidateAttributes(request.Attributes); err != nil {
+		return Packet{}, true, err
+	}
+	attr, ok, err := FindSingleAttribute(request.Attributes, AttributeNotification)
+	if err != nil {
+		return Packet{}, true, err
+	}
 	if !ok {
 		return Packet{}, true, fmt.Errorf("%w: missing AT_NOTIFICATION", ErrInvalidAKAChallenge)
 	}
@@ -1006,18 +1186,57 @@ func buildNotificationResponse(request Packet, kAut []byte, authenticated bool) 
 		return Packet{}, true, err
 	}
 	var attrs []Attribute
-	if code&NotificationPBit == 0 {
-		if !authenticated {
+	if code&NotificationPBit != 0 {
+		for _, a := range request.Attributes {
+			if a.Type == AttributeMAC || a.Type == AttributeIV || a.Type == AttributeEncrData {
+				return Packet{}, true, fmt.Errorf("%w: attribute %d forbidden when P=1", ErrInvalidAttribute, a.Type)
+			}
+		}
+	} else {
+		if !opts.Authenticated {
 			return Packet{}, true, fmt.Errorf("%w: notification requires K_aut", ErrInvalidKeyMaterial)
 		}
 		raw, err := request.MarshalBinary()
 		if err != nil {
 			return Packet{}, true, err
 		}
-		if err := verifyChallengeMAC(request.Type, kAut, raw); err != nil {
+		if err := verifyChallengeMAC(request.Type, opts.Keys.KAut, raw); err != nil {
 			return Packet{}, true, err
 		}
-		attrs = []Attribute{MACAttribute(nil)}
+		_, hasIV := FindAttribute(request.Attributes, AttributeIV)
+		_, hasEncr := FindAttribute(request.Attributes, AttributeEncrData)
+		if opts.FastReauth || hasIV || hasEncr {
+			decryptedAttrs, hasPair, err := DecryptPacketEncryptedAttributes(request, opts.Keys)
+			if err != nil {
+				return Packet{}, true, err
+			}
+			if !hasPair {
+				return Packet{}, true, fmt.Errorf("%w: missing AT_IV/AT_ENCR_DATA in fast-reauth notification", ErrInvalidReauth)
+			}
+			counter, hasCounter, err := CounterFromAttributes(decryptedAttrs)
+			if err != nil {
+				return Packet{}, true, err
+			}
+			if !hasCounter {
+				return Packet{}, true, fmt.Errorf("%w: missing AT_COUNTER in encrypted notification", ErrInvalidReauth)
+			}
+			if opts.FastReauth && counter != opts.ExpectedCounter {
+				return Packet{}, true, fmt.Errorf("%w: notification AT_COUNTER %d != expected %d", ErrInvalidReauth, counter, opts.ExpectedCounter)
+			}
+			iv := opts.ResponseIV
+			if len(iv) == 0 {
+				iv = make([]byte, aes.BlockSize)
+				if _, err := rand.Read(iv); err != nil {
+					return Packet{}, true, err
+				}
+			}
+			encryptedResp, err := EncryptAttributes(opts.Keys.KEncr, iv, []Attribute{CounterAttribute(counter)})
+			if err != nil {
+				return Packet{}, true, err
+			}
+			attrs = append(attrs, IVAttribute(iv), encryptedResp)
+		}
+		attrs = append(attrs, MACAttribute(nil))
 	}
 	eapType := request.Type
 	if eapType == 0 {
@@ -1037,11 +1256,11 @@ func buildNotificationResponse(request Packet, kAut []byte, authenticated bool) 
 	if err != nil {
 		return Packet{}, true, err
 	}
-	mac, err := calculateChallengeMAC(response.Type, kAut, raw)
+	mac, err := calculateChallengeMAC(response.Type, opts.Keys.KAut, raw)
 	if err != nil {
 		return Packet{}, true, err
 	}
-	response.Attributes[0] = MACAttribute(mac)
+	response.Attributes[len(response.Attributes)-1] = MACAttribute(mac)
 	return response, true, nil
 }
 
@@ -1214,6 +1433,7 @@ func firstKDFValue(attrs []Attribute) (uint16, error) {
 
 func kdfValues(attrs []Attribute) ([]uint16, error) {
 	var values []uint16
+	seen := make(map[uint16]struct{}, len(attrs))
 	for _, attr := range attrs {
 		if attr.Type != AttributeKDF {
 			continue
@@ -1222,13 +1442,20 @@ func kdfValues(attrs []Attribute) ([]uint16, error) {
 		if err != nil {
 			return nil, err
 		}
+		if _, exists := seen[value]; exists {
+			return nil, fmt.Errorf("%w: duplicate AT_KDF value %d", ErrInvalidAttribute, value)
+		}
+		seen[value] = struct{}{}
 		values = append(values, value)
 	}
 	return values, nil
 }
 
 func challengeKDFInput(attrs []Attribute) (string, error) {
-	attr, ok := FindAttribute(attrs, AttributeKDFInput)
+	attr, ok, err := FindSingleAttribute(attrs, AttributeKDFInput)
+	if err != nil {
+		return "", err
+	}
 	if !ok {
 		return "", fmt.Errorf("%w: missing AT_KDF_INPUT", ErrInvalidAKAChallenge)
 	}
@@ -1240,16 +1467,6 @@ func challengeKDFInput(attrs []Attribute) (string, error) {
 		return "", fmt.Errorf("%w: empty AT_KDF_INPUT", ErrInvalidAKAChallenge)
 	}
 	return value, nil
-}
-
-func challengeKDFAttributes(attrs []Attribute) []Attribute {
-	var out []Attribute
-	for _, attr := range attrs {
-		if attr.Type == AttributeKDF {
-			out = append(out, Attribute{Type: attr.Type, Data: append([]byte(nil), attr.Data...)})
-		}
-	}
-	return out
 }
 
 func clonePacket(packet Packet) Packet {

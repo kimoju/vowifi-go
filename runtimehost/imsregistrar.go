@@ -1,8 +1,11 @@
 package runtimehost
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -86,6 +89,9 @@ type WireIMSRegistrar struct {
 	RecoveryBackoffMax     time.Duration
 	DisableKeepalive       bool
 	KeepaliveInterval      time.Duration
+	EnableRegSubscribe     bool
+	DisableRegSubscribe    bool
+	RegSubscribeExpires    int
 	UserAgent              string
 	CallID                 string
 	CNonce                 string
@@ -189,18 +195,31 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		if refreshErr != nil {
 			err = errors.Join(err, refreshErr)
 		} else if refreshed {
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = cleanupIMSRegistrationSecurityPlans(cleanupCtx, r.SecurityPlanInstaller)
+			cancelCleanup()
+
 			cfg = refreshedCfg
 			profile = refreshedProfile
 			registrarURI = refreshedRegistrarURI
 			contactURI = refreshedContactURI
 			if r.Transport == nil {
+				if defaultFlow != nil {
+					_ = defaultFlow.Close()
+					defaultFlow = nil
+				} else if transport != nil {
+					if closer, ok := transport.(interface{ Close() error }); ok {
+						_ = closer.Close()
+					}
+				}
 				transport = nil
 				if r.TransportFactory != nil {
 					transport = r.TransportFactory(cfg, profile, registrarURI, contactURI)
 				}
 				if transport == nil {
-					if defaultFlow == nil {
-						defaultFlow = r.defaultSIPFlowForLocalIP(cfg, profile.LocalIP)
+					defaultFlow = r.defaultSIPFlowForLocalIP(cfg, profile.LocalIP)
+					if len(preResolvedTargets) > 0 {
+						defaultFlow.Targets = append([]string(nil), preResolvedTargets...)
 					}
 					transport = defaultFlow
 				}
@@ -214,6 +233,12 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 			cancelCleanup()
 			if defaultFlow != nil {
 				err = errors.Join(err, cleanupErr, defaultFlow.Close())
+			} else if r.Transport == nil && transport != nil {
+				if closer, ok := transport.(interface{ Close() error }); ok {
+					err = errors.Join(err, cleanupErr, closer.Close())
+				} else {
+					err = errors.Join(err, cleanupErr)
+				}
 			} else {
 				err = errors.Join(err, cleanupErr)
 			}
@@ -239,30 +264,46 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 	voiceTransport := r.voiceTransport(cfg, profile, result.Binding, defaultFlow)
 	smsTransport := r.smsTransport(cfg, profile, result.Binding, voiceTransport)
 	ussdTransport := r.ussdTransport(cfg, profile, result.Binding, voiceTransport)
-	maintenance := newIMSRegistrationMaintenance(defaultFlow, registerSession, result, r, cfg, profile, registeredAt)
+	inbound := r.inboundConfig(cfg, profile, effectiveContactURI, result.Binding, defaultFlow)
+	initialInboundAddr := ""
+	if inbound != nil {
+		initialInboundAddr = inbound.LocalAddr
+	}
+	maintenance := newIMSRegistrationMaintenance(defaultFlow, registerSession, result, r, cfg, profile, registeredAt, initialInboundAddr)
 	var closeRegistration func(context.Context) error
 	var recoverRegistration func(context.Context) (IMSRegistrationResult, error)
+	var startRegSubscription func()
+	var handleRegNotify func(context.Context, voicehost.InboundDialogRequest) (voicehost.IMSInfoResult, error)
 	if maintenance != nil {
 		closeRegistration = maintenance.Close
 		recoverRegistration = maintenance.Recover
+		if !r.DisableRegSubscribe {
+			startRegSubscription = maintenance.StartRegSubscription
+		}
+		handleRegNotify = maintenance.HandleRegNotify
+		if r.EnableRegSubscribe && !r.DisableRegSubscribe && result.Registered {
+			maintenance.StartRegSubscription()
+		}
 	}
 	return IMSRegistrationResult{
-		Registered:     result.Registered,
-		StatusCode:     result.StatusCode,
-		Reason:         firstRuntimeNonEmpty(result.Reason, "ims registered"),
-		Server:         firstRuntimeNonEmpty(result.Binding.PublicIdentity, profile.Domain),
-		Profile:        profile,
-		Binding:        result.Binding,
-		RegisteredAt:   registeredAt,
-		ExpiresAt:      expiresAt,
-		RefreshDelay:   refreshDelay,
-		NextRefreshAt:  nextRefreshAt,
-		VoiceTransport: voiceTransport,
-		SMSTransport:   smsTransport,
-		USSDTransport:  ussdTransport,
-		Inbound:        r.inboundConfig(cfg, profile, effectiveContactURI, result.Binding, defaultFlow),
-		Close:          closeRegistration,
-		Recover:        recoverRegistration,
+		Registered:           result.Registered,
+		StatusCode:           result.StatusCode,
+		Reason:               firstRuntimeNonEmpty(result.Reason, "ims registered"),
+		Server:               firstRuntimeNonEmpty(result.Binding.PublicIdentity, profile.Domain),
+		Profile:              profile,
+		Binding:              result.Binding,
+		RegisteredAt:         registeredAt,
+		ExpiresAt:            expiresAt,
+		RefreshDelay:         refreshDelay,
+		NextRefreshAt:        nextRefreshAt,
+		VoiceTransport:       voiceTransport,
+		SMSTransport:         smsTransport,
+		USSDTransport:        ussdTransport,
+		Inbound:              inbound,
+		Close:                closeRegistration,
+		Recover:              recoverRegistration,
+		StartRegSubscription: startRegSubscription,
+		HandleRegNotify:      handleRegNotify,
 	}, nil
 }
 
@@ -398,22 +439,26 @@ func matchDualStackLocalIPForTarget(target, ipv4, ipv6 string) string {
 }
 
 func runtimeEndpointIPIsV6(raw string) (bool, bool) {
-	s := strings.TrimSpace(raw)
+	s := unwrapSIPAngleBracketsRuntime(raw)
 	if s == "" {
 		return false, false
 	}
 	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "tel:") {
+		return false, false
+	}
 	if strings.HasPrefix(lower, "sip:") {
 		s = s[4:]
 	} else if strings.HasPrefix(lower, "sips:") {
 		s = s[5:]
 	}
-	if semi := strings.IndexByte(s, ';'); semi >= 0 {
-		s = s[:semi]
+	if q := strings.IndexByte(s, '?'); q >= 0 {
+		s = s[:q]
 	}
 	if at := strings.LastIndexByte(s, '@'); at >= 0 {
 		s = s[at+1:]
 	}
+	s = stripSIPHostParamsRuntime(s)
 	host := s
 	if strings.HasPrefix(s, "[") {
 		if end := strings.IndexByte(s, ']'); end > 0 {
@@ -550,21 +595,43 @@ func (r WireIMSRegistrar) inboundConfig(cfg IMSRegistrationConfig, profile voice
 	}
 }
 
-func sipURIHostLiteral(uri string) string {
-	s := strings.Trim(strings.TrimSpace(uri), "<>")
+func unwrapSIPAngleBracketsRuntime(raw string) string {
+	s := strings.TrimSpace(raw)
+	if start := strings.IndexByte(s, '<'); start >= 0 {
+		if end := strings.IndexByte(s[start+1:], '>'); end >= 0 {
+			return strings.TrimSpace(s[start+1 : start+1+end])
+		}
+	}
+	return strings.Trim(s, "<>")
+}
+
+func extractSIPURIHostPortRuntime(uri string) (string, bool) {
+	s := unwrapSIPAngleBracketsRuntime(uri)
 	lower := strings.ToLower(s)
 	if strings.HasPrefix(lower, "sip:") {
 		s = s[4:]
 	} else if strings.HasPrefix(lower, "sips:") {
 		s = s[5:]
 	} else {
-		return ""
+		return "", false
 	}
-	if semi := strings.IndexByte(s, ';'); semi >= 0 {
-		s = s[:semi]
+	if q := strings.IndexByte(s, '?'); q >= 0 {
+		s = s[:q]
 	}
 	if at := strings.LastIndexByte(s, '@'); at >= 0 {
 		s = s[at+1:]
+	}
+	s = stripSIPHostParamsRuntime(s)
+	if s == "" {
+		return "", false
+	}
+	return s, true
+}
+
+func sipURIHostLiteral(uri string) string {
+	s, ok := extractSIPURIHostPortRuntime(uri)
+	if !ok {
+		return ""
 	}
 	host := s
 	if strings.HasPrefix(s, "[") {
@@ -582,20 +649,9 @@ func sipURIHostLiteral(uri string) string {
 }
 
 func sipURIPortNumber(uri string) int {
-	s := strings.Trim(strings.TrimSpace(uri), "<>")
-	lower := strings.ToLower(s)
-	if strings.HasPrefix(lower, "sip:") {
-		s = s[4:]
-	} else if strings.HasPrefix(lower, "sips:") {
-		s = s[5:]
-	} else {
+	s, ok := extractSIPURIHostPortRuntime(uri)
+	if !ok {
 		return 0
-	}
-	if semi := strings.IndexByte(s, ';'); semi >= 0 {
-		s = s[:semi]
-	}
-	if at := strings.LastIndexByte(s, '@'); at >= 0 {
-		s = s[at+1:]
 	}
 	if _, portStr, err := net.SplitHostPort(s); err == nil {
 		if p, pErr := strconv.Atoi(portStr); pErr == nil && p > 0 && p <= 65535 {
@@ -719,23 +775,33 @@ func clonePreparedSession(in *identity.PreparedSession) identity.PreparedSession
 func refreshedISIMPublicIdentity(id identity.Identity, profile identity.Profile) string {
 	domain := strings.ToLower(strings.TrimSpace(id.Domain))
 	imsi := strings.TrimSpace(profile.IMSI)
+	var firstSIP string
 	for _, impu := range id.IMPU {
 		impu = strings.TrimSpace(impu)
 		if impu == "" {
 			continue
 		}
 		lower := strings.ToLower(impu)
-		if imsi != "" && strings.Contains(impu, imsi) {
+		isSIP := strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:")
+		if isSIP && firstSIP == "" {
+			firstSIP = impu
+		}
+		if isSIP && imsi != "" && strings.Contains(impu, imsi) {
 			return impu
 		}
-		if domain != "" && strings.Contains(lower, "@"+domain) {
+		if isSIP && domain != "" && strings.Contains(lower, "@"+domain) {
 			return impu
 		}
 	}
-	if len(id.IMPU) == 0 {
-		return ""
+	if firstSIP != "" {
+		return firstSIP
 	}
-	return strings.TrimSpace(id.IMPU[0])
+	for _, impu := range id.IMPU {
+		if trimmed := strings.TrimSpace(impu); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclient.SIPServerResolver {
@@ -878,33 +944,53 @@ type imsRegistrationMaintenance struct {
 	runtimeConfig IMSRegistrationConfig
 	profile       voiceclient.IMSProfile
 
-	recoverMu      sync.Mutex
-	mu             sync.Mutex
-	registered     bool
-	statusCode     int
-	reason         string
-	binding        voiceclient.RegistrationBinding
-	registeredAt   time.Time
-	nextCSeq       int
-	authHeader     string
-	authHeaderName string
-	authState      voiceclient.DigestAuthState
-	recoveryCount  int
-	recoveryState  IMSRegistrationRecoveryState
-	waitFunc       imsRegistrationWaitFunc
-	cancel         context.CancelFunc
-	done           chan struct{}
-	wg             sync.WaitGroup
-	closed         bool
+	recoverMu       sync.Mutex
+	mu              sync.Mutex
+	registered      bool
+	regHalted       bool
+	statusCode      int
+	reason          string
+	binding         voiceclient.RegistrationBinding
+	registeredAt    time.Time
+	nextCSeq        int
+	authHeader      string
+	authHeaderName  string
+	authState       voiceclient.DigestAuthState
+	lastInboundAddr string
+	pendingInbound  *IMSInboundConfig
+	recoveryCount   int
+	recoveryState   IMSRegistrationRecoveryState
+	waitFunc        imsRegistrationWaitFunc
+	cancel          context.CancelFunc
+	opCancel        context.CancelFunc
+	done            chan struct{}
+	wg              sync.WaitGroup
+	closed          bool
+
+	regSubStarted    bool
+	regSubCancel     context.CancelFunc
+	regSubDone       chan struct{}
+	regSubWake       chan struct{}
+	regSubCallID     string
+	regSubLocalTag   string
+	regSubRemoteTag  string
+	regSubNextCSeq   int
+	regSubExpires    int
+	regSubLastVer    int
+	regSubHasLastVer bool
 }
 
-func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voiceclient.RegisterSession, result voiceclient.RegisterResult, config WireIMSRegistrar, runtimeConfig IMSRegistrationConfig, profile voiceclient.IMSProfile, registeredAt time.Time) *imsRegistrationMaintenance {
+func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voiceclient.RegisterSession, result voiceclient.RegisterResult, config WireIMSRegistrar, runtimeConfig IMSRegistrationConfig, profile voiceclient.IMSProfile, registeredAt time.Time, initialInboundAddr ...string) *imsRegistrationMaintenance {
 	if flow == nil {
 		return nil
 	}
 	nextCSeq := result.NextCSeq
 	if nextCSeq <= 0 {
 		nextCSeq = 1
+	}
+	inboundAddr := ""
+	if len(initialInboundAddr) > 0 {
+		inboundAddr = strings.TrimSpace(initialInboundAddr[0])
 	}
 	m := &imsRegistrationMaintenance{
 		flow:          flow,
@@ -913,36 +999,40 @@ func newIMSRegistrationMaintenance(flow *voiceclient.WireSIPFlow, session voicec
 		runtimeConfig: runtimeConfig,
 		profile:       profile,
 
-		registered:     result.Registered,
-		statusCode:     result.StatusCode,
-		reason:         result.Reason,
-		binding:        result.Binding,
-		registeredAt:   registeredAt,
-		nextCSeq:       nextCSeq,
-		authHeader:     result.AuthHeader,
-		authHeaderName: result.AuthHeaderName,
-		authState:      result.AuthState,
+		registered:      result.Registered,
+		statusCode:      result.StatusCode,
+		reason:          result.Reason,
+		binding:         result.Binding,
+		registeredAt:    registeredAt,
+		nextCSeq:        nextCSeq,
+		authHeader:      result.AuthHeader,
+		authHeaderName:  result.AuthHeaderName,
+		authState:       result.AuthState,
+		lastInboundAddr: inboundAddr,
 	}
 	if result.Registered && (!config.DisableRefresh || !config.DisableKeepalive) {
 		ctx, cancel := context.WithCancel(context.Background())
+		opCtx, opCancel := context.WithCancel(context.Background())
 		m.cancel = cancel
+		m.opCancel = opCancel
 		m.done = make(chan struct{})
 		if !config.DisableRefresh {
 			m.wg.Add(1)
 			go func() {
 				defer m.wg.Done()
-				m.refreshLoop(ctx)
+				m.refreshLoop(ctx, opCtx)
 			}()
 		}
 		if !config.DisableKeepalive {
 			m.wg.Add(1)
 			go func() {
 				defer m.wg.Done()
-				m.keepaliveLoop(ctx)
+				m.keepaliveLoop(ctx, opCtx)
 			}()
 		}
 		go func() {
 			m.wg.Wait()
+			opCancel()
 			close(m.done)
 		}()
 	}
@@ -953,10 +1043,31 @@ func (m *imsRegistrationMaintenance) Recover(ctx context.Context) (IMSRegistrati
 	if m == nil {
 		return IMSRegistrationResult{}, errors.New("IMS registration maintenance unavailable")
 	}
+	m.mu.Lock()
+	m.regHalted = false
+	m.mu.Unlock()
 	if err := m.recoverRegistration(ctx, errors.New("requested IMS registration recovery"), 0); err != nil {
 		return IMSRegistrationResult{}, err
 	}
 	return m.result("IMS registration recovered"), nil
+}
+
+func (m *imsRegistrationMaintenance) captureInboundLocked() {
+	if m == nil || !m.registered {
+		return
+	}
+	effectiveContact := firstRuntimeNonEmpty(m.binding.ContactURI, m.session.ContactURI)
+	cfg := m.config.inboundConfig(m.runtimeConfig, m.profile, effectiveContact, m.binding, m.flow)
+	if cfg == nil {
+		return
+	}
+	if cfg.PacketConn != nil || m.lastInboundAddr == "" || !strings.EqualFold(strings.TrimSpace(cfg.LocalAddr), strings.TrimSpace(m.lastInboundAddr)) {
+		if m.pendingInbound != nil && m.pendingInbound.PacketConn != nil && m.pendingInbound.PacketConn != cfg.PacketConn {
+			_ = m.pendingInbound.PacketConn.Close()
+		}
+		m.lastInboundAddr = cfg.LocalAddr
+		m.pendingInbound = cfg
+	}
 }
 
 func (m *imsRegistrationMaintenance) result(defaultReason string) IMSRegistrationResult {
@@ -968,35 +1079,48 @@ func (m *imsRegistrationMaintenance) result(defaultReason string) IMSRegistratio
 	statusCode := m.statusCode
 	reason := m.reason
 	binding := m.binding
+	profile := m.profile
 	registeredAt := m.registeredAt
 	session := m.session
 	recoveryState := m.recoveryState
+	var inbound *IMSInboundConfig
+	if registered && m.pendingInbound != nil {
+		inbound = m.pendingInbound
+		m.pendingInbound = nil
+	}
 	m.mu.Unlock()
 
 	if statusCode == 0 && registered {
 		statusCode = 200
 	}
 	expiresAt, refreshDelay, nextRefreshAt := imsRegistrationSchedule(m.config, binding, session, registeredAt, registered)
-	voiceTransport := m.config.voiceTransport(m.runtimeConfig, m.profile, binding, m.flow)
-	smsTransport := m.config.smsTransport(m.runtimeConfig, m.profile, binding, voiceTransport)
-	ussdTransport := m.config.ussdTransport(m.runtimeConfig, m.profile, binding, voiceTransport)
+	voiceTransport := m.config.voiceTransport(m.runtimeConfig, profile, binding, m.flow)
+	smsTransport := m.config.smsTransport(m.runtimeConfig, profile, binding, voiceTransport)
+	ussdTransport := m.config.ussdTransport(m.runtimeConfig, profile, binding, voiceTransport)
+	var startRegSub func()
+	if !m.config.DisableRegSubscribe {
+		startRegSub = m.StartRegSubscription
+	}
 	return IMSRegistrationResult{
-		Registered:     registered,
-		StatusCode:     statusCode,
-		Reason:         firstRuntimeNonEmpty(reason, defaultReason),
-		Server:         firstRuntimeNonEmpty(binding.PublicIdentity, m.profile.Domain),
-		Profile:        m.profile,
-		Binding:        binding,
-		RegisteredAt:   registeredAt,
-		ExpiresAt:      expiresAt,
-		RefreshDelay:   refreshDelay,
-		NextRefreshAt:  nextRefreshAt,
-		RecoveryState:  recoveryState,
-		VoiceTransport: voiceTransport,
-		SMSTransport:   smsTransport,
-		USSDTransport:  ussdTransport,
-		Close:          m.Close,
-		Recover:        m.Recover,
+		Registered:           registered,
+		StatusCode:           statusCode,
+		Reason:               firstRuntimeNonEmpty(reason, defaultReason),
+		Server:               firstRuntimeNonEmpty(binding.PublicIdentity, profile.Domain),
+		Profile:              profile,
+		Binding:              binding,
+		RegisteredAt:         registeredAt,
+		ExpiresAt:            expiresAt,
+		RefreshDelay:         refreshDelay,
+		NextRefreshAt:        nextRefreshAt,
+		RecoveryState:        recoveryState,
+		VoiceTransport:       voiceTransport,
+		SMSTransport:         smsTransport,
+		USSDTransport:        ussdTransport,
+		Inbound:              inbound,
+		Close:                m.Close,
+		Recover:              m.Recover,
+		StartRegSubscription: startRegSub,
+		HandleRegNotify:      m.HandleRegNotify,
 	}
 }
 
@@ -1014,12 +1138,37 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 	}
 	m.closed = true
 	cancel := m.cancel
+	opCancel := m.opCancel
 	done := m.done
+	regSubCancel := m.regSubCancel
+	regSubDone := m.regSubDone
+	var pendingConn net.PacketConn
+	if m.pendingInbound != nil {
+		pendingConn = m.pendingInbound.PacketConn
+		m.pendingInbound = nil
+	}
 	m.mu.Unlock()
+	if pendingConn != nil {
+		_ = pendingConn.Close()
+	}
+	if regSubCancel != nil {
+		regSubCancel()
+	}
 	if cancel != nil {
 		cancel()
 	}
+	var stopOpAbort func() bool
+	if opCancel != nil && ctx.Done() != nil {
+		stopOpAbort = context.AfterFunc(ctx, opCancel)
+	}
 	var waitErr error
+	if regSubDone != nil {
+		select {
+		case <-regSubDone:
+		case <-ctx.Done():
+			waitErr = ctx.Err()
+		}
+	}
 	if done != nil {
 		select {
 		case <-done:
@@ -1027,15 +1176,31 @@ func (m *imsRegistrationMaintenance) Close(ctx context.Context) error {
 			waitErr = ctx.Err()
 		}
 	}
+	if stopOpAbort != nil {
+		stopOpAbort()
+	}
+	if opCancel != nil {
+		opCancel()
+	}
 
 	m.mu.Lock()
 	registered := m.registered
+	authHeaderName := m.authHeaderName
+	authHeader := m.authHeader
+	authState := m.authState
+	if m.binding.AuthSession != nil {
+		if snapName, snapHeader, snapState := m.binding.AuthSession.Snapshot(); snapState.Usable() || snapHeader != "" {
+			authHeaderName = snapName
+			authHeader = snapHeader
+			authState = snapState
+		}
+	}
 	req := voiceclient.DeregisterRequest{
 		Binding:        m.binding,
 		CSeq:           m.nextCSeq,
-		AuthHeader:     m.authHeader,
-		AuthHeaderName: m.authHeaderName,
-		AuthState:      m.authState,
+		AuthHeader:     authHeader,
+		AuthHeaderName: authHeaderName,
+		AuthState:      authState,
 	}
 	m.registered = false
 	m.mu.Unlock()
@@ -1063,33 +1228,36 @@ func cleanupIMSRegistrationSecurityPlans(ctx context.Context, installer voicecli
 	return cleaner.Cleanup(ctx)
 }
 
-func (m *imsRegistrationMaintenance) refreshLoop(ctx context.Context) {
+func (m *imsRegistrationMaintenance) refreshLoop(ctx, opCtx context.Context) {
 	for {
 		if !m.wait(ctx, m.refreshDelay()) {
 			return
 		}
 		for {
-			if err := m.refresh(ctx); err != nil {
-				if !m.wait(ctx, m.refreshRetryInterval()) {
+			if err := m.refresh(opCtx); err != nil {
+				if ctx.Err() != nil || !m.wait(ctx, m.refreshRetryInterval()) {
 					return
 				}
 				continue
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			break
 		}
 	}
 }
 
-func (m *imsRegistrationMaintenance) keepaliveLoop(ctx context.Context) {
+func (m *imsRegistrationMaintenance) keepaliveLoop(ctx, opCtx context.Context) {
 	for {
 		if !m.wait(ctx, m.keepaliveInterval()) {
 			return
 		}
-		if !m.isRegistered() {
+		if !m.isRegistered() || !m.shouldSendCRLFKeepalive() {
 			continue
 		}
-		if err := m.flow.SendCRLFKeepalive(ctx); err != nil {
-			if ctx.Err() != nil || errors.Is(err, voiceclient.ErrSIPFlowClosed) {
+		if err := m.flow.SendCRLFKeepalive(opCtx); err != nil {
+			if ctx.Err() != nil || opCtx.Err() != nil || errors.Is(err, voiceclient.ErrSIPFlowClosed) {
 				return
 			}
 			_ = m.recoverRegistration(ctx, err, 0)
@@ -1113,16 +1281,30 @@ func (m *imsRegistrationMaintenance) wait(ctx context.Context, delay time.Durati
 
 func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 	m.mu.Lock()
-	if !m.registered {
+	if m.closed || m.regHalted {
 		m.mu.Unlock()
 		return nil
+	}
+	if !m.registered {
+		m.mu.Unlock()
+		return m.recoverRegistration(ctx, errors.New("IMS registration inactive during refresh"), 0)
+	}
+	authHeaderName := m.authHeaderName
+	authHeader := m.authHeader
+	authState := m.authState
+	if m.binding.AuthSession != nil {
+		if snapName, snapHeader, snapState := m.binding.AuthSession.Snapshot(); snapState.Usable() || snapHeader != "" {
+			authHeaderName = snapName
+			authHeader = snapHeader
+			authState = snapState
+		}
 	}
 	req := voiceclient.RefreshRequest{
 		Binding:        m.binding,
 		CSeq:           m.nextCSeq,
-		AuthHeader:     m.authHeader,
-		AuthHeaderName: m.authHeaderName,
-		AuthState:      m.authState,
+		AuthHeader:     authHeader,
+		AuthHeaderName: authHeaderName,
+		AuthState:      authState,
 	}
 	m.mu.Unlock()
 
@@ -1136,6 +1318,10 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 	m.mu.Lock()
 	notifyUpdate := false
 	if result.Refreshed {
+		if req.Binding.AuthSession != nil && result.Binding.AuthSession != nil && req.Binding.AuthSession != result.Binding.AuthSession {
+			req.Binding.AuthSession.ReplaceFrom(result.Binding.AuthSession)
+			result.Binding.AuthSession = req.Binding.AuthSession
+		}
 		m.registered = true
 		m.statusCode = result.StatusCode
 		m.reason = result.Reason
@@ -1145,7 +1331,10 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 		m.authHeader = result.AuthHeader
 		m.authHeaderName = result.AuthHeaderName
 		m.authState = result.AuthState
-		notifyUpdate = true
+		if !m.closed {
+			m.captureInboundLocked()
+			notifyUpdate = true
+		}
 	}
 	onUpdate := m.runtimeConfig.OnRegistrationUpdate
 	m.mu.Unlock()
@@ -1166,7 +1355,7 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	defer m.recoverMu.Unlock()
 
 	m.mu.Lock()
-	if m.closed || !m.registered {
+	if m.closed || m.regHalted {
 		m.mu.Unlock()
 		return nil
 	}
@@ -1180,7 +1369,7 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 			return context.Canceled
 		}
 		m.mu.Lock()
-		if m.closed || !m.registered {
+		if m.closed || m.regHalted {
 			m.mu.Unlock()
 			return nil
 		}
@@ -1200,10 +1389,11 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		}
 	}
 	m.mu.Lock()
-	if m.closed || !m.registered {
+	if m.closed || m.regHalted {
 		m.mu.Unlock()
 		return nil
 	}
+	prevAuthSession := m.binding.AuthSession
 	m.recoveryCount++
 	m.recoveryState.Attempts = m.recoveryCount
 	m.recoveryState.LastReason = strings.TrimSpace(fmt.Sprint(cause))
@@ -1249,6 +1439,10 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		m.mu.Unlock()
 		return nil
 	}
+	if prevAuthSession != nil && result.Binding.AuthSession != nil && prevAuthSession != result.Binding.AuthSession {
+		prevAuthSession.ReplaceFrom(result.Binding.AuthSession)
+		result.Binding.AuthSession = prevAuthSession
+	}
 	if m.flow != nil && strings.TrimSpace(m.config.ContactHost) == "" {
 		ipv4, ipv6, _ := tunnelInnerAddresses(m.runtimeConfig.Tunnel)
 		if ipv4 != "" && ipv6 != "" {
@@ -1275,7 +1469,16 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	m.authHeader = result.AuthHeader
 	m.authHeaderName = result.AuthHeaderName
 	m.authState = result.AuthState
+	m.captureInboundLocked()
 	m.recordRecoverySuccessLocked()
+	if m.regSubStarted {
+		m.regSubRemoteTag = ""
+		m.regSubCallID = newRuntimeSIPToken("regsub")
+		m.regSubLocalTag = newRuntimeSIPToken("tag")
+		m.regSubNextCSeq = 1
+		m.regSubHasLastVer = false
+		m.signalRegSubWakeLocked()
+	}
 	onUpdate := m.runtimeConfig.OnRegistrationUpdate
 	m.mu.Unlock()
 	if onUpdate != nil {
@@ -1290,7 +1493,7 @@ func (m *imsRegistrationMaintenance) scheduleRecoveryRetryAfter(cause error, del
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed || !m.registered {
+	if m.closed || m.regHalted {
 		return
 	}
 	m.recoveryState.LastReason = strings.TrimSpace(fmt.Sprint(cause))
@@ -1481,11 +1684,364 @@ func (m *imsRegistrationMaintenance) refreshRetryInterval() time.Duration {
 	return 30 * time.Second
 }
 
+func (m *imsRegistrationMaintenance) shouldSendCRLFKeepalive() bool {
+	if m == nil || m.config.DisableKeepalive {
+		return false
+	}
+	if m.config.KeepaliveInterval > 0 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(m.config.Network)) {
+	case "tcp", "tcp4", "tcp6", "tls", "tls4", "tls6":
+		return true
+	}
+	m.mu.Lock()
+	negotiated := m.binding.KeepaliveNegotiated
+	m.mu.Unlock()
+	return negotiated
+}
+
 func (m *imsRegistrationMaintenance) keepaliveInterval() time.Duration {
 	if m.config.KeepaliveInterval > 0 {
 		return m.config.KeepaliveInterval
 	}
+	m.mu.Lock()
+	flowTimer := m.binding.FlowTimer
+	m.mu.Unlock()
+	if flowTimer > 0 {
+		return time.Duration(flowTimer) * time.Second
+	}
 	return 25 * time.Second
+}
+
+var errRegSubscribeUnsupported = errors.New("IMS reg event subscription unsupported")
+
+func (m *imsRegistrationMaintenance) signalRegSubWakeLocked() {
+	if m == nil || m.regSubWake == nil {
+		return
+	}
+	select {
+	case m.regSubWake <- struct{}{}:
+	default:
+	}
+}
+
+func (m *imsRegistrationMaintenance) StartRegSubscription() {
+	if m == nil || m.config.DisableRegSubscribe {
+		return
+	}
+	m.mu.Lock()
+	if m.closed || !m.registered || m.regHalted {
+		m.mu.Unlock()
+		return
+	}
+	if m.regSubStarted {
+		m.signalRegSubWakeLocked()
+		m.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	wake := make(chan struct{}, 1)
+	m.regSubStarted = true
+	m.regSubCancel = cancel
+	m.regSubDone = done
+	m.regSubWake = wake
+	m.regSubCallID = newRuntimeSIPToken("regsub")
+	m.regSubLocalTag = newRuntimeSIPToken("tag")
+	m.regSubNextCSeq = 1
+	m.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		m.regSubscribeLoop(ctx, wake)
+	}()
+}
+
+func (m *imsRegistrationMaintenance) regSubscribeLoop(ctx context.Context, wake <-chan struct{}) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		grantedExpires, err := m.sendRegSubscribe(ctx)
+		if errors.Is(err, errRegSubscribeUnsupported) || errors.Is(err, context.Canceled) {
+			return
+		}
+		var delay time.Duration
+		if err != nil {
+			delay = m.refreshRetryInterval()
+		} else {
+			if grantedExpires <= 0 {
+				grantedExpires = 3600
+			}
+			delay = imsRegistrationRefreshDelay(WireIMSRegistrar{}, grantedExpires, grantedExpires)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-wake:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+}
+
+func (m *imsRegistrationMaintenance) sendRegSubscribe(ctx context.Context) (int, error) {
+	return m.sendRegSubscribeAttempt(ctx, false)
+}
+
+func (m *imsRegistrationMaintenance) sendRegSubscribeAttempt(ctx context.Context, retried bool) (int, error) {
+	m.mu.Lock()
+	if m.closed || !m.registered || m.regHalted {
+		m.mu.Unlock()
+		return 0, nil
+	}
+	profile := m.profile
+	binding := m.binding
+	sessionContact := m.session.ContactURI
+	sessionExpires := m.session.Expires
+	callID := m.regSubCallID
+	if callID == "" {
+		callID = newRuntimeSIPToken("regsub")
+		m.regSubCallID = callID
+	}
+	localTag := m.regSubLocalTag
+	if localTag == "" {
+		localTag = newRuntimeSIPToken("tag")
+		m.regSubLocalTag = localTag
+	}
+	remoteTag := m.regSubRemoteTag
+	cseq := m.regSubNextCSeq
+	if cseq <= 0 {
+		cseq = 1
+	}
+	m.regSubNextCSeq = cseq + 1
+	expires := m.regSubExpires
+	if expires <= 0 {
+		expires = m.config.RegSubscribeExpires
+	}
+	if expires <= 0 {
+		expires = binding.Expires
+	}
+	if expires <= 0 {
+		expires = sessionExpires
+	}
+	if expires <= 0 {
+		expires = 3600
+	}
+	m.mu.Unlock()
+
+	targetURI := firstRuntimeNonEmpty(binding.PublicIdentity, profile.IMPU)
+	localContact := firstRuntimeNonEmpty(binding.ContactURI, sessionContact)
+	if targetURI == "" || localContact == "" {
+		return 0, nil
+	}
+	dcfg := voiceclient.DialogRequestConfig{
+		Profile:         profile,
+		Registration:    binding,
+		ContactURI:      localContact,
+		LocalURI:        targetURI,
+		RemoteURI:       targetURI,
+		RemoteTargetURI: targetURI,
+		LocalTag:        localTag,
+		RemoteTag:       remoteTag,
+		CallID:          callID,
+		CSeq:            cseq,
+		RouteSet:        append([]string(nil), binding.ServiceRoutes...),
+		UserAgent:       firstRuntimeNonEmpty(m.config.UserAgent, profile.UserAgent),
+		AuthSession:     binding.AuthSession,
+	}
+	msg, err := voiceclient.BuildSubscribeRequest(dcfg, "reg", strconv.Itoa(expires), "", nil)
+	if err != nil {
+		return 0, err
+	}
+	transport := m.config.voiceTransport(m.runtimeConfig, profile, binding, m.flow)
+	if transport == nil {
+		return 0, errRegSubscribeUnsupported
+	}
+	resp, sentReq, err := voiceclient.RoundTripRequestWithDigestAuthResult(ctx, transport, msg)
+	if sentSeq := parseCSeqNumberRuntime(sentReq.Headers["CSeq"]); sentSeq >= cseq {
+		m.mu.Lock()
+		if sentSeq+1 > m.regSubNextCSeq {
+			m.regSubNextCSeq = sentSeq + 1
+		}
+		m.mu.Unlock()
+	}
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		toTag := extractSIPHeaderTagRuntime(firstRuntimeSIPHeaderCI(resp.Headers, "To", "t"))
+		granted := expires
+		if expRaw := firstRuntimeSIPHeaderCI(resp.Headers, "Expires"); expRaw != "" {
+			if n, pErr := strconv.Atoi(strings.TrimSpace(expRaw)); pErr == nil && n > 0 {
+				granted = n
+			}
+		}
+		m.mu.Lock()
+		if toTag != "" && m.regSubCallID == callID {
+			m.regSubRemoteTag = toTag
+		}
+		m.mu.Unlock()
+		return granted, nil
+	case resp.StatusCode == 423 && !retried:
+		if minRaw := firstRuntimeSIPHeaderCI(resp.Headers, "Min-Expires"); minRaw != "" {
+			if minExp, pErr := strconv.Atoi(strings.TrimSpace(minRaw)); pErr == nil && minExp > expires {
+				m.mu.Lock()
+				m.regSubExpires = minExp
+				m.mu.Unlock()
+				return m.sendRegSubscribeAttempt(ctx, true)
+			}
+		}
+		return 0, fmt.Errorf("SUBSCRIBE reg rejected: %d %s", resp.StatusCode, resp.Reason)
+	case resp.StatusCode == 481 && !retried:
+		m.mu.Lock()
+		m.regSubRemoteTag = ""
+		m.regSubCallID = newRuntimeSIPToken("regsub")
+		m.regSubLocalTag = newRuntimeSIPToken("tag")
+		m.regSubNextCSeq = 1
+		m.regSubHasLastVer = false
+		m.mu.Unlock()
+		return m.sendRegSubscribeAttempt(ctx, true)
+	case resp.StatusCode == 405 || resp.StatusCode == 489 || resp.StatusCode == 501:
+		return 0, errRegSubscribeUnsupported
+	default:
+		return 0, fmt.Errorf("SUBSCRIBE reg rejected: %d %s", resp.StatusCode, resp.Reason)
+	}
+}
+
+func (m *imsRegistrationMaintenance) HandleRegNotify(ctx context.Context, req voicehost.InboundDialogRequest) (voicehost.IMSInfoResult, error) {
+	if m == nil {
+		return voicehost.IMSInfoResult{Handled: true, StatusCode: 200, Reason: "OK"}, nil
+	}
+	subRaw := firstRuntimeNonEmpty(req.SubscriptionState, firstRuntimeSIPHeaderCI(req.Headers, "Subscription-State"))
+	var subState voiceclient.SubscriptionStateInfo
+	if subRaw != "" {
+		parsed, err := voiceclient.ParseSubscriptionStateHeader(subRaw)
+		if err != nil {
+			return voicehost.IMSInfoResult{Handled: true, StatusCode: 400, Reason: "Bad Request"}, err
+		}
+		subState = parsed
+	}
+	var docPtr *voiceclient.RegInfoDocument
+	if len(bytes.TrimSpace(req.Body)) > 0 {
+		doc, err := voiceclient.ParseRegInfoXML(req.Body)
+		if err != nil {
+			return voicehost.IMSInfoResult{Handled: true, StatusCode: 400, Reason: "Bad Request"}, err
+		}
+		docPtr = &doc
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return voicehost.IMSInfoResult{Handled: true, StatusCode: 200, Reason: "OK"}, nil
+	}
+	if docPtr != nil && docPtr.HasVersion {
+		if docPtr.State == "partial" && m.regSubHasLastVer {
+			if docPtr.Version <= m.regSubLastVer {
+				m.mu.Unlock()
+				return voicehost.IMSInfoResult{Handled: true, StatusCode: 200, Reason: "OK"}, nil
+			}
+			if docPtr.Version != m.regSubLastVer+1 {
+				m.regSubHasLastVer = false
+				m.signalRegSubWakeLocked()
+				m.mu.Unlock()
+				return voicehost.IMSInfoResult{Handled: true, StatusCode: 200, Reason: "OK"}, nil
+			}
+		}
+		m.regSubLastVer = docPtr.Version
+		m.regSubHasLastVer = true
+	}
+	localContact := firstRuntimeNonEmpty(m.binding.ContactURI, m.session.ContactURI)
+	m.mu.Unlock()
+
+	eval := voiceclient.EvaluateRegEventNotify(subState, docPtr, localContact)
+	if eval.ShortenedExpires > 0 {
+		m.mu.Lock()
+		if m.registered && (m.binding.Expires <= 0 || eval.ShortenedExpires < m.binding.Expires) {
+			m.binding.Expires = eval.ShortenedExpires
+			m.registeredAt = time.Now()
+		}
+		m.mu.Unlock()
+	}
+	switch eval.Action {
+	case voiceclient.RegEventActionReRegister:
+		go func() {
+			_ = m.recoverRegistration(context.Background(), errors.New(eval.Reason), eval.RetryAfter)
+		}()
+	case voiceclient.RegEventActionHalt:
+		m.mu.Lock()
+		m.registered = false
+		m.regHalted = true
+		if m.statusCode >= 200 && m.statusCode < 300 {
+			m.statusCode = 403
+		}
+		m.reason = eval.Reason
+		onUpdate := m.runtimeConfig.OnRegistrationUpdate
+		m.mu.Unlock()
+		if onUpdate != nil {
+			onUpdate(m.result(eval.Reason))
+		}
+	case voiceclient.RegEventActionResubscribe:
+		m.mu.Lock()
+		m.regSubRemoteTag = ""
+		m.regSubCallID = newRuntimeSIPToken("regsub")
+		m.regSubLocalTag = newRuntimeSIPToken("tag")
+		m.regSubNextCSeq = 1
+		m.regSubHasLastVer = false
+		m.signalRegSubWakeLocked()
+		m.mu.Unlock()
+	}
+	return voicehost.IMSInfoResult{Handled: true, StatusCode: 200, Reason: "OK"}, nil
+}
+
+func newRuntimeSIPToken(prefix string) string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return prefix + "-" + hex.EncodeToString(b[:])
+	}
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+func parseCSeqNumberRuntime(value string) int {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) == 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(fields[0])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+func firstRuntimeSIPHeaderCI(headers map[string][]string, names ...string) string {
+	for _, name := range names {
+		for k, vals := range headers {
+			if strings.EqualFold(strings.TrimSpace(k), name) && len(vals) > 0 {
+				return strings.TrimSpace(vals[0])
+			}
+		}
+	}
+	return ""
+}
+
+func extractSIPHeaderTagRuntime(value string) string {
+	rest := value
+	if closeIdx := strings.IndexByte(rest, '>'); closeIdx >= 0 {
+		rest = rest[closeIdx+1:]
+	}
+	for _, part := range strings.Split(rest, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(k), "tag") {
+			return strings.Trim(strings.TrimSpace(v), `"`)
+		}
+	}
+	return ""
 }
 
 func (r WireIMSRegistrar) smsTransport(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, binding voiceclient.RegistrationBinding, voiceTransport voiceclient.SIPRequestTransport) messaging.SMSTransport {
@@ -1596,7 +2152,7 @@ func imsInstanceID(cfg IMSRegistrationConfig, impi string) string {
 			}
 		}
 		if valid {
-			return "urn:gsma:imei:" + imei[:8] + "-" + imei[8:14] + "-" + imei[14:]
+			return "urn:gsma:imei:" + imei[:8] + "-" + imei[8:14] + "-0"
 		}
 	}
 	return stableIMSUUID(impi)
@@ -1626,6 +2182,7 @@ func imsRegistrationNetworkHeaders(cfg IMSRegistrationConfig) (string, string) {
 		IMSI: imsi,
 		MCC:  mcc,
 		MNC:  mnc,
+		EFAD: cfgEFAD(cfg),
 	})
 	return strings.TrimSpace(profile.AccessNetworkInfo), strings.TrimSpace(profile.VisitedNetworkID)
 }
@@ -1667,6 +2224,17 @@ func defaultIMSRealm(cfg IMSRegistrationConfig) string {
 	return fmt.Sprintf("ims.mnc%s.mcc%s.3gppnetwork.org", leftPadRuntime(mnc, 3), mcc)
 }
 
+func cfgEFAD(cfg IMSRegistrationConfig) []byte {
+	mncLen := cfg.Profile.MNCLength
+	if mncLen != 2 && mncLen != 3 && cfg.Prepared != nil {
+		mncLen = cfg.Prepared.Profile.MNCLength
+	}
+	if mncLen == 2 || mncLen == 3 {
+		return []byte{0x00, 0x00, 0x00, byte(mncLen)}
+	}
+	return nil
+}
+
 func cfgMCCMNC(cfg IMSRegistrationConfig) (string, string) {
 	mcc := strings.TrimSpace(cfg.Profile.MCC)
 	mnc := strings.TrimSpace(cfg.Profile.MNC)
@@ -1689,7 +2257,7 @@ func cfgMCCMNC(cfg IMSRegistrationConfig) (string, string) {
 		}
 	}
 	if mcc == "" || mnc == "" {
-		derivedMCC, derivedMNC := carrier.DerivePLMNFromIMSI(imsi)
+		derivedMCC, derivedMNC := carrier.DerivePLMNFromIMSIWithAD(imsi, cfgEFAD(cfg))
 		if mcc == "" {
 			mcc = derivedMCC
 		}
@@ -1697,11 +2265,7 @@ func cfgMCCMNC(cfg IMSRegistrationConfig) (string, string) {
 			mnc = derivedMNC
 		}
 	}
-	trimmedMNC := strings.TrimLeft(mnc, "0")
-	if trimmedMNC == "" && mnc != "" {
-		trimmedMNC = mnc
-	}
-	return mcc, trimmedMNC
+	return mcc, mnc
 }
 
 func defaultIMPI(imsi, domain string) string {
@@ -1722,7 +2286,8 @@ func defaultIMPU(impi, domain string) string {
 	if impi == "" {
 		return ""
 	}
-	if strings.HasPrefix(strings.ToLower(impi), "sip:") || strings.HasPrefix(strings.ToLower(impi), "tel:") {
+	lower := strings.ToLower(impi)
+	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") || strings.HasPrefix(lower, "tel:") {
 		return impi
 	}
 	if strings.Contains(impi, "@") {
@@ -1735,14 +2300,26 @@ func defaultIMPU(impi, domain string) string {
 }
 
 func sipUser(uri string) string {
-	uri = strings.TrimSpace(uri)
-	if strings.HasPrefix(strings.ToLower(uri), "sip:") {
-		uri = uri[4:]
+	s := unwrapSIPAngleBracketsRuntime(uri)
+	lower := strings.ToLower(s)
+	switch {
+	case strings.HasPrefix(lower, "sip:"):
+		s = s[4:]
+	case strings.HasPrefix(lower, "sips:"):
+		s = s[5:]
+	case strings.HasPrefix(lower, "tel:"):
+		s = s[4:]
 	}
-	if user, _, ok := strings.Cut(uri, "@"); ok {
-		return strings.TrimSpace(user)
+	if q := strings.IndexByte(s, '?'); q >= 0 {
+		s = s[:q]
 	}
-	return strings.TrimSpace(uri)
+	if user, _, ok := strings.Cut(s, "@"); ok {
+		s = user
+	}
+	if semi := strings.IndexByte(s, ';'); semi >= 0 {
+		s = s[:semi]
+	}
+	return strings.TrimSpace(s)
 }
 
 func leftPadRuntime(s string, n int) string {

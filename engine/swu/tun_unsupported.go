@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+
+	"github.com/kimoju/vowifi-go/engine/swu/ikev2"
 )
 
 type TUNDeviceConfig struct {
@@ -32,3 +34,5 @@ func (d *TUNDevice) WriteInnerPacket(ctx context.Context, packet []byte) error {
 }
 
 func (d *TUNDevice) Close(ctx context.Context) error { return nil }
+
+func enableTransportKernelESPEncap(_ ikev2.InitTransport) error { return nil }

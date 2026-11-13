@@ -5,6 +5,8 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"math"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -395,6 +397,11 @@ func BuildEmergencyPIDFLO(cfg EmergencyPIDFLOConfig) ([]byte, error) {
 }
 
 func BuildEmergencyPIDFLOWithUsageRules(cfg EmergencyPIDFLOConfig, rules EmergencyPIDFLOUsageRules) ([]byte, error) {
+	if strings.TrimSpace(cfg.Address.Latitude) != "" || strings.TrimSpace(cfg.Address.Longitude) != "" {
+		if _, _, ok := parseWGS84Coordinates(cfg.Address.Latitude, cfg.Address.Longitude); !ok {
+			return nil, errors.New("invalid e911 pidf-lo: invalid geodetic coordinates")
+		}
+	}
 	if !emergencyAddressHasPIDFLOLocation(cfg.Address) {
 		return nil, errors.New("e911 pidf-lo requires emergency location")
 	}
@@ -565,7 +572,9 @@ func ParseEmergencyPIDFLO(body []byte) (EmergencyAddress, error) {
 				continue
 			}
 			if elem.key == pidfLOPositionKey {
-				collectPIDFLOGeodeticPosition(text, &result)
+				if !collectPIDFLOGeodeticPosition(text, &result) {
+					return EmergencyAddress{}, errors.New("invalid e911 pidf-lo: invalid geodetic coordinates")
+				}
 				continue
 			}
 			collectEmergencyAddressField(elem.key, text, &result)
@@ -648,15 +657,77 @@ func formatEmergencySIPRoute(value string) string {
 		return value
 	}
 	uri := value
-	lower := strings.ToLower(uri)
-	if !strings.HasPrefix(lower, "sip:") && !strings.HasPrefix(lower, "sips:") && !strings.Contains(uri, ":") {
-		uri = "sip:" + uri
-		lower = strings.ToLower(uri)
+	if !hasExplicitRouteURIScheme(uri) {
+		hostPart := uri
+		suffix := ""
+		if idx := strings.IndexAny(uri, ";?"); idx >= 0 {
+			hostPart = uri[:idx]
+			suffix = uri[idx:]
+		}
+		if ip := net.ParseIP(hostPart); ip != nil {
+			if ip.To4() == nil {
+				hostPart = "[" + hostPart + "]"
+			}
+		} else if !strings.HasPrefix(hostPart, "[") {
+			if host, port, err := net.SplitHostPort(hostPart); err == nil {
+				hostPart = net.JoinHostPort(host, port)
+			}
+		}
+		uri = "sip:" + hostPart + suffix
 	}
+	lower := strings.ToLower(uri)
 	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") {
 		uri = ensureLooseRoute(uri)
 	}
 	return "<" + uri + ">"
+}
+
+func hasExplicitRouteURIScheme(uri string) bool {
+	if uri == "" || strings.HasPrefix(uri, "[") {
+		return false
+	}
+	hostCandidate := uri
+	if idx := strings.IndexAny(uri, ";?"); idx >= 0 {
+		hostCandidate = uri[:idx]
+	}
+	if net.ParseIP(hostCandidate) != nil {
+		return false
+	}
+	colon := strings.IndexByte(hostCandidate, ':')
+	if colon <= 0 {
+		return false
+	}
+	scheme := hostCandidate[:colon]
+	for i := 0; i < len(scheme); i++ {
+		c := scheme[i]
+		if i == 0 {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+				return false
+			}
+			continue
+		}
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	switch strings.ToLower(scheme) {
+	case "sip", "sips", "tel", "urn":
+		return true
+	}
+	rest := hostCandidate[colon+1:]
+	if rest != "" {
+		allDigits := true
+		for i := 0; i < len(rest); i++ {
+			if rest[i] < '0' || rest[i] > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			return false
+		}
+	}
+	return true
 }
 
 func ensureLooseRoute(uri string) string {
@@ -693,7 +764,7 @@ func emergencyGeolocationHeader(cfg EmergencySIPHeaderConfig) string {
 	}
 	lat := strings.TrimSpace(cfg.Address.Latitude)
 	lon := strings.TrimSpace(cfg.Address.Longitude)
-	if lat == "" || lon == "" {
+	if _, _, ok := parseWGS84Coordinates(lat, lon); !ok {
 		return ""
 	}
 	return formatGeolocationURI("geo:" + lat + "," + lon)
@@ -730,8 +801,26 @@ func containsEmergencyServiceURN(urns []string, urn string) bool {
 	return false
 }
 
+func parseWGS84Coordinates(latStr, lonStr string) (float64, float64, bool) {
+	latStr = strings.TrimSpace(latStr)
+	lonStr = strings.TrimSpace(lonStr)
+	if latStr == "" || lonStr == "" {
+		return 0, 0, false
+	}
+	lat, err := strconv.ParseFloat(latStr, 64)
+	if err != nil || math.IsNaN(lat) || math.IsInf(lat, 0) || lat < -90 || lat > 90 {
+		return 0, 0, false
+	}
+	lon, err := strconv.ParseFloat(lonStr, 64)
+	if err != nil || math.IsNaN(lon) || math.IsInf(lon, 0) || lon < -180 || lon > 180 {
+		return 0, 0, false
+	}
+	return lat, lon, true
+}
+
 func emergencyAddressHasGeolocation(address EmergencyAddress) bool {
-	return strings.TrimSpace(address.Latitude) != "" && strings.TrimSpace(address.Longitude) != ""
+	_, _, ok := parseWGS84Coordinates(address.Latitude, address.Longitude)
+	return ok
 }
 
 func formatGeolocationURI(uri string) string {
@@ -1219,7 +1308,9 @@ func pidfLOValidationElementKey(local string, stack []pidfLOElement) string {
 func collectPIDFLOValidationText(key, text string, validation *EmergencyPIDFLOValidation, result *entitlementResult) error {
 	switch key {
 	case pidfLOPositionKey:
-		collectPIDFLOGeodeticPosition(text, result)
+		if !collectPIDFLOGeodeticPosition(text, result) {
+			return errors.New("invalid e911 pidf-lo: invalid geodetic coordinates")
+		}
 	case pidfLOMethodKey:
 		validation.Method = text
 	case pidfLOTimestampKey:
@@ -1308,11 +1399,14 @@ func pidfLOStackContainsLocal(stack []pidfLOElement, local string) bool {
 	return false
 }
 
-func collectPIDFLOGeodeticPosition(text string, out *entitlementResult) {
+func collectPIDFLOGeodeticPosition(text string, out *entitlementResult) bool {
 	text = strings.ReplaceAll(text, ",", " ")
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
-		return
+		return false
+	}
+	if _, _, ok := parseWGS84Coordinates(parts[0], parts[1]); !ok {
+		return false
 	}
 	if out.EmergencyAddress == nil {
 		out.EmergencyAddress = make(map[string]string)
@@ -1323,6 +1417,7 @@ func collectPIDFLOGeodeticPosition(text string, out *entitlementResult) {
 	if out.EmergencyAddress["longitude"] == "" {
 		out.EmergencyAddress["longitude"] = parts[1]
 	}
+	return true
 }
 
 func appendEmergencyMultipartPart(dst *bytes.Buffer, boundary, contentType, contentID, disposition string, body []byte) {

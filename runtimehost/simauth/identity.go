@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/kimoju/vowifi-go/runtimehost/carrier"
 )
@@ -81,19 +82,19 @@ func ParseEAPAKAPermanentIdentity(identity string) (EAPAKAPermanentIdentity, err
 
 // DecodeISIMIdentityString decodes EF_IMPI, EF_IMPU, and EF_DOMAIN string data.
 func DecodeISIMIdentityString(raw []byte) string {
-	data := trimEFPadding(raw)
+	data := trimTLVPadding(raw)
 	if len(data) == 0 {
 		return ""
 	}
 	if data[0] == 0x80 {
-		if v, ok := decodeISIMDataObject(data[1:]); ok {
-			return decodeISIMTextValue(v)
+		v, ok := decodeISIMDataObject(data[1:])
+		if !ok {
+			return ""
 		}
+		return decodeISIMTextValue(v)
 	}
 	if v, ok := FindTLV(data, 0x80); ok {
-		if s := decodeISIMTextValue(v); s != "" {
-			return s
-		}
+		return decodeISIMTextValue(v)
 	}
 	return decodeISIMStringValue(data)
 }
@@ -327,19 +328,38 @@ func decodeISIMDataObject(data []byte) ([]byte, bool) {
 }
 
 func decodeISIMStringValue(data []byte) string {
-	data = trimEFPadding(data)
+	data = trimTLVPadding(data)
 	if len(data) == 0 {
 		return ""
 	}
-	if l, rest, ok := readSIMStringLength(data); ok && l > 0 && len(rest) >= l {
-		return strings.TrimSpace(string(trimEFPadding(rest[:l])))
+	if l, rest, ok := readSIMStringLength(data); ok && l > 0 && len(rest) >= l && len(trimEFPadding(rest[l:])) == 0 {
+		if isLikelyISIMLengthPrefix(data[0], rest[:l]) {
+			if s := decodeISIMTextValue(rest[:l]); s != "" {
+				return s
+			}
+		}
 	}
-	return strings.TrimSpace(string(data))
+	return decodeISIMTextValue(data)
+}
+
+func isLikelyISIMLengthPrefix(first byte, payload []byte) bool {
+	if first < 0x20 || first > 0x7E {
+		return true
+	}
+	lower := strings.ToLower(string(payload))
+	if strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:") || strings.HasPrefix(lower, "tel:") || strings.HasPrefix(lower, "urn:") {
+		return true
+	}
+	isIdentStart := (first >= '0' && first <= '9') ||
+		(first >= 'A' && first <= 'Z') ||
+		(first >= 'a' && first <= 'z') ||
+		first == '+'
+	return !isIdentStart
 }
 
 func decodeISIMTextValue(data []byte) string {
 	data = trimEFPadding(data)
-	if len(data) == 0 {
+	if len(data) == 0 || !utf8.Valid(data) {
 		return ""
 	}
 	return strings.TrimSpace(string(data))

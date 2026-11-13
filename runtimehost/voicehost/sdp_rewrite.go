@@ -131,7 +131,11 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 	}
 	text := strings.ReplaceAll(string(body), "\r\n", "\n")
 	lines := strings.Split(text, "\n")
-	audioDisabled := sdpAudioPortDisabled(lines) || sdpAudioConnectionDisabled(lines)
+	targetAudioIdx, hasOtherMediaWithoutConn, targetAudioHasRTCPMux := inspectSDPMediaSectionsForRewrite(lines)
+	if targetAudioIdx < 0 {
+		return BuildSDPAnswer(endpoint)
+	}
+	audioDisabled := sdpAudioSectionDisabled(lines, targetAudioIdx)
 	ipVersion := "IP4"
 	if ip := net.ParseIP(endpoint.ConnectionIP); ip != nil && ip.To4() == nil {
 		ipVersion = "IP6"
@@ -144,37 +148,71 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 	if ip := net.ParseIP(rtcpIP); ip != nil && ip.To4() == nil {
 		rtcpIPVersion = "IP6"
 	}
-	rewroteConnection := false
+	rewroteSessionConn := false
+	rewroteAudioConn := false
 	rewroteAudio := false
 	rewroteRTCP := false
-	out := make([]string, 0, len(lines)+1)
+	inSession := true
+	currentMediaIdx := -1
+	inTargetAudio := false
+	rewroteAudioLineAt := -1
+	out := make([]string, 0, len(lines)+2)
 	for _, line := range lines {
 		if line == "" {
 			continue
 		}
-		switch {
-		case strings.HasPrefix(line, "c=IN IP"):
-			if audioDisabled {
-				out = append(out, line)
-			} else {
-				out = append(out, "c=IN "+ipVersion+" "+endpoint.ConnectionIP)
-			}
-			rewroteConnection = true
-		case strings.HasPrefix(line, "m=audio "):
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				if !audioDisabled && fields[1] != "0" {
-					fields[1] = strconv.Itoa(endpoint.MediaPort)
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(lower, "m=") {
+			inSession = false
+			currentMediaIdx++
+			inTargetAudio = currentMediaIdx == targetAudioIdx
+			if inTargetAudio {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if !audioDisabled && fields[1] != "0" {
+						fields[1] = strconv.Itoa(endpoint.MediaPort)
+					}
+					line = strings.Join(fields, " ")
+					rewroteAudio = true
 				}
-				line = strings.Join(fields, " ")
-				rewroteAudio = true
+				rewroteAudioLineAt = len(out)
 			}
 			out = append(out, line)
-		case strings.HasPrefix(line, "a=rtcp:") && endpoint.RTCPPort > 0:
+			continue
+		}
+		switch {
+		case inSession && strings.HasPrefix(line, "o="):
+			if !audioDisabled {
+				line = rewriteSDPOriginLine(line, ipVersion, endpoint.ConnectionIP, true)
+			}
+			out = append(out, line)
+		case strings.HasPrefix(line, "c=IN IP"):
+			if inSession {
+				if audioDisabled || hasOtherMediaWithoutConn {
+					out = append(out, line)
+				} else {
+					out = append(out, "c=IN "+ipVersion+" "+endpoint.ConnectionIP)
+					rewroteSessionConn = true
+				}
+			} else if inTargetAudio {
+				if audioDisabled {
+					out = append(out, line)
+				} else {
+					out = append(out, "c=IN "+ipVersion+" "+endpoint.ConnectionIP)
+				}
+				rewroteAudioConn = true
+			} else {
+				out = append(out, line)
+			}
+		case inTargetAudio && strings.HasPrefix(line, "a=rtcp:") && endpoint.RTCPPort > 0:
 			if audioDisabled {
 				out = append(out, line)
 			} else {
-				out = append(out, "a=rtcp:"+strconv.Itoa(endpoint.RTCPPort)+" IN "+rtcpIPVersion+" "+rtcpIP)
+				rtcpPort := endpoint.RTCPPort
+				if targetAudioHasRTCPMux {
+					rtcpPort = endpoint.MediaPort
+				}
+				out = append(out, "a=rtcp:"+strconv.Itoa(rtcpPort)+" IN "+rtcpIPVersion+" "+rtcpIP)
 			}
 			rewroteRTCP = true
 		default:
@@ -184,24 +222,27 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 	if !rewroteAudio {
 		return BuildSDPAnswer(endpoint)
 	}
-	if !rewroteConnection && !audioDisabled {
-		insertAt := len(out)
-		for i, line := range out {
-			if strings.HasPrefix(line, "m=audio ") {
-				insertAt = i
-				break
-			}
+	if !audioDisabled && !rewroteAudioConn && (!rewroteSessionConn || hasOtherMediaWithoutConn) {
+		insertAt := rewroteAudioLineAt
+		if hasOtherMediaWithoutConn && rewroteAudioLineAt >= 0 {
+			insertAt = rewroteAudioLineAt + 1
+		}
+		if insertAt < 0 {
+			insertAt = len(out)
 		}
 		out = append(out, "")
 		copy(out[insertAt+1:], out[insertAt:])
 		out[insertAt] = "c=IN " + ipVersion + " " + endpoint.ConnectionIP
+		if insertAt <= rewroteAudioLineAt {
+			rewroteAudioLineAt++
+		}
 	}
-	if endpoint.RTCPPort > 0 && !rewroteRTCP && !audioDisabled {
+	if endpoint.RTCPPort > 0 && !rewroteRTCP && !audioDisabled && !targetAudioHasRTCPMux {
 		insertAt := len(out)
-		for i, line := range out {
-			if strings.HasPrefix(line, "m=audio ") {
-				insertAt = i + 1
-				break
+		if rewroteAudioLineAt >= 0 {
+			insertAt = rewroteAudioLineAt + 1
+			if insertAt < len(out) && strings.HasPrefix(out[insertAt], "c=IN IP") {
+				insertAt++
 			}
 		}
 		out = append(out, "")
@@ -209,6 +250,146 @@ func RewriteSDPMediaEndpoint(body []byte, endpoint SDPInfo) []byte {
 		out[insertAt] = "a=rtcp:" + strconv.Itoa(endpoint.RTCPPort) + " IN " + rtcpIPVersion + " " + rtcpIP
 	}
 	return []byte(strings.Join(out, "\r\n") + "\r\n")
+}
+
+func inspectSDPMediaSectionsForRewrite(lines []string) (targetAudioIdx int, hasOtherMediaWithoutConn bool, targetAudioHasRTCPMux bool) {
+	targetAudioIdx = -1
+	firstAudioIdx := -1
+	currentMediaIdx := -1
+	currentIsTarget := false
+	currentIsOther := false
+	currentOtherHasConn := false
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "m=") {
+			if currentIsOther && !currentOtherHasConn {
+				hasOtherMediaWithoutConn = true
+			}
+			currentMediaIdx++
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && strings.EqualFold(fields[0], "m=audio") {
+				if firstAudioIdx < 0 {
+					firstAudioIdx = currentMediaIdx
+				}
+				if targetAudioIdx < 0 && fields[1] != "0" {
+					targetAudioIdx = currentMediaIdx
+				}
+			}
+			currentIsOther = false
+			currentOtherHasConn = false
+			currentIsTarget = false
+			continue
+		}
+		if currentMediaIdx >= 0 && strings.HasPrefix(line, "c=IN IP") {
+			currentOtherHasConn = true
+		}
+	}
+	if targetAudioIdx < 0 {
+		targetAudioIdx = firstAudioIdx
+	}
+	if targetAudioIdx < 0 {
+		return -1, false, false
+	}
+	// Second quick pass now that targetAudioIdx is finalized.
+	currentMediaIdx = -1
+	hasOtherMediaWithoutConn = false
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "m=") {
+			if currentIsOther && !currentOtherHasConn {
+				hasOtherMediaWithoutConn = true
+			}
+			currentMediaIdx++
+			currentIsTarget = currentMediaIdx == targetAudioIdx
+			currentIsOther = !currentIsTarget
+			currentOtherHasConn = false
+			continue
+		}
+		if currentIsOther && strings.HasPrefix(line, "c=IN IP") {
+			currentOtherHasConn = true
+		}
+		if currentIsTarget && lower == "a=rtcp-mux" {
+			targetAudioHasRTCPMux = true
+		}
+	}
+	if currentIsOther && !currentOtherHasConn {
+		hasOtherMediaWithoutConn = true
+	}
+	return targetAudioIdx, hasOtherMediaWithoutConn, targetAudioHasRTCPMux
+}
+
+func sdpAudioSectionDisabled(lines []string, targetAudioIdx int) bool {
+	if targetAudioIdx < 0 {
+		return true
+	}
+	sessionConn := ""
+	audioConn := ""
+	audioPortZero := false
+	currentMediaIdx := -1
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "m=") {
+			currentMediaIdx++
+			if currentMediaIdx == targetAudioIdx {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 && fields[1] == "0" {
+					audioPortZero = true
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "c=IN IP") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				if currentMediaIdx < 0 {
+					sessionConn = fields[2]
+				} else if currentMediaIdx == targetAudioIdx {
+					audioConn = fields[2]
+				}
+			}
+		}
+	}
+	if audioPortZero {
+		return true
+	}
+	effectiveConn := audioConn
+	if effectiveConn == "" {
+		effectiveConn = sessionConn
+	}
+	return sdpConnectionIsUnspecified(effectiveConn)
+}
+
+func rewriteSDPOriginLine(line, ipVersion, connectionIP string, incrementVersion bool) string {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "o=") {
+		return line
+	}
+	fields := strings.Fields(trimmed[2:])
+	if len(fields) < 6 {
+		return line
+	}
+	if incrementVersion {
+		if ver, err := strconv.ParseUint(fields[2], 10, 64); err == nil {
+			fields[2] = strconv.FormatUint(ver+1, 10)
+		}
+	}
+	if strings.EqualFold(fields[3], "IN") && strings.TrimSpace(connectionIP) != "" && strings.TrimSpace(ipVersion) != "" {
+		fields[4] = ipVersion
+		fields[5] = strings.TrimSpace(connectionIP)
+	}
+	return "o=" + strings.Join(fields, " ")
 }
 
 func RewriteSDPMediaEndpointWithOptions(body []byte, endpoint SDPInfo, options SDPMediaRewriteOptions) []byte {
@@ -348,8 +529,21 @@ func SelectSDPAnswerPacketizationTime(offer, local SDPInfo) (int, int) {
 // ClassifySDPAMRFMTPCompatibility checks whether offered AMR/AMR-WB fmtp
 // parameters can satisfy a local codec preference.
 func ClassifySDPAMRFMTPCompatibility(offered, want string) SDPAMRFMTPCompatibility {
+	return classifySDPAMRFMTPCompatibilityForMaxMode(offered, want, 8)
+}
+
+func classifySDPAMRFMTPCompatibilityForMaxMode(offered, want string, maxMode int) SDPAMRFMTPCompatibility {
 	offered = strings.TrimSpace(offered)
 	want = strings.TrimSpace(want)
+	offeredParams := ParseSDPFmtpParameters(offered)
+	if offeredModeSet, hasOfferedModeSet := offeredParams["mode-set"]; hasOfferedModeSet {
+		if len(parseSDPAMRModeSetMax(offeredModeSet, maxMode)) == 0 {
+			return SDPAMRFMTPCompatibility{
+				Status:    SDPAMRFMTPIncompatibleModeSet,
+				Parameter: "mode-set",
+			}
+		}
+	}
 	if want == "" {
 		return SDPAMRFMTPCompatibility{
 			Compatible: true,
@@ -357,7 +551,6 @@ func ClassifySDPAMRFMTPCompatibility(offered, want string) SDPAMRFMTPCompatibili
 			AnswerFMTP: offered,
 		}
 	}
-	offeredParams := ParseSDPFmtpParameters(offered)
 	wantParams := ParseSDPFmtpParameters(want)
 	out := make(map[string]string, len(offeredParams)+len(wantParams))
 	for key, value := range offeredParams {
@@ -376,8 +569,14 @@ func ClassifySDPAMRFMTPCompatibility(offered, want string) SDPAMRFMTPCompatibili
 		}
 	}
 	if wantModeSet, ok := wantParams["mode-set"]; ok {
+		if len(parseSDPAMRModeSetMax(wantModeSet, maxMode)) == 0 {
+			return SDPAMRFMTPCompatibility{
+				Status:    SDPAMRFMTPIncompatibleModeSet,
+				Parameter: "mode-set",
+			}
+		}
 		if offeredModeSet, hasOffered := offeredParams["mode-set"]; hasOffered {
-			intersection, ok := intersectSDPAMRModeSet(offeredModeSet, wantModeSet)
+			intersection, ok := intersectSDPAMRModeSetMax(offeredModeSet, wantModeSet, maxMode)
 			if !ok {
 				return SDPAMRFMTPCompatibility{
 					Status:    SDPAMRFMTPIncompatibleModeSet,
@@ -386,7 +585,7 @@ func ClassifySDPAMRFMTPCompatibility(offered, want string) SDPAMRFMTPCompatibili
 			}
 			out["mode-set"] = intersection
 		} else {
-			out["mode-set"] = strings.TrimSpace(wantModeSet)
+			out["mode-set"] = strings.Join(parseSDPAMRModeSetMax(wantModeSet, maxMode), ",")
 		}
 	}
 	for key, value := range wantParams {
@@ -526,12 +725,14 @@ func RewriteSDPMediaDirection(body []byte, direction string) ([]byte, error) {
 	inserted := false
 	inAudio := false
 	sawAudio := false
+	inSession := true
 	for _, line := range lines {
 		if line == "" {
 			continue
 		}
 		lower := strings.ToLower(strings.TrimSpace(line))
 		if strings.HasPrefix(lower, "m=") {
+			inSession = false
 			inAudio = false
 			fields := strings.Fields(line)
 			if !sawAudio && len(fields) > 0 && strings.EqualFold(fields[0], "m=audio") {
@@ -542,6 +743,10 @@ func RewriteSDPMediaDirection(body []byte, direction string) ([]byte, error) {
 				continue
 			}
 			out = append(out, line)
+			continue
+		}
+		if inSession && strings.HasPrefix(strings.TrimSpace(line), "o=") {
+			out = append(out, rewriteSDPOriginLine(line, "", "", true))
 			continue
 		}
 		if inAudio && isSDPDirectionLine(line) {
@@ -943,11 +1148,15 @@ func selectSDPCodecAnswer(offered, want SDPCodec) (SDPCodec, bool) {
 	}
 	answer := normalizeSDPCodec(offered)
 	if sdpCodecIsAMR(answer) && sdpCodecIsAMR(want) {
-		fmtp, ok := selectSDPAMRAnswerFMTP(answer.FMTP, want.FMTP)
-		if !ok {
+		maxMode := 7
+		if strings.EqualFold(strings.TrimSpace(answer.EncodingName), SDPCodecAMRWB) {
+			maxMode = 8
+		}
+		compat := classifySDPAMRFMTPCompatibilityForMaxMode(answer.FMTP, want.FMTP, maxMode)
+		if !compat.Compatible {
 			return SDPCodec{}, false
 		}
-		answer.FMTP = fmtp
+		answer.FMTP = compat.AnswerFMTP
 		return answer, true
 	}
 	if strings.TrimSpace(want.FMTP) != "" {
@@ -970,7 +1179,15 @@ func selectSDPAMRBinaryFMTPParam(offered, want map[string]string, key string) (s
 	wantValue, hasWant := want[key]
 	offerValue, hasOffer := offered[key]
 	if !hasWant {
-		return strings.TrimSpace(offerValue), true
+		// Per RFC 4867 §8.1, omitted octet-align, crc, robust-sorting, and interleaving default to 0.
+		if !hasOffer {
+			return "", true
+		}
+		offerNorm := normalizeSDPAMRBinaryFMTPValue(offerValue)
+		if offerNorm != "0" {
+			return "", false
+		}
+		return "0", true
 	}
 	wantValue = normalizeSDPAMRBinaryFMTPValue(wantValue)
 	if wantValue == "" {
@@ -999,8 +1216,12 @@ func normalizeSDPAMRBinaryFMTPValue(value string) string {
 }
 
 func intersectSDPAMRModeSet(offered, want string) (string, bool) {
-	offeredModes := parseSDPAMRModeSet(offered)
-	wantModes := parseSDPAMRModeSet(want)
+	return intersectSDPAMRModeSetMax(offered, want, 8)
+}
+
+func intersectSDPAMRModeSetMax(offered, want string, maxMode int) (string, bool) {
+	offeredModes := parseSDPAMRModeSetMax(offered, maxMode)
+	wantModes := parseSDPAMRModeSetMax(want, maxMode)
 	if len(offeredModes) == 0 || len(wantModes) == 0 {
 		return "", false
 	}
@@ -1023,18 +1244,196 @@ func intersectSDPAMRModeSet(offered, want string) (string, bool) {
 }
 
 func parseSDPAMRModeSet(value string) []string {
+	return parseSDPAMRModeSetMax(value, 8)
+}
+
+func parseSDPAMRModeSetMax(value string, maxMode int) []string {
 	var out []string
 	for _, part := range strings.Split(value, ",") {
 		mode := strings.TrimSpace(part)
 		if mode == "" {
 			continue
 		}
-		if _, err := strconv.Atoi(mode); err != nil {
+		n, err := strconv.Atoi(mode)
+		if err != nil || n < 0 || n > maxMode {
 			return nil
 		}
-		out = append(out, mode)
+		out = append(out, strconv.Itoa(n))
 	}
 	return out
+}
+
+// SDPPreconditions summarizes RFC 3312 / 3GPP TS 24.229 QoS precondition attributes.
+type SDPPreconditions struct {
+	Present               bool
+	LocalCurrent          string
+	RemoteCurrent         string
+	LocalDesiredStrength  string
+	LocalDesiredDirection string
+	RemoteDesiredStrength string
+	RemoteDesiredDir      string
+	ConfRequested         bool
+}
+
+func ParseSDPPreconditions(body []byte) SDPPreconditions {
+	var out SDPPreconditions
+	lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
+	inAudio := false
+	sawAudio := false
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "m=") {
+			if sawAudio {
+				break
+			}
+			fields := strings.Fields(line)
+			if len(fields) > 0 && strings.EqualFold(fields[0], "m=audio") {
+				inAudio = true
+				sawAudio = true
+			}
+			continue
+		}
+		if !inAudio {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(lower, "a=curr:qos "):
+			fields := strings.Fields(lower[len("a=curr:qos "):])
+			if len(fields) >= 2 {
+				out.Present = true
+				switch fields[0] {
+				case "local":
+					out.LocalCurrent = fields[1]
+				case "remote":
+					out.RemoteCurrent = fields[1]
+				}
+			}
+		case strings.HasPrefix(lower, "a=des:qos "):
+			fields := strings.Fields(lower[len("a=des:qos "):])
+			if len(fields) >= 3 {
+				out.Present = true
+				switch fields[1] {
+				case "local":
+					out.LocalDesiredStrength = fields[0]
+					out.LocalDesiredDirection = fields[2]
+				case "remote":
+					out.RemoteDesiredStrength = fields[0]
+					out.RemoteDesiredDir = fields[2]
+				}
+			}
+		case strings.HasPrefix(lower, "a=conf:qos "):
+			out.Present = true
+			out.ConfRequested = true
+		}
+	}
+	return out
+}
+
+func (p SDPPreconditions) Satisfied() bool {
+	if !p.Present {
+		return true
+	}
+	if strings.EqualFold(p.LocalDesiredStrength, "mandatory") && (p.LocalCurrent == "" || p.LocalCurrent == "none") {
+		return false
+	}
+	if strings.EqualFold(p.RemoteDesiredStrength, "mandatory") && (p.RemoteCurrent == "" || p.RemoteCurrent == "none") {
+		return false
+	}
+	return !p.ConfRequested
+}
+
+// RewriteSDPPreconditionsForAnswer translates an incoming SDP offer's RFC 3312
+// QoS precondition attributes into an answer where local VoWiFi tunnel QoS is
+// satisfied ("sendrecv") and remote status mirrors the offerer's local status.
+func RewriteSDPPreconditionsForAnswer(offerBody, answerBody []byte) []byte {
+	offerPre := ParseSDPPreconditions(offerBody)
+	if !offerPre.Present {
+		return answerBody
+	}
+	remoteCurr := firstVoiceNonEmpty(offerPre.LocalCurrent, "none")
+	localDesStrength := firstVoiceNonEmpty(offerPre.RemoteDesiredStrength, "optional")
+	localDesDir := firstVoiceNonEmpty(offerPre.RemoteDesiredDir, "sendrecv")
+	remoteDesStrength := firstVoiceNonEmpty(offerPre.LocalDesiredStrength, "optional")
+	remoteDesDir := firstVoiceNonEmpty(offerPre.LocalDesiredDirection, "sendrecv")
+	attrs := []string{
+		"a=curr:qos local sendrecv",
+		"a=curr:qos remote " + remoteCurr,
+		"a=des:qos " + localDesStrength + " local " + localDesDir,
+		"a=des:qos " + remoteDesStrength + " remote " + remoteDesDir,
+	}
+	if strings.EqualFold(remoteDesStrength, "mandatory") && remoteCurr == "none" {
+		attrs = append(attrs, "a=conf:qos remote "+remoteDesDir)
+	}
+	return replaceSDPAudioPreconditionLines(answerBody, attrs, false)
+}
+
+// BuildSDPPreconditionConfirmOffer builds an RFC 3312 UPDATE SDP offer after
+// receiving a 183 Session Progress answer whose QoS preconditions were pending.
+func BuildSDPPreconditionConfirmOffer(localOfferBody, remoteAnswerBody []byte) []byte {
+	ansPre := ParseSDPPreconditions(remoteAnswerBody)
+	remoteCurr := "sendrecv"
+	if ansPre.Present && ansPre.LocalCurrent != "" && ansPre.LocalCurrent != "none" {
+		remoteCurr = ansPre.LocalCurrent
+	}
+	offerPre := ParseSDPPreconditions(localOfferBody)
+	localDesStrength := firstVoiceNonEmpty(offerPre.LocalDesiredStrength, "mandatory")
+	localDesDir := firstVoiceNonEmpty(offerPre.LocalDesiredDirection, "sendrecv")
+	remoteDesStrength := firstVoiceNonEmpty(offerPre.RemoteDesiredStrength, "mandatory")
+	remoteDesDir := firstVoiceNonEmpty(offerPre.RemoteDesiredDir, "sendrecv")
+	attrs := []string{
+		"a=curr:qos local sendrecv",
+		"a=curr:qos remote " + remoteCurr,
+		"a=des:qos " + localDesStrength + " local " + localDesDir,
+		"a=des:qos " + remoteDesStrength + " remote " + remoteDesDir,
+	}
+	return replaceSDPAudioPreconditionLines(localOfferBody, attrs, true)
+}
+
+func replaceSDPAudioPreconditionLines(body []byte, attrs []string, incrementOrigin bool) []byte {
+	lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
+	out := make([]string, 0, len(lines)+len(attrs))
+	inSession := true
+	inAudio := false
+	sawAudio := false
+	inserted := false
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "m=") {
+			if inAudio && !inserted {
+				out = append(out, attrs...)
+				inserted = true
+			}
+			inSession = false
+			inAudio = false
+			fields := strings.Fields(line)
+			if !sawAudio && len(fields) > 0 && strings.EqualFold(fields[0], "m=audio") {
+				inAudio = true
+				sawAudio = true
+			}
+			out = append(out, line)
+			continue
+		}
+		if inSession && incrementOrigin && strings.HasPrefix(line, "o=") {
+			out = append(out, rewriteSDPOriginLine(line, "", "", true))
+			continue
+		}
+		if inAudio && (strings.HasPrefix(lower, "a=curr:qos ") || strings.HasPrefix(lower, "a=des:qos ") || strings.HasPrefix(lower, "a=conf:qos ")) {
+			continue
+		}
+		out = append(out, line)
+	}
+	if sawAudio && !inserted {
+		out = append(out, attrs...)
+	}
+	return []byte(strings.Join(out, "\r\n") + "\r\n")
 }
 
 func staticSDPCodec(payload int) (SDPCodec, bool) {

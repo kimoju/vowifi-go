@@ -846,12 +846,15 @@ func TestRTPRelaySessionTracksRTPStreamsAndSendsReceiverReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rtcp.Unmarshal() error = %v packet=%x", err, got)
 	}
-	if len(packets) != 1 {
-		t.Fatalf("packets=%d, want 1", len(packets))
+	if len(packets) != 2 {
+		t.Fatalf("packets=%d, want 2 (compound RR + SDES)", len(packets))
 	}
 	rr, ok := packets[0].(*rtcp.ReceiverReport)
 	if !ok {
 		t.Fatalf("packet type=%T, want ReceiverReport", packets[0])
+	}
+	if _, ok := packets[1].(*rtcp.SourceDescription); !ok {
+		t.Fatalf("packet[1] type=%T, want SourceDescription", packets[1])
 	}
 	if rr.SSRC != 0x33333333 || len(rr.Reports) != 1 {
 		t.Fatalf("receiver report=%+v", rr)

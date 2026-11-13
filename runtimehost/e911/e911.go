@@ -84,10 +84,16 @@ func (c defaultHTTPClient) Do(req *HTTPRequest) (*HTTPResponse, error) {
 		hreq.Header.Add(h.Key, h.Value)
 	}
 	client := c.client
+	ephemeral := false
 	if req.Proxy.IsActive() && !c.proxy.IsActive() {
 		client = newStandardHTTPClient(req.Proxy, defaultE911HTTPTimeout)
+		ephemeral = true
 	} else if client == nil {
 		client = newStandardHTTPClient(c.proxy, defaultE911HTTPTimeout)
+		ephemeral = true
+	}
+	if ephemeral && client != nil {
+		defer client.CloseIdleConnections()
 	}
 	resp, err := client.Do(hreq)
 	if err != nil {
@@ -259,13 +265,7 @@ func StartEmergencyAddressUpdate(ctx context.Context, req Request) (WebsheetRequ
 		return WebsheetRequest{}, ErrWebsheetUnavailable
 	}
 	if endpoint := strings.TrimSpace(req.Carrier.E911.EntitlementEndpoint); endpoint != "" {
-		ws, err := startTS43EmergencyAddressUpdate(ctx, endpoint, req)
-		if err == nil && strings.TrimSpace(ws.URL) != "" {
-			return ws, nil
-		}
-		if errors.Is(err, ErrChallengeNotImplemented) {
-			return WebsheetRequest{}, err
-		}
+		return startTS43EmergencyAddressUpdate(ctx, endpoint, req)
 	}
 	return fallbackWebsheetRequest(req), nil
 }
@@ -278,7 +278,11 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 		} else {
 			client = NewDefaultHTTPClient()
 		}
+		if dc, ok := client.(defaultHTTPClient); ok && dc.client != nil {
+			defer dc.client.CloseIdleConnections()
+		}
 	}
+	session := &entitlementSessionState{}
 	requestBody := map[string]any{
 		"message-id":      1,
 		"operation":       "emergency-address-update",
@@ -298,14 +302,14 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 	if err != nil {
 		return WebsheetRequest{}, err
 	}
-	resp, err := doEntitlementWithHTTPDigest(ctx, client, req.Trace, &HTTPRequest{
+	resp, err := doEntitlementWithHTTPDigestAndSession(ctx, client, req.Trace, &HTTPRequest{
 		Context: ctx,
 		Method:  "POST",
 		URL:     endpoint,
 		Headers: entitlementHeaders(req),
 		Body:    payload,
 		Proxy:   cloneE911ProxyConfig(req.Proxy),
-	}, req)
+	}, req, session)
 	if err != nil {
 		return WebsheetRequest{}, err
 	}
@@ -329,7 +333,7 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 		if challengeResponses >= maxEntitlementChallengeResponses {
 			return WebsheetRequest{}, ErrChallengeNotImplemented
 		}
-		answerBody, nextEAPKeys, nextIdentityTranscript, nextEAPIdentityState, nextReauthState, reauthUpdated, err := buildEntitlementChallengeAnswer(req, result, eapKeys, identityTranscript, eapReauthState)
+		answerBody, nextEAPKeys, nextIdentityTranscript, nextEAPIdentityState, nextReauthState, reauthUpdated, err := buildEntitlementChallengeAnswerWithMessageID(req, result, eapKeys, identityTranscript, eapReauthState, challengeResponses+2)
 		if err != nil {
 			return WebsheetRequest{}, err
 		}
@@ -351,14 +355,14 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 		if err != nil {
 			return WebsheetRequest{}, err
 		}
-		resp, err = doEntitlementWithHTTPDigest(ctx, client, req.Trace, &HTTPRequest{
+		resp, err = doEntitlementWithHTTPDigestAndSession(ctx, client, req.Trace, &HTTPRequest{
 			Context: ctx,
 			Method:  "POST",
 			URL:     endpoint,
 			Headers: entitlementHeaders(req),
 			Body:    answer,
 			Proxy:   cloneE911ProxyConfig(req.Proxy),
-		}, req)
+		}, req, session)
 		if err != nil {
 			return WebsheetRequest{}, err
 		}
@@ -381,9 +385,17 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 }
 
 func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapKeys *eapaka.Keys, identityTranscript [][]byte, reauthState swu.EAPReauthenticationState) (map[string]any, *eapaka.Keys, [][]byte, eapaka.EncryptedIdentityState, swu.EAPReauthenticationState, bool, error) {
+	return buildEntitlementChallengeAnswerWithMessageID(req, result, eapKeys, identityTranscript, reauthState, 2)
+}
+
+func buildEntitlementChallengeAnswerWithMessageID(req Request, result entitlementResult, eapKeys *eapaka.Keys, identityTranscript [][]byte, reauthState swu.EAPReauthenticationState, messageID int) (map[string]any, *eapaka.Keys, [][]byte, eapaka.EncryptedIdentityState, swu.EAPReauthenticationState, bool, error) {
+	if messageID <= 0 {
+		messageID = 2
+	}
 	answerBody := map[string]any{
-		"message-id":    2,
+		"message-id":    messageID,
 		"operation":     "emergency-address-update",
+		"app-id":        "ap2003",
 		"response-id":   result.ResponseID,
 		"sip-username":  req.Identity.SIPUsername,
 		"terminal-imei": req.Identity.IMEI,
@@ -480,10 +492,13 @@ func buildEntitlementChallengeAnswer(req Request, result entitlementResult, eapK
 		}
 	}
 	if !relayAuthenticationReject {
-		answerBody["aka-res"] = strings.ToUpper(hex.EncodeToString(aka.RES))
-		answerBody["aka-ck"] = strings.ToUpper(hex.EncodeToString(aka.CK))
-		answerBody["aka-ik"] = strings.ToUpper(hex.EncodeToString(aka.IK))
-		answerBody["aka-auts"] = strings.ToUpper(hex.EncodeToString(aka.AUTS))
+		if syncFailure {
+			if len(aka.AUTS) > 0 {
+				answerBody["aka-auts"] = strings.ToUpper(hex.EncodeToString(aka.AUTS))
+			}
+		} else if len(aka.RES) > 0 {
+			answerBody["aka-res"] = strings.ToUpper(hex.EncodeToString(aka.RES))
+		}
 	}
 	return answerBody, nextEAPKeys, nextIdentityTranscript, nextEAPIdentityState, reauthState, false, nil
 }
@@ -518,9 +533,6 @@ func entitlementHeaders(req Request) []HeaderPair {
 func fallbackWebsheetRequest(req Request) WebsheetRequest {
 	url := strings.TrimSpace(req.Carrier.E911.Websheet)
 	token := strings.TrimSpace(req.Identity.CachedToken)
-	if token != "" {
-		url = appendUserData(url, token)
-	}
 	return WebsheetRequest{
 		URL:         url,
 		UserData:    token,
@@ -530,6 +542,14 @@ func fallbackWebsheetRequest(req Request) WebsheetRequest {
 }
 
 func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req *HTTPRequest) (*HTTPResponse, error) {
+	resp, err := doEntitlementExchange(ctx, client, trace, req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func doEntitlementExchange(ctx context.Context, client HTTPClient, trace TraceSink, req *HTTPRequest) (*HTTPResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -559,9 +579,9 @@ func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req 
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if err := httpAuthenticationChallengeError(resp); err != nil {
-			return nil, err
+			return resp, err
 		}
-		return nil, fmt.Errorf("e911 entitlement HTTP status %d", resp.StatusCode)
+		return resp, fmt.Errorf("e911 entitlement HTTP status %d", resp.StatusCode)
 	}
 	return resp, nil
 }
@@ -748,6 +768,7 @@ type entitlementWalkContext struct {
 	inEmergencyRoute     bool
 	inLocationValidation bool
 	inWebsheet           bool
+	inPDN                bool
 }
 
 func (c entitlementWalkContext) withKey(canonical string) entitlementWalkContext {
@@ -755,7 +776,92 @@ func (c entitlementWalkContext) withKey(canonical string) entitlementWalkContext
 	c.inEmergencyRoute = c.inEmergencyRoute || isEmergencyRouteKey(canonical)
 	c.inLocationValidation = c.inLocationValidation || isLocationValidationKey(canonical)
 	c.inWebsheet = c.inWebsheet || isWebsheetKey(canonical)
+	c.inPDN = c.inPDN || isPDNKey(canonical)
 	return c
+}
+
+func xmlAttrValue(node entitlementXMLNode, attrLocal string) (string, bool) {
+	for _, attr := range node.Attrs {
+		if strings.EqualFold(attr.Name.Local, attrLocal) {
+			return attr.Value, true
+		}
+	}
+	return "", false
+}
+
+func xmlNodeEffectiveKey(node entitlementXMLNode) string {
+	if strings.EqualFold(node.XMLName.Local, "characteristic") {
+		if t, ok := xmlAttrValue(node, "type"); ok && strings.TrimSpace(t) != "" {
+			return normalizeEntitlementKey(t)
+		}
+	}
+	return normalizeEntitlementKey(node.XMLName.Local)
+}
+
+func plistXMLNodeToAny(node entitlementXMLNode) (any, bool) {
+	switch strings.ToLower(strings.TrimSpace(node.XMLName.Local)) {
+	case "plist":
+		if len(node.Children) == 0 {
+			return map[string]any{}, true
+		}
+		if len(node.Children) == 1 {
+			return plistXMLNodeToAny(node.Children[0])
+		}
+		items := make([]any, 0, len(node.Children))
+		for _, child := range node.Children {
+			if val, ok := plistXMLNodeToAny(child); ok {
+				items = append(items, val)
+			}
+		}
+		return items, true
+	case "dict":
+		out := make(map[string]any)
+		for i := 0; i < len(node.Children); i++ {
+			child := node.Children[i]
+			if !strings.EqualFold(child.XMLName.Local, "key") {
+				continue
+			}
+			k := strings.TrimSpace(child.Text)
+			if i+1 >= len(node.Children) {
+				break
+			}
+			i++
+			if k == "" {
+				continue
+			}
+			if val, ok := plistXMLNodeToAny(node.Children[i]); ok {
+				out[k] = val
+			}
+		}
+		return out, true
+	case "array":
+		items := make([]any, 0, len(node.Children))
+		for _, child := range node.Children {
+			if val, ok := plistXMLNodeToAny(child); ok {
+				items = append(items, val)
+			}
+		}
+		return items, true
+	case "string", "date", "data":
+		return strings.TrimSpace(node.Text), true
+	case "integer":
+		if n, ok := parseInt64String(node.Text); ok {
+			return n, true
+		}
+		return strings.TrimSpace(node.Text), true
+	case "real":
+		s := strings.TrimSpace(node.Text)
+		if s == "" {
+			return "", true
+		}
+		return json.Number(s), true
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	default:
+		return nil, false
+	}
 }
 
 func parseXMLEntitlementResponse(body []byte) (entitlementResult, error) {
@@ -767,6 +873,13 @@ func parseXMLEntitlementResponse(body []byte) (entitlementResult, error) {
 		return entitlementResult{}, errors.New("empty e911 entitlement XML response")
 	}
 	var out entitlementResult
+	if strings.EqualFold(root.XMLName.Local, "plist") || strings.EqualFold(root.XMLName.Local, "dict") {
+		if plistVal, ok := plistXMLNodeToAny(root); ok {
+			walkEntitlement(plistVal, &out)
+			collectJSONEmergencyRouting(plistVal, &out)
+			return finalizeEntitlementResult(out), nil
+		}
+	}
 	walkXMLEntitlement(root, &out, false)
 	collectXMLEmergencyRouting(root, &out)
 	return finalizeEntitlementResult(out), nil
@@ -805,28 +918,61 @@ func walkXMLEntitlement(node entitlementXMLNode, out *entitlementResult, inEmerg
 
 func walkXMLEntitlementValue(node entitlementXMLNode, out *entitlementResult, ctx entitlementWalkContext) {
 	key := node.XMLName.Local
-	canonical := normalizeEntitlementKey(key)
+	if strings.EqualFold(key, "plist") || strings.EqualFold(key, "dict") {
+		if plistVal, ok := plistXMLNodeToAny(node); ok {
+			walkEntitlementValue(plistVal, out, ctx)
+			return
+		}
+	}
+	if strings.EqualFold(key, "parm") || strings.EqualFold(key, "param") {
+		parmName, hasName := xmlAttrValue(node, "name")
+		parmVal, hasVal := xmlAttrValue(node, "value")
+		if !hasVal && strings.TrimSpace(node.Text) != "" {
+			parmVal = strings.TrimSpace(node.Text)
+			hasVal = true
+		}
+		if hasName && strings.TrimSpace(parmName) != "" && hasVal {
+			consumeEntitlementField(parmName, parmVal, out, ctx)
+			if ctx.inPDN {
+				consumePDNField(parmName, parmVal, out)
+			}
+			if ctx.inEmergencyAddress {
+				collectEmergencyAddressField(parmName, parmVal, out)
+			}
+			if ctx.inLocationValidation {
+				collectLocationValidationField(parmName, parmVal, out)
+			}
+		}
+		for _, child := range node.Children {
+			walkXMLEntitlementValue(child, out, ctx)
+		}
+		return
+	}
+	isCharacteristic := strings.EqualFold(key, "characteristic")
+	canonical := xmlNodeEffectiveKey(node)
 	text := strings.TrimSpace(node.Text)
 	nextCtx := ctx.withKey(canonical)
-	if text != "" {
+	if !isCharacteristic && text != "" {
 		consumeEntitlementField(key, text, out, ctx)
 	}
-	if nextCtx.inEmergencyAddress && text != "" && len(node.Children) == 0 {
+	if !isCharacteristic && nextCtx.inEmergencyAddress && text != "" && len(node.Children) == 0 {
 		collectEmergencyAddressField(key, text, out)
 	}
-	if nextCtx.inLocationValidation && text != "" && len(node.Children) == 0 {
+	if !isCharacteristic && nextCtx.inLocationValidation && text != "" && len(node.Children) == 0 {
 		collectLocationValidationField(key, text, out)
 	}
-	for _, attr := range node.Attrs {
-		consumeEntitlementField(attr.Name.Local, attr.Value, out, nextCtx)
-		if isPDNKey(canonical) {
-			consumePDNField(attr.Name.Local, attr.Value, out)
-		}
-		if nextCtx.inEmergencyAddress {
-			collectEmergencyAddressField(attr.Name.Local, attr.Value, out)
-		}
-		if nextCtx.inLocationValidation {
-			collectLocationValidationField(attr.Name.Local, attr.Value, out)
+	if !isCharacteristic {
+		for _, attr := range node.Attrs {
+			consumeEntitlementField(attr.Name.Local, attr.Value, out, nextCtx)
+			if isPDNKey(canonical) {
+				consumePDNField(attr.Name.Local, attr.Value, out)
+			}
+			if nextCtx.inEmergencyAddress {
+				collectEmergencyAddressField(attr.Name.Local, attr.Value, out)
+			}
+			if nextCtx.inLocationValidation {
+				collectLocationValidationField(attr.Name.Local, attr.Value, out)
+			}
 		}
 	}
 	for _, child := range node.Children {
@@ -856,7 +1002,7 @@ func consumeEntitlementField(key string, value any, out *entitlementResult, ctx 
 		if out.ResponseID == nil {
 			out.ResponseID = value
 		}
-	case "websheet", "websheeturl", "e911websheet", "e911websheeturl", "addressurl", "addressupdateurl", "emergencyaddressurl", "emergencyaddresswebsheeturl", "emergencyaddressupdateurl", "e911addressurl", "e911addressupdateurl", "locationurl", "locationvalidationurl", "url":
+	case "websheet", "websheeturl", "e911websheet", "e911websheeturl", "addressurl", "addressupdateurl", "emergencyaddressurl", "emergencyaddresswebsheeturl", "emergencyaddressupdateurl", "e911addressurl", "e911addressupdateurl", "locationurl", "locationvalidationurl", "serviceflowurl", "serviceflowuri", "provurl", "url":
 		if !ctx.inEmergencyRoute {
 			setHTTPURL(&out.WebsheetURL, value)
 		}
@@ -915,7 +1061,7 @@ func consumeEntitlementField(key string, value any, out *entitlementResult, ctx 
 		setRetryAfter(&out.RetryAfter, &out.RetryAfterIn, value)
 	case "staleiferror", "staleonerror", "staleiferrorseconds":
 		setDuration(&out.StaleIfError, value)
-	case "locationvalidationstatus", "validationstatus", "addressvalidationstatus", "e911addressvalidationstatus", "locationstatus", "locationvalidationresult", "validationresult", "addressvalidationresult", "civicaddressvalidationstatus", "civiclocationvalidationstatus":
+	case "locationvalidationstatus", "validationstatus", "addressvalidationstatus", "addrstatus", "e911addressvalidationstatus", "locationstatus", "locationvalidationresult", "validationresult", "addressvalidationresult", "civicaddressvalidationstatus", "civiclocationvalidationstatus":
 		setLocationValidationStatus(&out.LocationValidationStatus, value)
 	default:
 		if isServiceURNKey(canonical) {
@@ -1328,7 +1474,7 @@ func isLocationValidationKey(canonical string) bool {
 
 func isLocationValidationStatusKey(canonical string) bool {
 	switch canonical {
-	case "status", "state", "result", "statuscode", "resultcode", "validationstatus", "validationresult", "locationstatus", "locationvalidationstatus", "locationvalidationresult", "addressvalidationstatus", "addressvalidationresult":
+	case "status", "state", "result", "statuscode", "resultcode", "validationstatus", "validationresult", "locationstatus", "locationvalidationstatus", "locationvalidationresult", "addressvalidationstatus", "addrstatus", "addressvalidationresult":
 		return true
 	default:
 		return false
@@ -1346,7 +1492,7 @@ func isWebsheetKey(canonical string) bool {
 
 func isWebsheetUserDataKey(canonical string) bool {
 	switch canonical {
-	case "websheetuserdata", "websheetuserdatatoken", "websheettoken", "websheetauthtoken", "websheetauthorizationtoken":
+	case "websheetuserdata", "websheetuserdatatoken", "websheettoken", "websheetauthtoken", "websheetauthorizationtoken", "serviceflowuserdata":
 		return true
 	default:
 		return false
@@ -1425,6 +1571,12 @@ func routeMapHasDirectFields(m map[string]any) bool {
 }
 
 func collectXMLEmergencyRouting(root entitlementXMLNode, out *entitlementResult) {
+	if strings.EqualFold(root.XMLName.Local, "plist") || strings.EqualFold(root.XMLName.Local, "dict") {
+		if plistVal, ok := plistXMLNodeToAny(root); ok {
+			collectJSONEmergencyRouting(plistVal, out)
+			return
+		}
+	}
 	before := len(out.Routes)
 	collectExplicitXMLEmergencyRouting(root, out)
 	if len(out.Routes) != before {
@@ -1434,10 +1586,16 @@ func collectXMLEmergencyRouting(root entitlementXMLNode, out *entitlementResult)
 }
 
 func collectExplicitXMLEmergencyRouting(node entitlementXMLNode, out *entitlementResult) {
-	if isEmergencyRouteKey(normalizeEntitlementKey(node.XMLName.Local)) {
+	if strings.EqualFold(node.XMLName.Local, "plist") || strings.EqualFold(node.XMLName.Local, "dict") {
+		if plistVal, ok := plistXMLNodeToAny(node); ok {
+			collectExplicitJSONEmergencyRouting(plistVal, out)
+			return
+		}
+	}
+	if isEmergencyRouteKey(xmlNodeEffectiveKey(node)) {
 		var hasChildRoute bool
 		for _, child := range node.Children {
-			if isEmergencyRouteKey(normalizeEntitlementKey(child.XMLName.Local)) {
+			if isEmergencyRouteKey(xmlNodeEffectiveKey(child)) {
 				hasChildRoute = true
 				collectExplicitXMLEmergencyRouting(child, out)
 			}
@@ -1460,7 +1618,30 @@ func emergencyRouteFromXMLNode(node entitlementXMLNode, genericEndpoints bool) E
 }
 
 func collectXMLRouteFields(node entitlementXMLNode, route *EmergencyRoute, genericEndpoints bool) {
-	canonical := normalizeEntitlementKey(node.XMLName.Local)
+	if strings.EqualFold(node.XMLName.Local, "plist") || strings.EqualFold(node.XMLName.Local, "dict") {
+		if plistVal, ok := plistXMLNodeToAny(node); ok {
+			if m, ok := plistVal.(map[string]any); ok {
+				for key, value := range m {
+					collectEmergencyRouteField(key, value, route, genericEndpoints)
+				}
+			}
+			return
+		}
+	}
+	if strings.EqualFold(node.XMLName.Local, "parm") || strings.EqualFold(node.XMLName.Local, "param") {
+		parmName, hasName := xmlAttrValue(node, "name")
+		parmVal, hasVal := xmlAttrValue(node, "value")
+		if !hasVal && strings.TrimSpace(node.Text) != "" {
+			parmVal = strings.TrimSpace(node.Text)
+			hasVal = true
+		}
+		if hasName && strings.TrimSpace(parmName) != "" && hasVal {
+			collectEmergencyRouteField(parmName, parmVal, route, genericEndpoints)
+		}
+		return
+	}
+	isCharacteristic := strings.EqualFold(node.XMLName.Local, "characteristic")
+	canonical := xmlNodeEffectiveKey(node)
 	switch {
 	case isServiceURNKey(canonical):
 		for _, urn := range serviceURNsFromAny(xmlStrings(node)) {
@@ -1479,8 +1660,10 @@ func collectXMLRouteFields(node entitlementXMLNode, route *EmergencyRoute, gener
 		route.Endpoints = appendUniqueStrings(route.Endpoints, xmlStrings(node)...)
 		return
 	}
-	for _, attr := range node.Attrs {
-		collectEmergencyRouteField(attr.Name.Local, attr.Value, route, genericEndpoints)
+	if !isCharacteristic {
+		for _, attr := range node.Attrs {
+			collectEmergencyRouteField(attr.Name.Local, attr.Value, route, genericEndpoints)
+		}
 	}
 	for _, child := range node.Children {
 		collectXMLRouteFields(child, route, genericEndpoints)

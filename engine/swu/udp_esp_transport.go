@@ -153,6 +153,73 @@ func (t *UDPESPPacketTransport) LocalNetworkAddr() net.Addr {
 	return t.conn.LocalAddr()
 }
 
+func (t *UDPESPPacketTransport) RebindLocalIP(ctx context.Context, newLocalIP net.IP) (net.Addr, error) {
+	if t == nil {
+		return nil, ErrInvalidPacketTunnel
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ip := normalizedMOBIKEIP(newLocalIP)
+	if ip == nil {
+		return nil, fmt.Errorf("%w: invalid MOBIKE local IP", ErrInvalidPacketTunnel)
+	}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil, ErrPacketTunnelClosed
+	}
+	proxy := cloneProxyConfig(t.Proxy)
+	remoteAddr := t.RemoteAddr
+	timeout := t.Timeout
+	t.mu.Unlock()
+
+	newLocalAddr := net.JoinHostPort(ip.String(), "0")
+	var newConn net.Conn
+	var err error
+	if proxy.IsActive() {
+		newConn, err = dialSOCKS5UDPConn(ctx, proxy, remoteAddr, newLocalAddr, timeout)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		remote, resolveErr := udpAddrWithDefaultPort(remoteAddr, DefaultNATTUDPPort)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		localUDP, resolveErr := net.ResolveUDPAddr("udp", newLocalAddr)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		dialer := net.Dialer{LocalAddr: localUDP}
+		newConn, err = dialer.DialContext(ctx, "udp", remote)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		_ = newConn.Close()
+		return nil, ErrPacketTunnelClosed
+	}
+	oldConn := t.conn
+	t.conn = newConn
+	if la := newConn.LocalAddr(); la != nil {
+		t.LocalAddr = la.String()
+	} else {
+		t.LocalAddr = newLocalAddr
+	}
+	localNetAddr := newConn.LocalAddr()
+	t.mu.Unlock()
+
+	if oldConn != nil && oldConn != newConn {
+		_ = oldConn.Close()
+	}
+	return localNetAddr, nil
+}
+
 func (t *UDPESPPacketTransport) proxyRouteIPs() []net.IP {
 	if t == nil {
 		return nil

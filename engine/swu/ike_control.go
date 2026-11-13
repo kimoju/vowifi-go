@@ -15,6 +15,10 @@ import (
 var ErrInvalidIKEControl = errors.New("invalid swu ike control")
 var ErrMOBIKEUpdateRejected = errors.New("mobike update rejected")
 
+type localIPRebinder interface {
+	RebindLocalIP(ctx context.Context, newLocalIP net.IP) (net.Addr, error)
+}
+
 type IKECloseConfig struct {
 	Transport     ikev2.InitTransport
 	Init          ikev2.InitResult
@@ -81,9 +85,35 @@ func NewIKEMOBIKEHandler(cfg IKEMOBIKEConfig) (func(context.Context, MOBIKEReque
 	if err != nil {
 		return nil, err
 	}
+	var stateMu sync.Mutex
+	curLocalIP := normalizedMOBIKEIP(cfg.LocalIP)
+	curLocalPort := cfg.LocalPort
 	retransmitTransport := newRetransmittingIKETransport(cfg.Transport, defaultIKEControlMaxRetransmits)
 	return func(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
-		payloads, err := mobikeUpdatePayloads(cfg, additional, req)
+		stateMu.Lock()
+		localIP := normalizedMOBIKEIP(curLocalIP)
+		localPort := curLocalPort
+		stateMu.Unlock()
+
+		if newIP := normalizedMOBIKEIP(nil, req.NewIP); newIP != nil {
+			if rebinder, ok := cfg.Transport.(localIPRebinder); ok {
+				reboundAddr, err := rebinder.RebindLocalIP(ctx, newIP)
+				if err != nil {
+					return MOBIKEResult{}, err
+				}
+				localIP = newIP
+				if udpAddr, ok := reboundAddr.(*net.UDPAddr); ok && udpAddr.Port > 0 && udpAddr.Port <= 65535 {
+					localPort = uint16(udpAddr.Port)
+				}
+			} else {
+				localIP = newIP
+			}
+		}
+
+		reqCfg := cfg
+		reqCfg.LocalIP = localIP
+		reqCfg.LocalPort = localPort
+		payloads, err := mobikeUpdatePayloads(reqCfg, additional, req)
 		if err != nil {
 			return MOBIKEResult{}, err
 		}
@@ -103,6 +133,12 @@ func NewIKEMOBIKEHandler(cfg IKEMOBIKEConfig) (func(context.Context, MOBIKEReque
 		})
 		if err != nil {
 			return MOBIKEResult{}, err
+		}
+		if localIP != nil {
+			stateMu.Lock()
+			curLocalIP = append(net.IP(nil), localIP...)
+			curLocalPort = localPort
+			stateMu.Unlock()
 		}
 		return MOBIKEResult{
 			Rekeyed:          false,
@@ -289,4 +325,51 @@ func (t *retransmittingIKETransport) ExchangeIKE(ctx context.Context, request []
 		}
 	}
 	return nil, lastErr
+}
+
+func (t *retransmittingIKETransport) ExchangeIKEFragments(ctx context.Context, requests [][]byte, acceptResponse func(raw []byte) (done bool, err error)) error {
+	fragBase, ok := t.base.(ikev2.FragmentInitTransport)
+	if !ok {
+		if len(requests) != 1 {
+			return fmt.Errorf("%w: underlying transport does not support IKE fragmentation", ErrInvalidIKEControl)
+		}
+		resp, err := t.ExchangeIKE(ctx, requests[0])
+		if err != nil {
+			return err
+		}
+		done, err := acceptResponse(resp)
+		if err != nil {
+			return err
+		}
+		if !done {
+			return fmt.Errorf("%w: incomplete fragmented IKE response", ErrInvalidIKEControl)
+		}
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var lastErr error
+	for attempt := 0; attempt <= t.maxRetransmits; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := fragBase.ExchangeIKEFragments(ctx, requests, acceptResponse)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() || ctx.Err() != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
+func (t *retransmittingIKETransport) RebindLocalIP(ctx context.Context, newLocalIP net.IP) (net.Addr, error) {
+	if rebinder, ok := t.base.(localIPRebinder); ok {
+		return rebinder.RebindLocalIP(ctx, newLocalIP)
+	}
+	return nil, fmt.Errorf("%w: underlying transport does not support local IP rebind", ErrInvalidIKEControl)
 }

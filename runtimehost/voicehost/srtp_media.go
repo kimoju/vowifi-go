@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,8 +28,10 @@ const (
 )
 
 type SRTPKeys struct {
-	MasterKey  []byte
-	MasterSalt []byte
+	MasterKey     []byte
+	MasterSalt    []byte
+	MKI           []byte
+	SessionParams string
 }
 
 func (k SRTPKeys) IsZero() bool {
@@ -71,6 +74,8 @@ type SDPCryptoInlineKeyParams struct {
 
 type SRTPMediaConfig struct {
 	Profile               SRTPProtectionProfile
+	ClientPlaintext       bool
+	IMSPlaintext          bool
 	ClientKeys            SRTPKeys
 	IMSKeys               SRTPKeys
 	ClientProtectKeys     SRTPKeys
@@ -81,11 +86,14 @@ type SRTPMediaConfig struct {
 	RTCPFeedbackHandler   RTCPFeedbackHandler
 	RTPDTMFHandler        RTPDTMFHandler
 	RTPPlaintextHandler   RTPPlaintextHandler
+	RTPPlaintextRewriter  RTPPlaintextRewriter
 	ClientRTPDTMFPayloads map[uint8]int
 	IMSRTPDTMFPayloads    map[uint8]int
 }
 
 type RTPPlaintextHandler func(RTPPlaintextEvent)
+
+type RTPPlaintextRewriter func(direction RTPDTMFDirection, packet []byte) []byte
 
 type RTPPlaintextEvent struct {
 	Direction RTPDTMFDirection
@@ -95,6 +103,8 @@ type RTPPlaintextEvent struct {
 type SRTPMediaSession struct {
 	mu sync.Mutex
 
+	clientPlaintext       bool
+	imsPlaintext          bool
 	clientProtect         *srtp.Context
 	clientUnprotect       *srtp.Context
 	imsProtect            *srtp.Context
@@ -102,6 +112,7 @@ type SRTPMediaSession struct {
 	rtcpFeedbackHandler   RTCPFeedbackHandler
 	rtpDTMFHandler        RTPDTMFHandler
 	rtpPlaintextHandler   RTPPlaintextHandler
+	rtpPlaintextRewriter  RTPPlaintextRewriter
 	clientRTPDTMFPayloads map[uint8]int
 	imsRTPDTMFPayloads    map[uint8]int
 }
@@ -266,6 +277,18 @@ func SelectSDPCryptoAttribute(crypto []SDPCryptoAttribute, preferred []SRTPProte
 				}
 				continue
 			}
+			if _, _, err := parseSupportedSDPSessionParams(attr.SessionParams); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			if _, err := EncodeSDPCryptoMKI(params.MKIValue, params.MKILength); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
 			return trimSDPCryptoAttribute(attr), profile, params, true, nil
 		}
 		if firstErr != nil {
@@ -292,6 +315,18 @@ func SelectSDPCryptoAttribute(crypto []SDPCryptoAttribute, preferred []SRTPProte
 				}
 				continue
 			}
+			if _, _, err := parseSupportedSDPSessionParams(attr.SessionParams); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			if _, err := EncodeSDPCryptoMKI(params.MKIValue, params.MKILength); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
 			return trimSDPCryptoAttribute(attr), profile, params, true, nil
 		}
 	}
@@ -299,6 +334,40 @@ func SelectSDPCryptoAttribute(crypto []SDPCryptoAttribute, preferred []SRTPProte
 		return SDPCryptoAttribute{}, "", SDPCryptoInlineKeyParams{}, false, firstErr
 	}
 	return SDPCryptoAttribute{}, "", SDPCryptoInlineKeyParams{}, false, nil
+}
+
+func EncodeSDPCryptoMKI(value string, length int) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	if value == "" && length <= 0 {
+		return nil, nil
+	}
+	if value == "" || length <= 0 || length > 128 {
+		return nil, fmt.Errorf("%w: invalid SDP crypto MKI %q:%d", ErrSRTPMediaConfig, value, length)
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(value, 10); !ok || n.Sign() < 0 {
+		return nil, fmt.Errorf("%w: invalid SDP crypto MKI value %q", ErrSRTPMediaConfig, value)
+	}
+	if (n.BitLen()+7)/8 > length {
+		return nil, fmt.Errorf("%w: SDP crypto MKI value %q exceeds %d bytes", ErrSRTPMediaConfig, value, length)
+	}
+	out := make([]byte, length)
+	n.FillBytes(out)
+	return out, nil
+}
+
+func parseSupportedSDPSessionParams(raw string) (unencryptedSRTP, unencryptedSRTCP bool, err error) {
+	for _, token := range strings.Fields(raw) {
+		switch strings.ToUpper(strings.TrimSpace(token)) {
+		case "UNENCRYPTED_SRTP":
+			unencryptedSRTP = true
+		case "UNENCRYPTED_SRTCP":
+			unencryptedSRTCP = true
+		default:
+			return false, false, fmt.Errorf("%w: unsupported SDP crypto session parameter %q", ErrSRTPMediaConfig, token)
+		}
+	}
+	return unencryptedSRTP, unencryptedSRTCP, nil
 }
 
 func BuildSDPCryptoAttribute(tag string, profile SRTPProtectionProfile, params SDPCryptoInlineKeyParams, sessionParams string) (SDPCryptoAttribute, error) {
@@ -332,47 +401,75 @@ func trimSDPCryptoAttribute(attr SDPCryptoAttribute) SDPCryptoAttribute {
 }
 
 func NewSRTPMediaSession(cfg SRTPMediaConfig) (*SRTPMediaSession, error) {
-	profile, err := srtpProtectionProfile(cfg.Profile)
+	profileCfg := cfg.Profile
+	if cfg.ClientPlaintext && cfg.IMSPlaintext && strings.TrimSpace(string(profileCfg)) == "" {
+		profileCfg = SRTPProfileAes128CmHmacSha1_80
+	}
+	profile, err := srtpProtectionProfile(profileCfg)
 	if err != nil {
-		return nil, err
-	}
-	clientProtectKeys := resolveSRTPDirectionKeys(cfg.ClientProtectKeys, cfg.ClientKeys)
-	clientUnprotectKeys := resolveSRTPDirectionKeys(cfg.ClientUnprotectKeys, cfg.ClientKeys)
-	imsProtectKeys := resolveSRTPDirectionKeys(cfg.IMSProtectKeys, cfg.IMSKeys)
-	imsUnprotectKeys := resolveSRTPDirectionKeys(cfg.IMSUnprotectKeys, cfg.IMSKeys)
-	if err := validateSRTPKeys(profile, clientProtectKeys, "client protect"); err != nil {
-		return nil, err
-	}
-	if err := validateSRTPKeys(profile, clientUnprotectKeys, "client unprotect"); err != nil {
-		return nil, err
-	}
-	if err := validateSRTPKeys(profile, imsProtectKeys, "ims protect"); err != nil {
-		return nil, err
-	}
-	if err := validateSRTPKeys(profile, imsUnprotectKeys, "ims unprotect"); err != nil {
 		return nil, err
 	}
 	window := cfg.ReplayWindowSize
 	if window == 0 {
 		window = 64
 	}
-	clientProtect, err := srtp.CreateContext(clientProtectKeys.MasterKey, clientProtectKeys.MasterSalt, profile)
-	if err != nil {
-		return nil, fmt.Errorf("%w: client protect: %v", ErrSRTPMediaConfig, err)
+	var clientProtect, clientUnprotect *srtp.Context
+	if !cfg.ClientPlaintext {
+		clientProtectKeys := resolveSRTPDirectionKeys(cfg.ClientProtectKeys, cfg.ClientKeys)
+		clientUnprotectKeys := resolveSRTPDirectionKeys(cfg.ClientUnprotectKeys, cfg.ClientKeys)
+		if err := validateSRTPKeys(profile, clientProtectKeys, "client protect"); err != nil {
+			return nil, err
+		}
+		if err := validateSRTPKeys(profile, clientUnprotectKeys, "client unprotect"); err != nil {
+			return nil, err
+		}
+		protectOpts, err := srtpContextOptionsForKeys(clientProtectKeys, 0, false)
+		if err != nil {
+			return nil, fmt.Errorf("%w: client protect options: %v", ErrSRTPMediaConfig, err)
+		}
+		clientProtect, err = srtp.CreateContext(clientProtectKeys.MasterKey, clientProtectKeys.MasterSalt, profile, protectOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("%w: client protect: %v", ErrSRTPMediaConfig, err)
+		}
+		unprotectOpts, err := srtpContextOptionsForKeys(clientUnprotectKeys, window, true)
+		if err != nil {
+			return nil, fmt.Errorf("%w: client unprotect options: %v", ErrSRTPMediaConfig, err)
+		}
+		clientUnprotect, err = srtp.CreateContext(clientUnprotectKeys.MasterKey, clientUnprotectKeys.MasterSalt, profile, unprotectOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("%w: client unprotect: %v", ErrSRTPMediaConfig, err)
+		}
 	}
-	clientUnprotect, err := srtp.CreateContext(clientUnprotectKeys.MasterKey, clientUnprotectKeys.MasterSalt, profile, srtp.SRTPReplayProtection(window), srtp.SRTCPReplayProtection(window))
-	if err != nil {
-		return nil, fmt.Errorf("%w: client unprotect: %v", ErrSRTPMediaConfig, err)
-	}
-	imsProtect, err := srtp.CreateContext(imsProtectKeys.MasterKey, imsProtectKeys.MasterSalt, profile)
-	if err != nil {
-		return nil, fmt.Errorf("%w: ims protect: %v", ErrSRTPMediaConfig, err)
-	}
-	imsUnprotect, err := srtp.CreateContext(imsUnprotectKeys.MasterKey, imsUnprotectKeys.MasterSalt, profile, srtp.SRTPReplayProtection(window), srtp.SRTCPReplayProtection(window))
-	if err != nil {
-		return nil, fmt.Errorf("%w: ims unprotect: %v", ErrSRTPMediaConfig, err)
+	var imsProtect, imsUnprotect *srtp.Context
+	if !cfg.IMSPlaintext {
+		imsProtectKeys := resolveSRTPDirectionKeys(cfg.IMSProtectKeys, cfg.IMSKeys)
+		imsUnprotectKeys := resolveSRTPDirectionKeys(cfg.IMSUnprotectKeys, cfg.IMSKeys)
+		if err := validateSRTPKeys(profile, imsProtectKeys, "ims protect"); err != nil {
+			return nil, err
+		}
+		if err := validateSRTPKeys(profile, imsUnprotectKeys, "ims unprotect"); err != nil {
+			return nil, err
+		}
+		protectOpts, err := srtpContextOptionsForKeys(imsProtectKeys, 0, false)
+		if err != nil {
+			return nil, fmt.Errorf("%w: ims protect options: %v", ErrSRTPMediaConfig, err)
+		}
+		imsProtect, err = srtp.CreateContext(imsProtectKeys.MasterKey, imsProtectKeys.MasterSalt, profile, protectOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("%w: ims protect: %v", ErrSRTPMediaConfig, err)
+		}
+		unprotectOpts, err := srtpContextOptionsForKeys(imsUnprotectKeys, window, true)
+		if err != nil {
+			return nil, fmt.Errorf("%w: ims unprotect options: %v", ErrSRTPMediaConfig, err)
+		}
+		imsUnprotect, err = srtp.CreateContext(imsUnprotectKeys.MasterKey, imsUnprotectKeys.MasterSalt, profile, unprotectOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("%w: ims unprotect: %v", ErrSRTPMediaConfig, err)
+		}
 	}
 	return &SRTPMediaSession{
+		clientPlaintext:       cfg.ClientPlaintext,
+		imsPlaintext:          cfg.IMSPlaintext,
 		clientProtect:         clientProtect,
 		clientUnprotect:       clientUnprotect,
 		imsProtect:            imsProtect,
@@ -380,13 +477,44 @@ func NewSRTPMediaSession(cfg SRTPMediaConfig) (*SRTPMediaSession, error) {
 		rtcpFeedbackHandler:   cfg.RTCPFeedbackHandler,
 		rtpDTMFHandler:        cfg.RTPDTMFHandler,
 		rtpPlaintextHandler:   cfg.RTPPlaintextHandler,
+		rtpPlaintextRewriter:  cfg.RTPPlaintextRewriter,
 		clientRTPDTMFPayloads: cloneRTPDTMFPayloadTypes(cfg.ClientRTPDTMFPayloads),
 		imsRTPDTMFPayloads:    cloneRTPDTMFPayloadTypes(cfg.IMSRTPDTMFPayloads),
 	}, nil
 }
 
+func srtpContextOptionsForKeys(keys SRTPKeys, window uint, withReplay bool) ([]srtp.ContextOption, error) {
+	unencRTP, unencRTCP, err := parseSupportedSDPSessionParams(keys.SessionParams)
+	if err != nil {
+		return nil, err
+	}
+	var opts []srtp.ContextOption
+	if withReplay {
+		opts = append(opts, srtp.SRTPReplayProtection(window), srtp.SRTCPReplayProtection(window))
+	}
+	if len(keys.MKI) > 0 {
+		if len(keys.MKI) > 128 {
+			return nil, fmt.Errorf("MKI length %d exceeds 128 bytes", len(keys.MKI))
+		}
+		opts = append(opts, srtp.MasterKeyIndicator(append([]byte(nil), keys.MKI...)))
+	}
+	if unencRTP {
+		opts = append(opts, srtp.SRTPNoEncryption())
+	}
+	if unencRTCP {
+		opts = append(opts, srtp.SRTCPNoEncryption())
+	}
+	return opts, nil
+}
+
 func (s *SRTPMediaSession) ProtectClientRTP(packet []byte) ([]byte, error) {
-	if s == nil || s.clientProtect == nil {
+	if s == nil {
+		return nil, ErrSRTPMediaConfig
+	}
+	if s.clientPlaintext {
+		return append([]byte(nil), packet...), nil
+	}
+	if s.clientProtect == nil {
 		return nil, ErrSRTPMediaConfig
 	}
 	s.mu.Lock()
@@ -395,7 +523,13 @@ func (s *SRTPMediaSession) ProtectClientRTP(packet []byte) ([]byte, error) {
 }
 
 func (s *SRTPMediaSession) UnprotectClientRTP(packet []byte) ([]byte, error) {
-	if s == nil || s.clientUnprotect == nil {
+	if s == nil {
+		return nil, ErrSRTPMediaConfig
+	}
+	if s.clientPlaintext {
+		return append([]byte(nil), packet...), nil
+	}
+	if s.clientUnprotect == nil {
 		return nil, ErrSRTPMediaConfig
 	}
 	s.mu.Lock()
@@ -404,7 +538,13 @@ func (s *SRTPMediaSession) UnprotectClientRTP(packet []byte) ([]byte, error) {
 }
 
 func (s *SRTPMediaSession) ProtectIMSRTP(packet []byte) ([]byte, error) {
-	if s == nil || s.imsProtect == nil {
+	if s == nil {
+		return nil, ErrSRTPMediaConfig
+	}
+	if s.imsPlaintext {
+		return append([]byte(nil), packet...), nil
+	}
+	if s.imsProtect == nil {
 		return nil, ErrSRTPMediaConfig
 	}
 	s.mu.Lock()
@@ -413,7 +553,13 @@ func (s *SRTPMediaSession) ProtectIMSRTP(packet []byte) ([]byte, error) {
 }
 
 func (s *SRTPMediaSession) UnprotectIMSRTP(packet []byte) ([]byte, error) {
-	if s == nil || s.imsUnprotect == nil {
+	if s == nil {
+		return nil, ErrSRTPMediaConfig
+	}
+	if s.imsPlaintext {
+		return append([]byte(nil), packet...), nil
+	}
+	if s.imsUnprotect == nil {
 		return nil, ErrSRTPMediaConfig
 	}
 	s.mu.Lock()
@@ -422,7 +568,13 @@ func (s *SRTPMediaSession) UnprotectIMSRTP(packet []byte) ([]byte, error) {
 }
 
 func (s *SRTPMediaSession) ProtectClientRTCP(packet []byte) ([]byte, error) {
-	if s == nil || s.clientProtect == nil {
+	if s == nil {
+		return nil, ErrSRTPMediaConfig
+	}
+	if s.clientPlaintext {
+		return append([]byte(nil), packet...), nil
+	}
+	if s.clientProtect == nil {
 		return nil, ErrSRTPMediaConfig
 	}
 	s.mu.Lock()
@@ -431,7 +583,13 @@ func (s *SRTPMediaSession) ProtectClientRTCP(packet []byte) ([]byte, error) {
 }
 
 func (s *SRTPMediaSession) UnprotectClientRTCP(packet []byte) ([]byte, error) {
-	if s == nil || s.clientUnprotect == nil {
+	if s == nil {
+		return nil, ErrSRTPMediaConfig
+	}
+	if s.clientPlaintext {
+		return append([]byte(nil), packet...), nil
+	}
+	if s.clientUnprotect == nil {
 		return nil, ErrSRTPMediaConfig
 	}
 	s.mu.Lock()
@@ -440,7 +598,13 @@ func (s *SRTPMediaSession) UnprotectClientRTCP(packet []byte) ([]byte, error) {
 }
 
 func (s *SRTPMediaSession) ProtectIMSRTCP(packet []byte) ([]byte, error) {
-	if s == nil || s.imsProtect == nil {
+	if s == nil {
+		return nil, ErrSRTPMediaConfig
+	}
+	if s.imsPlaintext {
+		return append([]byte(nil), packet...), nil
+	}
+	if s.imsProtect == nil {
 		return nil, ErrSRTPMediaConfig
 	}
 	s.mu.Lock()
@@ -449,7 +613,13 @@ func (s *SRTPMediaSession) ProtectIMSRTCP(packet []byte) ([]byte, error) {
 }
 
 func (s *SRTPMediaSession) UnprotectIMSRTCP(packet []byte) ([]byte, error) {
-	if s == nil || s.imsUnprotect == nil {
+	if s == nil {
+		return nil, ErrSRTPMediaConfig
+	}
+	if s.imsPlaintext {
+		return append([]byte(nil), packet...), nil
+	}
+	if s.imsUnprotect == nil {
 		return nil, ErrSRTPMediaConfig
 	}
 	s.mu.Lock()
@@ -523,6 +693,9 @@ func (s *SRTPMediaSession) clientToIMSRTP(packet []byte, dtmfHandler RTPDTMFHand
 	}
 	emitRTPPlaintext(rtpHandler, RTPDTMFClientToIMS, plain)
 	plain = rewriteSRTPRTPDTMF(RTPDTMFClientToIMS, plain, payloads, targetPayloads, dtmfHandler)
+	if s.rtpPlaintextRewriter != nil {
+		plain = s.rtpPlaintextRewriter(RTPDTMFClientToIMS, plain)
+	}
 	return s.ProtectIMSRTP(plain)
 }
 
@@ -540,6 +713,9 @@ func (s *SRTPMediaSession) imsToClientRTP(packet []byte, dtmfHandler RTPDTMFHand
 	}
 	emitRTPPlaintext(rtpHandler, RTPDTMFIMSToClient, plain)
 	plain = rewriteSRTPRTPDTMF(RTPDTMFIMSToClient, plain, payloads, targetPayloads, dtmfHandler)
+	if s.rtpPlaintextRewriter != nil {
+		plain = s.rtpPlaintextRewriter(RTPDTMFIMSToClient, plain)
+	}
 	return s.ProtectClientRTP(plain)
 }
 

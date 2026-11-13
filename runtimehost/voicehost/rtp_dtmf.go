@@ -25,6 +25,7 @@ type RTPDTMFHandler func(RTPDTMFEvent)
 
 type RTPDTMFPacket struct {
 	PayloadType     uint8
+	HasPayloadType  bool
 	Marker          bool
 	SequenceNumber  uint16
 	Timestamp       uint32
@@ -32,17 +33,20 @@ type RTPDTMFPacket struct {
 	Signal          string
 	End             bool
 	Volume          uint8
+	HasVolume       bool
 	DurationSamples uint16
 	ClockRate       int
 }
 
 type RTPDTMFSequenceConfig struct {
 	PayloadType    uint8
+	HasPayloadType bool
 	Signal         string
 	DurationMS     int
 	StepMS         int
 	EndPacketCount int
 	Volume         uint8
+	HasVolume      bool
 	SequenceNumber uint16
 	Timestamp      uint32
 	SSRC           uint32
@@ -81,7 +85,7 @@ func BuildRTPDTMFPacket(in RTPDTMFPacket) ([]byte, error) {
 		return nil, err
 	}
 	payloadType := in.PayloadType
-	if payloadType == 0 {
+	if payloadType == 0 && !in.HasPayloadType {
 		payloadType = DefaultRTPDTMFPayloadType
 	}
 	if payloadType > 127 {
@@ -92,7 +96,7 @@ func BuildRTPDTMFPacket(in RTPDTMFPacket) ([]byte, error) {
 		clockRate = DefaultRTPDTMFClockRate
 	}
 	volume := in.Volume
-	if volume == 0 {
+	if volume == 0 && !in.HasVolume {
 		volume = DefaultRTPDTMFVolume
 	}
 	if volume > 63 {
@@ -167,12 +171,14 @@ func BuildRTPDTMFSequence(cfg RTPDTMFSequenceConfig) ([][]byte, error) {
 	for len(packets) == 0 || current < totalSamples {
 		packet, err := BuildRTPDTMFPacket(RTPDTMFPacket{
 			PayloadType:     cfg.PayloadType,
+			HasPayloadType:  cfg.HasPayloadType,
 			Marker:          len(packets) == 0,
 			SequenceNumber:  sequence,
 			Timestamp:       cfg.Timestamp,
 			SSRC:            cfg.SSRC,
 			Signal:          signal,
 			Volume:          cfg.Volume,
+			HasVolume:       cfg.HasVolume,
 			DurationSamples: uint16(current),
 			ClockRate:       clockRate,
 		})
@@ -189,6 +195,7 @@ func BuildRTPDTMFSequence(cfg RTPDTMFSequenceConfig) ([][]byte, error) {
 	for i := 0; i < endPackets; i++ {
 		packet, err := BuildRTPDTMFPacket(RTPDTMFPacket{
 			PayloadType:     cfg.PayloadType,
+			HasPayloadType:  cfg.HasPayloadType,
 			Marker:          len(packets) == 0,
 			SequenceNumber:  sequence,
 			Timestamp:       cfg.Timestamp,
@@ -196,6 +203,7 @@ func BuildRTPDTMFSequence(cfg RTPDTMFSequenceConfig) ([][]byte, error) {
 			Signal:          signal,
 			End:             true,
 			Volume:          cfg.Volume,
+			HasVolume:       cfg.HasVolume,
 			DurationSamples: uint16(totalSamples),
 			ClockRate:       clockRate,
 		})

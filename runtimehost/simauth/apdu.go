@@ -28,7 +28,15 @@ type LogicalChannelSessionLocker interface {
 	LockLogicalChannelSession() func()
 }
 
-var logicalChannelSessionLocks sync.Map
+type logicalChannelRefLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+var (
+	logicalChannelLocksMu      sync.Mutex
+	logicalChannelSessionLocks = map[any]*logicalChannelRefLock{}
+)
 
 // LockLogicalChannel serializes logical channel open/transmit/close sequences
 // against concurrent access on the same LogicalChannelTransport.
@@ -40,16 +48,31 @@ func LockLogicalChannel(t LogicalChannelTransport) func() {
 		return locker.LockLogicalChannelSession()
 	}
 	typ := reflect.TypeOf(t)
-	if typ == nil || !typ.Comparable() {
+	if typ == nil || typ.Kind() != reflect.Ptr || reflect.ValueOf(t).IsNil() {
 		return func() {}
 	}
-	if typ.Kind() == reflect.Ptr && reflect.ValueOf(t).IsNil() {
-		return func() {}
+	logicalChannelLocksMu.Lock()
+	entry := logicalChannelSessionLocks[t]
+	if entry == nil {
+		entry = &logicalChannelRefLock{}
+		logicalChannelSessionLocks[t] = entry
 	}
-	val, _ := logicalChannelSessionLocks.LoadOrStore(t, &sync.Mutex{})
-	mu := val.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	entry.refs++
+	logicalChannelLocksMu.Unlock()
+
+	entry.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.mu.Unlock()
+			logicalChannelLocksMu.Lock()
+			entry.refs--
+			if entry.refs <= 0 {
+				delete(logicalChannelSessionLocks, t)
+			}
+			logicalChannelLocksMu.Unlock()
+		})
+	}
 }
 
 type LogicalChannelAIDResolver interface {
@@ -256,7 +279,10 @@ func SelectFileAPDU(fid uint16) []byte {
 	return []byte{0x00, 0xA4, 0x00, 0x04, 0x02, byte(fid >> 8), byte(fid)}
 }
 
-func ReadBinaryAPDU(offset, le int) []byte {
+func ReadBinaryAPDUChecked(offset, le int) ([]byte, error) {
+	if offset < 0 || offset > 0x7FFF {
+		return nil, fmt.Errorf("invalid READ BINARY offset: %d", offset)
+	}
 	if le <= 0 || le > 256 {
 		le = 256
 	}
@@ -264,7 +290,17 @@ func ReadBinaryAPDU(offset, le int) []byte {
 	if le == 256 {
 		leByte = 0x00
 	}
-	return []byte{0x00, 0xB0, byte(offset >> 8), byte(offset), leByte}
+	return []byte{0x00, 0xB0, byte(offset >> 8), byte(offset), leByte}, nil
+}
+
+func ReadBinaryAPDU(offset, le int) []byte {
+	if offset < 0 {
+		offset = 0
+	} else if offset > 0x7FFF {
+		offset = 0x7FFF
+	}
+	apdu, _ := ReadBinaryAPDUChecked(offset, le)
+	return apdu
 }
 
 func ReadRecordAPDU(record, le int) []byte {
@@ -279,7 +315,7 @@ func ReadRecordAPDU(record, le int) []byte {
 }
 
 func UpdateBinaryAPDU(offset int, data []byte) ([]byte, error) {
-	if offset < 0 || offset > 0xFFFF {
+	if offset < 0 || offset > 0x7FFF {
 		return nil, fmt.Errorf("invalid UPDATE BINARY offset: %d", offset)
 	}
 	if err := validateShortAPDUData("UPDATE BINARY", data); err != nil {
@@ -341,7 +377,13 @@ func chaseGetResponse(t LogicalChannelTransport, channel int, cla byte, resp Res
 		if err != nil {
 			return Response{}, err
 		}
-		getResp, err := transmitOnce(t, channel, []byte{cla, 0xC0, 0x00, 0x00, leByte})
+		getRespCLA := cla
+		if resp.SW1 == 0x9F {
+			getRespCLA = 0xA0
+		} else if (getRespCLA&0xF0) == 0x80 || (getRespCLA&0xF0) == 0xC0 {
+			getRespCLA &^= 0x80
+		}
+		getResp, err := transmitOnce(t, channel, []byte{getRespCLA, 0xC0, 0x00, 0x00, leByte})
 		if err != nil {
 			return Response{}, err
 		}
@@ -472,26 +514,44 @@ func ReadTransparentEF(t LogicalChannelTransport, channel int, fid uint16) ([]by
 	if err != nil {
 		return nil, selectResp, err
 	}
-	size := FileSizeFromFCP(selectResp.Body)
-	if size <= 0 {
-		size = 256
+	fcpSize := FileSizeFromFCP(selectResp.Body)
+	knownSize := fcpSize > 0
+	limit := fcpSize
+	if !knownSize {
+		limit = 4096
+	} else if limit > 0x8000 {
+		limit = 0x8000
 	}
 	var out []byte
-	for offset := 0; offset < size; {
-		chunk := size - offset
+	for offset := 0; offset < limit; {
+		if offset > 0x7FFF {
+			break
+		}
+		chunk := limit - offset
 		if chunk > 256 {
 			chunk = 256
 		}
-		resp, err := Transmit(t, channel, ReadBinaryAPDU(offset, chunk))
+		if offset+chunk > 0x8000 {
+			chunk = 0x8000 - offset
+		}
+		cmd, err := ReadBinaryAPDUChecked(offset, chunk)
+		if err != nil {
+			return nil, selectResp, err
+		}
+		resp, err := Transmit(t, channel, cmd)
 		if err != nil {
 			return nil, resp, err
 		}
 		eofWarning := resp.SW1 == 0x62 && resp.SW2 == 0x82
+		offsetEOF := !knownSize && offset > 0 && resp.Status() == 0x6B00
+		if offsetEOF {
+			break
+		}
 		if !resp.Success() && !(eofWarning && (len(resp.Body) > 0 || len(out) > 0)) {
 			return nil, resp, newStatusError(fmt.Sprintf("READ BINARY %04X offset=%d", fid, offset), resp)
 		}
 		out = append(out, resp.Body...)
-		if eofWarning || len(resp.Body) == 0 || size == 256 && len(resp.Body) < chunk {
+		if eofWarning || len(resp.Body) == 0 || (!knownSize && len(resp.Body) < chunk) {
 			break
 		}
 		offset += len(resp.Body)

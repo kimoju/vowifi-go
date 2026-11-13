@@ -22,6 +22,7 @@ type IMSInboundWireServer struct {
 	ResponsePacketHandler       SIPResponsePacketHandler
 	InfoHandler                 IMSInfoHandler
 	ByeHandler                  IMSByeHandler
+	NotifyHandler               IMSNotifyHandler
 	ContactURI                  string
 	LocalTag                    string
 	UserAgent                   string
@@ -34,6 +35,7 @@ type IMSInboundWireServer struct {
 	Reliable1xxT2               time.Duration
 
 	mu                    sync.Mutex
+	defaultLocalTag       string
 	transactions          map[string]imsInboundWireTransaction
 	inviteRetransmits     map[string]imsInboundResponseRetransmit
 	inviteFinalAcks       map[string]time.Time
@@ -46,12 +48,23 @@ type SIPResponsePacketHandler interface {
 	HandleSIPResponsePacket([]byte) bool
 }
 
+type IMSNotifyHandler interface {
+	HandleIMSNotify(ctx context.Context, req InboundDialogRequest) (IMSInfoResult, bool, error)
+}
+
+type IMSNotifyHandlerFunc func(ctx context.Context, req InboundDialogRequest) (IMSInfoResult, bool, error)
+
+func (f IMSNotifyHandlerFunc) HandleIMSNotify(ctx context.Context, req InboundDialogRequest) (IMSInfoResult, bool, error) {
+	return f(ctx, req)
+}
+
 type IMSInboundWireResponse struct {
 	StatusCode    int
 	Reason        string
 	Headers       map[string]string
 	Body          []byte
 	NoResponse    bool
+	localTag      string
 	afterResponse func(context.Context)
 }
 
@@ -234,13 +247,28 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		responses, err = s.handleInvite(ctx, req, key, emit)
 	case "ACK":
 		s.stopInviteFinalRetransmission(req)
-		if h := s.outboundDialogHandler(); h != nil && h.AckOutboundReinvite(ctx, wireCallID(req)) {
-			return nil, nil
+		callID := wireCallID(req)
+		if h := s.outboundDialogHandler(); h != nil {
+			if bodyAck, ok := h.(interface {
+				AckOutboundReinviteWithBody(context.Context, string, []byte) bool
+			}); ok {
+				if bodyAck.AckOutboundReinviteWithBody(ctx, callID, req.Body) {
+					return nil, nil
+				}
+			} else if h.AckOutboundReinvite(ctx, callID) {
+				return nil, nil
+			}
 		}
 		if s == nil || s.Agent == nil {
 			return nil, ErrIMSInboundAgentNotReady
 		}
-		return nil, s.Agent.AckInboundCall(ctx, DialogInfo{CallID: wireCallID(req)})
+		return nil, s.Agent.AckInboundCall(ctx, DialogInfo{
+			CallID:      callID,
+			CSeq:        wireCSeq(req),
+			ContentType: firstVoiceHeader(req.Headers, "Content-Type"),
+			Body:        append([]byte(nil), req.Body...),
+			Headers:     firstValueSIPHeaders(req.Headers),
+		})
 	case "UPDATE":
 		responses, err = s.handleUpdate(ctx, req)
 	case "PRACK":
@@ -304,8 +332,15 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		resp.Headers["Allow"] = s.allowHeader()
 		responses = []IMSInboundWireResponse{s.withResponseHeaders(resp)}
 	}
-	if method != "INVITE" && key != "" && len(responses) > 0 {
-		s.storeTransactionForRequest(req, key, responses)
+	if method != "INVITE" && len(responses) > 0 {
+		for i := range responses {
+			if responses[i].StatusCode > 100 && strings.TrimSpace(responses[i].localTag) == "" {
+				responses[i].localTag = s.resolveResponseLocalTag(req, responses[i])
+			}
+		}
+		if key != "" {
+			s.storeTransactionForRequest(req, key, responses)
+		}
 	}
 	return responses, err
 }
@@ -606,7 +641,20 @@ func (s *IMSInboundWireServer) handleNotify(ctx context.Context, req voiceclient
 			return s.infoResultResponse(result, err), err
 		}
 	}
+	if s != nil && s.Agent != nil && s.Agent.hasInboundDialog(dialogReq.CallID) {
+		result, err := s.Agent.HandleInboundNotify(ctx, dialogReq)
+		return s.infoResultResponse(result, err), err
+	}
+	if s != nil && s.NotifyHandler != nil {
+		result, handled, err := s.NotifyHandler.HandleIMSNotify(ctx, dialogReq)
+		if handled || err != nil {
+			return s.infoResultResponse(result, err), err
+		}
+	}
 	if s == nil || s.Agent == nil {
+		if s != nil && s.NotifyHandler != nil {
+			return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(489, "Bad Event"))}, nil
+		}
 		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
 	}
 	result, err := s.Agent.HandleInboundNotify(ctx, dialogReq)
@@ -627,7 +675,18 @@ func (s *IMSInboundWireServer) handleSubscribe(ctx context.Context, req voicecli
 		Expires:     firstVoiceHeader(req.Headers, "Expires"),
 	})
 	ensureSubscribeResultExpires(&result, req, err)
-	return s.infoResultResponse(result, err), err
+	responses := s.infoResultResponse(result, err)
+	for i := range responses {
+		if responses[i].StatusCode >= 200 && responses[i].StatusCode < 300 {
+			if stringMapHeader(responses[i].Headers, "Contact") == "" {
+				responses[i].Headers["Contact"] = "<" + s.contactURI() + ">"
+			}
+			if routes := uasRecordRouteSet(req.Headers); len(routes) > 0 && stringMapHeader(responses[i].Headers, "Record-Route") == "" {
+				responses[i].Headers["Record-Route"] = strings.Join(routes, ", ")
+			}
+		}
+	}
+	return responses, err
 }
 
 const defaultSubscribeExpires = "3600"
@@ -675,6 +734,7 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 	provisionals := []IMSInboundWireResponse{}
 	final, err := s.handleInviteFinal(ctx, req, func(result InboundCallResult) error {
 		provisional := s.inviteResultResponse(result, 180, "Ringing")
+		s.finalizeInviteResponseForRequest(req, &provisional)
 		if key != "" {
 			pendingResponses = append(pendingResponses, provisional)
 			s.storeTransactionForRequest(req, key, pendingResponses)
@@ -690,6 +750,7 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 		s.trackReliableProvisional(req, provisional)
 		return nil
 	})
+	s.finalizeInviteResponseForRequest(req, &final)
 	responses = append(responses, provisionals...)
 	responses = append(responses, final)
 	if key != "" {
@@ -698,11 +759,29 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 	return responses, err
 }
 
+func (s *IMSInboundWireServer) finalizeInviteResponseForRequest(req voiceclient.SIPIncomingRequest, resp *IMSInboundWireResponse) {
+	if resp == nil {
+		return
+	}
+	if resp.StatusCode >= 180 && resp.StatusCode < 300 {
+		if routes := uasRecordRouteSet(req.Headers); len(routes) > 0 && stringMapHeader(resp.Headers, "Record-Route") == "" {
+			if resp.Headers == nil {
+				resp.Headers = make(map[string]string)
+			}
+			resp.Headers["Record-Route"] = strings.Join(routes, ", ")
+		}
+	}
+	if resp.StatusCode > 100 && strings.TrimSpace(resp.localTag) == "" {
+		resp.localTag = s.resolveResponseLocalTag(req, *resp)
+	}
+}
+
 func (s *IMSInboundWireServer) handleInviteFinal(ctx context.Context, req voiceclient.SIPIncomingRequest, onProvisional func(InboundCallResult) error) (IMSInboundWireResponse, error) {
 	callReq := InboundCallRequest{
 		CallID:          wireCallID(req),
 		CallerURI:       wireHeaderURI(req, "From"),
 		CalleeURI:       wireCalleeURI(req),
+		LocalTag:        s.configuredLocalTag(),
 		RemoteTag:       sipHeaderTag(firstVoiceHeader(req.Headers, "From")),
 		RemoteTargetURI: wireHeaderURI(req, "Contact"),
 		CSeq:            wireCSeq(req),
@@ -724,6 +803,7 @@ func (s *IMSInboundWireServer) handleInviteFinal(ctx context.Context, req voicec
 
 func (s *IMSInboundWireServer) inviteResultResponse(result InboundCallResult, fallbackStatus int, fallbackReason string) IMSInboundWireResponse {
 	final := wireResponse(inboundStatusCode(result.StatusCode, fallbackStatus), firstVoiceNonEmpty(result.Reason, fallbackReason))
+	final.localTag = strings.TrimSpace(result.LocalTag)
 	if result.Accepted {
 		final.StatusCode = inboundStatusCode(result.StatusCode, 200)
 		final.Reason = firstVoiceNonEmpty(result.Reason, "OK")
@@ -771,12 +851,13 @@ func (s *IMSInboundWireServer) handlePacket(ctx context.Context, pc net.PacketCo
 		if resp.NoResponse {
 			return nil
 		}
-		taggedReq := taggedWireRequest(req, s.localTag())
+		taggedReq := s.taggedWireRequestForResponse(req, resp)
 		if err := writePacketSIPResponse(pc, addr, taggedReq, resp); err != nil {
 			return err
 		}
 		if resp.afterResponse != nil {
-			resp.afterResponse(ctx)
+			afterFn := resp.afterResponse
+			go afterFn(context.WithoutCancel(ctx))
 		}
 		s.afterPacketResponse(ctx, pc, addr, taggedReq, resp)
 		return nil
@@ -799,45 +880,105 @@ func (s *IMSInboundWireServer) afterPacketResponse(ctx context.Context, pc net.P
 	}
 }
 
+func (s *IMSInboundWireServer) afterStreamResponse(ctx context.Context, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) {
+	if shouldRetransmitInviteFinal(req, resp) {
+		s.stopReliableProvisionalsForInvite(req)
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			s.startInviteFinalAckWatchdog(ctx, req)
+		}
+	}
+}
+
 func (s *IMSInboundWireServer) handleConn(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	connCtx, cancelConn := context.WithCancel(ctx)
+	var reqWG sync.WaitGroup
+	defer func() {
+		cancelConn()
+		_ = conn.Close()
+		reqWG.Wait()
+	}()
+	var writeMu sync.Mutex
+	writeResponse := func(req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) error {
+		if resp.NoResponse {
+			return nil
+		}
+		taggedReq := s.taggedWireRequestForResponse(req, resp)
+		writeMu.Lock()
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		err := writeStreamSIPResponse(conn, taggedReq, resp)
+		_ = conn.SetWriteDeadline(time.Time{})
+		writeMu.Unlock()
+		if err != nil {
+			return err
+		}
+		if resp.afterResponse != nil {
+			afterFn := resp.afterResponse
+			go afterFn(context.WithoutCancel(ctx))
+		}
+		s.afterStreamResponse(ctx, taggedReq, resp)
+		return nil
+	}
+	writeBadRequest := func() {
+		writeMu.Lock()
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_ = writeStreamSIPResponse(conn, voiceclient.SIPIncomingRequest{}, wireResponse(400, "Bad Request"))
+		_ = conn.SetWriteDeadline(time.Time{})
+		writeMu.Unlock()
+	}
+
 	reader := bufio.NewReader(conn)
 	for {
-		if err := conn.SetDeadline(time.Now().Add(s.readTimeout())); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(s.readTimeout())); err != nil {
+			return
+		}
+		b, err := reader.Peek(1)
+		if err != nil {
+			if ctx.Err() == nil && isTimeout(err) {
+				continue
+			}
+			return
+		}
+		if b[0] == '\r' || b[0] == '\n' {
+			_, _ = reader.ReadByte()
+			continue
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 			return
 		}
 		raw, err := voiceclient.ReadSIPStreamMessage(reader)
+		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
+			if errors.Is(err, voiceclient.ErrInvalidSIPMessage) {
+				writeBadRequest()
+			}
 			return
+		}
+		if s != nil && s.ResponsePacketHandler != nil && s.ResponsePacketHandler.HandleSIPResponsePacket(raw) {
+			continue
 		}
 		req, err := voiceclient.ParseSIPRequest(raw)
 		if err != nil {
-			_ = writeStreamSIPResponse(conn, voiceclient.SIPIncomingRequest{}, wireResponse(400, "Bad Request"))
+			writeBadRequest()
 			return
 		}
-		responses, _ := s.handleRequest(ctx, req, func(resp IMSInboundWireResponse) error {
-			if resp.NoResponse {
-				return nil
+		reqWG.Add(1)
+		go func(inReq voiceclient.SIPIncomingRequest) {
+			defer reqWG.Done()
+			responses, _ := s.handleRequest(connCtx, inReq, func(resp IMSInboundWireResponse) error {
+				return writeResponse(inReq, resp)
+			})
+			for _, resp := range responses {
+				if err := writeResponse(inReq, resp); err != nil {
+					return
+				}
 			}
-			if err := writeStreamSIPResponse(conn, taggedWireRequest(req, s.localTag()), resp); err != nil {
-				return err
-			}
-			if resp.afterResponse != nil {
-				resp.afterResponse(ctx)
-			}
-			return nil
-		})
-		for _, resp := range responses {
-			if resp.NoResponse {
-				continue
-			}
-			if err := writeStreamSIPResponse(conn, taggedWireRequest(req, s.localTag()), resp); err != nil {
-				return
-			}
-			if resp.afterResponse != nil {
-				resp.afterResponse(ctx)
-			}
-		}
+		}(req)
 	}
 }
 
@@ -863,7 +1004,7 @@ func wireResponse(statusCode int, reason string) IMSInboundWireResponse {
 	return IMSInboundWireResponse{StatusCode: statusCode, Reason: reason, Headers: make(map[string]string)}
 }
 
-var wireSupportedOptionTags = []string{"100rel", "timer", "replaces", "outbound", "norefersub"}
+var wireSupportedOptionTags = []string{"100rel", "timer", "replaces", "outbound", "norefersub", "precondition"}
 
 const wireMMTelAcceptContact = `*;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`
 
@@ -907,16 +1048,22 @@ func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 	resp.Headers["Allow"] = s.allowHeader()
 	resp.Headers["Supported"] = wireSupportedOptionsHeader()
 	resp.Headers["Allow-Events"] = "refer"
+	if s != nil && s.NotifyHandler != nil {
+		resp.Headers["Allow-Events"] = "refer, reg, message-summary"
+	}
 	resp.Headers["Accept"] = "application/sdp"
 	resp.Headers["Accept-Contact"] = wireMMTelAcceptContact
 	resp.Headers["User-Agent"] = "vowifi-go"
-	if s != nil && (s.MessageHandler != nil || s.InfoHandler != nil || s.Agent != nil) {
+	if s != nil && (s.MessageHandler != nil || s.InfoHandler != nil || s.NotifyHandler != nil || s.Agent != nil) {
 		accept := []string{"application/sdp"}
 		if s.InfoHandler != nil {
 			accept = append(accept, "application/vnd.3gpp.ussd+xml")
 		}
 		if s.MessageHandler != nil || s.Agent != nil {
 			accept = append(accept, "application/vnd.3gpp.sms", "text/plain")
+		}
+		if s.NotifyHandler != nil {
+			accept = append(accept, "application/reginfo+xml", "application/simple-message-summary")
 		}
 		resp.Headers["Accept"] = strings.Join(accept, ", ")
 	}
@@ -970,15 +1117,60 @@ func (s *IMSInboundWireServer) contactURI() string {
 	return strings.Trim(contact, "<>")
 }
 
-func (s *IMSInboundWireServer) localTag() string {
+func (s *IMSInboundWireServer) configuredLocalTag() string {
 	if s == nil {
-		return "vowifi-go"
+		return ""
 	}
 	tag := firstVoiceNonEmpty(s.LocalTag)
 	if tag == "" && s.Agent != nil {
 		tag = s.Agent.DefaultLocalTag()
 	}
-	return firstVoiceNonEmpty(tag, "vowifi-go")
+	return strings.TrimSpace(tag)
+}
+
+func (s *IMSInboundWireServer) localTag() string {
+	if tag := s.configuredLocalTag(); tag != "" {
+		return tag
+	}
+	if s == nil {
+		return randomVoiceSIPTag()
+	}
+	s.mu.Lock()
+	if s.defaultLocalTag == "" {
+		s.defaultLocalTag = randomVoiceSIPTag()
+	}
+	tag := s.defaultLocalTag
+	s.mu.Unlock()
+	return tag
+}
+
+func (s *IMSInboundWireServer) resolveResponseLocalTag(req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) string {
+	if resp.StatusCode <= 100 {
+		return ""
+	}
+	if tag := sipHeaderTag(firstVoiceHeader(req.Headers, "To")); tag != "" {
+		return tag
+	}
+	if tag := strings.TrimSpace(resp.localTag); tag != "" {
+		return tag
+	}
+	callID := wireCallID(req)
+	if s != nil && s.Agent != nil && callID != "" {
+		if tag := s.Agent.InboundDialogLocalTag(callID); tag != "" {
+			return tag
+		}
+	}
+	if h := s.outboundDialogHandler(); h != nil && callID != "" {
+		if tagProvider, ok := h.(interface{ OutboundDialogLocalTag(string) string }); ok {
+			if tag := strings.TrimSpace(tagProvider.OutboundDialogLocalTag(callID)); tag != "" {
+				return tag
+			}
+		}
+	}
+	if tag := s.configuredLocalTag(); tag != "" {
+		return tag
+	}
+	return randomVoiceSIPTag()
 }
 
 func (s *IMSInboundWireServer) readTimeout() time.Duration {
@@ -1032,6 +1224,57 @@ func shouldRetransmitReliableProvisional(req voiceclient.SIPIncomingRequest, res
 		return false
 	}
 	return strings.TrimSpace(wireResponseHeader(resp, "RSeq")) != "" && wireResponseHeaderHasToken(resp, "Require", "100rel")
+}
+
+func (s *IMSInboundWireServer) startInviteFinalAckWatchdog(ctx context.Context, req voiceclient.SIPIncomingRequest) {
+	if s == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key := wireInviteRetransmissionKey(req)
+	if key == "" {
+		return
+	}
+	childCtx, cancel := context.WithCancel(ctx)
+	entry := imsInboundResponseRetransmit{cancel: cancel, done: make(chan struct{})}
+	s.mu.Lock()
+	now := time.Now()
+	s.pruneWireStateLocked(now)
+	if expires, ok := s.inviteFinalAcks[key]; ok && now.Before(expires) {
+		s.mu.Unlock()
+		cancel()
+		return
+	}
+	if s.inviteRetransmits == nil {
+		s.inviteRetransmits = make(map[string]imsInboundResponseRetransmit)
+	}
+	if _, exists := s.inviteRetransmits[key]; exists {
+		s.mu.Unlock()
+		cancel()
+		return
+	}
+	s.inviteRetransmits[key] = entry
+	s.mu.Unlock()
+	go func() {
+		defer close(entry.done)
+		defer s.removeInviteFinalRetransmission(key, entry.done)
+		timer := time.NewTimer(s.transactionTTL())
+		defer timer.Stop()
+		select {
+		case <-childCtx.Done():
+			return
+		case <-timer.C:
+			if childCtx.Err() == nil && s.Agent != nil {
+				callID := wireCallID(req)
+				if s.Agent.hasInboundDialog(callID) {
+					s.Agent.closeInboundDialog(callID)
+					s.Agent.emitDialogEvent(context.Background(), callID, wireCalleeURI(req), DialogStateTerminated, wireHeaderURI(req, "From"), wireCalleeURI(req), 408, "ACK timeout")
+				}
+			}
+		}
+	}()
 }
 
 func (s *IMSInboundWireServer) startInviteFinalRetransmission(ctx context.Context, pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) {
@@ -1491,6 +1734,24 @@ func cloneWireResponses(responses []IMSInboundWireResponse) []IMSInboundWireResp
 	return out
 }
 
+func (s *IMSInboundWireServer) taggedWireRequestForResponse(req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) voiceclient.SIPIncomingRequest {
+	out := req
+	out.Headers = cloneSIPHeaders(req.Headers)
+	if resp.StatusCode == 100 {
+		return out
+	}
+	to := firstVoiceHeader(out.Headers, "To")
+	if to == "" || sipHeaderTag(to) != "" {
+		return out
+	}
+	tag := s.resolveResponseLocalTag(req, resp)
+	if tag == "" {
+		return out
+	}
+	out.Headers["To"] = []string{to + ";tag=" + tag}
+	return out
+}
+
 func taggedWireRequest(req voiceclient.SIPIncomingRequest, tag string) voiceclient.SIPIncomingRequest {
 	out := req
 	out.Headers = cloneSIPHeaders(req.Headers)
@@ -1498,7 +1759,7 @@ func taggedWireRequest(req voiceclient.SIPIncomingRequest, tag string) voiceclie
 	if to == "" || sipHeaderTag(to) != "" {
 		return out
 	}
-	out.Headers["To"] = []string{to + ";tag=" + firstVoiceNonEmpty(tag, "vowifi-go")}
+	out.Headers["To"] = []string{to + ";tag=" + firstVoiceNonEmpty(tag, randomVoiceSIPTag())}
 	return out
 }
 

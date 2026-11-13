@@ -1592,7 +1592,7 @@ func TestStartEmergencyAddressUpdateFallsBackWithCachedToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartEmergencyAddressUpdate() error = %v", err)
 	}
-	if ws.UserData != "cached-token-abc" || !strings.Contains(ws.URL, "existing=1") || !strings.Contains(ws.URL, "token=cached-token-abc") {
+	if ws.UserData != "cached-token-abc" || ws.URL != "https://example.test/static?existing=1" || strings.Contains(ws.URL, "token=") {
 		t.Fatalf("websheet=%+v", ws)
 	}
 }

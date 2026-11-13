@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -14,10 +15,11 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 	if err != nil {
 		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
 	}
-	if installPlan.ReqID != 1 || installPlan.Mode != "transport" ||
+	if installPlan.ReqID < 1000 || installPlan.Mode != "transport" ||
 		installPlan.LocalAddress != "192.0.2.20" || installPlan.RemoteAddress != "198.51.100.10" {
 		t.Fatalf("install plan metadata=%+v", installPlan)
 	}
+	reqIDStr := strconv.Itoa(installPlan.ReqID)
 	ik := securityXFRMHexKey(req.AKA.IK)
 	want := []IMSSecurityAssociationXFRMCommand{
 		{
@@ -27,7 +29,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 				"dst", "198.51.100.10",
 				"proto", "esp",
 				"spi", "0x0a0b0c0d",
-				"reqid", "1",
+				"reqid", reqIDStr,
 				"mode", "transport",
 				"auth-trunc", "hmac(sha1)", ik, "96",
 				"enc", "ecb(cipher_null)", "",
@@ -41,7 +43,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 				"dst", "192.0.2.20",
 				"proto", "esp",
 				"spi", "0x01020304",
-				"reqid", "1",
+				"reqid", reqIDStr,
 				"mode", "transport",
 				"auth-trunc", "hmac(sha1)", ik, "96",
 				"enc", "ecb(cipher_null)", "",
@@ -61,7 +63,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 				"src", "192.0.2.20",
 				"dst", "198.51.100.10",
 				"proto", "esp",
-				"reqid", "1",
+				"reqid", reqIDStr,
 				"mode", "transport",
 			},
 			UndoArgs: []string{"xfrm", "policy", "delete", "src", "192.0.2.20", "dst", "198.51.100.10", "proto", "udp", "sport", "5062", "dport", "5063", "dir", "out"},
@@ -79,10 +81,46 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 				"src", "198.51.100.10",
 				"dst", "192.0.2.20",
 				"proto", "esp",
-				"reqid", "1",
+				"reqid", reqIDStr,
 				"mode", "transport",
 			},
 			UndoArgs: []string{"xfrm", "policy", "delete", "src", "198.51.100.10", "dst", "192.0.2.20", "proto", "udp", "sport", "5063", "dport", "5062", "dir", "in"},
+		},
+		{
+			Args: []string{
+				"xfrm", "policy", "update",
+				"src", "192.0.2.20",
+				"dst", "198.51.100.10",
+				"proto", "tcp",
+				"sport", "5062",
+				"dport", "5063",
+				"dir", "out",
+				"tmpl",
+				"src", "192.0.2.20",
+				"dst", "198.51.100.10",
+				"proto", "esp",
+				"reqid", reqIDStr,
+				"mode", "transport",
+			},
+			UndoArgs: []string{"xfrm", "policy", "delete", "src", "192.0.2.20", "dst", "198.51.100.10", "proto", "tcp", "sport", "5062", "dport", "5063", "dir", "out"},
+		},
+		{
+			Args: []string{
+				"xfrm", "policy", "update",
+				"src", "198.51.100.10",
+				"dst", "192.0.2.20",
+				"proto", "tcp",
+				"sport", "5063",
+				"dport", "5062",
+				"dir", "in",
+				"tmpl",
+				"src", "198.51.100.10",
+				"dst", "192.0.2.20",
+				"proto", "esp",
+				"reqid", reqIDStr,
+				"mode", "transport",
+			},
+			UndoArgs: []string{"xfrm", "policy", "delete", "src", "198.51.100.10", "dst", "192.0.2.20", "proto", "tcp", "sport", "5063", "dport", "5062", "dir", "in"},
 		},
 	}
 	if !reflect.DeepEqual(installPlan.Commands, want) {
@@ -107,7 +145,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanDerivesPlanFromAgreement(t *t
 	if err != nil {
 		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
 	}
-	if len(installPlan.Commands) != 4 || installPlan.Commands[0].Args[10] != "0x0a0b0c0d" ||
+	if len(installPlan.Commands) != 6 || installPlan.Commands[0].Args[10] != "0x0a0b0c0d" ||
 		installPlan.Commands[1].Args[10] != "0x01020304" {
 		t.Fatalf("install plan commands=%+v", installPlan.Commands)
 	}
@@ -138,9 +176,11 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanUsesClientSPIForBothIMSFlows(
 	if err != nil {
 		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
 	}
-	if len(plan.Commands) != 8 {
-		t.Fatalf("commands=%d, want four states and four policies", len(plan.Commands))
+	if len(plan.Commands) != 12 {
+		t.Fatalf("commands=%d, want four states and eight (UDP+TCP) policies", len(plan.Commands))
 	}
+	clientReqID := strconv.Itoa(plan.ReqID)
+	serverReqID := strconv.Itoa(plan.ReqID + 1)
 	checks := []struct {
 		command int
 		values  []string
@@ -149,10 +189,14 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanUsesClientSPIForBothIMSFlows(
 		{1, []string{"0x80000001"}},
 		{2, []string{"0x90000001"}},
 		{3, []string{"0x80000002"}},
-		{4, []string{"5062", "65529"}},
-		{5, []string{"65529", "5062"}},
-		{6, []string{"5063", "65528"}},
-		{7, []string{"65528", "5063"}},
+		{4, []string{"udp", "5062", "65529"}},
+		{5, []string{"udp", "65529", "5062"}},
+		{6, []string{"tcp", "5062", "65529"}},
+		{7, []string{"tcp", "65529", "5062"}},
+		{8, []string{"udp", "5063", "65528"}},
+		{9, []string{"udp", "65528", "5063"}},
+		{10, []string{"tcp", "5063", "65528"}},
+		{11, []string{"tcp", "65528", "5063"}},
 	}
 	for _, check := range checks {
 		args := plan.Commands[check.command].Args
@@ -167,16 +211,20 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanUsesClientSPIForBothIMSFlows(
 			t.Fatalf("state command %d unexpectedly contains a selector: %v", command, plan.Commands[command].Args)
 		}
 	}
-	if !containsSecurityXFRMArgSequence(plan.Commands[0].Args, "reqid", "1") ||
-		!containsSecurityXFRMArgSequence(plan.Commands[1].Args, "reqid", "1") ||
-		!containsSecurityXFRMArgSequence(plan.Commands[2].Args, "reqid", "2") ||
-		!containsSecurityXFRMArgSequence(plan.Commands[3].Args, "reqid", "2") ||
-		!containsSecurityXFRMArgSequence(plan.Commands[4].Args, "reqid", "1") ||
-		!containsSecurityXFRMArgSequence(plan.Commands[6].Args, "reqid", "2") {
+	if !containsSecurityXFRMArgSequence(plan.Commands[0].Args, "reqid", clientReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[1].Args, "reqid", clientReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[2].Args, "reqid", serverReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[3].Args, "reqid", serverReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[4].Args, "reqid", clientReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[6].Args, "reqid", clientReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[8].Args, "reqid", serverReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[10].Args, "reqid", serverReqID) {
 		t.Fatalf("client and server flows do not use distinct reqids: %+v", plan.Commands)
 	}
-	if !containsSecurityXFRMArgSequence(plan.Commands[5].Args, "reqid", "1") ||
-		!containsSecurityXFRMArgSequence(plan.Commands[7].Args, "reqid", "2") {
+	if !containsSecurityXFRMArgSequence(plan.Commands[5].Args, "reqid", clientReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[7].Args, "reqid", clientReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[9].Args, "reqid", serverReqID) ||
+		!containsSecurityXFRMArgSequence(plan.Commands[11].Args, "reqid", serverReqID) {
 		t.Fatalf("inbound policies must require the matching ESP flow: %+v", plan.Commands)
 	}
 }
@@ -351,34 +399,30 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanRejectsInvalidInput(t *testin
 
 func TestLinuxIMSSecurityXFRMInstallerApplyInstallAndCleanup(t *testing.T) {
 	req := validSecurityXFRMInstallRequest()
-	plan, err := BuildIMSSecurityAssociationXFRMInstallPlan(req)
-	if err != nil {
-		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
-	}
 	runner := &fakeIMSSecurityXFRMRunner{}
 	installer := &LinuxIMSSecurityXFRMInstaller{Runner: runner}
-	state, err := installer.Apply(context.Background(), req)
+	state1, err := installer.Apply(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Apply() error = %v", err)
 	}
-	if installer.StateCount() != 1 || state.Plan.LocalAddress != "192.0.2.20" || len(state.undo) != len(plan.Commands) {
-		t.Fatalf("state=%+v count=%d", state, installer.StateCount())
+	if installer.StateCount() != 1 || state1.Plan.LocalAddress != "192.0.2.20" || len(state1.undo) != len(state1.Plan.Commands) {
+		t.Fatalf("state=%+v count=%d", state1, installer.StateCount())
 	}
-	if !reflect.DeepEqual(runner.commands, imsSecurityXFRMCommandArgs(plan.Commands, false)) {
-		t.Fatalf("apply commands=\n%v\nwant\n%v", runner.commands, imsSecurityXFRMCommandArgs(plan.Commands, false))
-	}
-
-	if err := installer.InstallSecurityPlanRequest(context.Background(), req); err != nil {
-		t.Fatalf("InstallSecurityPlanRequest() error = %v", err)
-	}
-	if installer.StateCount() != 2 {
-		t.Fatalf("StateCount()=%d, want 2", installer.StateCount())
+	if !reflect.DeepEqual(runner.commands, imsSecurityXFRMCommandArgs(state1.Plan.Commands, false)) {
+		t.Fatalf("apply commands=\n%v\nwant\n%v", runner.commands, imsSecurityXFRMCommandArgs(state1.Plan.Commands, false))
 	}
 
-	want := append([][]string{}, imsSecurityXFRMCommandArgs(plan.Commands, false)...)
-	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, false)...)
-	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, true)...)
-	want = append(want, imsSecurityXFRMCommandArgs(plan.Commands, true)...)
+	state2, err := installer.Apply(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Apply(second) error = %v", err)
+	}
+	if installer.StateCount() != 1 {
+		t.Fatalf("StateCount()=%d, want 1", installer.StateCount())
+	}
+
+	want := append([][]string{}, imsSecurityXFRMCommandArgs(state1.Plan.Commands, false)...)
+	want = append(want, imsSecurityXFRMCommandArgs(state2.Plan.Commands, false)...)
+	want = append(want, imsSecurityXFRMCommandArgs(state2.Plan.Commands, true)...)
 	if err := installer.Cleanup(context.Background()); err != nil {
 		t.Fatalf("Cleanup() error = %v", err)
 	}
@@ -393,13 +437,9 @@ func TestLinuxIMSSecurityXFRMInstallerApplyInstallAndCleanup(t *testing.T) {
 func TestLinuxIMSSecurityXFRMInstallerRollsBackOnFailure(t *testing.T) {
 	wantErr := errors.New("policy install failed")
 	req := validSecurityXFRMInstallRequest()
-	plan, err := BuildIMSSecurityAssociationXFRMInstallPlan(req)
-	if err != nil {
-		t.Fatalf("BuildIMSSecurityAssociationXFRMInstallPlan() error = %v", err)
-	}
 	runner := &fakeIMSSecurityXFRMRunner{failAt: 2, err: wantErr}
 	installer := &LinuxIMSSecurityXFRMInstaller{Runner: runner}
-	_, err = installer.Apply(context.Background(), req)
+	state, err := installer.Apply(context.Background(), req)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("Apply() err=%v, want policy failure", err)
 	}
@@ -407,11 +447,11 @@ func TestLinuxIMSSecurityXFRMInstallerRollsBackOnFailure(t *testing.T) {
 		t.Fatalf("StateCount()=%d, want 0 after rollback", installer.StateCount())
 	}
 	want := [][]string{
-		plan.Commands[0].Args,
-		plan.Commands[1].Args,
-		plan.Commands[2].Args,
-		plan.Commands[1].UndoArgs,
-		plan.Commands[0].UndoArgs,
+		state.Plan.Commands[0].Args,
+		state.Plan.Commands[1].Args,
+		state.Plan.Commands[2].Args,
+		state.Plan.Commands[1].UndoArgs,
+		state.Plan.Commands[0].UndoArgs,
 	}
 	if !reflect.DeepEqual(runner.commands, want) {
 		t.Fatalf("commands=\n%v\nwant\n%v", runner.commands, want)

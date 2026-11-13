@@ -10,8 +10,26 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
+
+var nextIMSSecurityXFRMReqID atomic.Uint32
+
+func allocateIMSSecurityXFRMReqIDPair() (int, int) {
+	for {
+		cur := nextIMSSecurityXFRMReqID.Load()
+		base := cur
+		if base < 1000 || base > 0x7ffffff0 {
+			base = 1000
+		}
+		next := base + 2
+		if nextIMSSecurityXFRMReqID.CompareAndSwap(cur, next) {
+			return int(base), int(base + 1)
+		}
+	}
+}
 
 // ErrInvalidIMSSecurityXFRMPlan marks an install request that cannot be mapped to Linux XFRM.
 var ErrInvalidIMSSecurityXFRMPlan = errors.New("invalid IMS security XFRM plan")
@@ -78,6 +96,7 @@ var (
 )
 
 type imsSecurityXFRMParams struct {
+	clientReqIDNum    int
 	clientReqID       string
 	serverReqID       string
 	mode              string
@@ -120,17 +139,21 @@ func BuildIMSSecurityAssociationXFRMInstallPlan(req IMSSecurityAssociationInstal
 		)
 	}
 	commands = append(commands,
-		imssSecurityXFRMPolicyCommand(params, "out"),
-		imssSecurityXFRMPolicyCommand(params, "in"),
+		imssSecurityXFRMPolicyCommand(params, "udp", "out"),
+		imssSecurityXFRMPolicyCommand(params, "udp", "in"),
+		imssSecurityXFRMPolicyCommand(params, "tcp", "out"),
+		imssSecurityXFRMPolicyCommand(params, "tcp", "in"),
 	)
 	if params.hasServerFlow {
 		commands = append(commands,
-			imssSecurityXFRMServerPolicyCommand(params, "out"),
-			imssSecurityXFRMServerPolicyCommand(params, "in"),
+			imssSecurityXFRMServerPolicyCommand(params, "udp", "out"),
+			imssSecurityXFRMServerPolicyCommand(params, "udp", "in"),
+			imssSecurityXFRMServerPolicyCommand(params, "tcp", "out"),
+			imssSecurityXFRMServerPolicyCommand(params, "tcp", "in"),
 		)
 	}
 	return IMSSecurityAssociationXFRMInstallPlan{
-		ReqID:         1,
+		ReqID:         params.clientReqIDNum,
 		Mode:          params.mode,
 		LocalAddress:  params.localAddress,
 		RemoteAddress: params.remoteAddress,
@@ -158,13 +181,27 @@ func (i *LinuxIMSSecurityXFRMInstaller) Apply(ctx context.Context, req IMSSecuri
 	if err != nil {
 		return IMSSecurityAssociationXFRMState{}, err
 	}
-	state, err := applyIMSSecurityXFRMPlan(ctx, imssSecurityXFRMRunner(i.Runner), plan)
+	runner := imssSecurityXFRMRunner(i.Runner)
+	state, err := applyIMSSecurityXFRMPlan(ctx, runner, plan)
 	if err != nil {
 		return state, err
 	}
+
 	i.mu.Lock()
-	i.states = append(i.states, state)
+	prior := append([]IMSSecurityAssociationXFRMState(nil), i.states...)
+	i.states = []IMSSecurityAssociationXFRMState{state}
 	i.mu.Unlock()
+
+	if superseded := supersededIMSSecurityXFRMUndo(prior, state); len(superseded) > 0 {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		remaining, _ := runIMSSecurityXFRMUndoIdempotent(cleanupCtx, runner, superseded)
+		cancel()
+		if len(remaining) > 0 {
+			i.mu.Lock()
+			i.states = append([]IMSSecurityAssociationXFRMState{{undo: remaining}}, i.states...)
+			i.mu.Unlock()
+		}
+	}
 	return state, nil
 }
 
@@ -174,24 +211,21 @@ func (i *LinuxIMSSecurityXFRMInstaller) Cleanup(ctx context.Context) error {
 	defer cancel()
 	i.mu.Lock()
 	states := append([]IMSSecurityAssociationXFRMState(nil), i.states...)
+	i.states = nil
 	i.mu.Unlock()
 
-	var err error
+	var allUndo []IMSSecurityAssociationXFRMCommand
+	for _, st := range states {
+		allUndo = append(allUndo, st.undo...)
+	}
 	runner := imssSecurityXFRMRunner(i.Runner)
-	for idx := len(states) - 1; idx >= 0; idx-- {
-		err = errors.Join(err, cleanupIMSSecurityXFRMState(cleanupCtx, runner, states[idx]))
+	remaining, err := runIMSSecurityXFRMUndoIdempotent(cleanupCtx, runner, allUndo)
+	if len(remaining) > 0 {
+		i.mu.Lock()
+		i.states = append([]IMSSecurityAssociationXFRMState{{undo: remaining}}, i.states...)
+		i.mu.Unlock()
 	}
-	if err != nil {
-		return err
-	}
-	i.mu.Lock()
-	if len(i.states) >= len(states) {
-		i.states = append([]IMSSecurityAssociationXFRMState(nil), i.states[len(states):]...)
-	} else {
-		i.states = nil
-	}
-	i.mu.Unlock()
-	return nil
+	return err
 }
 
 func (i *LinuxIMSSecurityXFRMInstaller) StateCount() int {
@@ -205,7 +239,7 @@ func applyIMSSecurityXFRMPlan(ctx context.Context, runner IMSSecurityXFRMCommand
 	for _, command := range plan.Commands {
 		if err := runner.RunIP(ctx, command.Args...); err != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			rollbackErr := runIMSSecurityXFRMUndo(cleanupCtx, runner, state.undo)
+			_, rollbackErr := runIMSSecurityXFRMUndoIdempotent(cleanupCtx, runner, state.undo)
 			cancel()
 			if rollbackErr != nil {
 				return state, errors.Join(err, rollbackErr)
@@ -220,18 +254,77 @@ func applyIMSSecurityXFRMPlan(ctx context.Context, runner IMSSecurityXFRMCommand
 }
 
 func cleanupIMSSecurityXFRMState(ctx context.Context, runner IMSSecurityXFRMCommandRunner, state IMSSecurityAssociationXFRMState) error {
-	return runIMSSecurityXFRMUndo(ctx, runner, state.undo)
+	_, err := runIMSSecurityXFRMUndoIdempotent(ctx, runner, state.undo)
+	return err
 }
 
 func runIMSSecurityXFRMUndo(ctx context.Context, runner IMSSecurityXFRMCommandRunner, undo []IMSSecurityAssociationXFRMCommand) error {
+	_, err := runIMSSecurityXFRMUndoIdempotent(ctx, runner, undo)
+	return err
+}
+
+func runIMSSecurityXFRMUndoIdempotent(ctx context.Context, runner IMSSecurityXFRMCommandRunner, undo []IMSSecurityAssociationXFRMCommand) ([]IMSSecurityAssociationXFRMCommand, error) {
 	var err error
+	var failed []IMSSecurityAssociationXFRMCommand
+	seen := make(map[string]bool, len(undo))
 	for idx := len(undo) - 1; idx >= 0; idx-- {
-		if len(undo[idx].UndoArgs) == 0 {
+		args := undo[idx].UndoArgs
+		if len(args) == 0 {
 			continue
 		}
-		err = errors.Join(err, runner.RunIP(ctx, undo[idx].UndoArgs...))
+		key := xfrmArgsKey(args)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if runErr := runner.RunIP(ctx, args...); runErr != nil && !isBenignIMSSecurityXFRMDeleteError(runErr) {
+			err = errors.Join(err, runErr)
+			failed = append([]IMSSecurityAssociationXFRMCommand{cloneIMSSecurityXFRMCommand(undo[idx], true)}, failed...)
+		}
 	}
-	return err
+	return failed, err
+}
+
+func supersededIMSSecurityXFRMUndo(prior []IMSSecurityAssociationXFRMState, current IMSSecurityAssociationXFRMState) []IMSSecurityAssociationXFRMCommand {
+	if len(prior) == 0 {
+		return nil
+	}
+	active := make(map[string]bool, len(current.undo))
+	for _, cmd := range current.undo {
+		if len(cmd.UndoArgs) > 0 {
+			active[xfrmArgsKey(cmd.UndoArgs)] = true
+		}
+	}
+	var out []IMSSecurityAssociationXFRMCommand
+	for _, st := range prior {
+		for _, cmd := range st.undo {
+			if len(cmd.UndoArgs) == 0 {
+				continue
+			}
+			if active[xfrmArgsKey(cmd.UndoArgs)] {
+				continue
+			}
+			out = append(out, cloneIMSSecurityXFRMCommand(cmd, true))
+		}
+	}
+	return out
+}
+
+func xfrmArgsKey(args []string) string {
+	return strings.Join(args, "\x00")
+}
+
+func isBenignIMSSecurityXFRMDeleteError(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ESRCH) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such file or directory") ||
+		strings.Contains(msg, "no such process") ||
+		strings.Contains(msg, "does not exist")
 }
 
 func imssSecurityXFRMRunner(runner IMSSecurityXFRMCommandRunner) IMSSecurityXFRMCommandRunner {
@@ -346,9 +439,11 @@ func normalizeIMSSecurityAssociationXFRMRequest(req IMSSecurityAssociationInstal
 			return imsSecurityXFRMParams{}, err
 		}
 	}
+	clientReqIDNum, serverReqIDNum := allocateIMSSecurityXFRMReqIDPair()
 	return imsSecurityXFRMParams{
-		clientReqID:       "1",
-		serverReqID:       "2",
+		clientReqIDNum:    clientReqIDNum,
+		clientReqID:       strconv.Itoa(clientReqIDNum),
+		serverReqID:       strconv.Itoa(serverReqIDNum),
 		mode:              mode,
 		localAddress:      localAddress,
 		remoteAddress:     remoteAddress,
@@ -407,7 +502,7 @@ func imssSecurityXFRMStateCommand(params imsSecurityXFRMParams, outbound bool) I
 	return IMSSecurityAssociationXFRMCommand{Args: args, UndoArgs: undo}
 }
 
-func imssSecurityXFRMPolicyCommand(params imsSecurityXFRMParams, dir string) IMSSecurityAssociationXFRMCommand {
+func imssSecurityXFRMPolicyCommand(params imsSecurityXFRMParams, proto, dir string) IMSSecurityAssociationXFRMCommand {
 	src, dst, sport, dport := params.localAddress, params.remoteAddress, params.localPort, params.remotePort
 	if dir == "in" {
 		src, dst, sport, dport = params.remoteAddress, params.localAddress, params.inboundRemotePort, params.inboundLocalPort
@@ -416,7 +511,7 @@ func imssSecurityXFRMPolicyCommand(params imsSecurityXFRMParams, dir string) IMS
 		"xfrm", "policy", "update",
 		"src", src,
 		"dst", dst,
-		"proto", "udp",
+		"proto", proto,
 		"sport", sport,
 		"dport", dport,
 		"dir", dir,
@@ -426,7 +521,7 @@ func imssSecurityXFRMPolicyCommand(params imsSecurityXFRMParams, dir string) IMS
 		"xfrm", "policy", "delete",
 		"src", src,
 		"dst", dst,
-		"proto", "udp",
+		"proto", proto,
 		"sport", sport,
 		"dport", dport,
 		"dir", dir,
@@ -434,12 +529,12 @@ func imssSecurityXFRMPolicyCommand(params imsSecurityXFRMParams, dir string) IMS
 	return IMSSecurityAssociationXFRMCommand{Args: args, UndoArgs: undo}
 }
 
-func imssSecurityXFRMServerPolicyCommand(params imsSecurityXFRMParams, dir string) IMSSecurityAssociationXFRMCommand {
+func imssSecurityXFRMServerPolicyCommand(params imsSecurityXFRMParams, proto, dir string) IMSSecurityAssociationXFRMCommand {
 	src, dst, sport, dport := params.localAddress, params.remoteAddress, params.serverLocalPort, params.serverRemotePort
 	if dir == "in" {
 		src, dst, sport, dport = params.remoteAddress, params.localAddress, params.serverRemotePort, params.serverLocalPort
 	}
-	selector := []string{"src", src, "dst", dst, "proto", "udp", "sport", sport, "dport", dport}
+	selector := []string{"src", src, "dst", dst, "proto", proto, "sport", sport, "dport", dport}
 	args := append([]string{"xfrm", "policy", "update"}, selector...)
 	args = append(args, "dir", dir)
 	args = append(args, imssSecurityXFRMPolicyTemplate(src, dst, params.serverReqID, params.mode, dir)...)

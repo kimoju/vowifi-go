@@ -78,6 +78,7 @@ type TUNPacketTunnelSession struct {
 var _ TunnelManager = (*TUNTunnelManager)(nil)
 var _ TunnelSession = (*TUNPacketTunnelSession)(nil)
 var _ ChildSARekeyScheduler = (*TUNPacketTunnelSession)(nil)
+var _ IKESARekeyController = (*TUNPacketTunnelSession)(nil)
 var _ IKELivenessController = (*TUNPacketTunnelSession)(nil)
 var _ MOBIKENATObserver = (*TUNPacketTunnelSession)(nil)
 
@@ -117,6 +118,10 @@ func (m *TUNTunnelManager) EstablishTunnel(ctx context.Context, cfg TunnelConfig
 		return nil, fmt.Errorf("%w: base session cannot read packet tunnel traffic", ErrInvalidTUNTunnelManager)
 	}
 	result := completeTUNResult(packetSession.Result())
+	sessionMTU := effectiveSessionMTU(m.Config.MTU, baseCfg, result)
+	if setter, ok := packetSession.(interface{ SetMTU(int) }); ok {
+		setter.SetMTU(sessionMTU)
+	}
 	device, iface, err := m.openDevice(ctx, baseCfg, result)
 	if err != nil {
 		cleanupCtx, cancel := independentCleanupContext(ctx)
@@ -216,6 +221,11 @@ func (s *TUNPacketTunnelSession) maintenanceLoop(ctx context.Context, interval t
 		case now := <-ticker.C:
 			_, _ = s.AdvanceIKELiveness(ctx, now)
 			_, _ = s.RunChildSARekeyDue(ctx, now)
+			if runner, ok := s.base.(interface {
+				RunIKESARekeyDue(context.Context, time.Time) (ChildSARekeyDecision, error)
+			}); ok {
+				_, _ = runner.RunIKESARekeyDue(ctx, now)
+			}
 		}
 	}
 }
@@ -259,6 +269,7 @@ func (m *TUNTunnelManager) routingConfigWithSessionIPs(ctx context.Context, cfg 
 	if len(addresses) == 0 {
 		addresses = innerAddressesForTUN(result)
 	}
+	mtu := effectiveSessionMTU(m.Config.MTU, cfg, result)
 	routes := cloneTUNRoutes(m.Config.Routes)
 	rules := cloneTUNRules(m.Config.Rules)
 	if m.Config.IsolateHostRouting && len(routes) == 0 && len(rules) == 0 {
@@ -274,22 +285,28 @@ func (m *TUNTunnelManager) routingConfigWithSessionIPs(ctx context.Context, cfg 
 				return TUNRoutingConfig{}, err
 			}
 			destination := "default"
+			isV6 := false
 			if prefix, parseErr := netip.ParsePrefix(source); parseErr == nil && prefix.Addr().Is6() {
 				destination = "::/0"
+				isV6 = true
 			}
 			if !seenDest[destination] {
 				seenDest[destination] = true
-				routes = append(routes, TUNRoute{Destination: destination, Table: table})
+				routes = append(routes, TUNRoute{
+					Destination: destination,
+					Table:       table,
+					AdvMSS:      defaultAdvMSSForMTU(mtu, isV6),
+				})
 			}
 			rules = append(rules, TUNRule{Priority: priority, From: source, Table: table})
 		}
 	} else if m.Config.DefaultRoutes && len(routes) == 0 {
 		hasV4, hasV6 := addressFamiliesForTUN(addresses)
 		if hasV4 || !hasV6 {
-			routes = append(routes, TUNRoute{Destination: "default"})
+			routes = append(routes, TUNRoute{Destination: "default", AdvMSS: defaultAdvMSSForMTU(mtu, false)})
 		}
 		if hasV6 {
-			routes = append(routes, TUNRoute{Destination: "::/0"})
+			routes = append(routes, TUNRoute{Destination: "::/0", AdvMSS: defaultAdvMSSForMTU(mtu, true)})
 		}
 	}
 	exclusions := cloneEPDGRouteExclusions(m.Config.EPDGRouteExclusions)
@@ -302,12 +319,68 @@ func (m *TUNTunnelManager) routingConfigWithSessionIPs(ctx context.Context, cfg 
 	}
 	return TUNRoutingConfig{
 		InterfaceName:       iface,
-		MTU:                 m.Config.MTU,
+		MTU:                 mtu,
 		Addresses:           addresses,
 		EPDGRouteExclusions: exclusions,
 		Routes:              routes,
 		Rules:               rules,
 	}, nil
+}
+
+func effectiveSessionMTU(configured int, cfg TunnelConfig, result TunnelResult) int {
+	mtu := configured
+	if mtu <= 0 {
+		if cfg.Proxy.IsActive() || outerEndpointIsIPv6(cfg, result) {
+			mtu = MinIPv6TunnelInnerMTU
+		} else {
+			mtu = DefaultTunnelInnerMTU
+		}
+	}
+	if resultHasInnerIPv6(result) && mtu < MinIPv6TunnelInnerMTU {
+		mtu = MinIPv6TunnelInnerMTU
+	} else if mtu < 576 {
+		mtu = 576
+	}
+	return mtu
+}
+
+func outerEndpointIsIPv6(cfg TunnelConfig, result TunnelResult) bool {
+	for _, candidate := range []string{cfg.OuterLocalIP, tunnelAddressHost(result.EPDGAddress), tunnelAddressHost(cfg.EPDGAddress)} {
+		candidate = strings.Trim(strings.TrimSpace(candidate), "[]")
+		if candidate == "" {
+			continue
+		}
+		if ip := net.ParseIP(candidate); ip != nil && ip.To4() == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func resultHasInnerIPv6(result TunnelResult) bool {
+	if strings.TrimSpace(result.LocalInnerIPv6) != "" || strings.TrimSpace(result.LocalInnerIPv6Prefix) != "" {
+		return true
+	}
+	_, hasV6 := addressFamiliesForTUN(innerAddressesForTUN(result))
+	return hasV6
+}
+
+func defaultAdvMSSForMTU(mtu int, ipv6 bool) int {
+	if mtu <= 0 {
+		return 0
+	}
+	if ipv6 {
+		mss := mtu - 60
+		if mss < 1220 {
+			mss = 1220
+		}
+		return mss
+	}
+	mss := mtu - 40
+	if mss < 536 {
+		mss = 536
+	}
+	return mss
 }
 
 func innerAddressesForTUN(result TunnelResult) []string {
@@ -321,12 +394,28 @@ func innerAddressesForTUN(result TunnelResult) []string {
 		seen[v] = true
 		out = append(out, v)
 	}
+	v6Raw := strings.TrimSpace(result.LocalInnerIPv6)
+	v6Pref := strings.TrimSpace(result.LocalInnerIPv6Prefix)
 	for _, addr := range result.LocalInnerIPs {
-		add(addr)
+		trimmed := strings.TrimSpace(addr)
+		if v6Pref != "" && v6Raw != "" && trimmed == v6Raw {
+			add(v6Pref)
+			continue
+		}
+		add(trimmed)
 	}
 	add(result.LocalInnerIPv4)
-	add(result.LocalInnerIPv6)
-	add(result.LocalInnerIP)
+	if v6Pref != "" {
+		add(v6Pref)
+	} else {
+		add(v6Raw)
+	}
+	localRaw := strings.TrimSpace(result.LocalInnerIP)
+	if v6Pref != "" && v6Raw != "" && localRaw == v6Raw {
+		add(v6Pref)
+	} else {
+		add(localRaw)
+	}
 	return out
 }
 
@@ -588,6 +677,21 @@ func (s *TUNPacketTunnelSession) RekeyChildSA(ctx context.Context) (TunnelResult
 		return TunnelResult{}, fmt.Errorf("%w: base session cannot rekey child sa", ErrInvalidTUNTunnelManager)
 	}
 	result, err := controller.RekeyChildSA(ctx)
+	if err != nil {
+		return TunnelResult{}, err
+	}
+	return s.setResult(result), nil
+}
+
+func (s *TUNPacketTunnelSession) RekeyIKESA(ctx context.Context) (TunnelResult, error) {
+	if s == nil || s.base == nil {
+		return TunnelResult{}, ErrInvalidTUNTunnelManager
+	}
+	controller, ok := s.base.(IKESARekeyController)
+	if !ok {
+		return TunnelResult{}, fmt.Errorf("%w: base session cannot rekey ike sa", ErrInvalidTUNTunnelManager)
+	}
+	result, err := controller.RekeyIKESA(ctx)
 	if err != nil {
 		return TunnelResult{}, err
 	}

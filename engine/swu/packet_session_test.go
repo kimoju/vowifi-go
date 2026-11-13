@@ -33,7 +33,7 @@ func TestPacketSessionSendsAndReceivesIPv4AndIPv6(t *testing.T) {
 		t.Fatalf("NewPacketSession(b) error = %v", err)
 	}
 
-	ipv4 := []byte{0x45, 0x00, 0x00, 0x14, 0xaa, 0xbb, 0xcc, 0xdd}
+	ipv4 := testValidIPv4Packet(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 1), []byte{0xaa, 0xbb, 0xcc, 0xdd})
 	if err := a.SendInnerPacket(context.Background(), ipv4); err != nil {
 		t.Fatalf("SendInnerPacket(ipv4) error = %v", err)
 	}
@@ -48,7 +48,7 @@ func TestPacketSessionSendsAndReceivesIPv4AndIPv6(t *testing.T) {
 		t.Fatalf("got4=%+v payload=%x", got4, got4.Payload)
 	}
 
-	ipv6 := []byte{0x60, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef}
+	ipv6 := testValidIPv6Packet(net.ParseIP("2001:db8::2"), net.ParseIP("2001:db8::1"), []byte{0xde, 0xad, 0xbe, 0xef})
 	if err := a.SendInnerPacket(context.Background(), ipv6); err != nil {
 		t.Fatalf("SendInnerPacket(ipv6) error = %v", err)
 	}
@@ -128,7 +128,7 @@ func TestPacketSessionRekeyChildSAReplacesSAsAndResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPacketSession() error = %v", err)
 	}
-	if err := session.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14}); err != nil {
+	if err := session.SendInnerPacket(context.Background(), testValidIPv4Packet(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 1), nil)); err != nil {
 		t.Fatalf("SendInnerPacket(before rekey) error = %v", err)
 	}
 	statsBefore := session.PacketStats()
@@ -149,7 +149,7 @@ func TestPacketSessionRekeyChildSAReplacesSAsAndResult(t *testing.T) {
 		t.Fatalf("stats changed during rekey: before=%+v after=%+v", statsBefore, stats)
 	}
 
-	if err := session.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14, 0xaa}); err != nil {
+	if err := session.SendInnerPacket(context.Background(), testValidIPv4Packet(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 1), []byte{0xaa})); err != nil {
 		t.Fatalf("SendInnerPacket(after rekey) error = %v", err)
 	}
 	if gotSPI := binary.BigEndian.Uint32(transport.packets[len(transport.packets)-1][0:4]); gotSPI != 0x44444444 {
@@ -159,7 +159,7 @@ func TestPacketSessionRekeyChildSAReplacesSAsAndResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOutboundSAFromChild(peer) error = %v", err)
 	}
-	packet, err := peerOutbound.Seal(esp.NextHeaderIPv4, []byte{0x45, 0x00, 0x00, 0x14, 0xbb}, esp.SealOptions{
+	packet, err := peerOutbound.Seal(esp.NextHeaderIPv4, testValidIPv4Packet(net.IPv4(10, 0, 0, 1), net.IPv4(10, 0, 0, 2), []byte{0xbb}), esp.SealOptions{
 		Sequence: 1,
 		IV:       bytes.Repeat([]byte{0x77}, 16),
 	})
@@ -207,7 +207,7 @@ func TestPacketSessionRekeyChildSAErrorKeepsOldSAAndResult(t *testing.T) {
 	if stats := session.PacketStats(); stats != statsBefore {
 		t.Fatalf("stats changed during failed rekey: before=%+v after=%+v", statsBefore, stats)
 	}
-	if err := session.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14}); err != nil {
+	if err := session.SendInnerPacket(context.Background(), testValidIPv4Packet(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 1), nil)); err != nil {
 		t.Fatalf("SendInnerPacket(after failed rekey) error = %v", err)
 	}
 	if gotSPI := binary.BigEndian.Uint32(transport.packets[0][0:4]); gotSPI != 0x22222222 {
@@ -464,7 +464,7 @@ func TestPacketSessionReadInnerPacketUsesReadableTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPacketSession(b) error = %v", err)
 	}
-	inner := []byte{0x45, 0x00, 0x00, 0x14, 0xde, 0xad}
+	inner := testValidIPv4Packet(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 1), []byte{0xde, 0xad})
 	if err := a.SendInnerPacket(context.Background(), inner); err != nil {
 		t.Fatalf("SendInnerPacket() error = %v", err)
 	}
@@ -491,7 +491,7 @@ func TestPacketSessionRejectsReplayAndCountsDrop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPacketSession(b) error = %v", err)
 	}
-	if err := a.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14}); err != nil {
+	if err := a.SendInnerPacket(context.Background(), testValidIPv4Packet(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 1), nil)); err != nil {
 		t.Fatalf("SendInnerPacket() error = %v", err)
 	}
 	if _, err := b.ReceiveESPPacket(context.Background(), transport.packets[0]); err != nil {
@@ -597,7 +597,7 @@ func TestPacketSessionCountsTransportFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPacketSession() error = %v", err)
 	}
-	if err := session.SendInnerPacket(context.Background(), []byte{0x45, 0x00, 0x00, 0x14}); !errors.Is(err, wantErr) {
+	if err := session.SendInnerPacket(context.Background(), testValidIPv4Packet(net.IPv4(10, 0, 0, 2), net.IPv4(10, 0, 0, 1), nil)); !errors.Is(err, wantErr) {
 		t.Fatalf("SendInnerPacket() err=%v, want send failed", err)
 	}
 	stats := session.PacketStats()
@@ -930,4 +930,30 @@ func packetRekeyChildSA(aToB bool) ikev2.ChildSAResult {
 	child.Keys.Outbound = aInbound
 	child.Keys.Inbound = aOutbound
 	return child
+}
+
+func testValidIPv4Packet(src, dst net.IP, payload []byte) []byte {
+	totalLen := 20 + len(payload)
+	pkt := make([]byte, totalLen)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+	pkt[8] = 64
+	pkt[9] = 253 // RFC 3692 experimental L4 protocol (no minimum L4 header restriction)
+	copy(pkt[12:16], src.To4())
+	copy(pkt[16:20], dst.To4())
+	binary.BigEndian.PutUint16(pkt[10:12], computeOnesComplementChecksum(pkt[:20]))
+	copy(pkt[20:], payload)
+	return pkt
+}
+
+func testValidIPv6Packet(src, dst net.IP, payload []byte) []byte {
+	pkt := make([]byte, 40+len(payload))
+	pkt[0] = 0x60
+	binary.BigEndian.PutUint16(pkt[4:6], uint16(len(payload)))
+	pkt[6] = 253
+	pkt[7] = 64
+	copy(pkt[8:24], src.To16())
+	copy(pkt[24:40], dst.To16())
+	copy(pkt[40:], payload)
+	return pkt
 }

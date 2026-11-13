@@ -199,6 +199,14 @@ func RecommendRecovery(class RecoveryClass, attempt int) RecoveryRecommendation 
 // ClassifyControlPortRecovery converts modem control-port failures into a
 // bounded recovery decision. It does not execute AT commands.
 func ClassifyControlPortRecovery(input ControlPortRecoveryInput) ControlPortRecoveryDecision {
+	if errors.Is(input.Err, context.Canceled) {
+		return ControlPortRecoveryDecision{
+			Class:  RecoveryClassNone,
+			Action: RecoveryActionNone,
+			Mode:   ControlPortRecoveryModeNone,
+			Reason: recoveryErrorReason(input.Err),
+		}
+	}
 	attempt := input.Attempt
 	if attempt < 0 {
 		attempt = 0
@@ -504,7 +512,7 @@ func GetResponseAPDUWithCLA(cla byte, le int) ([]byte, error) {
 }
 
 func ClassifyError(err error) RecoveryClass {
-	if err == nil {
+	if err == nil || errors.Is(err, context.Canceled) {
 		return RecoveryClassNone
 	}
 	var classifier recoveryClassifier
@@ -616,34 +624,30 @@ func sleepATRecoveryDelay(ctx context.Context, delay time.Duration) error {
 
 func classifyErrorText(text string) RecoveryClass {
 	s := strings.ToLower(strings.TrimSpace(text))
-	statusClass := statusTextRecoveryClass(s)
-	cmeClass := cmeErrorRecoveryClass(s)
-	switch {
-	case s == "":
+	if s == "" || strings.Contains(s, "context canceled") {
 		return RecoveryClassNone
-	case strings.Contains(s, "isim identity data empty") ||
+	}
+	if strings.Contains(s, "isim identity data empty") ||
 		strings.Contains(s, "empty ef") ||
-		strings.Contains(s, "ef data empty"):
+		strings.Contains(s, "ef data empty") {
 		return RecoveryClassEmptyEF
-	case s == "6a82" ||
-		s == "6a83" ||
-		strings.Contains(s, "sw=6a82") ||
-		strings.Contains(s, "sw=6a83") ||
-		strings.Contains(s, "status=6a82") ||
-		strings.Contains(s, "status=6a83") ||
-		strings.Contains(s, " 6a82") ||
-		strings.Contains(s, " 6a83"):
-		return RecoveryClassFileNotFound
-	case statusClass != RecoveryClassNone:
-		return statusClass
-	case cmeClass != RecoveryClassNone:
+	}
+	if explicitStatus := explicitStatusTextRecoveryClass(s); explicitStatus != RecoveryClassNone {
+		return explicitStatus
+	}
+	if cmeClass := cmeErrorRecoveryClass(s); cmeClass != RecoveryClassNone {
 		return cmeClass
-	case strings.Contains(s, "sim busy") ||
+	}
+	if cmsClass := cmsErrorRecoveryClass(s); cmsClass != RecoveryClassNone {
+		return cmsClass
+	}
+	if strings.Contains(s, "sim busy") ||
 		strings.Contains(s, "apdu busy") ||
 		strings.Contains(s, "sim is busy") ||
-		strings.Contains(s, "resource busy"):
+		strings.Contains(s, "resource busy") {
 		return RecoveryClassSIMBusy
-	case strings.Contains(s, "context deadline exceeded") ||
+	}
+	if strings.Contains(s, "context deadline exceeded") ||
 		strings.Contains(s, "timeout") ||
 		strings.Contains(s, "timed out") ||
 		strings.Contains(s, "i/o timeout") ||
@@ -655,18 +659,24 @@ func classifyErrorText(text string) RecoveryClass {
 		strings.Contains(s, "parse imei") ||
 		strings.Contains(s, "parse imsi") ||
 		strings.Contains(s, "parse crsm result") ||
-		strings.Contains(s, "parse apdu response hex"):
+		strings.Contains(s, "parse apdu response hex") {
 		return RecoveryClassControlPortHung
-	case strings.Contains(s, "invalid crsm data") ||
-		strings.Contains(s, "invalid apdu response") ||
-		strings.Contains(s, "apdu response too short"):
-		return RecoveryClassMalformedReply
-	case strings.Contains(s, "at cme error") ||
-		strings.Contains(s, "at error"):
-		return RecoveryClassATError
-	default:
-		return RecoveryClassNone
 	}
+	if statusClass := statusTextRecoveryClass(s); statusClass != RecoveryClassNone {
+		return statusClass
+	}
+	if strings.Contains(s, "invalid crsm data") ||
+		strings.Contains(s, "invalid apdu response") ||
+		strings.Contains(s, "apdu response too short") {
+		return RecoveryClassMalformedReply
+	}
+	if strings.Contains(s, "at cme error") ||
+		strings.Contains(s, "at cms error") ||
+		strings.Contains(s, "+cms error") ||
+		strings.Contains(s, "at error") {
+		return RecoveryClassATError
+	}
+	return RecoveryClassNone
 }
 
 func cloneATRecoverySteps(steps []ATRecoveryStep) []ATRecoveryStep {
@@ -849,15 +859,116 @@ func cmeErrorRecoveryClass(text string) RecoveryClass {
 	}
 }
 
-func statusTextRecoveryClass(text string) RecoveryClass {
-	for _, token := range strings.FieldsFunc(text, func(r rune) bool {
-		return !('0' <= r && r <= '9' || 'a' <= r && r <= 'f' || 'A' <= r && r <= 'F')
-	}) {
-		if class := StatusStringRecoveryClass(token); class != RecoveryClassNone {
-			return class
+func cmsErrorRecoveryClass(text string) RecoveryClass {
+	var detail string
+	switch {
+	case strings.Contains(text, "at cms error:"):
+		i := strings.Index(text, "at cms error:")
+		detail = strings.TrimSpace(text[i+len("at cms error:"):])
+	case strings.Contains(text, "+cms error:"):
+		i := strings.Index(text, "+cms error:")
+		detail = strings.TrimSpace(text[i+len("+cms error:"):])
+	default:
+		return RecoveryClassNone
+	}
+	if nl := strings.IndexAny(detail, "\r\n\""); nl >= 0 {
+		detail = strings.TrimSpace(detail[:nl])
+	}
+	if detail == "" {
+		return RecoveryClassATError
+	}
+	switch {
+	case detail == "314" ||
+		strings.Contains(detail, "sim busy") ||
+		strings.Contains(detail, "busy") ||
+		strings.Contains(detail, "temporarily not allowed"):
+		return RecoveryClassSIMBusy
+	default:
+		return RecoveryClassATError
+	}
+}
+
+func explicitStatusTextRecoveryClass(text string) RecoveryClass {
+	if class := StatusStringRecoveryClass(text); class != RecoveryClassNone {
+		return class
+	}
+	for _, prefix := range []string{"sw=", "status=", "sw:", "status:", "sw ", "status "} {
+		search := text
+		for {
+			i := strings.Index(search, prefix)
+			if i < 0 {
+				break
+			}
+			rest := strings.TrimSpace(search[i+len(prefix):])
+			rest = strings.TrimPrefix(rest, "0x")
+			if len(rest) >= 4 && looksHex(rest[:4]) && (len(rest) == 4 || !isHexASCII(rest[4])) {
+				if class := StatusStringRecoveryClass(rest[:4]); class != RecoveryClassNone {
+					return class
+				}
+			}
+			search = search[i+len(prefix):]
 		}
 	}
 	return RecoveryClassNone
+}
+
+func statusTextRecoveryClass(text string) RecoveryClass {
+	if class := explicitStatusTextRecoveryClass(text); class != RecoveryClassNone {
+		return class
+	}
+	if !hasAPDUStatusContext(text) {
+		return RecoveryClassNone
+	}
+	start := -1
+	for i := 0; i <= len(text); i++ {
+		var r byte
+		if i < len(text) {
+			r = text[i]
+		}
+		if i < len(text) && isHexASCII(r) {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 {
+			token := text[start:i]
+			if start >= 2 && text[start-2:start] == "0x" {
+				if class := StatusStringRecoveryClass(token); class != RecoveryClassNone {
+					return class
+				}
+			} else if len(token) == 4 && !isPortNumberToken(text, start) {
+				if class := StatusStringRecoveryClass(token); class != RecoveryClassNone {
+					return class
+				}
+			}
+			start = -1
+		}
+	}
+	return RecoveryClassNone
+}
+
+func hasAPDUStatusContext(text string) bool {
+	for _, kw := range []string{"sw", "status", "apdu", "crsm", "csim", "cgla", "select", "read binary", "read record", "authenticate"} {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPortNumberToken(text string, start int) bool {
+	if start > 0 && text[start-1] == ':' {
+		return true
+	}
+	if start >= 5 && text[start-5:start] == "port " {
+		return true
+	}
+	return false
+}
+
+func isHexASCII(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 func apduLeFromSW2(sw2 byte) int {

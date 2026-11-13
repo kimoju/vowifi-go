@@ -33,11 +33,13 @@ type WireRegisterTransport struct {
 	TLSConfig             *tls.Config
 }
 
+const sipUDPMaxPayloadSize = 1300
+
 func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg RegisterMessage) (RegisterResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	network := sipNetworkForRequest(t.Network, msg.URI)
+	network, explicitURI := sipNetworkForRequestWithHeaders(t.Network, msg.URI, msg.Headers)
 	targets, err := sipTargetsForRequest(ctx, t.Resolver, network, t.ServerAddr, msg.URI)
 	if err != nil {
 		return RegisterResponse{}, err
@@ -48,21 +50,36 @@ func (t WireRegisterTransport) RoundTripRegister(ctx context.Context, msg Regist
 	}
 	var lastErr error
 	redirects := 0
+	targetNetworks := make(map[string]string)
 	for idx := 0; idx < len(targets); idx++ {
 		target := targets[idx]
+		reqMsg := cloneRegisterMessage(msg)
+		if idx > 0 || redirects > 0 {
+			refreshHeaderViaBranch(reqMsg.Headers)
+		}
+		targetNet := network
+		targetExplicit := explicitURI
+		if override, ok := targetNetworks[target]; ok && override != "" {
+			targetNet = applyNetworkFamilySuffix(override, network)
+			targetExplicit = true
+		}
 		var resp RegisterResponse
 		var err error
 		switch {
-		case isSIPUDPNetwork(network):
-			resp, err = t.roundTripUDP(ctx, network, target, timeout, msg)
-		case isSIPStreamNetwork(network):
-			resp, err = t.roundTripTCP(ctx, network, target, timeout, msg)
+		case isSIPUDPNetwork(targetNet):
+			resp, err = t.roundTripUDP(ctx, targetNet, targetExplicit, target, timeout, reqMsg)
+		case isSIPStreamNetwork(targetNet):
+			resp, err = t.roundTripTCP(ctx, targetNet, target, timeout, reqMsg)
 		default:
-			return RegisterResponse{}, fmt.Errorf("unsupported SIP register network %q", network)
+			return RegisterResponse{}, fmt.Errorf("unsupported SIP register network %q", targetNet)
 		}
 		if err == nil {
 			if redirects < maxSIPRedirectTargets && sipRedirectStatus(resp.StatusCode) {
-				if nextTargets, nextIndex, ok := sipTargetsWithRedirects(targets, idx, sipRedirectTargets(resp)); ok {
+				redirectTargets, redirectTransports := sipRedirectTargetsWithTransports(resp)
+				if nextTargets, nextIndex, ok := sipTargetsWithRedirects(targets, idx, redirectTargets); ok {
+					for k, v := range redirectTransports {
+						targetNetworks[k] = v
+					}
 					targets = nextTargets
 					idx = nextIndex - 1
 					redirects++
@@ -105,15 +122,85 @@ func sipTargetsForRequest(ctx context.Context, resolver SIPServerResolver, netwo
 }
 
 func sipNetworkForRequest(network, uri string) string {
-	network = normalizeSIPNetwork(network)
-	if network != "" {
-		return network
+	resolved, _ := sipNetworkForRequestWithHeaders(network, uri, nil)
+	return resolved
+}
+
+func sipNetworkForRequestWithHeaders(network, uri string, headers map[string]string) (string, bool) {
+	return sipNetworkForMethodWithHeaders("", network, uri, headers)
+}
+
+func sipNetworkForMethodWithHeaders(method, network, uri string, headers map[string]string) (string, bool) {
+	configured := normalizeSIPNetwork(network)
+	if strings.EqualFold(strings.TrimSpace(method), "CANCEL") || strings.EqualFold(strings.TrimSpace(method), "ACK") {
+		if viaProto := sipViaTransport(firstHeaderValue(headers, "Via")); viaProto != "" {
+			switch strings.ToUpper(viaProto) {
+			case "TCP":
+				if configured == "" || isSIPUDPNetwork(configured) {
+					return applyNetworkFamilySuffix("tcp", configured), true
+				}
+			case "TLS":
+				if configured == "" || isSIPUDPNetwork(configured) {
+					return applyNetworkFamilySuffix("tls", configured), true
+				}
+			case "UDP":
+				if configured == "" {
+					return "udp", true
+				}
+			}
+		}
 	}
-	endpoint, err := parseSIPURIEndpoint(uri)
-	if err == nil && endpoint.Secure {
-		return "tls"
+	uriTransport := ""
+	if route := firstHeaderValue(headers, "Route"); route != "" {
+		if routes := splitSIPHeaderValues(route); len(routes) > 0 {
+			if ep, err := parseSIPURIEndpoint(routes[0]); err == nil {
+				if ep.Secure {
+					uriTransport = "tls"
+				} else if ep.Transport != "" {
+					uriTransport = ep.Transport
+				}
+			}
+		}
 	}
-	return "udp"
+	if uriTransport == "" {
+		if ep, err := parseSIPURIEndpoint(uri); err == nil {
+			if ep.Secure {
+				uriTransport = "tls"
+			} else if ep.Transport != "" {
+				uriTransport = ep.Transport
+			}
+		}
+	}
+	if configured == "" {
+		if uriTransport != "" {
+			return uriTransport, true
+		}
+		return "udp", false
+	}
+	if isSIPUDPNetwork(configured) {
+		if uriTransport == "tcp" || uriTransport == "tls" {
+			return applyNetworkFamilySuffix(uriTransport, configured), true
+		}
+		return configured, uriTransport == "udp"
+	}
+	return configured, true
+}
+
+func applyNetworkFamilySuffix(proto, current string) string {
+	proto = strings.ToLower(strings.TrimSpace(proto))
+	current = strings.ToLower(strings.TrimSpace(current))
+	switch {
+	case strings.HasSuffix(current, "4"):
+		return proto + "4"
+	case strings.HasSuffix(current, "6"):
+		return proto + "6"
+	default:
+		return proto
+	}
+}
+
+func sipTCPFallbackNetwork(network string) string {
+	return applyNetworkFamilySuffix("tcp", network)
 }
 
 func normalizeSIPNetwork(network string) string {
@@ -199,6 +286,13 @@ func dialSIPConn(ctx context.Context, network, target, localAddr string, timeout
 				return nil, err
 			}
 			dialer.LocalAddr = addr
+			dialer.Control = func(_, _ string, c syscall.RawConn) error {
+				var sockErr error
+				_ = c.Control(func(fd uintptr) {
+					sockErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				})
+				return sockErr
+			}
 		}
 	}
 	if isSIPTLSNetwork(network) {
@@ -263,7 +357,7 @@ func firstNonEmptySIPString(values ...string) string {
 	return ""
 }
 
-func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target string, timeout time.Duration, msg RegisterMessage) (RegisterResponse, error) {
+func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network string, explicitUDP bool, target string, timeout time.Duration, msg RegisterMessage) (RegisterResponse, error) {
 	conn, err := dialSIPConn(ctx, network, target, t.LocalAddr, timeout, nil, "")
 	if err != nil {
 		return RegisterResponse{}, err
@@ -282,6 +376,14 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 	wire, err := buildSIPRequestWire(attempt, "UDP", conn.LocalAddr())
 	if err != nil {
 		return RegisterResponse{}, err
+	}
+	if !explicitUDP && len(wire) > sipUDPMaxPayloadSize {
+		tcpMsg := cloneRegisterMessage(msg)
+		deleteSIPHeader(tcpMsg.Headers, "Via")
+		resp, tcpErr := t.roundTripTCP(ctx, sipTCPFallbackNetwork(network), target, timeout, tcpMsg)
+		if tcpErr == nil || !errors.Is(tcpErr, syscall.ECONNREFUSED) {
+			return resp, tcpErr
+		}
 	}
 	if _, err := conn.Write(wire); err != nil {
 		return RegisterResponse{}, err
@@ -317,6 +419,14 @@ func (t WireRegisterTransport) roundTripUDP(ctx context.Context, network, target
 				continue
 			}
 			drainSIPUDPFinalResponses(ctx, conn, attempt, sipFinalResponseDrainDuration(attempt.Method, t.FinalResponseDrain))
+			if resp.StatusCode == 513 && !explicitUDP {
+				tcpMsg := cloneRegisterMessage(msg)
+				refreshHeaderViaBranch(tcpMsg.Headers)
+				if via := firstHeaderValue(tcpMsg.Headers, "Via"); via != "" {
+					setSIPHeader(tcpMsg.Headers, "Via", rewriteSIPViaTransport(via, "TCP"))
+				}
+				return t.roundTripTCP(ctx, sipTCPFallbackNetwork(network), target, timeout, tcpMsg)
+			}
 			return resp, nil
 		}
 		if ctx.Err() != nil {
@@ -380,20 +490,42 @@ func (t WireRegisterTransport) roundTripTCP(ctx context.Context, network, target
 	}
 }
 
+func sanitizeSIPHeaderValue(value string) string {
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\n", " ")
+	return strings.TrimSpace(value)
+}
+
 func buildSIPRequestWire(msg SIPRequestMessage, transport string, localAddr net.Addr) ([]byte, error) {
 	method := strings.ToUpper(strings.TrimSpace(msg.Method))
 	if method == "" {
 		return nil, errors.New("SIP method is empty")
 	}
+	if strings.ContainsAny(method, "\r\n \t") {
+		return nil, fmt.Errorf("%w: invalid SIP method", ErrInvalidSIPMessage)
+	}
 	uri := strings.TrimSpace(msg.URI)
 	if uri == "" {
 		return nil, errors.New("SIP request URI is empty")
 	}
+	if strings.ContainsAny(uri, "\r\n") {
+		return nil, fmt.Errorf("%w: invalid SIP request URI", ErrInvalidSIPMessage)
+	}
 	headers := make(map[string]string, len(msg.Headers)+4)
 	for k, v := range msg.Headers {
-		if strings.TrimSpace(k) != "" {
-			headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		rawKey := strings.TrimSpace(k)
+		if rawKey == "" {
+			continue
 		}
+		if strings.ContainsAny(rawKey, "\r\n:") {
+			return nil, fmt.Errorf("%w: invalid SIP header name %q", ErrInvalidSIPMessage, rawKey)
+		}
+		canonical := canonicalHeaderName(rawKey)
+		cleanVal := sanitizeSIPHeaderValue(v)
+		if cleanVal == "" && !strings.EqualFold(canonical, "Content-Length") {
+			continue
+		}
+		headers[canonical] = cleanVal
 	}
 	if firstHeaderValue(headers, "Via") == "" {
 		headers["Via"] = buildViaHeader(transport, localAddr)
@@ -422,7 +554,7 @@ func ensureSIPRequestVia(msg *SIPRequestMessage, transport string, localAddr net
 	viaKey := ""
 	viaValue := ""
 	for key, value := range msg.Headers {
-		if strings.EqualFold(key, "Via") {
+		if strings.EqualFold(key, "Via") || strings.EqualFold(canonicalHeaderName(key), "Via") {
 			viaKey = key
 			viaValue = strings.TrimSpace(value)
 			break
@@ -432,9 +564,152 @@ func ensureSIPRequestVia(msg *SIPRequestMessage, transport string, localAddr net
 		msg.Headers["Via"] = buildViaHeader(transport, localAddr)
 		return
 	}
-	if sipViaBranch(viaValue) == "" {
-		msg.Headers[viaKey] = strings.TrimRight(viaValue, " \t;") + ";branch=" + newBranch()
+	if viaKey != "Via" {
+		delete(msg.Headers, viaKey)
 	}
+	updated := viaValue
+	if strings.TrimSpace(transport) != "" {
+		updated = rewriteSIPViaTransport(updated, transport)
+	}
+	if localAddr != nil {
+		updated = rewriteZeroViaSentBy(updated, localAddr)
+	}
+	if sipViaBranch(updated) == "" {
+		updated = replaceSIPViaBranchValue(updated, newBranch())
+	}
+	msg.Headers["Via"] = updated
+}
+
+func rewriteZeroViaSentBy(via string, localAddr net.Addr) string {
+	values := splitSIPHeaderValues(strings.TrimSpace(via))
+	if len(values) == 0 {
+		return via
+	}
+	params := splitSIPHeaderParams(values[0])
+	if len(params) == 0 {
+		return via
+	}
+	fields := strings.Fields(params[0])
+	if len(fields) >= 2 && (fields[1] == "0.0.0.0" || fields[1] == "0.0.0.0:0" || fields[1] == "[::]" || fields[1] == "[::]:0") {
+		if sentBy := viaSentByFromAddr(localAddr); sentBy != "" && sentBy != "0.0.0.0" {
+			fields[1] = sentBy
+			params[0] = strings.Join(fields, " ")
+			values[0] = strings.Join(params, ";")
+			return strings.Join(values, ", ")
+		}
+	}
+	return via
+}
+
+func viaSentByFromAddr(localAddr net.Addr) string {
+	if localAddr == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(localAddr.String())
+	if raw == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(raw)
+	if err != nil {
+		return raw
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return ""
+	}
+	if port == "" || port == "0" {
+		if strings.Contains(host, ":") {
+			return "[" + host + "]"
+		}
+		return host
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func refreshHeaderViaBranch(headers map[string]string) {
+	if headers == nil {
+		return
+	}
+	if via := firstHeaderValue(headers, "Via"); via != "" {
+		setSIPHeader(headers, "Via", replaceSIPViaBranchValue(via, newBranch()))
+	}
+}
+
+func replaceSIPViaBranchValue(via, branch string) string {
+	via = strings.TrimSpace(via)
+	if via == "" {
+		return ""
+	}
+	values := splitSIPHeaderValues(via)
+	if len(values) == 0 {
+		return via
+	}
+	params := splitSIPHeaderParams(values[0])
+	if len(params) == 0 {
+		return via
+	}
+	out := make([]string, 0, len(params)+1)
+	out = append(out, params[0])
+	replaced := false
+	for _, p := range params[1:] {
+		k, _, ok := strings.Cut(strings.TrimSpace(p), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(k), "branch") {
+			if !replaced {
+				out = append(out, "branch="+branch)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, strings.TrimSpace(p))
+	}
+	if !replaced {
+		out = append(out, "branch="+branch)
+	}
+	values[0] = strings.Join(out, ";")
+	return strings.Join(values, ", ")
+}
+
+func rewriteSIPViaTransport(via, transport string) string {
+	via = strings.TrimSpace(via)
+	transport = strings.ToUpper(strings.TrimSpace(transport))
+	if via == "" || transport == "" {
+		return via
+	}
+	values := splitSIPHeaderValues(via)
+	if len(values) == 0 {
+		return via
+	}
+	params := splitSIPHeaderParams(values[0])
+	if len(params) == 0 {
+		return via
+	}
+	fields := strings.Fields(params[0])
+	if len(fields) >= 2 && strings.HasPrefix(strings.ToUpper(fields[0]), "SIP/2.0/") {
+		fields[0] = "SIP/2.0/" + transport
+		params[0] = strings.Join(fields, " ")
+		values[0] = strings.Join(params, ";")
+		return strings.Join(values, ", ")
+	}
+	return via
+}
+
+func sipViaTransport(via string) string {
+	values := splitSIPHeaderValues(strings.TrimSpace(via))
+	if len(values) == 0 {
+		return ""
+	}
+	params := splitSIPHeaderParams(values[0])
+	if len(params) == 0 {
+		return ""
+	}
+	fields := strings.Fields(params[0])
+	if len(fields) == 0 {
+		return ""
+	}
+	prefix := strings.ToUpper(strings.TrimSpace(fields[0]))
+	if strings.HasPrefix(prefix, "SIP/2.0/") {
+		return strings.TrimSpace(prefix[len("SIP/2.0/"):])
+	}
+	return ""
 }
 
 func writeOrderedHeaders(out *bytes.Buffer, headers map[string]string) {
@@ -754,9 +1029,15 @@ func sipRedirectStatus(code int) bool {
 }
 
 func sipRedirectTargets(resp SIPResponse) []string {
+	targets, _ := sipRedirectTargetsWithTransports(resp)
+	return targets
+}
+
+func sipRedirectTargetsWithTransports(resp SIPResponse) ([]string, map[string]string) {
 	type redirectContact struct {
-		target string
-		q      float64
+		target    string
+		transport string
+		q         float64
 	}
 
 	var contacts []redirectContact
@@ -768,9 +1049,14 @@ func sipRedirectTargets(resp SIPResponse) []string {
 		if uri == "" || uri == "*" {
 			continue
 		}
-		target, err := sipURIAddr(uri)
+		ep, err := parseSIPURIEndpoint(uri)
 		if err != nil {
 			continue
+		}
+		target := ep.addr()
+		transport := ep.Transport
+		if ep.Secure {
+			transport = "tls"
 		}
 		q := sipContactQ(contact)
 		duplicate := -1
@@ -783,19 +1069,26 @@ func sipRedirectTargets(resp SIPResponse) []string {
 		if duplicate >= 0 {
 			if q > contacts[duplicate].q {
 				contacts[duplicate].q = q
+				if transport != "" {
+					contacts[duplicate].transport = transport
+				}
 			}
 			continue
 		}
-		contacts = append(contacts, redirectContact{target: target, q: q})
+		contacts = append(contacts, redirectContact{target: target, transport: transport, q: q})
 	}
 	sort.SliceStable(contacts, func(i, j int) bool {
 		return contacts[i].q > contacts[j].q
 	})
 	targets := make([]string, 0, len(contacts))
+	transports := make(map[string]string, len(contacts))
 	for _, contact := range contacts {
 		targets = appendSIPTargets(targets, contact.target)
+		if contact.transport != "" {
+			transports[contact.target] = contact.transport
+		}
 	}
-	return targets
+	return targets, transports
 }
 
 func sipContactQ(contact string) float64 {
@@ -998,7 +1291,7 @@ func sipCSeqParts(value string) (int, string, bool) {
 }
 
 func sipResponseViaMatchesRequest(resp RegisterResponse, req SIPRequestMessage) bool {
-	respVia := firstHeader(resp.Headers, "Via")
+	respVia := firstTopViaHeader(resp.Headers)
 	if respVia == "" {
 		return true
 	}
@@ -1015,10 +1308,15 @@ func sipResponseViaMatchesRequest(resp RegisterResponse, req SIPRequestMessage) 
 }
 
 func sipViaBranch(via string) string {
-	for _, part := range strings.Split(via, ";") {
+	values := splitSIPHeaderValues(strings.TrimSpace(via))
+	if len(values) == 0 {
+		return ""
+	}
+	params := splitSIPHeaderParams(values[0])
+	for _, part := range params[1:] {
 		key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if ok && strings.EqualFold(strings.TrimSpace(key), "branch") {
-			return strings.TrimSpace(value)
+			return strings.TrimSpace(unquote(strings.TrimSpace(value)))
 		}
 	}
 	return ""
@@ -1062,23 +1360,42 @@ func BuildSIPResponseWire(req SIPIncomingRequest, statusCode int, reason string,
 	if !validSIPStatusCode(statusCode) {
 		return nil, fmt.Errorf("%w: invalid response status", ErrInvalidSIPMessage)
 	}
-	reason = strings.TrimSpace(reason)
+	reason = sanitizeSIPHeaderValue(reason)
 	if reason == "" {
 		reason = defaultSIPReason(statusCode)
 	}
-	outHeaders := make(map[string][]string, len(headers)+6)
+	outHeaders := make(map[string][]string, len(headers)+7)
 	copyIncomingHeader(outHeaders, req.Headers, "Via")
+	if statusCode >= 180 && statusCode < 300 &&
+		(strings.EqualFold(strings.TrimSpace(req.Method), "INVITE") || strings.EqualFold(strings.TrimSpace(req.Method), "SUBSCRIBE")) {
+		copyIncomingHeader(outHeaders, req.Headers, "Record-Route")
+	}
 	copyIncomingHeader(outHeaders, req.Headers, "To")
 	copyIncomingHeader(outHeaders, req.Headers, "From")
 	copyIncomingHeader(outHeaders, req.Headers, "Call-ID")
 	copyIncomingHeader(outHeaders, req.Headers, "CSeq")
+	replacedRecordRoute := false
 	for key, value := range headers {
 		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		if key == "" || value == "" || strings.EqualFold(key, "Content-Length") {
+		if key == "" || strings.EqualFold(key, "Content-Length") || strings.EqualFold(canonicalHeaderName(key), "Content-Length") {
+			continue
+		}
+		if strings.ContainsAny(key, "\r\n:") {
+			return nil, fmt.Errorf("%w: invalid response header name %q", ErrInvalidSIPMessage, key)
+		}
+		value = sanitizeSIPHeaderValue(value)
+		if value == "" {
 			continue
 		}
 		canonical := canonicalHeaderName(key)
+		if strings.EqualFold(canonical, "Record-Route") && !replacedRecordRoute {
+			delete(outHeaders, "Record-Route")
+			replacedRecordRoute = true
+		}
+		if strings.EqualFold(canonical, "To") {
+			outHeaders["To"] = []string{value}
+			continue
+		}
 		outHeaders[canonical] = append(outHeaders[canonical], value)
 	}
 	outHeaders["Content-Length"] = []string{strconv.Itoa(len(body))}
@@ -1099,11 +1416,18 @@ func ReadSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 }
 
 func splitSIPMessage(raw []byte) (string, []byte, error) {
-	if idx := bytes.Index(raw, []byte("\r\n\r\n")); idx >= 0 {
-		return string(raw[:idx]), raw[idx+4:], nil
+	bestIdx := -1
+	bestSepLen := 0
+	for _, sep := range []string{"\r\n\r\n", "\r\n\n", "\n\r\n", "\n\n"} {
+		if idx := bytes.Index(raw, []byte(sep)); idx >= 0 {
+			if bestIdx < 0 || idx < bestIdx || (idx == bestIdx && len(sep) > bestSepLen) {
+				bestIdx = idx
+				bestSepLen = len(sep)
+			}
+		}
 	}
-	if idx := bytes.Index(raw, []byte("\n\n")); idx >= 0 {
-		return string(raw[:idx]), raw[idx+2:], nil
+	if bestIdx >= 0 {
+		return string(raw[:bestIdx]), raw[bestIdx+bestSepLen:], nil
 	}
 	return "", nil, fmt.Errorf("%w: missing header terminator", ErrInvalidSIPMessage)
 }
@@ -1251,19 +1575,21 @@ const (
 
 func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 	var raw []byte
+	sawStartLine := false
 	for {
 		line, err := readBoundedSIPLine(r, maxSIPStreamHeaderBytes-len(raw))
 		if err != nil {
 			return nil, err
 		}
-		if len(raw) == 0 && isSIPBlankLine(line) {
+		if !sawStartLine && isSIPBlankLine(line) {
 			continue
 		}
+		sawStartLine = true
 		raw = append(raw, line...)
 		if len(raw) > maxSIPStreamHeaderBytes {
 			return nil, fmt.Errorf("%w: SIP header exceeds %d bytes", ErrInvalidSIPMessage, maxSIPStreamHeaderBytes)
 		}
-		if bytes.HasSuffix(raw, []byte("\r\n\r\n")) || bytes.HasSuffix(raw, []byte("\n\n")) {
+		if isSIPBlankLine(line) {
 			break
 		}
 	}
@@ -1271,7 +1597,11 @@ func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	parsed, err := parseSIPHeaders(splitHeaderLines(headers)[1:])
+	headerLines := splitHeaderLines(headers)
+	if len(headerLines) == 0 {
+		return nil, ErrInvalidSIPMessage
+	}
+	parsed, err := parseSIPHeaders(headerLines[1:])
 	if err != nil {
 		return nil, err
 	}
@@ -1279,7 +1609,10 @@ func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if ok && n > 0 {
+	if !ok {
+		return nil, fmt.Errorf("%w: missing Content-Length on stream transport", ErrInvalidSIPMessage)
+	}
+	if n > 0 {
 		if n > maxSIPStreamBodyBytes {
 			return nil, fmt.Errorf("%w: content length %d exceeds maximum %d", ErrInvalidSIPMessage, n, maxSIPStreamBodyBytes)
 		}
@@ -1556,6 +1889,16 @@ func canonicalHeaderName(name string) string {
 		return "To"
 	case "v":
 		return "Via"
+	case "y":
+		return "Identity"
+	case "identity":
+		return "Identity"
+	case "cseq":
+		return "CSeq"
+	case "rack":
+		return "RAck"
+	case "rseq":
+		return "RSeq"
 	case "www-authenticate":
 		return "WWW-Authenticate"
 	case "proxy-authenticate":
@@ -1589,8 +1932,9 @@ func canonicalHeaderName(name string) string {
 }
 
 func firstHeaderValue(headers map[string]string, name string) string {
+	want := canonicalHeaderName(name)
 	for key, value := range headers {
-		if strings.EqualFold(key, name) {
+		if strings.EqualFold(key, name) || strings.EqualFold(canonicalHeaderName(key), want) {
 			return strings.TrimSpace(value)
 		}
 	}
@@ -1607,12 +1951,9 @@ func rewriteSIPURIPort(uri string, port int) string {
 	}
 	angleWrapped := strings.HasPrefix(trimmed, "<") && strings.HasSuffix(trimmed, ">")
 	core := strings.Trim(trimmed, "<>")
-	params := ""
-	if idx := indexOutsideBrackets(core, ';'); idx >= 0 {
-		params = core[idx:]
-		core = core[:idx]
-	} else if idx := indexOutsideBrackets(core, '?'); idx >= 0 {
-		params = core[idx:]
+	query := ""
+	if idx := indexOutsideBrackets(core, '?'); idx >= 0 {
+		query = core[idx:]
 		core = core[:idx]
 	}
 	colon := strings.IndexByte(core, ':')
@@ -1626,6 +1967,11 @@ func rewriteSIPURIPort(uri string, port int) string {
 		userPrefix = rest[:at+1]
 		rest = rest[at+1:]
 	}
+	uriParams := ""
+	if idx := indexOutsideBrackets(rest, ';'); idx >= 0 {
+		uriParams = rest[idx:]
+		rest = rest[:idx]
+	}
 	host := parseSIPHostOnly(rest)
 	if host == "" {
 		return trimmed
@@ -1634,7 +1980,7 @@ func rewriteSIPURIPort(uri string, port int) string {
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		formattedHost = "[" + host + "]"
 	}
-	rebuilt := scheme + userPrefix + formattedHost + ":" + strconv.Itoa(port) + params
+	rebuilt := scheme + userPrefix + formattedHost + ":" + strconv.Itoa(port) + uriParams + query
 	if angleWrapped {
 		return "<" + rebuilt + ">"
 	}
@@ -1652,12 +1998,9 @@ func rewriteSIPURIHost(uri string, host string) string {
 	}
 	angleWrapped := strings.HasPrefix(trimmed, "<") && strings.HasSuffix(trimmed, ">")
 	core := strings.Trim(trimmed, "<>")
-	params := ""
-	if idx := indexOutsideBrackets(core, ';'); idx >= 0 {
-		params = core[idx:]
-		core = core[:idx]
-	} else if idx := indexOutsideBrackets(core, '?'); idx >= 0 {
-		params = core[idx:]
+	query := ""
+	if idx := indexOutsideBrackets(core, '?'); idx >= 0 {
+		query = core[idx:]
 		core = core[:idx]
 	}
 	colon := strings.IndexByte(core, ':')
@@ -1671,12 +2014,17 @@ func rewriteSIPURIHost(uri string, host string) string {
 		userPrefix = rest[:at+1]
 		rest = rest[at+1:]
 	}
+	uriParams := ""
+	if idx := indexOutsideBrackets(rest, ';'); idx >= 0 {
+		uriParams = rest[idx:]
+		rest = rest[:idx]
+	}
 	_, portSuffix := splitSIPHostAndPortSuffix(rest)
 	formattedHost := host
 	if strings.Contains(host, ":") {
 		formattedHost = "[" + host + "]"
 	}
-	rebuilt := scheme + userPrefix + formattedHost + portSuffix + params
+	rebuilt := scheme + userPrefix + formattedHost + portSuffix + uriParams + query
 	if angleWrapped {
 		return "<" + rebuilt + ">"
 	}

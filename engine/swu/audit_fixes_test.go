@@ -149,7 +149,7 @@ func TestPacketSessionDropsTFCDummyRetainsPrevInboundAndSendsChildDelete(t *test
 	if err != nil {
 		t.Fatalf("Seal(dummy) error = %v", err)
 	}
-	realIPv4 := []byte{0x45, 0x00, 0x00, 0x14, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2}
+	realIPv4 := testValidIPv4Packet(net.IPv4(10, 0, 0, 1), net.IPv4(10, 0, 0, 2), nil)
 	realESP, err := peerOutboundOld.Seal(esp.NextHeaderIPv4, realIPv4, esp.SealOptions{Random: rand.Reader})
 	if err != nil {
 		t.Fatalf("Seal(real) error = %v", err)

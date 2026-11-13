@@ -129,8 +129,8 @@ func TestRunIKESAInitDerivesKeys(t *testing.T) {
 	if !bytes.Equal(res.SKEYSEED, wantSKEYSEED) {
 		t.Fatalf("skeyseed=%x want %x", res.SKEYSEED, wantSKEYSEED)
 	}
-	if got := countPayloadType(fake.request.Payloads, PayloadNotify); got != 3 {
-		t.Fatalf("request notify payloads=%d, want NAT-D source/dest + MOBIKE", got)
+	if got := countPayloadType(fake.request.Payloads, PayloadNotify); got != 5 {
+		t.Fatalf("request notify payloads=%d, want NAT-D source/dest + MOBIKE + Fragmentation + SigHash", got)
 	}
 }
 

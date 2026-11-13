@@ -843,8 +843,11 @@ func TestHandleIncomingSMSAcceptsEmptyControlUDH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleIncomingSMS() error = %v", err)
 	}
-	if len(dispatch.events) != 0 {
-		t.Fatalf("events=%+v, want none for empty control-only SMS", dispatch.events)
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%+v, want MWI event without SMSReceived", dispatch.events)
+	}
+	if mwi, ok := dispatch.events[0].(MessageWaitingEvent); !ok || !mwi.Active || mwi.Count != 2 || mwi.MessageType != "voicemail" {
+		t.Fatalf("event=%+v, want active voicemail MessageWaitingEvent", dispatch.events[0])
 	}
 
 	err = svc.HandleIncomingSMS(context.Background(), IncomingSMS{Sender: "+10086"})
@@ -899,21 +902,8 @@ func TestHandleIMSMessageUnwrapsCPIM3GPPSMSAndWrapsAck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleIMSMessage() error = %v", err)
 	}
-	if result.StatusCode != 200 || result.ReplyContentType != IMSCPIMContentType || result.Incoming == nil || result.Incoming.Content != "hello" {
+	if result.StatusCode != 200 || result.ReplyContentType != IMS3GPPSMSContentType || string(result.ReplyBody) != string(BuildSMSRPAck(0x33)) || result.Incoming == nil || result.Incoming.Content != "hello" {
 		t.Fatalf("result=%+v", result)
-	}
-	reply, err := ParseIMSCPIMMessage(result.ReplyBody)
-	if err != nil {
-		t.Fatalf("ParseIMSCPIMMessage(reply) error = %v body=%x", err, result.ReplyBody)
-	}
-	if reply.ContentType != IMS3GPPSMSContentType || string(reply.Body) != string(BuildSMSRPAck(0x33)) {
-		t.Fatalf("reply=%+v body=%x", reply, reply.Body)
-	}
-	if got := imsHeaderValue(reply.Headers, "From"); got != "<sip:user@ims.example>" {
-		t.Fatalf("reply From=%q", got)
-	}
-	if got := imsHeaderValue(reply.Headers, "To"); got != "<sip:smsc@ims.example>" {
-		t.Fatalf("reply To=%q", got)
 	}
 	if len(dispatch.events) != 1 {
 		t.Fatalf("events=%d", len(dispatch.events))
@@ -939,7 +929,7 @@ func TestHandleIMSMessageRejectsMalformedCPIM(t *testing.T) {
 func TestHandleIMSMessageAcceptsAlphanumericSender(t *testing.T) {
 	dispatch := &fakeDispatcher{}
 	svc := NewService("dev-1", "310280233641503", nil, dispatch)
-	tpdu := mustHex(t, "0006D0C7F7FBCC2E0300006270502143650005E8329BFD06")
+	tpdu := mustHex(t, "000BD0C7F7FBCC2E0300006270502143650005E8329BFD06")
 
 	result, err := svc.HandleIMSMessage(context.Background(), IMSMessageRequest{
 		FromURI:     "sip:smsc@ims.example",
@@ -1061,8 +1051,11 @@ func TestHandleIMSMessageAcksEmptyMessageIndicationSMS(t *testing.T) {
 	if len(header.SpecialMessageIndications) != 1 || header.SpecialMessageIndications[0].MessageType != "voicemail" || header.SpecialMessageIndications[0].Count != 2 {
 		t.Fatalf("special indications=%+v", header.SpecialMessageIndications)
 	}
-	if len(dispatch.events) != 0 {
-		t.Fatalf("events=%+v, want none for empty control-only SMS", dispatch.events)
+	if len(dispatch.events) != 1 {
+		t.Fatalf("events=%+v, want MWI event without SMSReceived", dispatch.events)
+	}
+	if mwi, ok := dispatch.events[0].(MessageWaitingEvent); !ok || !mwi.Active || mwi.Count != 2 || mwi.MessageType != "voicemail" {
+		t.Fatalf("event=%+v, want active voicemail MessageWaitingEvent", dispatch.events[0])
 	}
 }
 
@@ -1207,7 +1200,7 @@ func TestHandleIMSMessageMarksStatusReportFailureText(t *testing.T) {
 	if result.StatusCode != 200 || result.DeliveryReport == nil {
 		t.Fatalf("result=%+v", result)
 	}
-	if store.reportCallID != "status-report-failed" || store.reportRPMR != 7 || store.reportState != "failed" || store.reportRPCause != 0x46 {
+	if store.reportCallID != "status-report-failed" || store.reportRPMR != 7 || store.reportState != "failed" || store.reportRPCause != 0 {
 		t.Fatalf("store=%+v", store)
 	}
 	if !strings.Contains(store.reportErrText, "validity period expired") {

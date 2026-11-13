@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kimoju/vowifi-go/engine/swu/ikev2"
@@ -207,31 +208,49 @@ func buildSOCKS5UDPHeader(host string, port uint16) ([]byte, net.IP, error) {
 }
 
 func decapsulateSOCKS5UDPDatagram(datagram []byte) (payload []byte, ok bool) {
+	_, _, _, payload, ok = decapsulateSOCKS5UDPDatagramFrom(datagram)
+	return payload, ok
+}
+
+func decapsulateSOCKS5UDPDatagramFrom(datagram []byte) (srcHost string, srcIP net.IP, srcPort uint16, payload []byte, ok bool) {
 	if len(datagram) < 4 {
-		return nil, false
+		return "", nil, 0, nil, false
 	}
 	// RSV must be 0x0000; FRAG != 0 must be silently discarded per RFC 1928 §7.
 	if datagram[0] != 0x00 || datagram[1] != 0x00 || datagram[2] != 0x00 {
-		return nil, false
+		return "", nil, 0, nil, false
 	}
 	var hdrLen int
 	switch datagram[3] {
 	case socks5ATYPIPv4:
 		hdrLen = 4 + net.IPv4len + 2
+		if len(datagram) < hdrLen {
+			return "", nil, 0, nil, false
+		}
+		srcIP = net.IPv4(datagram[4], datagram[5], datagram[6], datagram[7])
+		srcPort = binary.BigEndian.Uint16(datagram[8:10])
 	case socks5ATYPIPv6:
 		hdrLen = 4 + net.IPv6len + 2
+		if len(datagram) < hdrLen {
+			return "", nil, 0, nil, false
+		}
+		srcIP = append(net.IP(nil), datagram[4:20]...)
+		srcPort = binary.BigEndian.Uint16(datagram[20:22])
 	case socks5ATYPDomain:
 		if len(datagram) < 5 {
-			return nil, false
+			return "", nil, 0, nil, false
 		}
-		hdrLen = 4 + 1 + int(datagram[4]) + 2
+		dlen := int(datagram[4])
+		hdrLen = 4 + 1 + dlen + 2
+		if dlen == 0 || len(datagram) < hdrLen {
+			return "", nil, 0, nil, false
+		}
+		srcHost = strings.Trim(strings.TrimSpace(string(datagram[5:5+dlen])), "[]")
+		srcPort = binary.BigEndian.Uint16(datagram[5+dlen : 7+dlen])
 	default:
-		return nil, false
+		return "", nil, 0, nil, false
 	}
-	if len(datagram) < hdrLen {
-		return nil, false
-	}
-	return datagram[hdrLen:], true
+	return srcHost, srcIP, srcPort, datagram[hdrLen:], true
 }
 
 type socks5UDPConn struct {
@@ -241,10 +260,11 @@ type socks5UDPConn struct {
 	proxyIP   net.IP
 	target    socks5TargetSpec
 
-	closeOnce sync.Once
-	closedCh  chan struct{}
-	mu        sync.Mutex
-	ctrlErr   error
+	closeOnce      sync.Once
+	closedCh       chan struct{}
+	mu             sync.Mutex
+	ctrlErr        error
+	pinnedRemoteIP net.IP
 }
 
 var _ net.Conn = (*socks5UDPConn)(nil)
@@ -303,8 +323,13 @@ func dialSOCKS5UDPConn(ctx context.Context, proxy *ProxyConfig, remoteAddr, loca
 		_ = tcpConn.Close()
 		return nil, err
 	}
-	// Clear handshake deadline so the idle TCP control connection stays alive.
+	// Clear handshake deadline and enable TCP keepalives so dead SOCKS5 proxies
+	// or silent NAT drops are detected promptly.
 	_ = tcpConn.SetDeadline(time.Time{})
+	if kaConn, ok := tcpConn.(*net.TCPConn); ok {
+		_ = kaConn.SetKeepAlive(true)
+		_ = kaConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 
 	udpConn, err := openSOCKS5LocalUDPSocket(tcpConn, relayAddr, localBindIP)
 	if err != nil {
@@ -498,11 +523,7 @@ func (c *socks5UDPConn) monitorControl() {
 		if err != nil {
 			c.mu.Lock()
 			if c.ctrlErr == nil {
-				if errors.Is(err, io.EOF) {
-					c.ctrlErr = fmt.Errorf("%w: socks5 tcp control closed: %w", net.ErrClosed, io.EOF)
-				} else {
-					c.ctrlErr = err
-				}
+				c.ctrlErr = fmt.Errorf("%w: socks5 tcp control closed: %v", net.ErrClosed, err)
 			}
 			c.mu.Unlock()
 			_ = c.Close()
@@ -511,33 +532,79 @@ func (c *socks5UDPConn) monitorControl() {
 	}
 }
 
+func (c *socks5UDPConn) closedError() error {
+	c.mu.Lock()
+	err := c.ctrlErr
+	c.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return net.ErrClosed
+}
+
+func (c *socks5UDPConn) matchesInnerSource(srcHost string, srcIP net.IP, srcPort uint16) bool {
+	if c.target.port != 0 && srcPort != c.target.port {
+		return false
+	}
+	if c.target.ip != nil {
+		if srcIP != nil {
+			return srcIP.Equal(c.target.ip)
+		}
+		if parsed := net.ParseIP(srcHost); parsed != nil {
+			return parsed.Equal(c.target.ip)
+		}
+		return strings.EqualFold(strings.TrimSuffix(srcHost, "."), strings.TrimSuffix(c.target.host, "."))
+	}
+	if srcHost != "" {
+		if parsed := net.ParseIP(srcHost); parsed != nil {
+			srcIP = parsed
+		} else {
+			return strings.EqualFold(strings.TrimSuffix(srcHost, "."), strings.TrimSuffix(c.target.host, "."))
+		}
+	}
+	if srcIP != nil {
+		if srcIP.IsUnspecified() {
+			return false
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.pinnedRemoteIP == nil {
+			c.pinnedRemoteIP = normalizedMOBIKEIP(srcIP)
+			return true
+		}
+		return srcIP.Equal(c.pinnedRemoteIP)
+	}
+	return false
+}
+
 func (c *socks5UDPConn) Write(p []byte) (int, error) {
 	select {
 	case <-c.closedCh:
-		return 0, net.ErrClosed
+		return 0, c.closedError()
 	default:
 	}
 	frame := make([]byte, len(c.target.header)+len(p))
 	copy(frame, c.target.header)
 	copy(frame[len(c.target.header):], p)
 	if _, err := c.udpConn.WriteToUDP(frame, c.relayAddr); err != nil {
+		select {
+		case <-c.closedCh:
+			return 0, c.closedError()
+		default:
+		}
 		return 0, err
 	}
 	return len(p), nil
 }
 
 func (c *socks5UDPConn) Read(p []byte) (int, error) {
-	bufSize := len(p) + 512
-	if bufSize < 2048 {
-		bufSize = 2048
-	}
-	buf := make([]byte, bufSize)
+	buf := make([]byte, 64*1024)
 	for {
 		n, srcAddr, err := c.udpConn.ReadFromUDP(buf)
 		if err != nil {
 			select {
 			case <-c.closedCh:
-				return 0, net.ErrClosed
+				return 0, c.closedError()
 			default:
 			}
 			return 0, err
@@ -550,9 +617,15 @@ func (c *socks5UDPConn) Read(p []byte) (int, error) {
 				continue
 			}
 		}
-		payload, ok := decapsulateSOCKS5UDPDatagram(buf[:n])
+		srcHost, srcIP, srcPort, payload, ok := decapsulateSOCKS5UDPDatagramFrom(buf[:n])
 		if !ok {
 			continue
+		}
+		if !c.matchesInnerSource(srcHost, srcIP, srcPort) {
+			continue
+		}
+		if len(payload) > len(p) {
+			return 0, syscall.EMSGSIZE
 		}
 		copied := copy(p, payload)
 		return copied, nil

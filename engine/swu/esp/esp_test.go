@@ -430,3 +430,187 @@ func newTestSA(t *testing.T, spi uint32, replayWindow uint32) *SA {
 	}
 	return sa
 }
+
+func TestMED02SHA384AndSHA512AndPreMACReplayCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		integ     IntegrityAlgorithm
+		keyLen    int
+		wantICVLn int
+	}{
+		{name: "HMAC-SHA2-384-192", integ: IntegrityHMACSHA2_384_192, keyLen: 48, wantICVLn: 24},
+		{name: "HMAC-SHA2-512-256", integ: IntegrityHMACSHA2_512_256, keyLen: 64, wantICVLn: 32},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child := ikev2.ChildSAResult{
+				LocalSPI:  []byte{0x11, 0x22, 0x33, 0x44},
+				RemoteSPI: []byte{0x11, 0x22, 0x33, 0x44},
+				Keys: ikev2.ChildSAKeys{
+					Profile: ikev2.ESPKeyProfile{
+						EncryptionID: ikev2.ENCR_AES_CBC,
+						IntegrityID:  uint16(tc.integ),
+					},
+					Outbound: ikev2.ESPKeys{
+						EncryptionKey: bytes.Repeat([]byte{0xaa}, 16),
+						IntegrityKey:  bytes.Repeat([]byte{0xbb}, tc.keyLen),
+					},
+					Inbound: ikev2.ESPKeys{
+						EncryptionKey: bytes.Repeat([]byte{0xaa}, 16),
+						IntegrityKey:  bytes.Repeat([]byte{0xbb}, tc.keyLen),
+					},
+				},
+			}
+			outSA, err := NewOutboundSAFromChild(child)
+			if err != nil {
+				t.Fatalf("NewOutboundSAFromChild() error = %v", err)
+			}
+			inSA, err := NewInboundSAFromChild(child)
+			if err != nil {
+				t.Fatalf("NewInboundSAFromChild() error = %v", err)
+			}
+			if outSA.ICVLength != tc.wantICVLn || inSA.ICVLength != tc.wantICVLn {
+				t.Fatalf("ICVLength out=%d in=%d, want %d", outSA.ICVLength, inSA.ICVLength, tc.wantICVLn)
+			}
+			pkt, err := outSA.Seal(NextHeaderIPv4, []byte{0x45, 0x00, 0x00, 0x14}, SealOptions{Sequence: 5})
+			if err != nil {
+				t.Fatalf("Seal() error = %v", err)
+			}
+			res, err := inSA.Open(pkt)
+			if err != nil {
+				t.Fatalf("Open() error = %v", err)
+			}
+			if !bytes.Equal(res.Payload, []byte{0x45, 0x00, 0x00, 0x14}) {
+				t.Fatalf("Payload=%x", res.Payload)
+			}
+			// Replaying seq=5 with a corrupted ICV MUST return ErrReplay BEFORE computing HMAC!
+			replayedGarbageICV := append([]byte(nil), pkt...)
+			replayedGarbageICV[len(replayedGarbageICV)-1] ^= 0xff
+			if _, err := inSA.Open(replayedGarbageICV); !errors.Is(err, ErrReplay) {
+				t.Fatalf("Open(replayed seq with garbage ICV) err=%v, want ErrReplay (pre-MAC replay check)", err)
+			}
+		})
+	}
+}
+
+func TestCRIT03ESN64BitWraparoundCBCAndGCM(t *testing.T) {
+	t.Run("AES-CBC+HMAC ESN wraparound and out-of-order across 2^32", func(t *testing.T) {
+		child := ikev2.ChildSAResult{
+			LocalSPI:  []byte{0xaa, 0xbb, 0xcc, 0xdd},
+			RemoteSPI: []byte{0xaa, 0xbb, 0xcc, 0xdd},
+			Keys: ikev2.ChildSAKeys{
+				Profile: ikev2.ESPKeyProfile{
+					EncryptionID: ikev2.ENCR_AES_CBC,
+					IntegrityID:  ikev2.INTEG_HMAC_SHA2_256_128,
+					ESN:          true,
+				},
+				Outbound: ikev2.ESPKeys{
+					EncryptionKey: bytes.Repeat([]byte{0x12}, 16),
+					IntegrityKey:  bytes.Repeat([]byte{0x34}, 32),
+				},
+				Inbound: ikev2.ESPKeys{
+					EncryptionKey: bytes.Repeat([]byte{0x12}, 16),
+					IntegrityKey:  bytes.Repeat([]byte{0x34}, 32),
+				},
+			},
+		}
+		outSA, err := NewOutboundSAFromChild(child)
+		if err != nil {
+			t.Fatalf("NewOutboundSAFromChild() error = %v", err)
+		}
+		inSA, err := NewInboundSAFromChild(child)
+		if err != nil {
+			t.Fatalf("NewInboundSAFromChild() error = %v", err)
+		}
+		// Advance near 2^32 boundary.
+		pktPreWrap1, err := outSA.Seal(NextHeaderIPv4, []byte{0x01}, SealOptions{Sequence64: 0x00000000fffffffe})
+		if err != nil {
+			t.Fatalf("Seal(0xfffffffe) error = %v", err)
+		}
+		pktPreWrap2, err := outSA.Seal(NextHeaderIPv4, []byte{0x02}, SealOptions{})
+		if err != nil {
+			t.Fatalf("Seal(0xffffffff) error = %v", err)
+		}
+		// Next auto-increment wraps low 32 bits to 0 with SequenceHigh = 1!
+		pktWrap0, err := outSA.Seal(NextHeaderIPv4, []byte{0x03}, SealOptions{})
+		if err != nil {
+			t.Fatalf("Seal(0x100000000) error = %v", err)
+		}
+		if binary.BigEndian.Uint32(pktWrap0[4:8]) != 0 {
+			t.Fatalf("wire seqLow = %x, want 0", binary.BigEndian.Uint32(pktWrap0[4:8]))
+		}
+		// Deliver 0xfffffffe, then 0x100000000, then out-of-order 0xffffffff!
+		res1, err := inSA.Open(pktPreWrap1)
+		if err != nil || res1.Sequence64 != 0xfffffffe {
+			t.Fatalf("Open(0xfffffffe) = (%+v, %v)", res1, err)
+		}
+		resWrap, err := inSA.Open(pktWrap0)
+		if err != nil || resWrap.Sequence64 != 0x100000000 {
+			t.Fatalf("Open(0x100000000) = (%+v, %v)", resWrap, err)
+		}
+		resDelayed, err := inSA.Open(pktPreWrap2)
+		if err != nil || resDelayed.Sequence64 != 0xffffffff {
+			t.Fatalf("Open(delayed 0xffffffff) = (%+v, %v)", resDelayed, err)
+		}
+		if _, err := inSA.Open(pktWrap0); !errors.Is(err, ErrReplay) {
+			t.Fatalf("Open(replayed 0x100000000) err=%v, want ErrReplay", err)
+		}
+		// Non-ESN peer must fail ICV when seqHigh > 0 because seqHigh is part of ESN ICV!
+		nonESN, err := NewSA(SA{
+			SPI:           0xaabbccdd,
+			EncryptionKey: bytes.Repeat([]byte{0x12}, 16),
+			IntegrityKey:  bytes.Repeat([]byte{0x34}, 32),
+			Integrity:     IntegrityHMACSHA2_256_128,
+			ESN:           false,
+		})
+		if err != nil {
+			t.Fatalf("NewSA(nonESN) error = %v", err)
+		}
+		pktWrap1, err := outSA.Seal(NextHeaderIPv4, []byte{0x04}, SealOptions{})
+		if err != nil {
+			t.Fatalf("Seal(0x100000001) error = %v", err)
+		}
+		if _, err := nonESN.Open(pktWrap1); !errors.Is(err, ErrInvalidPacket) {
+			t.Fatalf("nonESN.Open(ESN seqHigh=1) err=%v, want ErrInvalidPacket", err)
+		}
+	})
+
+	t.Run("AES-GCM-16 12-byte ESN AAD wraparound", func(t *testing.T) {
+		key := append(bytes.Repeat([]byte{0x55}, 16), 0x01, 0x02, 0x03, 0x04)
+		child := ikev2.ChildSAResult{
+			LocalSPI:  []byte{0xde, 0xad, 0xca, 0xfe},
+			RemoteSPI: []byte{0xde, 0xad, 0xca, 0xfe},
+			Keys: ikev2.ChildSAKeys{
+				Profile: ikev2.ESPKeyProfile{
+					EncryptionID:        ikev2.ENCR_AES_GCM_16,
+					EncryptionKeyLength: 20,
+					ESN:                 true,
+				},
+				Outbound: ikev2.ESPKeys{EncryptionKey: key},
+				Inbound:  ikev2.ESPKeys{EncryptionKey: key},
+			},
+		}
+		outSA, err := NewOutboundSAFromChild(child)
+		if err != nil {
+			t.Fatalf("NewOutboundSAFromChild() error = %v", err)
+		}
+		inSA, err := NewInboundSAFromChild(child)
+		if err != nil {
+			t.Fatalf("NewInboundSAFromChild() error = %v", err)
+		}
+		p1, err := outSA.Seal(NextHeaderIPv6, []byte{0x60, 0x00, 0x00, 0x00}, SealOptions{Sequence64: 0xffffffff})
+		if err != nil {
+			t.Fatalf("Seal(0xffffffff) error = %v", err)
+		}
+		p2, err := outSA.Seal(NextHeaderIPv6, []byte{0x60, 0x00, 0x00, 0x01}, SealOptions{})
+		if err != nil {
+			t.Fatalf("Seal(0x100000000) error = %v", err)
+		}
+		if _, err := inSA.Open(p1); err != nil {
+			t.Fatalf("Open(0xffffffff) error = %v", err)
+		}
+		r2, err := inSA.Open(p2)
+		if err != nil || r2.Sequence64 != 0x100000000 {
+			t.Fatalf("Open(0x100000000) = (%+v, %v)", r2, err)
+		}
+	})
+}

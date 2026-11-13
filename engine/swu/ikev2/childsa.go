@@ -99,6 +99,15 @@ func DeriveChildSAKeys(init InitResult, selectedSA SecurityAssociation) (ChildSA
 }
 
 func DeriveChildSAKeysWithNonces(prf crypto.Hash, skD, nonceI, nonceR []byte, selectedSA SecurityAssociation) (ChildSAKeys, error) {
+	return DeriveChildSAKeysForRole(prf, skD, nil, nonceI, nonceR, selectedSA, true)
+}
+
+// DeriveChildSAKeysForRole derives ESP Child SA keys per RFC 7296 §2.17:
+// KEYMAT = prf+(SK_d, [g^ir (new) |] Ni | Nr).
+// Per RFC 7296 §2.17, the first direction key slice protects traffic from the
+// CREATE_CHILD_SA initiator to the CREATE_CHILD_SA responder, and the second
+// protects traffic from the responder to the initiator.
+func DeriveChildSAKeysForRole(prf crypto.Hash, skD, dhShared, nonceI, nonceR []byte, selectedSA SecurityAssociation, localIsExchangeInitiator bool) (ChildSAKeys, error) {
 	if len(skD) == 0 || len(nonceI) == 0 || len(nonceR) == 0 {
 		return ChildSAKeys{}, fmt.Errorf("%w: missing child SA key seed", ErrInvalidChildSA)
 	}
@@ -110,16 +119,20 @@ func DeriveChildSAKeysWithNonces(prf crypto.Hash, skD, nonceI, nonceR []byte, se
 	if dirLen <= 0 {
 		return ChildSAKeys{}, fmt.Errorf("%w: invalid ESP profile", ErrInvalidChildSA)
 	}
-	seed := make([]byte, 0, len(nonceI)+len(nonceR))
+	seed := make([]byte, 0, len(dhShared)+len(nonceI)+len(nonceR))
+	seed = append(seed, dhShared...)
 	seed = append(seed, nonceI...)
 	seed = append(seed, nonceR...)
 	keymat, err := PRFPlus(prf, skD, seed, dirLen*2)
 	if err != nil {
 		return ChildSAKeys{}, err
 	}
-	outbound := splitESPKeys(profile, keymat[:dirLen])
-	inbound := splitESPKeys(profile, keymat[dirLen:])
-	return ChildSAKeys{Profile: profile, Outbound: outbound, Inbound: inbound}, nil
+	initToResp := splitESPKeys(profile, keymat[:dirLen])
+	respToInit := splitESPKeys(profile, keymat[dirLen:])
+	if localIsExchangeInitiator {
+		return ChildSAKeys{Profile: profile, Outbound: initToResp, Inbound: respToInit}, nil
+	}
+	return ChildSAKeys{Profile: profile, Outbound: respToInit, Inbound: initToResp}, nil
 }
 
 func ParseChildSAResult(init InitResult, inner []Payload, localSPI []byte) (ChildSAResult, error) {
@@ -135,6 +148,10 @@ func parseChildSAResultWithOfferedSA(init InitResult, inner []Payload, localSPI 
 }
 
 func parseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, nonceI, nonceR []byte, offeredSA *SecurityAssociation, offeredTSi, offeredTSr TrafficSelectors) (ChildSAResult, error) {
+	return parseChildSAResultWithNoncesAndDH(init, inner, localSPI, nil, nonceI, nonceR, offeredSA, offeredTSi, offeredTSr, true)
+}
+
+func parseChildSAResultWithNoncesAndDH(init InitResult, inner []Payload, localSPI, dhShared, nonceI, nonceR []byte, offeredSA *SecurityAssociation, offeredTSi, offeredTSr TrafficSelectors, localIsExchangeInitiator bool) (ChildSAResult, error) {
 	var out ChildSAResult
 	for _, p := range inner {
 		switch p.Type {
@@ -197,14 +214,18 @@ func parseChildSAResultWithNonces(init InitResult, inner []Payload, localSPI, no
 			return ChildSAResult{}, fmt.Errorf("%w: TSr narrowing: %w", ErrInvalidChildSA, err)
 		}
 	}
-	keys, err := DeriveChildSAKeysWithNonces(init.Keys.Profile.PRF, init.Keys.SKD, nonceI, nonceR, out.SelectedSA)
+	keys, err := DeriveChildSAKeysForRole(init.Keys.Profile.PRF, init.Keys.SKD, dhShared, nonceI, nonceR, out.SelectedSA, localIsExchangeInitiator)
 	if err != nil {
-		return ChildSAResult{}, err
+		return ChildSAKeysResultZero(err)
 	}
 	out.LocalSPI = append([]byte(nil), localSPI...)
 	out.RemoteSPI = append([]byte(nil), out.SelectedSA.Proposals[0].SPI...)
 	out.Keys = keys
 	return out, nil
+}
+
+func ChildSAKeysResultZero(err error) (ChildSAResult, error) {
+	return ChildSAResult{}, err
 }
 
 func firstSecurityAssociation(payloads []Payload) (SecurityAssociation, bool, error) {

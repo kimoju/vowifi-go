@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 )
 
 type NotifyActionKind uint8
@@ -36,6 +37,7 @@ type NotifyAction struct {
 	RecreateIKE      bool
 	RecreateChild    bool
 	SuggestedDHGroup uint16
+	BackoffDuration  time.Duration
 }
 
 type InformationalHandling struct {
@@ -49,6 +51,7 @@ type InformationalHandling struct {
 	AdditionalAddresses   []net.IP
 	Cookie2               []byte
 	InvalidSelectors      []InvalidSelectorReport
+	BackoffDuration       time.Duration
 	NotifyError           error
 	Notifies              []Notify
 	NotifyActions         []NotifyAction
@@ -113,6 +116,7 @@ type InformationalRecoveryPlan struct {
 	Reauthenticate        bool
 	MOBIKEAddressRecovery bool
 	SuggestedDHGroup      uint16
+	BackoffDuration       time.Duration
 	EchoCookie2           bool
 	DeleteIKE             bool
 	DeleteCurrentChild    bool
@@ -235,6 +239,9 @@ func PlanInformationalRecovery(content InformationalContent, child ChildSAResult
 	for _, action := range handling.NotifyActions {
 		plan.considerNotifyRecovery(&priority, action)
 	}
+	if handling.BackoffDuration > plan.BackoffDuration {
+		plan.BackoffDuration = handling.BackoffDuration
+	}
 	if priority == 0 && plan.EchoCookie2 {
 		plan.Reason = "COOKIE2 response required"
 	}
@@ -268,6 +275,14 @@ func handleInformationalNotify(handling *InformationalHandling, notify Notify) e
 			return fmt.Errorf("%w: %w", ErrInvalidInformational, err)
 		}
 		handling.InvalidSelectors = append(handling.InvalidSelectors, report)
+	case Notify3GPPBackoffTimer:
+		d, _, err := notify.BackoffTimer()
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidInformational, err)
+		}
+		if d > handling.BackoffDuration {
+			handling.BackoffDuration = d
+		}
 	}
 	return nil
 }
@@ -302,14 +317,23 @@ func ClassifyNotifyAction(notify Notify) NotifyAction {
 		action.Kind = NotifyActionNarrowTrafficSelectors
 		action.Retry = true
 		action.RecreateChild = true
-	case NotifyInvalidSPI:
+	case NotifyInvalidSPI, NotifyChildSANotFound:
 		action.Kind = NotifyActionRecreateChildSA
 		action.Retry = true
 		action.RecreateChild = true
-	case NotifyNoAdditionalSAs:
+	case NotifyNoAdditionalSAs, NotifyTemporaryFailure, Notify3GPPNetworkFailure, Notify3GPPCongestion:
 		action.Kind = NotifyActionWaitAndRetry
 		action.Retry = true
 		action.RetryLater = true
+	case Notify3GPPBackoffTimer:
+		if d, ok, err := notify.BackoffTimer(); err == nil && ok {
+			action.Kind = NotifyActionWaitAndRetry
+			action.Retry = true
+			action.RetryLater = true
+			action.BackoffDuration = d
+		} else {
+			action.Kind = NotifyActionAbort
+		}
 	case NotifyInvalidIKESPI, NotifyInternalAddressFailure, NotifyFailedCPRequired:
 		action.Kind = NotifyActionRecreateIKESA
 		action.Retry = true
@@ -320,7 +344,7 @@ func ClassifyNotifyAction(notify Notify) NotifyAction {
 	case NotifyAuthenticationFailed:
 		action.Kind = NotifyActionReauthenticate
 		action.RecreateIKE = true
-	case NotifyUnsupportedCriticalPayload, NotifyInvalidMajorVersion, NotifyInvalidSyntax, NotifyInvalidMessageID:
+	case NotifyUnsupportedCriticalPayload, NotifyInvalidMajorVersion, NotifyInvalidSyntax, NotifyInvalidMessageID, Notify3GPPRATDisallowed, Notify3GPPNoAPNSubscription:
 		action.Kind = NotifyActionAbort
 	default:
 		if notify.NotifyType < 16384 {
@@ -351,9 +375,15 @@ func (p *InformationalRecoveryPlan) considerNotifyRecovery(priority *int, action
 			p.SuggestedDHGroup = action.SuggestedDHGroup
 		})
 	case NotifyActionWaitAndRetry:
+		if action.BackoffDuration > p.BackoffDuration {
+			p.BackoffDuration = action.BackoffDuration
+		}
 		p.considerRecovery(priority, InformationalRecoveryWaitAndRetry, 50, notifyRecoveryReason(action), func() {
 			p.Retry = true
 			p.RetryLater = true
+			if action.BackoffDuration > p.BackoffDuration {
+				p.BackoffDuration = action.BackoffDuration
+			}
 		})
 	case NotifyActionRecreateIKESA:
 		p.considerRecovery(priority, InformationalRecoveryRecreateIKESA, 80, notifyRecoveryReason(action), func() {
@@ -412,5 +442,8 @@ func NotifyActionFromError(err error) (NotifyAction, bool) {
 		return NotifyAction{}, false
 	}
 	action := ClassifyNotifyAction(notifyErr.Notify)
+	if notifyErr.BackoffDuration > action.BackoffDuration {
+		action.BackoffDuration = notifyErr.BackoffDuration
+	}
 	return action, action.Kind != NotifyActionNone
 }

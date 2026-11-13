@@ -96,15 +96,8 @@ func TestHandleIMSMessageAcceptsMultipartCPIM3GPPSMS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleIMSMessage() error = %v", err)
 	}
-	if result.StatusCode != 200 || result.ReplyContentType != IMSCPIMContentType || result.Incoming == nil || result.Incoming.Content != "hello" {
+	if result.StatusCode != 200 || result.ReplyContentType != IMS3GPPSMSContentType || string(result.ReplyBody) != string(BuildSMSRPAck(0x34)) || result.Incoming == nil || result.Incoming.Content != "hello" {
 		t.Fatalf("result=%+v", result)
-	}
-	reply, err := ParseIMSCPIMMessage(result.ReplyBody)
-	if err != nil {
-		t.Fatalf("ParseIMSCPIMMessage(reply) error = %v body=%x", err, result.ReplyBody)
-	}
-	if reply.ContentType != IMS3GPPSMSContentType || string(reply.Body) != string(BuildSMSRPAck(0x34)) {
-		t.Fatalf("reply=%+v body=%x", reply, reply.Body)
 	}
 	if len(dispatch.events) != 1 {
 		t.Fatalf("events=%d", len(dispatch.events))
@@ -344,13 +337,13 @@ func TestHandleIMSMessageAcceptsRPACKStatusReportBuiltFromStruct(t *testing.T) {
 		t.Fatalf("result=%+v", result)
 	}
 	report := result.DeliveryReport
-	if report.CallID != "status-report-call" || report.RPMR != 7 || report.State != "failed" || report.RPCause != 0x46 {
+	if report.CallID != "status-report-call" || report.RPMR != 7 || report.State != "failed" || report.RPCause != 0 || !report.HasTPStatus || report.TPStatus != 0x46 {
 		t.Fatalf("report=%+v", report)
 	}
 	if report.Recipient != "+18005551212" || !report.SentAt.Equal(sentAt) || !report.ReportAt.Equal(doneAt) || !strings.Contains(report.ErrorText, "validity period expired") {
 		t.Fatalf("report fields=%+v", report)
 	}
-	if store.reportCallID != "status-report-call" || store.reportRPMR != 7 || store.reportState != "failed" || store.reportRPCause != 0x46 {
+	if store.reportCallID != "status-report-call" || store.reportRPMR != 7 || store.reportState != "failed" || store.reportRPCause != 0 {
 		t.Fatalf("store report=%+v", store)
 	}
 	if store.recomputedMessageID != "msg-456" {

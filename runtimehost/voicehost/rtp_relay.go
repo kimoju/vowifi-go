@@ -63,10 +63,12 @@ type RTPRelayDTMFRequest struct {
 	StepMS         int
 	EndPacketCount int
 	Volume         uint8
+	HasVolume      bool
 	SequenceNumber uint16
 	Timestamp      uint32
 	SSRC           uint32
 	PayloadType    uint8
+	HasPayloadType bool
 	ClockRate      int
 }
 
@@ -96,6 +98,7 @@ type RTPRelayRTCPResult struct {
 type RTPRelayReceiverReportRequest struct {
 	Direction  RTCPFeedbackDirection
 	SenderSSRC uint32
+	CNAME      string
 }
 
 type RTPRelaySenderReportRequest struct {
@@ -276,6 +279,8 @@ type RTPRelaySession struct {
 	clientDirection       string
 	clientRTPDTMFPayloads map[uint8]int
 	imsRTPDTMFPayloads    map[uint8]int
+	clientCodecs          []SDPCodec
+	imsCodecs             []SDPCodec
 
 	clientAdvertiseIP  string
 	imsAdvertiseIP     string
@@ -346,9 +351,18 @@ type RTPRelaySession struct {
 }
 
 type rtpDTMFSequenceState struct {
-	nextSeq       uint16
-	nextTimestamp uint32
-	ssrc          uint32
+	nextSeq            uint16
+	nextTimestamp      uint32
+	ssrc               uint32
+	hasAudio           bool
+	hasSentDTMF        bool
+	audioSSRC          uint32
+	lastAudioOrigSeq   uint16
+	lastAudioTimestamp uint32
+	lastAudioArrival   time.Time
+	audioClockRate     int
+	seqOffset          uint16
+	lastScheduledSent  uint64
 }
 
 type rtpRelayRTCPReportKey struct {
@@ -528,6 +542,9 @@ func (s *RTPRelaySession) SetIMSRemote(info SDPInfo) error {
 	s.imsRTCPTarget = rtcpAddr
 	s.imsDirection = normalizeSDPDirection(info.Direction)
 	s.imsRTPDTMFPayloads = rtpDTMFPayloadTypesFromSDP(info)
+	if len(info.Codecs) > 0 {
+		s.imsCodecs = cloneSDPCodecs(info.Codecs)
+	}
 	s.mu.Unlock()
 	return nil
 }
@@ -545,8 +562,29 @@ func (s *RTPRelaySession) SetClientRemote(info SDPInfo) error {
 	s.clientRTCPTarget = rtcpAddr
 	s.clientDirection = normalizeSDPDirection(info.Direction)
 	s.clientRTPDTMFPayloads = rtpDTMFPayloadTypesFromSDP(info)
+	if len(info.Codecs) > 0 {
+		s.clientCodecs = cloneSDPCodecs(info.Codecs)
+	}
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *RTPRelaySession) SetClientCodecs(codecs []SDPCodec) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.clientCodecs = cloneSDPCodecs(codecs)
+	s.mu.Unlock()
+}
+
+func (s *RTPRelaySession) SetIMSCodecs(codecs []SDPCodec) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.imsCodecs = cloneSDPCodecs(codecs)
+	s.mu.Unlock()
 }
 
 func (s *RTPRelaySession) ClientEndpoint() SDPInfo {
@@ -684,6 +722,24 @@ func (s *RTPRelaySession) IMSToClientRTPStreamStats() []RTPStreamStats {
 	s.rtpStatsMu.Lock()
 	defer s.rtpStatsMu.Unlock()
 	return s.imsToClientRTPStats.Stats()
+}
+
+func (s *RTPRelaySession) takeClientToIMSRTPStreamStats() []RTPStreamStats {
+	if s == nil {
+		return nil
+	}
+	s.rtpStatsMu.Lock()
+	defer s.rtpStatsMu.Unlock()
+	return s.clientToIMSRTPStats.TakeRTCPReportStats()
+}
+
+func (s *RTPRelaySession) takeIMSToClientRTPStreamStats() []RTPStreamStats {
+	if s == nil {
+		return nil
+	}
+	s.rtpStatsMu.Lock()
+	defer s.rtpStatsMu.Unlock()
+	return s.imsToClientRTPStats.TakeRTCPReportStats()
 }
 
 func newRTPRelayDirectionQuality(direction RTCPFeedbackDirection, rtpPackets, rtpBytes, rtpDrops, rtcpPackets, rtcpBytes, rtcpDrops uint64, streams []RTPStreamStats, reports []RTPRelayRTCPReportQuality) RTPRelayDirectionQuality {
@@ -1036,11 +1092,36 @@ func emitRTPRelayQuality(handler RTPRelayQualityHandler, event RTPRelayQualityEv
 	}
 }
 
+func (s *RTPRelaySession) RTCPFeedbackHandler() RTCPFeedbackHandler {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rtcpFeedbackHandler
+}
+
+func (s *RTPRelaySession) RTPDTMFHandler() RTPDTMFHandler {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rtpDTMFHandler
+}
+
 func (s *RTPRelaySession) RTPPlaintextHandler() RTPPlaintextHandler {
 	if s == nil {
 		return nil
 	}
 	return s.ObserveRTPPlaintext
+}
+
+func (s *RTPRelaySession) RTPPlaintextRewriter() RTPPlaintextRewriter {
+	if s == nil {
+		return nil
+	}
+	return s.rewriteSRTPPlaintextRTP
 }
 
 func (s *RTPRelaySession) ObserveRTPPlaintext(event RTPPlaintextEvent) {
@@ -1052,6 +1133,17 @@ func (s *RTPRelaySession) ObserveRTPPlaintext(event RTPPlaintextEvent) {
 		clockRate = s.imsRTPClockRate
 	}
 	s.observeRTPStream(event.Direction, event.Packet, time.Now(), clockRate)
+}
+
+func (s *RTPRelaySession) rewriteSRTPPlaintextRTP(direction RTPDTMFDirection, packet []byte) []byte {
+	if s == nil {
+		return packet
+	}
+	clockRate := s.clientRTPClockRate
+	if direction == RTPDTMFIMSToClient {
+		clockRate = s.imsRTPClockRate
+	}
+	return s.rewritePlaintextRTP(direction, packet, clockRate)
 }
 
 func (s *RTPRelaySession) Close() error {
@@ -1125,7 +1217,7 @@ func (s *RTPRelaySession) SendRTPDTMF(ctx context.Context, req RTPRelayDTMFReque
 		route.drops.Add(1)
 		return RTPRelayDTMFResult{Signal: signal, DurationMS: rtpDTMFDurationMS(req.DurationMS)}, fmt.Errorf("%w: %s RTP direction is not sendable", ErrRTPRelayConfig, route.label)
 	}
-	if len(route.payloads) == 0 && req.PayloadType == 0 {
+	if len(route.payloads) == 0 && req.PayloadType == 0 && !req.HasPayloadType {
 		route.drops.Add(1)
 		return RTPRelayDTMFResult{Signal: signal, DurationMS: rtpDTMFDurationMS(req.DurationMS)}, fmt.Errorf("%w: %s RTP telephone-event payload unavailable", ErrRTPRelayConfig, route.label)
 	}
@@ -1158,7 +1250,7 @@ func (s *RTPRelaySession) SendRTPDTMF(ctx context.Context, req RTPRelayDTMFReque
 			default:
 			}
 		}
-		summary, err := InspectRTPDTMF(direction, packet, payloads, s.rtpDTMFHandler)
+		summary, err := InspectRTPDTMF(direction, packet, payloads, s.RTPDTMFHandler())
 		if err != nil {
 			route.drops.Add(1)
 			s.rtpDTMFParseErrors.Add(1)
@@ -1269,13 +1361,24 @@ func (s *RTPRelaySession) SendReceiverReport(ctx context.Context, req RTPRelayRe
 	if err != nil {
 		return RTPRelayRTCPResult{}, err
 	}
-	stats := s.IMSToClientRTPStreamStats()
+	stats := s.takeIMSToClientRTPStreamStats()
 	if direction == RTCPFeedbackIMSToClient {
-		stats = s.ClientToIMSRTPStreamStats()
+		stats = s.takeClientToIMSRTPStreamStats()
+	}
+	senderSSRC := req.SenderSSRC
+	if senderSSRC == 0 {
+		senderSSRC = s.defaultReportSSRC(direction)
+	}
+	cname := strings.TrimSpace(req.CNAME)
+	if cname == "" {
+		cname = s.defaultReportCNAME(direction)
 	}
 	return s.SendRTCP(ctx, RTPRelayRTCPRequest{
 		Direction: direction,
-		Packets:   []rtcp.Packet{BuildReceiverReport(req.SenderSSRC, stats)},
+		Packets: []rtcp.Packet{
+			BuildReceiverReport(senderSSRC, stats),
+			BuildSourceDescription(RTCPSourceDescriptionConfig{SSRC: senderSSRC, CNAME: cname}),
+		},
 	})
 }
 
@@ -1297,21 +1400,37 @@ func (s *RTPRelaySession) SendSenderReport(ctx context.Context, req RTPRelaySend
 	if err != nil {
 		return RTPRelayRTCPResult{}, err
 	}
-	stats := s.IMSToClientRTPStreamStats()
+	stats := s.takeIMSToClientRTPStreamStats()
 	if direction == RTCPFeedbackIMSToClient {
-		stats = s.ClientToIMSRTPStreamStats()
+		stats = s.takeClientToIMSRTPStreamStats()
 	}
-	packets := []rtcp.Packet{BuildSenderReport(RTCPSenderReportConfig{
-		SSRC:           req.SSRC,
-		NTPTime:        req.NTPTime,
-		WallClock:      req.WallClock,
-		RTPTime:        req.RTPTime,
-		PacketCount:    req.PacketCount,
-		OctetCount:     req.OctetCount,
-		ReceptionStats: stats,
-	})}
-	if strings.TrimSpace(req.CNAME) != "" {
-		packets = append(packets, BuildSourceDescription(RTCPSourceDescriptionConfig{SSRC: req.SSRC, CNAME: req.CNAME}))
+	ssrc := req.SSRC
+	if ssrc == 0 {
+		ssrc = s.defaultReportSSRC(direction)
+	}
+	rtpTime := req.RTPTime
+	if rtpTime == 0 {
+		wall := req.WallClock
+		if wall.IsZero() {
+			wall = time.Now()
+		}
+		rtpTime = s.extrapolatedSenderRTPTime(direction, wall)
+	}
+	cname := strings.TrimSpace(req.CNAME)
+	if cname == "" {
+		cname = s.defaultReportCNAME(direction)
+	}
+	packets := []rtcp.Packet{
+		BuildSenderReport(RTCPSenderReportConfig{
+			SSRC:           ssrc,
+			NTPTime:        req.NTPTime,
+			WallClock:      req.WallClock,
+			RTPTime:        rtpTime,
+			PacketCount:    req.PacketCount,
+			OctetCount:     req.OctetCount,
+			ReceptionStats: stats,
+		}),
+		BuildSourceDescription(RTCPSourceDescriptionConfig{SSRC: ssrc, CNAME: cname}),
 	}
 	return s.SendRTCP(ctx, RTPRelayRTCPRequest{
 		Direction: direction,
@@ -1374,6 +1493,9 @@ func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn
 			}
 			packet = s.processRTPDTMF(dtmfDirection, packet, dtmfPayloads(), targetPayloads)
 		}
+		if transform == nil && rtpStatsDirection != "" {
+			packet = s.rewritePlaintextRTP(rtpStatsDirection, packet, rtpClockRate)
+		}
 		pktLen := uint64(len(packet))
 		packets.Add(1)
 		bytes.Add(pktLen)
@@ -1418,7 +1540,7 @@ func (s *RTPRelaySession) processRTPDTMF(direction RTPDTMFDirection, packet []by
 	if s == nil || len(sourcePayloads) == 0 {
 		return packet
 	}
-	summary, err := InspectRTPDTMF(direction, packet, sourcePayloads, s.rtpDTMFHandler)
+	summary, err := InspectRTPDTMF(direction, packet, sourcePayloads, s.RTPDTMFHandler())
 	if err != nil {
 		s.rtpDTMFParseErrors.Add(1)
 		return packet
@@ -1443,7 +1565,7 @@ func (s *RTPRelaySession) inspectRTPDTMF(direction RTPDTMFDirection, packet []by
 	if s == nil || len(payloads) == 0 {
 		return
 	}
-	summary, err := InspectRTPDTMF(direction, packet, payloads, s.rtpDTMFHandler)
+	summary, err := InspectRTPDTMF(direction, packet, payloads, s.RTPDTMFHandler())
 	if err != nil {
 		s.rtpDTMFParseErrors.Add(1)
 		return
@@ -1576,11 +1698,13 @@ func (s *RTPRelaySession) buildGeneratedRTPDTMFSequence(direction RTPDTMFDirecti
 	}
 	cfg := RTPDTMFSequenceConfig{
 		PayloadType:    payloadType,
+		HasPayloadType: req.HasPayloadType || payloadType != 0,
 		Signal:         req.Signal,
 		DurationMS:     rtpDTMFDurationMS(req.DurationMS),
 		StepMS:         req.StepMS,
 		EndPacketCount: req.EndPacketCount,
 		Volume:         req.Volume,
+		HasVolume:      req.HasVolume,
 		SequenceNumber: req.SequenceNumber,
 		Timestamp:      req.Timestamp,
 		SSRC:           req.SSRC,
@@ -1595,14 +1719,42 @@ func (s *RTPRelaySession) buildGeneratedRTPDTMFSequence(direction RTPDTMFDirecti
 	if state.ssrc == 0 {
 		*state = newRTPDTMFSequenceState()
 	}
-	if cfg.SequenceNumber == 0 {
-		cfg.SequenceNumber = state.nextSeq
-	}
-	if cfg.Timestamp == 0 {
-		cfg.Timestamp = state.nextTimestamp
-	}
-	if cfg.SSRC == 0 {
-		cfg.SSRC = state.ssrc
+	if state.hasAudio {
+		if cfg.SSRC == 0 {
+			cfg.SSRC = state.audioSSRC
+		}
+		if cfg.SequenceNumber == 0 {
+			cfg.SequenceNumber = state.lastAudioOrigSeq + state.seqOffset + 1
+		}
+		if cfg.Timestamp == 0 {
+			elapsed := time.Since(state.lastAudioArrival)
+			if elapsed < 0 {
+				elapsed = 0
+			}
+			extrapolated := state.lastAudioTimestamp + uint32(elapsed.Seconds()*float64(cfg.ClockRate))
+			if extrapolated == state.lastAudioTimestamp {
+				step := uint32(cfg.ClockRate / 50)
+				if step == 0 {
+					step = 160
+				}
+				extrapolated += step
+			}
+			if state.hasSentDTMF && int32(state.nextTimestamp-extrapolated) > 0 {
+				cfg.Timestamp = state.nextTimestamp
+			} else {
+				cfg.Timestamp = extrapolated
+			}
+		}
+	} else {
+		if cfg.SequenceNumber == 0 {
+			cfg.SequenceNumber = state.nextSeq
+		}
+		if cfg.Timestamp == 0 {
+			cfg.Timestamp = state.nextTimestamp
+		}
+		if cfg.SSRC == 0 {
+			cfg.SSRC = state.ssrc
+		}
 	}
 	packets, err := BuildRTPDTMFSequence(cfg)
 	if err != nil {
@@ -1612,6 +1764,10 @@ func (s *RTPRelaySession) buildGeneratedRTPDTMFSequence(direction RTPDTMFDirecti
 	if err != nil {
 		return nil, cfg, err
 	}
+	if state.hasAudio && req.SequenceNumber == 0 {
+		state.seqOffset += uint16(len(packets))
+	}
+	state.hasSentDTMF = true
 	state.nextSeq = cfg.SequenceNumber + uint16(len(packets))
 	state.nextTimestamp = cfg.Timestamp + uint32(durationSamples)
 	state.ssrc = cfg.SSRC
@@ -1694,7 +1850,7 @@ func rtcpFeedbackDirectionFromRTPDirection(direction RTPDTMFDirection) (RTCPFeed
 }
 
 func rtpDTMFGenerationPayload(req RTPRelayDTMFRequest, payloads map[uint8]int) (uint8, int) {
-	if req.PayloadType != 0 {
+	if req.PayloadType != 0 || req.HasPayloadType {
 		clockRate := req.ClockRate
 		if clockRate <= 0 {
 			clockRate = payloads[req.PayloadType]
@@ -1895,10 +2051,11 @@ func (s *RTPRelaySession) inspectRTCPFeedback(direction RTCPFeedbackDirection, p
 
 func (s *RTPRelaySession) inspectRTCPFeedbackPacket(direction RTCPFeedbackDirection, packet []byte) (RTCPFeedbackSummary, error) {
 	observedAt := time.Now()
+	handler := s.RTCPFeedbackHandler()
 	return InspectRTCPFeedback(direction, packet, func(event RTCPFeedbackEvent) {
 		s.recordRTCPSenderReport(event, observedAt)
 		s.recordRTCPReportQuality(event, observedAt)
-		emitRTCPFeedback(s.rtcpFeedbackHandler, event)
+		emitRTCPFeedback(handler, event)
 	})
 }
 
@@ -2260,4 +2417,365 @@ func advertiseIP(explicit, listenIP string) string {
 		return "127.0.0.1"
 	}
 	return ip
+}
+
+func (s *RTPRelaySession) defaultReportSSRC(direction RTCPFeedbackDirection) uint32 {
+	if s == nil {
+		return randomRTPDTMFNonZeroUint32()
+	}
+	s.dtmfMu.Lock()
+	defer s.dtmfMu.Unlock()
+	state := &s.dtmfClientToIMSState
+	if direction == RTCPFeedbackIMSToClient {
+		state = &s.dtmfIMSToClientState
+	}
+	if state.ssrc == 0 {
+		*state = newRTPDTMFSequenceState()
+	}
+	if state.hasAudio && state.audioSSRC != 0 {
+		return state.audioSSRC
+	}
+	return state.ssrc
+}
+
+func (s *RTPRelaySession) defaultReportCNAME(direction RTCPFeedbackDirection) string {
+	if s == nil {
+		return "vowifi-go@127.0.0.1"
+	}
+	host := s.imsAdvertiseIP
+	if direction == RTCPFeedbackIMSToClient {
+		host = s.clientAdvertiseIP
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return "vowifi-go@" + host
+}
+
+func (s *RTPRelaySession) takeScheduledSenderIntervalActive(direction RTCPFeedbackDirection) bool {
+	if s == nil {
+		return false
+	}
+	current := s.clientToIMSRTPPackets.Load()
+	if direction == RTCPFeedbackIMSToClient {
+		current = s.imsToClientRTPPackets.Load()
+	}
+	s.dtmfMu.Lock()
+	defer s.dtmfMu.Unlock()
+	state := &s.dtmfClientToIMSState
+	if direction == RTCPFeedbackIMSToClient {
+		state = &s.dtmfIMSToClientState
+	}
+	active := current > state.lastScheduledSent
+	state.lastScheduledSent = current
+	return active
+}
+
+func (s *RTPRelaySession) extrapolatedSenderRTPTime(direction RTCPFeedbackDirection, now time.Time) uint32 {
+	if s == nil {
+		return randomRTPDTMFUint32()
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.dtmfMu.Lock()
+	defer s.dtmfMu.Unlock()
+	state := &s.dtmfClientToIMSState
+	if direction == RTCPFeedbackIMSToClient {
+		state = &s.dtmfIMSToClientState
+	}
+	if state.ssrc == 0 {
+		*state = newRTPDTMFSequenceState()
+	}
+	if state.hasAudio {
+		clock := state.audioClockRate
+		if clock <= 0 {
+			clock = DefaultRTPDTMFClockRate
+		}
+		elapsed := now.Sub(state.lastAudioArrival)
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		return state.lastAudioTimestamp + uint32(elapsed.Seconds()*float64(clock))
+	}
+	return state.nextTimestamp
+}
+
+func (s *RTPRelaySession) rewritePlaintextRTP(direction RTPDTMFDirection, packet []byte, clockRate int) []byte {
+	if s == nil || len(packet) < 12 || (packet[0]>>6) != 2 {
+		return packet
+	}
+	headerLen, ok := rtpHeaderByteLen(packet)
+	if !ok {
+		return packet
+	}
+	pt := packet[1] & 0x7F
+	if pt >= 72 && pt <= 76 {
+		return packet
+	}
+	origSeq := binary.BigEndian.Uint16(packet[2:4])
+	ts := binary.BigEndian.Uint32(packet[4:8])
+	ssrc := binary.BigEndian.Uint32(packet[8:12])
+
+	s.mu.RLock()
+	var srcCodecs, dstCodecs []SDPCodec
+	var srcDTMF, dstDTMF map[uint8]int
+	if direction == RTPDTMFIMSToClient {
+		srcCodecs = s.imsCodecs
+		dstCodecs = s.clientCodecs
+		srcDTMF = s.imsRTPDTMFPayloads
+		dstDTMF = s.clientRTPDTMFPayloads
+	} else {
+		srcCodecs = s.clientCodecs
+		dstCodecs = s.imsCodecs
+		srcDTMF = s.clientRTPDTMFPayloads
+		dstDTMF = s.imsRTPDTMFPayloads
+	}
+	s.mu.RUnlock()
+
+	_, isSrcDTMF := srcDTMF[pt]
+	_, isDstDTMF := dstDTMF[pt]
+	isDTMF := isSrcDTMF || isDstDTMF
+
+	s.dtmfMu.Lock()
+	state := &s.dtmfClientToIMSState
+	if direction == RTPDTMFIMSToClient {
+		state = &s.dtmfIMSToClientState
+	}
+	if state.ssrc == 0 {
+		*state = newRTPDTMFSequenceState()
+	}
+	if !isDTMF || (state.hasAudio && state.audioSSRC == ssrc) {
+		state.hasAudio = true
+		state.audioSSRC = ssrc
+		state.lastAudioOrigSeq = origSeq
+		state.lastAudioTimestamp = ts
+		state.lastAudioArrival = time.Now()
+		if clockRate > 0 {
+			state.audioClockRate = clockRate
+		}
+	}
+	seqOffset := state.seqOffset
+	s.dtmfMu.Unlock()
+
+	out := packet
+	copied := false
+	ensureCopy := func() {
+		if !copied {
+			out = append([]byte(nil), packet...)
+			copied = true
+		}
+	}
+	if seqOffset != 0 {
+		ensureCopy()
+		binary.BigEndian.PutUint16(out[2:4], origSeq+seqOffset)
+	}
+	if isDTMF || len(srcCodecs) == 0 || len(dstCodecs) == 0 {
+		return out
+	}
+	srcCodec, foundSrc := findSDPCodecByPT(srcCodecs, int(pt))
+	if !foundSrc || strings.TrimSpace(srcCodec.EncodingName) == "" {
+		return out
+	}
+	dstCodec, foundDst := findMatchingTargetSDPCodec(srcCodec, dstCodecs)
+	if !foundDst {
+		return out
+	}
+	if dstCodec.Payload != int(pt) && dstCodec.Payload >= 0 && dstCodec.Payload <= 127 {
+		ensureCopy()
+		out[1] = (out[1] & 0x80) | uint8(dstCodec.Payload)
+	}
+	if strings.EqualFold(srcCodec.EncodingName, "AMR") || strings.EqualFold(srcCodec.EncodingName, "AMR-WB") {
+		srcOctet := amrCodecOctetAligned(srcCodec.FMTP)
+		dstOctet := amrCodecOctetAligned(dstCodec.FMTP)
+		if srcOctet != dstOctet {
+			payloadEnd := len(out)
+			if out[0]&0x20 != 0 {
+				pad := int(out[len(out)-1])
+				if pad <= 0 || headerLen+pad > len(out) {
+					return out
+				}
+				payloadEnd -= pad
+			}
+			repacked, repackedOK := repackAMRPayload(strings.EqualFold(srcCodec.EncodingName, "AMR-WB"), srcOctet, dstOctet, out[headerLen:payloadEnd])
+			if repackedOK {
+				rebuilt := make([]byte, headerLen+len(repacked))
+				copy(rebuilt, out[:headerLen])
+				rebuilt[0] &^= 0x20 // clear padding bit on repacked payload
+				copy(rebuilt[headerLen:], repacked)
+				out = rebuilt
+			}
+		}
+	}
+	return out
+}
+
+func rtpHeaderByteLen(packet []byte) (int, bool) {
+	if len(packet) < 12 || (packet[0]>>6) != 2 {
+		return 0, false
+	}
+	cc := int(packet[0] & 0x0F)
+	offset := 12 + cc*4
+	if len(packet) < offset {
+		return 0, false
+	}
+	if packet[0]&0x10 != 0 {
+		if len(packet) < offset+4 {
+			return 0, false
+		}
+		extWords := int(binary.BigEndian.Uint16(packet[offset+2 : offset+4]))
+		offset += 4 + extWords*4
+		if len(packet) < offset {
+			return 0, false
+		}
+	}
+	return offset, true
+}
+
+func findSDPCodecByPT(codecs []SDPCodec, pt int) (SDPCodec, bool) {
+	for _, c := range codecs {
+		if c.Payload == pt {
+			return c, true
+		}
+	}
+	return SDPCodec{}, false
+}
+
+func findMatchingTargetSDPCodec(src SDPCodec, dstCodecs []SDPCodec) (SDPCodec, bool) {
+	// Prefer exact same PT if target already defines the same codec there.
+	for _, c := range dstCodecs {
+		if c.Payload == src.Payload && sdpCodecSameEncoding(src, c) {
+			return c, true
+		}
+	}
+	for _, c := range dstCodecs {
+		if sdpCodecSameEncoding(src, c) {
+			return c, true
+		}
+	}
+	return SDPCodec{}, false
+}
+
+func sdpCodecSameEncoding(a, b SDPCodec) bool {
+	if !strings.EqualFold(strings.TrimSpace(a.EncodingName), strings.TrimSpace(b.EncodingName)) {
+		return false
+	}
+	ca := a.ClockRate
+	if ca <= 0 {
+		ca = 8000
+	}
+	cb := b.ClockRate
+	if cb <= 0 {
+		cb = 8000
+	}
+	return ca == cb
+}
+
+func amrCodecOctetAligned(fmtp string) bool {
+	for _, part := range strings.Split(fmtp, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(k), "octet-align") {
+			return strings.TrimSpace(v) == "1"
+		}
+	}
+	return false
+}
+
+var (
+	amrSpeechFrameBits   = [9]int{95, 103, 118, 134, 148, 159, 204, 244, 39}
+	amrWBSpeechFrameBits = [10]int{132, 177, 253, 285, 317, 365, 397, 461, 477, 40}
+)
+
+func amrFrameSpeechBits(wideband bool, ft uint8) (int, bool) {
+	if ft == 15 || (wideband && ft == 14) {
+		return 0, true
+	}
+	if wideband {
+		if int(ft) < len(amrWBSpeechFrameBits) {
+			return amrWBSpeechFrameBits[ft], true
+		}
+		return 0, false
+	}
+	if int(ft) < len(amrSpeechFrameBits) {
+		return amrSpeechFrameBits[ft], true
+	}
+	return 0, false
+}
+
+func repackAMRPayload(wideband, srcOctetAligned, dstOctetAligned bool, payload []byte) ([]byte, bool) {
+	if srcOctetAligned == dstOctetAligned {
+		return payload, false
+	}
+	if srcOctetAligned && !dstOctetAligned {
+		// Octet-aligned (RFC 4867 §4.4) -> Bandwidth-efficient (RFC 4867 §4.3), single frame (F=0).
+		if len(payload) < 2 {
+			return nil, false
+		}
+		cmr := (payload[0] >> 4) & 0x0F
+		f := (payload[1] >> 7) & 0x01
+		if f != 0 {
+			return nil, false
+		}
+		ft := (payload[1] >> 3) & 0x0F
+		q := (payload[1] >> 2) & 0x01
+		speechBits, ok := amrFrameSpeechBits(wideband, ft)
+		if !ok {
+			return nil, false
+		}
+		needBytes := (speechBits + 7) / 8
+		if len(payload) < 2+needBytes {
+			return nil, false
+		}
+		totalBits := 10 + speechBits
+		out := make([]byte, (totalBits+7)/8)
+		writeBit(out, 0, (cmr>>3)&1)
+		writeBit(out, 1, (cmr>>2)&1)
+		writeBit(out, 2, (cmr>>1)&1)
+		writeBit(out, 3, cmr&1)
+		writeBit(out, 4, 0)
+		writeBit(out, 5, (ft>>3)&1)
+		writeBit(out, 6, (ft>>2)&1)
+		writeBit(out, 7, (ft>>1)&1)
+		writeBit(out, 8, ft&1)
+		writeBit(out, 9, q&1)
+		speech := payload[2:]
+		for i := 0; i < speechBits; i++ {
+			writeBit(out, 10+i, readBit(speech, i))
+		}
+		return out, true
+	}
+	// Bandwidth-efficient (RFC 4867 §4.3) -> Octet-aligned (RFC 4867 §4.4), single frame (F=0).
+	if len(payload) < 2 {
+		return nil, false
+	}
+	cmr := (readBit(payload, 0) << 3) | (readBit(payload, 1) << 2) | (readBit(payload, 2) << 1) | readBit(payload, 3)
+	f := readBit(payload, 4)
+	if f != 0 {
+		return nil, false
+	}
+	ft := (readBit(payload, 5) << 3) | (readBit(payload, 6) << 2) | (readBit(payload, 7) << 1) | readBit(payload, 8)
+	q := readBit(payload, 9)
+	speechBits, ok := amrFrameSpeechBits(wideband, ft)
+	if !ok || len(payload)*8 < 10+speechBits {
+		return nil, false
+	}
+	out := make([]byte, 2+(speechBits+7)/8)
+	out[0] = cmr << 4
+	out[1] = (ft << 3) | (q << 2)
+	speech := out[2:]
+	for i := 0; i < speechBits; i++ {
+		writeBit(speech, i, readBit(payload, 10+i))
+	}
+	return out, true
+}
+
+func readBit(buf []byte, bitIdx int) uint8 {
+	return (buf[bitIdx/8] >> (7 - uint(bitIdx%8))) & 1
+}
+
+func writeBit(buf []byte, bitIdx int, val uint8) {
+	if val != 0 {
+		buf[bitIdx/8] |= 1 << (7 - uint(bitIdx%8))
+	}
 }

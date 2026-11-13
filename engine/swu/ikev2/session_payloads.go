@@ -13,6 +13,7 @@ const (
 	IDFQDN       uint8 = 2
 	IDRFC822Addr uint8 = 3
 	IDIPv6Addr   uint8 = 5
+	IDDERASN1DN  uint8 = 9
 	IDKeyID      uint8 = 11
 )
 
@@ -24,16 +25,20 @@ const (
 )
 
 const (
-	ConfigInternalIPv4Address   uint16 = 1
-	ConfigInternalIPv4DNS       uint16 = 3
-	ConfigInternalAddressExpiry uint16 = 5
-	ConfigInternalIPv6Address   uint16 = 8
-	ConfigInternalIPv6DNS       uint16 = 10
-	ConfigInternalIPv4Subnet    uint16 = 13
-	ConfigSupportedAttributes   uint16 = 14
-	ConfigInternalIPv6Subnet    uint16 = 15
-	ConfigPCSCFIPv4Address      uint16 = 20
-	ConfigPCSCFIPv6Address      uint16 = 21
+	ConfigInternalIPv4Address     uint16 = 1
+	ConfigInternalIPv4DNS         uint16 = 3
+	ConfigInternalAddressExpiry   uint16 = 5
+	ConfigInternalIPv6Address     uint16 = 8
+	ConfigInternalIPv6DNS         uint16 = 10
+	ConfigInternalIPv4Subnet      uint16 = 13
+	ConfigSupportedAttributes     uint16 = 14
+	ConfigInternalIPv6Subnet      uint16 = 15
+	ConfigPCSCFIPv4Address        uint16 = 20
+	ConfigPCSCFIPv6Address        uint16 = 21
+	Config3GPPPCSCFIPv4Address    uint16 = 16384
+	Config3GPPPCSCFIPv6Address    uint16 = 16386
+	Config3GPPPCSCFIPv4AddressAlt uint16 = 16388
+	Config3GPPPCSCFIPv6AddressAlt uint16 = 16390
 )
 
 const (
@@ -99,6 +104,9 @@ func (c Configuration) MarshalBinary() ([]byte, error) {
 	}
 	out := []byte{c.Type, 0, 0, 0}
 	for _, attr := range c.Attributes {
+		if attr.Type > 0x7fff {
+			return nil, fmt.Errorf("%w: attribute type %d sets reserved bit", ErrInvalidConfiguration, attr.Type)
+		}
 		if len(attr.Value) > 0xffff {
 			return nil, fmt.Errorf("%w: attribute too long", ErrInvalidConfiguration)
 		}
@@ -129,7 +137,7 @@ func ParseConfiguration(data []byte) (Configuration, error) {
 			return Configuration{}, ErrInvalidConfiguration
 		}
 		cfg.Attributes = append(cfg.Attributes, ConfigurationAttribute{
-			Type:  binary.BigEndian.Uint16(rest[0:2]),
+			Type:  binary.BigEndian.Uint16(rest[0:2]) & 0x7fff,
 			Value: append([]byte(nil), rest[4:4+length]...),
 		})
 		rest = rest[4+length:]
@@ -153,6 +161,8 @@ func SWuConfigurationRequest() Configuration {
 		{Type: ConfigInternalIPv6DNS},
 		{Type: ConfigPCSCFIPv4Address},
 		{Type: ConfigPCSCFIPv6Address},
+		{Type: Config3GPPPCSCFIPv4Address},
+		{Type: Config3GPPPCSCFIPv6Address},
 	}}
 }
 

@@ -199,6 +199,7 @@ func (p *PacketPump) deviceToESP(ctx context.Context) {
 		if len(packet) == 0 {
 			continue
 		}
+		packet = clampInnerPacketTCPMSS(packet, p.effectiveMTU())
 		if err := p.runChildSARekeyDue(ctx, PacketPumpDeviceToESP); err != nil {
 			return
 		}
@@ -240,7 +241,8 @@ func (p *PacketPump) espToDevice(ctx context.Context) {
 		if len(packet.Payload) == 0 {
 			continue
 		}
-		if err := p.device.WriteInnerPacket(ctx, packet.Payload); err != nil {
+		payload := clampInnerPacketTCPMSS(packet.Payload, p.effectiveMTU())
+		if err := p.device.WriteInnerPacket(ctx, payload); err != nil {
 			if p.isNormalStop(ctx, err) {
 				p.requestStop()
 				return
@@ -254,7 +256,7 @@ func (p *PacketPump) espToDevice(ctx context.Context) {
 		}
 		p.mu.Lock()
 		p.stats.ESPToDevicePackets++
-		p.stats.ESPToDeviceBytes += uint64(len(packet.Payload))
+		p.stats.ESPToDeviceBytes += uint64(len(payload))
 		p.mu.Unlock()
 		if err := p.runChildSARekeyDue(ctx, PacketPumpESPToDevice); err != nil {
 			return
@@ -349,6 +351,18 @@ func (p *PacketPump) isNormalStop(ctx context.Context, err error) bool {
 		errors.Is(err, os.ErrClosed) ||
 		errors.Is(err, ErrPacketTunnelClosed) ||
 		(ctx != nil && ctx.Err() != nil)
+}
+
+func (p *PacketPump) effectiveMTU() int {
+	if p == nil || p.session == nil {
+		return DefaultTunnelInnerMTU
+	}
+	if provider, ok := p.session.(interface{ EffectiveMTU() int }); ok {
+		if mtu := provider.EffectiveMTU(); mtu > 0 {
+			return mtu
+		}
+	}
+	return DefaultTunnelInnerMTU
 }
 
 func isNonFatalPacketPumpError(err error) bool {

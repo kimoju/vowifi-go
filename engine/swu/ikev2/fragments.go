@@ -1,6 +1,7 @@
 package ikev2
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,9 +11,19 @@ const (
 	encryptedFragmentBodyHeaderLength = 4
 	MaxEncryptedFragments             = 64
 	MaxReassembledEncryptedSize       = 64 * 1024
+	DefaultIKEFragmentMTU             = 1280
+	MinIKEFragmentMTU                 = 576
 )
 
 var ErrInvalidEncryptedFragment = errors.New("invalid ikev2 encrypted fragment payload")
+
+// FragmentInitTransport is an optional extension of InitTransport for transports
+// that can transmit multiple SKF request datagrams and read multiple SKF
+// response datagrams within a single IKEv2 exchange (RFC 7383).
+type FragmentInitTransport interface {
+	InitTransport
+	ExchangeIKEFragments(ctx context.Context, requests [][]byte, acceptResponse func(raw []byte) (done bool, err error)) error
+}
 
 type EncryptedFragment struct {
 	FragmentNumber uint16
@@ -84,48 +95,64 @@ func EncryptedFragmentPayload(nextPayload uint8, fragment EncryptedFragment) (Pa
 }
 
 // EncryptedFragmentAssembler bounds fragment count and total reassembled size
-// per RFC 7383 to prevent memory exhaustion from untrusted SKF payloads.
+// per RFC 7383 to prevent memory exhaustion from SKF payloads. Use
+// AddProtectedFragment when processing wire SKF packets so outer MAC/AEAD
+// authentication is verified before mutating reassembly state (RFC 7383 §2.6).
 type EncryptedFragmentAssembler struct {
 	MaxFragments uint16
 	MaxSize      int
 
-	total     uint16
-	received  int
-	totalSize int
-	parts     [][]byte
+	total            uint16
+	received         int
+	totalSize        int
+	parts            [][]byte
+	hasHeader        bool
+	header           Header
+	firstMessage     Message
+	firstNextPayload uint8
 }
 
 func (a *EncryptedFragmentAssembler) Add(fragment EncryptedFragment) ([]byte, bool, error) {
 	if fragment.FragmentNumber == 0 || fragment.TotalFragments == 0 || fragment.FragmentNumber > fragment.TotalFragments || len(fragment.EncryptedData) == 0 {
 		return nil, false, fmt.Errorf("%w: invalid fragment metadata", ErrInvalidEncryptedFragment)
 	}
+	return a.addChunk(fragment.FragmentNumber, fragment.TotalFragments, fragment.EncryptedData)
+}
+
+func (a *EncryptedFragmentAssembler) addChunk(fragNum, totalFrags uint16, chunk []byte) ([]byte, bool, error) {
+	if fragNum == 0 || totalFrags == 0 || fragNum > totalFrags {
+		return nil, false, fmt.Errorf("%w: invalid fragment metadata", ErrInvalidEncryptedFragment)
+	}
 	maxFragments := a.MaxFragments
 	if maxFragments == 0 {
 		maxFragments = MaxEncryptedFragments
 	}
-	if fragment.TotalFragments > maxFragments {
-		return nil, false, fmt.Errorf("%w: total fragments %d exceeds maximum %d", ErrInvalidEncryptedFragment, fragment.TotalFragments, maxFragments)
+	if totalFrags > maxFragments {
+		return nil, false, fmt.Errorf("%w: total fragments %d exceeds maximum %d", ErrInvalidEncryptedFragment, totalFrags, maxFragments)
 	}
 	maxSize := a.MaxSize
 	if maxSize <= 0 {
 		maxSize = MaxReassembledEncryptedSize
 	}
-	if a.total == 0 {
-		a.total = fragment.TotalFragments
-		a.parts = make([][]byte, int(a.total))
-	} else if fragment.TotalFragments != a.total {
-		return nil, false, fmt.Errorf("%w: total fragments %d != %d", ErrInvalidEncryptedFragment, fragment.TotalFragments, a.total)
+	if a.total != 0 && totalFrags != a.total {
+		return nil, false, fmt.Errorf("%w: total fragments %d != %d", ErrInvalidEncryptedFragment, totalFrags, a.total)
 	}
-	idx := int(fragment.FragmentNumber - 1)
-	if a.parts[idx] != nil {
+	idx := int(fragNum - 1)
+	if a.total != 0 && a.parts[idx] != nil {
 		// Ignore duplicate retransmitted fragment per RFC 7383 §2.6.
 		return nil, false, nil
 	}
-	if a.totalSize+len(fragment.EncryptedData) > maxSize {
-		return nil, false, fmt.Errorf("%w: reassembled size %d exceeds maximum %d", ErrInvalidEncryptedFragment, a.totalSize+len(fragment.EncryptedData), maxSize)
+	if a.totalSize+len(chunk) > maxSize {
+		return nil, false, fmt.Errorf("%w: reassembled size %d exceeds maximum %d", ErrInvalidEncryptedFragment, a.totalSize+len(chunk), maxSize)
 	}
-	a.parts[idx] = append([]byte(nil), fragment.EncryptedData...)
-	a.totalSize += len(fragment.EncryptedData)
+	if a.total == 0 {
+		a.total = totalFrags
+		a.parts = make([][]byte, int(a.total))
+	}
+	copied := make([]byte, len(chunk))
+	copy(copied, chunk)
+	a.parts[idx] = copied
+	a.totalSize += len(copied)
 	a.received++
 	if a.received < int(a.total) {
 		return nil, false, nil
@@ -135,6 +162,48 @@ func (a *EncryptedFragmentAssembler) Add(fragment EncryptedFragment) ([]byte, bo
 		out = append(out, part...)
 	}
 	return out, true, nil
+}
+
+// AddProtectedFragment verifies the outer SKF MAC/AEAD tag and decrypts the
+// fragment chunk via UnprotectFragment BEFORE mutating reassembly state per
+// RFC 7383 §2.6. Once all fragments 1..TotalFragments are authenticated, it
+// parses and returns the inner payload chain.
+func (a *EncryptedFragmentAssembler) AddProtectedFragment(raw []byte, keys IKEKeys, fromInitiator bool) (Message, []Payload, bool, error) {
+	msg, nextPayload, fragNum, totalFrags, plainChunk, err := UnprotectFragment(raw, keys, fromInitiator)
+	if err != nil {
+		return Message{}, nil, false, err
+	}
+	if a.hasHeader {
+		h := msg.Header
+		if h.InitiatorSPI != a.header.InitiatorSPI ||
+			h.ResponderSPI != a.header.ResponderSPI ||
+			h.ExchangeType != a.header.ExchangeType ||
+			h.Flags != a.header.Flags ||
+			h.MessageID != a.header.MessageID {
+			return Message{}, nil, false, fmt.Errorf("%w: inconsistent fragment IKE header", ErrInvalidEncryptedFragment)
+		}
+	}
+	reassembled, complete, err := a.addChunk(fragNum, totalFrags, plainChunk)
+	if err != nil {
+		return Message{}, nil, false, err
+	}
+	if !a.hasHeader {
+		a.hasHeader = true
+		a.header = msg.Header
+		a.firstMessage = msg
+	}
+	if fragNum == 1 {
+		a.firstNextPayload = nextPayload
+		a.firstMessage = msg
+	}
+	if !complete {
+		return Message{}, nil, false, nil
+	}
+	inner, err := ParsePayloads(a.firstNextPayload, reassembled)
+	if err != nil {
+		return Message{}, nil, false, err
+	}
+	return a.firstMessage, inner, true, nil
 }
 
 func ReassembleEncryptedFragments(fragments []EncryptedFragment) ([]byte, error) {

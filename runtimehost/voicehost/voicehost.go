@@ -86,15 +86,40 @@ type DialogHoldController interface {
 	SendDialogResume(context.Context, DialogResumeRequest) (DialogUpdateResult, error)
 }
 
+type InboundDialogLookup interface {
+	HasInboundDialog(callID string) bool
+}
+
+type DialogAckSender interface {
+	AckDialog(context.Context, DialogAckRequest) error
+}
+
+type DialogAckRequest struct {
+	DeviceID    string
+	CallID      string
+	ContentType string
+	Body        []byte
+	Headers     map[string]string
+}
+
+type OutboundProvisionalResponse struct {
+	StatusCode  int
+	Reason      string
+	ContentType string
+	Body        []byte
+	Headers     map[string]string
+}
+
 type OutboundCallRequest struct {
-	DeviceID   string
-	CallID     string
-	Callee     string
-	RequestURI string
-	RouteSet   []string
-	RemoteSDP  SDPInfo
-	RawSDP     []byte
-	Headers    map[string]string
+	DeviceID      string
+	CallID        string
+	Callee        string
+	RequestURI    string
+	RouteSet      []string
+	RemoteSDP     SDPInfo
+	RawSDP        []byte
+	Headers       map[string]string
+	OnProvisional func(OutboundProvisionalResponse)
 }
 
 type OutboundCallResult struct {
@@ -112,6 +137,7 @@ type DialogInfo struct {
 	DeviceID    string
 	CallID      string
 	Callee      string
+	Direction   string
 	State       DialogState
 	CSeq        int
 	ContentType string
@@ -236,6 +262,7 @@ type DialogReinviteRequest struct {
 	ContentType string
 	Body        []byte
 	Headers     map[string]string
+	DeferAck    bool
 }
 
 type DialogReinviteResult struct {
@@ -265,16 +292,21 @@ type DialogResumeRequest struct {
 }
 
 type Gateway struct {
-	mu       sync.RWMutex
-	agents   map[string]Agent
-	dialogs  map[string]DialogInfo
-	client   ClientAdapter
-	notifier any
-	started  bool
+	mu            sync.RWMutex
+	agents        map[string]Agent
+	inboundAgents map[string]Agent
+	dialogs       map[string]DialogInfo
+	client        ClientAdapter
+	notifier      any
+	started       bool
 }
 
 func NewGateway() *Gateway {
-	return &Gateway{agents: make(map[string]Agent), dialogs: make(map[string]DialogInfo)}
+	return &Gateway{
+		agents:        make(map[string]Agent),
+		inboundAgents: make(map[string]Agent),
+		dialogs:       make(map[string]DialogInfo),
+	}
 }
 
 func (g *Gateway) Start(ctx context.Context) error {
@@ -327,6 +359,56 @@ func (g *Gateway) RegisterAgent(deviceID string, agent Agent) {
 	g.mu.Unlock()
 }
 
+func (g *Gateway) RegisterInboundAgent(deviceID string, agent Agent) {
+	if g == nil || strings.TrimSpace(deviceID) == "" {
+		return
+	}
+	g.mu.Lock()
+	if g.inboundAgents == nil {
+		g.inboundAgents = make(map[string]Agent)
+	}
+	g.inboundAgents[strings.TrimSpace(deviceID)] = agent
+	g.mu.Unlock()
+}
+
+func (g *Gateway) UnregisterInboundAgent(deviceID string) {
+	if g == nil || strings.TrimSpace(deviceID) == "" {
+		return
+	}
+	g.mu.Lock()
+	delete(g.inboundAgents, strings.TrimSpace(deviceID))
+	g.mu.Unlock()
+}
+
+func (g *Gateway) GetInboundAgent(deviceID string) Agent {
+	if g == nil {
+		return nil
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.inboundAgents[strings.TrimSpace(deviceID)]
+}
+
+func (g *Gateway) agentForCall(deviceID, callID string) Agent {
+	if g == nil {
+		return nil
+	}
+	callID = strings.TrimSpace(callID)
+	inbound := g.GetInboundAgent(deviceID)
+	if inbound != nil && callID != "" {
+		if lookup, ok := inbound.(InboundDialogLookup); ok && lookup.HasInboundDialog(callID) {
+			return inbound
+		}
+		if strings.EqualFold(g.dialog(callID).Direction, "inbound") {
+			return inbound
+		}
+	}
+	if out := g.GetAgent(deviceID); out != nil {
+		return out
+	}
+	return inbound
+}
+
 func (g *Gateway) UnregisterAgent(deviceID string) {
 	if g == nil || strings.TrimSpace(deviceID) == "" {
 		return
@@ -334,6 +416,7 @@ func (g *Gateway) UnregisterAgent(deviceID string) {
 	devID := strings.TrimSpace(deviceID)
 	g.mu.Lock()
 	delete(g.agents, devID)
+	delete(g.inboundAgents, devID)
 	for callID, dialog := range g.dialogs {
 		if dialog.DeviceID == devID && dialog.State != DialogStateTerminated {
 			dialog.State = DialogStateTerminated
@@ -448,13 +531,13 @@ func (g *Gateway) HandleClientInvite(deviceID string, req *sip.Request, tx sip.S
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
 		return
 	}
+	if dialog := g.dialog(callID); dialog.State == DialogStateEstablished {
+		g.handleClientReinvite(deviceID, req, tx, callID)
+		return
+	}
 	remoteSDP, err := ParseSDP(req.Body())
 	if err != nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 488, "Invalid SDP", nil))
-		return
-	}
-	if dialog := g.dialog(callID); dialog.State == DialogStateEstablished {
-		g.handleClientReinvite(deviceID, req, tx, callID)
 		return
 	}
 	agent, _ := g.GetAgent(deviceID).(OutboundCallAgent)
@@ -468,26 +551,55 @@ func (g *Gateway) HandleClientInvite(deviceID string, req *sip.Request, tx sip.S
 		return
 	}
 	_ = tx.Respond(sip.NewResponseFromRequest(req, 100, "Trying", nil))
-	g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, State: DialogStateEarly})
+	g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, Direction: "outbound", State: DialogStateEarly})
 	result, err := agent.StartOutboundCall(context.Background(), OutboundCallRequest{
 		DeviceID:  strings.TrimSpace(deviceID),
 		CallID:    callID,
 		Callee:    callee,
 		RemoteSDP: remoteSDP,
 		RawSDP:    append([]byte(nil), req.Body()...),
+		Headers:   sipRequestHeaderMap(req),
+		OnProvisional: func(prov OutboundProvisionalResponse) {
+			if prov.StatusCode <= 100 || prov.StatusCode >= 200 {
+				return
+			}
+			provReason := firstVoiceNonEmpty(prov.Reason, "Session Progress")
+			provBody := append([]byte(nil), prov.Body...)
+			provRes := sip.NewResponseFromRequest(req, prov.StatusCode, provReason, provBody)
+			if len(provBody) > 0 {
+				provRes.AppendHeader(sip.NewHeader("Content-Type", firstVoiceNonEmpty(prov.ContentType, "application/sdp")))
+			}
+			for key, value := range prov.Headers {
+				key = strings.TrimSpace(key)
+				value = strings.TrimSpace(value)
+				if key == "" || value == "" || isProtectedDialogHeader(key) {
+					continue
+				}
+				provRes.AppendHeader(sip.NewHeader(key, value))
+			}
+			attachGatewayContactHeader(provRes, req, prov.Headers)
+			_ = tx.Respond(provRes)
+		},
 	})
 	if err != nil {
-		g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, State: DialogStateTerminated})
+		g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, Direction: "outbound", State: DialogStateTerminated})
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice setup failed", nil))
 		return
 	}
 	if !result.Accepted {
-		g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, State: DialogStateTerminated})
+		g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, Direction: "outbound", State: DialogStateTerminated})
 		reason := strings.TrimSpace(result.Reason)
 		if reason == "" {
 			reason = "Busy Here"
 		}
 		_ = tx.Respond(sip.NewResponseFromRequest(req, localFinalStatusCode(result.StatusCode, 486), reason, nil))
+		return
+	}
+	if g.dialog(callID).State == DialogStateTerminated {
+		if terminator, ok := g.GetAgent(deviceID).(DialogTerminator); ok {
+			_ = terminator.EndVoiceCall(context.Background(), DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, State: DialogStateTerminated})
+		}
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 487, "Request Terminated", nil))
 		return
 	}
 	body := append([]byte(nil), result.RawSDP...)
@@ -504,12 +616,13 @@ func (g *Gateway) HandleClientInvite(deviceID string, req *sip.Request, tx sip.S
 		}
 		res.AppendHeader(sip.NewHeader(key, value))
 	}
-	g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, State: DialogStateEstablished})
+	attachGatewayContactHeader(res, req, result.Headers)
+	g.recordDialog(DialogInfo{DeviceID: deviceID, CallID: callID, Callee: callee, Direction: "outbound", State: DialogStateEstablished})
 	_ = tx.Respond(res)
 }
 
 func (g *Gateway) handleClientReinvite(deviceID string, req *sip.Request, tx sip.ServerTransaction, callID string) {
-	reinviter, _ := g.GetAgent(deviceID).(DialogReinviter)
+	reinviter, _ := g.agentForCall(deviceID, callID).(DialogReinviter)
 	if reinviter == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
@@ -519,12 +632,19 @@ func (g *Gateway) handleClientReinvite(deviceID string, req *sip.Request, tx sip
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 415, "Unsupported Media Type", nil))
 		return
 	}
+	if len(req.Body()) > 0 {
+		if _, err := ParseSDP(req.Body()); err != nil {
+			_ = tx.Respond(sip.NewResponseFromRequest(req, 488, "Invalid SDP", nil))
+			return
+		}
+	}
 	result, err := reinviter.SendDialogReinvite(context.Background(), DialogReinviteRequest{
 		DeviceID:    strings.TrimSpace(deviceID),
 		CallID:      callID,
 		ContentType: contentType,
 		Body:        append([]byte(nil), req.Body()...),
 		Headers:     sipRequestHeaderMap(req),
+		DeferAck:    len(req.Body()) == 0,
 	})
 	if err != nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi re-INVITE failed", nil))
@@ -548,6 +668,9 @@ func (g *Gateway) handleClientReinvite(deviceID string, req *sip.Request, tx sip
 		}
 		res.AppendHeader(sip.NewHeader(key, value))
 	}
+	if statusCode >= 200 && statusCode < 300 {
+		attachGatewayContactHeader(res, req, result.Headers)
+	}
 	_ = tx.Respond(res)
 }
 
@@ -568,7 +691,7 @@ func (g *Gateway) HandleClientCancel(deviceID string, req *sip.Request, tx sip.S
 	dialog.Body = append([]byte(nil), req.Body()...)
 	dialog.Headers = sipRequestHeaderMap(req)
 	dialog.State = DialogStateTerminated
-	agent := g.GetAgent(deviceID)
+	agent := g.agentForCall(deviceID, callID)
 	if canceller, ok := agent.(DialogCancellerWithResult); ok {
 		result, err := canceller.CancelVoiceCallWithResult(context.Background(), dialog)
 		if dialogResultTerminatesLocalDialog(result, err) {
@@ -599,12 +722,12 @@ func (g *Gateway) HandleClientPrack(deviceID string, req *sip.Request, tx sip.Se
 	if tx == nil || req == nil {
 		return
 	}
-	sender, _ := g.GetAgent(deviceID).(DialogPrackSender)
+	callID := sipCallID(req)
+	sender, _ := g.agentForCall(deviceID, callID).(DialogPrackSender)
 	if sender == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
-	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
 		return
@@ -660,12 +783,12 @@ func (g *Gateway) HandleClientOptions(deviceID string, req *sip.Request, tx sip.
 	if tx == nil || req == nil {
 		return
 	}
-	sender, _ := g.GetAgent(deviceID).(DialogOptionsSender)
+	callID := sipCallID(req)
+	sender, _ := g.agentForCall(deviceID, callID).(DialogOptionsSender)
 	if sender == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
-	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
 		return
@@ -701,12 +824,12 @@ func (g *Gateway) HandleClientRefer(deviceID string, req *sip.Request, tx sip.Se
 	if tx == nil || req == nil {
 		return
 	}
-	sender, _ := g.GetAgent(deviceID).(DialogReferSender)
+	callID := sipCallID(req)
+	sender, _ := g.agentForCall(deviceID, callID).(DialogReferSender)
 	if sender == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
-	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
 		return
@@ -757,12 +880,12 @@ func (g *Gateway) HandleClientNotify(deviceID string, req *sip.Request, tx sip.S
 	if tx == nil || req == nil {
 		return
 	}
-	sender, _ := g.GetAgent(deviceID).(DialogNotifySender)
+	callID := sipCallID(req)
+	sender, _ := g.agentForCall(deviceID, callID).(DialogNotifySender)
 	if sender == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
-	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
 		return
@@ -812,12 +935,12 @@ func (g *Gateway) HandleClientSubscribe(deviceID string, req *sip.Request, tx si
 	if tx == nil || req == nil {
 		return
 	}
-	sender, _ := g.GetAgent(deviceID).(DialogSubscribeSender)
+	callID := sipCallID(req)
+	sender, _ := g.agentForCall(deviceID, callID).(DialogSubscribeSender)
 	if sender == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
-	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
 		return
@@ -864,14 +987,14 @@ func (g *Gateway) HandleClientInfo(deviceID string, req *sip.Request, tx sip.Ser
 	if tx == nil || req == nil {
 		return
 	}
-	agent := g.GetAgent(deviceID)
+	callID := sipCallID(req)
+	agent := g.agentForCall(deviceID, callID)
 	sender, _ := agent.(DialogInfoSender)
 	autoDTMF, _ := agent.(DialogAutoDTMFSender)
 	if sender == nil && autoDTMF == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
-	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
 		return
@@ -975,12 +1098,12 @@ func (g *Gateway) HandleClientMessage(deviceID string, req *sip.Request, tx sip.
 	if tx == nil || req == nil {
 		return
 	}
-	sender, _ := g.GetAgent(deviceID).(DialogMessageSender)
+	callID := sipCallID(req)
+	sender, _ := g.agentForCall(deviceID, callID).(DialogMessageSender)
 	if sender == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
-	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
 		return
@@ -1018,12 +1141,12 @@ func (g *Gateway) HandleClientUpdate(deviceID string, req *sip.Request, tx sip.S
 	if tx == nil || req == nil {
 		return
 	}
-	updater, _ := g.GetAgent(deviceID).(DialogUpdater)
+	callID := sipCallID(req)
+	updater, _ := g.agentForCall(deviceID, callID).(DialogUpdater)
 	if updater == nil {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 503, "VoWiFi voice bridge unavailable", nil))
 		return
 	}
-	callID := sipCallID(req)
 	if callID == "" {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "Missing Call-ID", nil))
 		return
@@ -1069,7 +1192,24 @@ func (g *Gateway) HandleClientUpdate(deviceID string, req *sip.Request, tx sip.S
 	_ = tx.Respond(res)
 }
 
-func (g *Gateway) HandleClientAck(deviceID string, req *sip.Request, tx sip.ServerTransaction) {}
+func (g *Gateway) HandleClientAck(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
+	if g == nil || req == nil {
+		return
+	}
+	callID := sipCallID(req)
+	if callID == "" {
+		return
+	}
+	if sender, ok := g.agentForCall(deviceID, callID).(DialogAckSender); ok {
+		_ = sender.AckDialog(context.Background(), DialogAckRequest{
+			DeviceID:    strings.TrimSpace(deviceID),
+			CallID:      callID,
+			ContentType: sipHeaderValue(req, "Content-Type"),
+			Body:        append([]byte(nil), req.Body()...),
+			Headers:     sipRequestHeaderMap(req),
+		})
+	}
+}
 
 func (g *Gateway) HandleClientBye(deviceID string, req *sip.Request, tx sip.ServerTransaction) {
 	if req == nil {
@@ -1088,7 +1228,7 @@ func (g *Gateway) HandleClientBye(deviceID string, req *sip.Request, tx sip.Serv
 	dialog.ContentType = sipHeaderValue(req, "Content-Type")
 	dialog.Body = append([]byte(nil), req.Body()...)
 	dialog.Headers = sipRequestHeaderMap(req)
-	agent := g.GetAgent(deviceID)
+	agent := g.agentForCall(deviceID, callID)
 	if terminator, ok := agent.(DialogTerminatorWithResult); ok {
 		result, err := terminator.EndVoiceCallWithResult(context.Background(), dialog)
 		if dialogResultTerminatesLocalDialog(result, err) {
@@ -1120,7 +1260,9 @@ type SDPInfo struct {
 	MediaPort              int
 	RTCPIP                 string
 	RTCPPort               int
+	RTCPMux                bool
 	Payloads               []int
+	Codecs                 []SDPCodec
 	TelephoneEventPayloads map[uint8]int
 	Direction              string
 	PTimeMS                int
@@ -1128,63 +1270,271 @@ type SDPInfo struct {
 }
 
 var (
-	sdpMediaRE  = regexp.MustCompile(`(?m)^m=audio ([0-9]+) [A-Z0-9/]+(.*)$`)
-	sdpRTCPRE   = regexp.MustCompile(`(?m)^a=rtcp:([0-9]+)(?:\s+IN\s+IP[46]\s+([^\r\n]+))?`)
+	sdpMediaRE  = regexp.MustCompile(`(?mi)^m=audio\s+([0-9]+)(?:/[0-9]+)?\s+[A-Za-z0-9/]+(.*)$`)
+	sdpRTCPRE   = regexp.MustCompile(`(?mi)^a=rtcp:([0-9]+)(?:\s+IN\s+IP[46]\s+([^\r\n]+))?$`)
 	sdpRTPMapRE = regexp.MustCompile(`(?mi)^a=rtpmap:([0-9]+)\s+telephone-event/([0-9]+)(?:/[0-9]+)?\s*$`)
 )
 
 func ParseSDP(body []byte) (SDPInfo, error) {
-	text := string(body)
-	var out SDPInfo
-	if ip := parseSDPAudioConnectionIP(body); ip != "" {
-		out.ConnectionIP = ip
+	lines := sdpSecurityLines(body)
+	type audioSection struct {
+		port  int
+		fmt   string
+		lines []string
 	}
+	var (
+		sessionLines []string
+		sections     []audioSection
+		inMedia      bool
+		curAudioIdx  = -1
+	)
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "m=") {
+			inMedia = true
+			curAudioIdx = -1
+			if m := sdpMediaRE.FindStringSubmatch(line); len(m) == 3 {
+				port, err := strconv.Atoi(m[1])
+				if err == nil {
+					sections = append(sections, audioSection{port: port, fmt: m[2]})
+					curAudioIdx = len(sections) - 1
+				}
+			}
+			continue
+		}
+		if !inMedia {
+			sessionLines = append(sessionLines, line)
+		} else if curAudioIdx >= 0 {
+			sections[curAudioIdx].lines = append(sections[curAudioIdx].lines, line)
+		}
+	}
+	if len(sections) == 0 {
+		return SDPInfo{}, errors.New("missing SDP audio port")
+	}
+	chosen := sections[0]
+	for _, sec := range sections {
+		if sec.port > 0 {
+			chosen = sec
+			break
+		}
+	}
+
+	var out SDPInfo
+	out.MediaPort = chosen.port
+	for _, part := range strings.Fields(chosen.fmt) {
+		payload, err := strconv.Atoi(part)
+		if err == nil {
+			out.Payloads = append(out.Payloads, payload)
+		}
+	}
+
+	sessionConnIP := ""
+	sessionDir := ""
+	sessionPTime := 0
+	sessionMaxPTime := 0
+	for _, line := range sessionLines {
+		if ip := parseSDPConnectionLineIP(line); ip != "" {
+			sessionConnIP = ip
+		}
+		if dir, ok := parseSDPDirectionAttributeLine(line); ok {
+			sessionDir = dir
+		}
+		if pt, ok := parseSDPPTimeLine(line, "a=ptime:"); ok {
+			sessionPTime = pt
+		}
+		if mpt, ok := parseSDPPTimeLine(line, "a=maxptime:"); ok {
+			sessionMaxPTime = mpt
+		}
+	}
+
+	mediaConnIP := ""
+	mediaDir := ""
+	mediaPTime := 0
+	mediaMaxPTime := 0
+	codecsByPayload := make(map[int]SDPCodec)
+	for _, line := range chosen.lines {
+		lower := strings.ToLower(line)
+		if ip := parseSDPConnectionLineIP(line); ip != "" {
+			mediaConnIP = ip
+			continue
+		}
+		if dir, ok := parseSDPDirectionAttributeLine(line); ok {
+			mediaDir = dir
+			continue
+		}
+		if pt, ok := parseSDPPTimeLine(line, "a=ptime:"); ok {
+			mediaPTime = pt
+			continue
+		}
+		if mpt, ok := parseSDPPTimeLine(line, "a=maxptime:"); ok {
+			mediaMaxPTime = mpt
+			continue
+		}
+		if strings.EqualFold(line, "a=rtcp-mux") {
+			out.RTCPMux = true
+			continue
+		}
+		if m := sdpRTCPRE.FindStringSubmatch(line); len(m) >= 2 {
+			port, _ := strconv.Atoi(m[1])
+			out.RTCPPort = port
+			if len(m) >= 3 && strings.TrimSpace(m[2]) != "" {
+				out.RTCPIP = strings.TrimSpace(m[2])
+			}
+			continue
+		}
+		if m := sdpRTPMapRE.FindStringSubmatch(line); len(m) == 3 {
+			payload, _ := strconv.Atoi(m[1])
+			clockRate, _ := strconv.Atoi(m[2])
+			if payload >= 0 && payload <= 127 && clockRate > 0 {
+				if out.TelephoneEventPayloads == nil {
+					out.TelephoneEventPayloads = make(map[uint8]int)
+				}
+				out.TelephoneEventPayloads[uint8(payload)] = clockRate
+			}
+		}
+		if strings.HasPrefix(lower, "a=rtpmap:") {
+			if codec, ok, err := parseSDPRTPMapCodec(line); err == nil && ok {
+				if existing, exists := codecsByPayload[codec.Payload]; exists {
+					codec.FMTP = existing.FMTP
+				}
+				codecsByPayload[codec.Payload] = codec
+			}
+		} else if strings.HasPrefix(lower, "a=fmtp:") {
+			if payload, fmtp, ok, err := parseSDPFmtpLine(line); err == nil && ok {
+				codec := codecsByPayload[payload]
+				codec.Payload = payload
+				codec.FMTP = fmtp
+				codecsByPayload[payload] = codec
+			}
+		}
+	}
+
+	out.ConnectionIP = firstVoiceNonEmpty(mediaConnIP, sessionConnIP)
 	if out.ConnectionIP == "" {
-		out.ConnectionIP = "127.0.0.1"
+		return SDPInfo{}, errors.New("missing SDP connection IP")
 	}
 	ip := net.ParseIP(out.ConnectionIP)
 	if ip == nil {
 		return SDPInfo{}, errors.New("invalid SDP connection IP")
 	}
-	hasAudio := false
-	if m := sdpMediaRE.FindStringSubmatch(text); len(m) == 3 {
-		hasAudio = true
-		port, _ := strconv.Atoi(m[1])
-		out.MediaPort = port
-		for _, part := range strings.Fields(m[2]) {
-			payload, err := strconv.Atoi(part)
-			if err == nil {
-				out.Payloads = append(out.Payloads, payload)
-			}
-		}
-	}
-	if !hasAudio {
-		return SDPInfo{}, errors.New("missing SDP audio port")
-	}
-	if m := sdpRTCPRE.FindStringSubmatch(text); len(m) >= 2 {
-		port, _ := strconv.Atoi(m[1])
-		out.RTCPPort = port
-		if len(m) >= 3 && strings.TrimSpace(m[2]) != "" {
-			out.RTCPIP = strings.TrimSpace(m[2])
-		}
-	}
-	for _, m := range sdpRTPMapRE.FindAllStringSubmatch(text, -1) {
-		payload, _ := strconv.Atoi(m[1])
-		clockRate, _ := strconv.Atoi(m[2])
-		if payload < 0 || payload > 127 || clockRate <= 0 {
-			continue
-		}
-		if out.TelephoneEventPayloads == nil {
-			out.TelephoneEventPayloads = make(map[uint8]int)
-		}
-		out.TelephoneEventPayloads[uint8(payload)] = clockRate
-	}
+
 	if out.TelephoneEventPayloads == nil && sdpPayloadsContain(out.Payloads, DefaultRTPDTMFPayloadType) {
 		out.TelephoneEventPayloads = map[uint8]int{DefaultRTPDTMFPayloadType: DefaultRTPDTMFClockRate}
 	}
-	out.PTimeMS, out.MaxPTimeMS = parseSDPAudioPacketizationTime(body)
-	out.Direction = parseSDPAudioDirection(body, out.ConnectionIP, out.MediaPort)
+	if len(out.Payloads) > 0 {
+		out.Codecs = make([]SDPCodec, 0, len(out.Payloads))
+		for _, payload := range out.Payloads {
+			codec, ok := codecsByPayload[payload]
+			if !ok {
+				codec, _ = staticSDPCodec(payload)
+			}
+			codec.Payload = payload
+			out.Codecs = append(out.Codecs, codec)
+		}
+	}
+	out.PTimeMS = mediaPTime
+	if out.PTimeMS <= 0 {
+		out.PTimeMS = sessionPTime
+	}
+	out.MaxPTimeMS = mediaMaxPTime
+	if out.MaxPTimeMS <= 0 {
+		out.MaxPTimeMS = sessionMaxPTime
+	}
+	out.Direction = firstVoiceNonEmpty(mediaDir, sessionDir, "sendrecv")
+	if out.MediaPort <= 0 || ip.IsUnspecified() {
+		out.Direction = "inactive"
+	}
+	if out.RTCPMux && out.MediaPort > 0 {
+		out.RTCPPort = out.MediaPort
+		out.RTCPIP = out.ConnectionIP
+	}
 	return out, nil
+}
+
+func parseSDPConnectionLineIP(line string) string {
+	line = strings.TrimSpace(line)
+	if len(line) < 2 || !strings.EqualFold(line[:2], "c=") {
+		return ""
+	}
+	fields := strings.Fields(line[2:])
+	if len(fields) < 3 || !strings.EqualFold(fields[0], "IN") {
+		return ""
+	}
+	if !strings.EqualFold(fields[1], "IP4") && !strings.EqualFold(fields[1], "IP6") {
+		return ""
+	}
+	addr := strings.TrimSpace(fields[2])
+	if slash := strings.IndexByte(addr, '/'); slash >= 0 {
+		addr = addr[:slash]
+	}
+	return strings.TrimSpace(addr)
+}
+
+func parseSDPDirectionAttributeLine(line string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "a=sendrecv":
+		return "sendrecv", true
+	case "a=sendonly":
+		return "sendonly", true
+	case "a=recvonly":
+		return "recvonly", true
+	case "a=inactive":
+		return "inactive", true
+	default:
+		return "", false
+	}
+}
+
+func parseSDPPTimeLine(line, prefix string) (int, bool) {
+	trimmed := strings.TrimSpace(line)
+	if len(trimmed) <= len(prefix) || !strings.EqualFold(trimmed[:len(prefix)], prefix) {
+		return 0, false
+	}
+	val, err := strconv.Atoi(strings.TrimSpace(trimmed[len(prefix):]))
+	if err != nil || val <= 0 {
+		return 0, false
+	}
+	return val, true
+}
+
+func attachGatewayContactHeader(res *sip.Response, req *sip.Request, resultHeaders map[string]string) {
+	if res == nil {
+		return
+	}
+	if res.GetHeader("Contact") != nil || res.GetHeader("m") != nil {
+		return
+	}
+	for k, v := range resultHeaders {
+		if strings.EqualFold(strings.TrimSpace(k), "Contact") && strings.TrimSpace(v) != "" {
+			res.AppendHeader(sip.NewHeader("Contact", strings.TrimSpace(v)))
+			return
+		}
+	}
+	host := "127.0.0.1"
+	port := 5060
+	if req != nil {
+		if dst := strings.TrimSpace(req.Destination()); dst != "" {
+			if h, p, err := net.SplitHostPort(dst); err == nil && strings.TrimSpace(h) != "" {
+				host = strings.TrimSpace(h)
+				if pn, err := strconv.Atoi(p); err == nil && pn > 0 {
+					port = pn
+				}
+			}
+		} else if h := strings.TrimSpace(req.Recipient.Host); h != "" {
+			host = h
+			if req.Recipient.Port > 0 {
+				port = req.Recipient.Port
+			}
+		}
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	res.AppendHeader(sip.NewHeader("Contact", fmt.Sprintf("<sip:vowifi-gateway@%s:%d>", host, port)))
 }
 
 func BuildSDPAnswer(info SDPInfo) []byte {

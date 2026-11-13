@@ -38,6 +38,9 @@ type SendOptions struct {
 	UseDataCodingScheme   bool
 	ReplyPath             bool
 	RejectDuplicates      bool
+	TPMR                  int
+	HasTPMR               bool
+	UnsentQueued          bool
 	ConcatRef             int
 	ConcatRefBits         int
 	ApplicationDestPort   int
@@ -56,14 +59,15 @@ type SendOutcome struct {
 }
 
 type USSDResult struct {
-	SessionID                  string        `json:"session_id,omitempty"`
-	Text                       string        `json:"text,omitempty"`
-	RawText                    string        `json:"raw_text,omitempty"`
-	Status                     int           `json:"status,omitempty"`
-	DCS                        int           `json:"dcs,omitempty"`
-	Done                       bool          `json:"done"`
-	RegistrationRecoveryNeeded bool          `json:"registration_recovery_needed,omitempty"`
-	RetryAfter                 time.Duration `json:"retry_after,omitempty"`
+	SessionID                  string              `json:"session_id,omitempty"`
+	Text                       string              `json:"text,omitempty"`
+	RawText                    string              `json:"raw_text,omitempty"`
+	Status                     int                 `json:"status,omitempty"`
+	DCS                        int                 `json:"dcs,omitempty"`
+	Done                       bool                `json:"done"`
+	RegistrationRecoveryNeeded bool                `json:"registration_recovery_needed,omitempty"`
+	RetryAfter                 time.Duration       `json:"retry_after,omitempty"`
+	Headers                    map[string][]string `json:"-"`
 }
 
 type IncomingSMS struct {
@@ -88,6 +92,8 @@ type SMSDeliveryReport struct {
 	State                 string
 	SIPCode               int
 	RPCause               int
+	TPStatus              int
+	HasTPStatus           bool
 	ErrorText             string
 	ReportAt              time.Time
 	Recipient             string
@@ -118,6 +124,9 @@ type SMSPart struct {
 	UseDataCodingScheme   bool
 	ReplyPath             bool
 	RejectDuplicates      bool
+	TPMR                  int
+	HasTPMR               bool
+	UnsentQueued          bool
 	ConcatRef             int
 	ConcatRefBits         int
 	ApplicationDestPort   int
@@ -144,6 +153,7 @@ type SMSSendResult struct {
 	ErrorText                  string
 	RegistrationRecoveryNeeded bool
 	RetryAfter                 time.Duration
+	Headers                    map[string][]string `json:"-"`
 }
 
 type SMSTransport interface {
@@ -241,6 +251,21 @@ func RPCauseText(code int) string {
 	return fmt.Sprintf("RP cause %d", code)
 }
 
+type ussdSessionEntry struct {
+	result    USSDResult
+	updatedAt time.Time
+}
+
+type smsSentPartKey struct {
+	peer string
+	rpMR int
+}
+
+type smsSentPartEntry struct {
+	callID string
+	sentAt time.Time
+}
+
 type Service struct {
 	deviceID      string
 	imsi          string
@@ -249,8 +274,9 @@ type Service struct {
 	transport     SMSTransport
 	ussdTransport USSDTransport
 	mu            sync.Mutex
-	ussdSessions  map[string]USSDResult
+	ussdSessions  map[string]ussdSessionEntry
 	smsConcat     map[smsConcatKey]*smsConcatState
+	sentSMSParts  map[smsSentPartKey]smsSentPartEntry
 }
 
 var smsConcatRefCounter atomic.Uint32
@@ -400,8 +426,22 @@ func (s *Service) replayIMSSMSSubmitRetry(ctx context.Context, envelope IMSMessa
 		result.Err = ErrSMSTransportUnavailable
 		return result, ErrSMSTransportUnavailable
 	}
-	res, err := transport.SendSMSPart(ctx, req)
+	sendReq := req
+	if !sendReq.Part.UnsentQueued {
+		sendReq.Part.RejectDuplicates = true
+	}
+	sendReq.Part.UnsentQueued = false
+	res, err := transport.SendSMSPart(ctx, sendReq)
 	result.Replayed = true
+	if res.RPMR > 0 || !sendReq.Part.HasTPMR {
+		if res.RPMR > 0 || sendReq.Part.TPMR == 0 {
+			sendReq.Part.TPMR = res.RPMR
+			if res.RPMR > 0 {
+				sendReq.Part.HasTPMR = true
+			}
+		}
+	}
+	sendReq.Part.RejectDuplicates = true
 	if err != nil {
 		res.State = "failed"
 		if strings.TrimSpace(res.ErrorText) == "" {
@@ -411,11 +451,12 @@ func (s *Service) replayIMSSMSSubmitRetry(ctx context.Context, envelope IMSMessa
 		res.State = "sent"
 	}
 	result.SMSResult = res
-	if s != nil && s.store != nil && strings.TrimSpace(req.MessageID) != "" {
-		_ = s.store.UpsertSMSDeliveryPart(req.MessageID, req.Part.PartNo, res.CallID, res.RPMR, res.State, now)
-		_ = s.store.RecomputeSMSDelivery(req.MessageID, now)
+	s.rememberSentSMSPart(sendReq.Peer, res.RPMR, res.CallID, now)
+	if s != nil && s.store != nil && strings.TrimSpace(sendReq.MessageID) != "" {
+		_ = s.store.UpsertSMSDeliveryPart(sendReq.MessageID, sendReq.Part.PartNo, res.CallID, res.RPMR, res.State, now)
+		_ = s.store.RecomputeSMSDelivery(sendReq.MessageID, now)
 	}
-	next := NewIMSSMSSubmitRetryEnvelope(req, res, err, IMSMessagingRetryOptions{
+	next := NewIMSSMSSubmitRetryEnvelope(sendReq, res, err, IMSMessagingRetryOptions{
 		Attempt:        imsMessagingRetryReplayAttempt(envelope),
 		Now:            now,
 		IdempotencyKey: firstNonEmpty(envelope.IdempotencyKey, envelope.Key),
@@ -502,10 +543,15 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 	state := "sent"
 	deliveryState := "sent"
 	lastErr := ""
-	for _, part := range parts {
+	for idx, part := range parts {
 		partNow := time.Now()
+		if !part.HasTPMR {
+			part.TPMR = int(nextIMSSMSMessageRef())
+			part.HasTPMR = true
+		}
 		res := SMSSendResult{State: "sent"}
 		var sendErr error
+		var retryEnvelope IMSMessagingRetryEnvelope
 		req := SMSSendRequest{
 			DeviceID:  s.deviceID,
 			IMSI:      s.imsi,
@@ -515,10 +561,18 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 		}
 		if transport := s.smsTransport(); transport != nil {
 			res, sendErr = transport.SendSMSPart(ctx, req)
-			s.recordIMSMessagingRetry(NewIMSSMSSubmitRetryEnvelope(req, res, sendErr, IMSMessagingRetryOptions{
+			retryReq := req
+			if res.RPMR > 0 {
+				retryReq.Part.TPMR = res.RPMR
+				retryReq.Part.HasTPMR = true
+			}
+			retryReq.Part.RejectDuplicates = true
+			retryReq.Part.UnsentQueued = false
+			retryEnvelope = NewIMSSMSSubmitRetryEnvelope(retryReq, res, sendErr, IMSMessagingRetryOptions{
 				Attempt: 1,
 				Now:     time.Now(),
-			}))
+			})
+			s.recordIMSMessagingRetry(retryEnvelope)
 		}
 		if res.State == "" {
 			res.State = "sent"
@@ -529,22 +583,41 @@ func (s *Service) SendSMSWithOptions(ctx context.Context, to, text string, opts 
 				res.ErrorText = sendErr.Error()
 			}
 		}
+		s.rememberSentSMSPart(to, res.RPMR, res.CallID, partNow)
 		if s != nil && s.store != nil {
 			_ = s.store.UpsertSMSDeliveryPart(id, part.PartNo, res.CallID, res.RPMR, res.State, partNow)
 		}
 		if res.State == "sent" || res.State == "delivered" || res.State == "accepted" {
 			acks++
 		}
-		if sendErr != nil {
+		if sendErr != nil || res.State == "failed" {
 			state = "failed"
 			deliveryState = "failed"
 			lastErr = res.ErrorText
-			break
-		}
-		if res.State == "failed" {
-			state = "failed"
-			deliveryState = "failed"
-			lastErr = res.ErrorText
+			if retryEnvelope.Pending() && idx+1 < len(parts) {
+				retryNow := time.Now()
+				for _, remPart := range parts[idx+1:] {
+					if !remPart.HasTPMR {
+						remPart.TPMR = int(nextIMSSMSMessageRef())
+						remPart.HasTPMR = true
+					}
+					remPart.UnsentQueued = true
+					remReq := SMSSendRequest{
+						DeviceID:  s.deviceID,
+						IMSI:      s.imsi,
+						Peer:      to,
+						MessageID: id,
+						Part:      remPart,
+					}
+					if s != nil && s.store != nil {
+						_ = s.store.UpsertSMSDeliveryPart(id, remPart.PartNo, smsCallID(remReq), remPart.TPMR, "failed", retryNow)
+					}
+					s.recordIMSMessagingRetry(NewIMSSMSSubmitRetryEnvelope(remReq, res, sendErr, IMSMessagingRetryOptions{
+						Attempt: 1,
+						Now:     retryNow,
+					}))
+				}
+			}
 			break
 		}
 	}
@@ -657,14 +730,16 @@ func (s *Service) HandleIncomingSMS(ctx context.Context, msg IncomingSMS) error 
 	if sender == "" {
 		return errors.New("incoming sms sender is empty")
 	}
-	if content == "" && !incomingSMSHasUserDataHeader(msg) {
+	hasMWI := msg.DataCoding.MessageWaiting || len(msg.UserDataHeaderInfo.SpecialMessageIndications) > 0
+	if content == "" && !incomingSMSHasUserDataHeader(msg) && !hasMWI {
 		return errors.New("incoming sms content is empty")
 	}
 	at := msg.Timestamp
 	if at.IsZero() {
 		at = time.Now()
 	}
-	if content != "" && s != nil && s.dispatch != nil {
+	discardText := s.dispatchIncomingSMSMessageWaiting(ctx, sender, at, msg)
+	if content != "" && !discardText && s != nil && s.dispatch != nil {
 		s.dispatch.Dispatch(ctx, eventhost.SMSReceived{
 			DevID:   s.deviceID,
 			Sender:  sender,
@@ -673,6 +748,63 @@ func (s *Service) HandleIncomingSMS(ctx context.Context, msg IncomingSMS) error 
 		})
 	}
 	return nil
+}
+
+func (s *Service) dispatchIncomingSMSMessageWaiting(ctx context.Context, sender string, at time.Time, msg IncomingSMS) bool {
+	if len(msg.UserDataHeaderInfo.SpecialMessageIndications) > 0 {
+		totalCount := 0
+		anyActive := false
+		anyStore := false
+		msgType := ""
+		for _, ind := range msg.UserDataHeaderInfo.SpecialMessageIndications {
+			totalCount += ind.Count
+			if ind.Active || ind.Count > 0 {
+				anyActive = true
+			}
+			if msgType == "" && strings.TrimSpace(ind.MessageType) != "" {
+				msgType = strings.TrimSpace(ind.MessageType)
+			}
+			if ind.StoreMessage {
+				anyStore = true
+			}
+		}
+		discard := !anyStore && (!msg.DataCoding.MessageWaiting || msg.DataCoding.MessageWaitingDiscard)
+		if s != nil && s.dispatch != nil {
+			s.dispatch.Dispatch(ctx, MessageWaitingEvent{
+				DevID:       s.deviceID,
+				Source:      "sms-udh",
+				Sender:      sender,
+				Recipient:   strings.TrimSpace(msg.Recipient),
+				MessageType: msgType,
+				Active:      anyActive,
+				Count:       totalCount,
+				Discard:     discard,
+				Time:        at,
+			})
+		}
+		return discard
+	}
+	if !msg.DataCoding.MessageWaiting {
+		return false
+	}
+	count := 0
+	if msg.DataCoding.MessageWaitingActive {
+		count = 1
+	}
+	if s != nil && s.dispatch != nil {
+		s.dispatch.Dispatch(ctx, MessageWaitingEvent{
+			DevID:       s.deviceID,
+			Source:      "sms-dcs",
+			Sender:      sender,
+			Recipient:   strings.TrimSpace(msg.Recipient),
+			MessageType: msg.DataCoding.MessageWaitingType,
+			Active:      msg.DataCoding.MessageWaitingActive,
+			Count:       count,
+			Discard:     msg.DataCoding.MessageWaitingDiscard,
+			Time:        at,
+		})
+	}
+	return msg.DataCoding.MessageWaitingDiscard
 }
 
 func incomingSMSHasUserDataHeader(msg IncomingSMS) bool {
@@ -690,14 +822,24 @@ func (s *Service) HandleSMSDeliveryReport(ctx context.Context, report SMSDeliver
 	if at.IsZero() {
 		at = time.Now()
 	}
-	state := normalizeDeliveryReportState(report.State, report.SIPCode, report.RPCause)
-	errText := strings.TrimSpace(report.ErrorText)
-	if errText == "" && report.RPCause != 0 {
-		errText = RPCauseText(report.RPCause)
+	rawState := report.State
+	if report.HasTPStatus && strings.TrimSpace(rawState) == "" {
+		rawState = smsStatusReportState(byte(report.TPStatus))
 	}
+	state := normalizeDeliveryReportState(rawState, report.SIPCode, report.RPCause)
+	errText := strings.TrimSpace(report.ErrorText)
+	if errText == "" {
+		if report.RPCause != 0 {
+			errText = RPCauseText(report.RPCause)
+		} else if report.HasTPStatus && state != "delivered" {
+			errText = SMSStatusReportText(byte(report.TPStatus))
+		}
+	}
+	inReplyTo := strings.TrimSpace(report.InReplyTo)
+	callID := strings.TrimSpace(report.CallID)
 	match, err := s.store.MarkSMSDeliveryPartReport(
-		strings.TrimSpace(report.InReplyTo),
-		strings.TrimSpace(report.CallID),
+		inReplyTo,
+		callID,
 		s.deviceID,
 		report.RPMR,
 		state,
@@ -706,6 +848,24 @@ func (s *Service) HandleSMSDeliveryReport(ctx context.Context, report SMSDeliver
 		errText,
 		at,
 	)
+	if ((err == nil && match.MessageID == "") || errors.Is(err, ErrDeliveryNotFound)) && inReplyTo == "" && strings.TrimSpace(report.Recipient) != "" {
+		if sentCallID := s.lookupSentSMSPartCallID(report.Recipient, report.RPMR, at); sentCallID != "" {
+			if fallbackMatch, fallbackErr := s.store.MarkSMSDeliveryPartReport(
+				sentCallID,
+				sentCallID,
+				s.deviceID,
+				report.RPMR,
+				state,
+				report.SIPCode,
+				report.RPCause,
+				errText,
+				at,
+			); fallbackErr == nil {
+				match = fallbackMatch
+				err = nil
+			}
+		}
+	}
 	if err != nil {
 		return DeliveryPartMatch{}, err
 	}
@@ -1201,20 +1361,75 @@ func normalizeUSSDResult(res USSDResult, sessionID string) USSDResult {
 	return res
 }
 
+func (s *Service) rememberSentSMSPart(peer string, rpMR int, callID string, now time.Time) {
+	callID = strings.TrimSpace(callID)
+	normalizedPeer := normalizeSMSNumber(peer)
+	if s == nil || callID == "" || normalizedPeer == "" || rpMR < 0 {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sentSMSParts == nil {
+		s.sentSMSParts = make(map[smsSentPartKey]smsSentPartEntry)
+	}
+	for k, v := range s.sentSMSParts {
+		if now.Sub(v.sentAt) > 48*time.Hour {
+			delete(s.sentSMSParts, k)
+		}
+	}
+	s.sentSMSParts[smsSentPartKey{peer: normalizedPeer, rpMR: rpMR}] = smsSentPartEntry{callID: callID, sentAt: now}
+}
+
+func (s *Service) lookupSentSMSPartCallID(peer string, rpMR int, now time.Time) string {
+	normalizedPeer := normalizeSMSNumber(peer)
+	if s == nil || normalizedPeer == "" || rpMR < 0 {
+		return ""
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.sentSMSParts) == 0 {
+		return ""
+	}
+	entry, ok := s.sentSMSParts[smsSentPartKey{peer: normalizedPeer, rpMR: rpMR}]
+	if !ok || now.Sub(entry.sentAt) > 48*time.Hour {
+		return ""
+	}
+	return entry.callID
+}
+
+func (s *Service) pruneUSSDSessionsLocked(now time.Time) {
+	if s == nil || len(s.ussdSessions) == 0 {
+		return
+	}
+	for id, entry := range s.ussdSessions {
+		if !entry.updatedAt.IsZero() && now.Sub(entry.updatedAt) >= defaultUSSDSessionTTL {
+			delete(s.ussdSessions, id)
+		}
+	}
+}
+
 func (s *Service) recordUSSDSession(res USSDResult) {
 	if s == nil || strings.TrimSpace(res.SessionID) == "" {
 		return
 	}
+	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneUSSDSessionsLocked(now)
 	if res.Done {
 		delete(s.ussdSessions, res.SessionID)
 		return
 	}
 	if s.ussdSessions == nil {
-		s.ussdSessions = make(map[string]USSDResult)
+		s.ussdSessions = make(map[string]ussdSessionEntry)
 	}
-	s.ussdSessions[res.SessionID] = res
+	s.ussdSessions[res.SessionID] = ussdSessionEntry{result: res, updatedAt: now}
 }
 
 func (s *Service) dispatchUSSDUpdated(ctx context.Context, res USSDResult) {
@@ -1239,6 +1454,7 @@ func (s *Service) hasUSSDSession(sessionID string) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneUSSDSessionsLocked(time.Now())
 	_, ok := s.ussdSessions[sessionID]
 	return ok
 }

@@ -1421,6 +1421,7 @@ func TestIMSInboundWireServerDispatchesPrackUpdateReferNotifySubscribeMessageAnd
 			ClientContactURI: "sip:client@127.0.0.1:5070",
 			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
 		},
+		LocalTag:   "ue-tag",
 		ContactURI: "sip:vowifi@127.0.0.1:5060",
 	}
 	invite := parseWireIncoming(t, wireIMSInvite("wire-call-dialog", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170))))
@@ -1632,6 +1633,7 @@ func TestIMSInboundWireServerPropagatesSessionTimerHeaders(t *testing.T) {
 			ClientContactURI: "sip:client@127.0.0.1:5070",
 			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
 		},
+		LocalTag:   "ue-tag",
 		ContactURI: "sip:vowifi@127.0.0.1:5060",
 	}
 	invite := parseWireIncoming(t, wireIMSRequest("wire-call-session-timer", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170)),
@@ -1696,6 +1698,7 @@ func TestIMSInboundWireServerDispatchesReinviteAndAck(t *testing.T) {
 			ClientContactURI: "sip:client@127.0.0.1:5070",
 			LocalContactURI:  "sip:vowifi@127.0.0.1:5060",
 		},
+		LocalTag:   "ue-tag",
 		ContactURI: "sip:vowifi@127.0.0.1:5060",
 	}
 	initial := parseWireIncoming(t, wireIMSInvite("wire-call-reinvite", "INVITE", 1, []byte(sampleSDP("203.0.113.10", 49170))))
@@ -2500,7 +2503,11 @@ func wireIMSRequest(callID, method string, cseq int, body []byte, extraHeaders .
 	b.WriteString(method + " sip:user@ims.example SIP/2.0\r\n")
 	b.WriteString("Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-" + branchMethod + "\r\n")
 	b.WriteString("From: <sip:+18005551212@ims.example>;tag=ims-tag\r\n")
-	b.WriteString("To: <sip:user@ims.example>\r\n")
+	if cseq > 1 && method != "CANCEL" && method != "OPTIONS" && !strings.HasPrefix(callID, "wire-cache-") {
+		b.WriteString("To: <sip:user@ims.example>;tag=ue-tag\r\n")
+	} else {
+		b.WriteString("To: <sip:user@ims.example>\r\n")
+	}
 	b.WriteString("Call-ID: " + callID + "\r\n")
 	b.WriteString("CSeq: " + strconv.Itoa(cseq) + " " + method + "\r\n")
 	b.WriteString("Contact: <sip:ims@203.0.113.10:5060>\r\n")

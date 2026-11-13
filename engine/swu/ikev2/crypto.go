@@ -13,7 +13,7 @@ import (
 var ErrUnsupportedPRF = errors.New("unsupported ikev2 prf")
 
 func PRF(hash crypto.Hash, key, data []byte) ([]byte, error) {
-	if !hash.Available() {
+	if hash == 0 || !hash.Available() {
 		return nil, fmt.Errorf("%w: %v", ErrUnsupportedPRF, hash)
 	}
 	mac := hmac.New(hash.New, key)
@@ -24,6 +24,9 @@ func PRF(hash crypto.Hash, key, data []byte) ([]byte, error) {
 func PRFPlus(hash crypto.Hash, key, seed []byte, length int) ([]byte, error) {
 	if length < 0 {
 		return nil, fmt.Errorf("%w: negative length", ErrInvalidLength)
+	}
+	if hash == 0 || !hash.Available() {
+		return nil, fmt.Errorf("%w: %v", ErrUnsupportedPRF, hash)
 	}
 	if length == 0 {
 		return nil, nil
@@ -53,6 +56,16 @@ func SKEYSEED(hash crypto.Hash, nonceI, nonceR, sharedSecret []byte) ([]byte, er
 	key = append(key, nonceI...)
 	key = append(key, nonceR...)
 	return PRF(hash, key, sharedSecret)
+}
+
+// RekeySKEYSEED computes SKEYSEED = prf(SK_d (old), g^ir (new) | Ni | Nr) per
+// RFC 7296 §2.18 using the old IKE SA's PRF and SK_d.
+func RekeySKEYSEED(oldPRF crypto.Hash, oldSKD, sharedSecret, nonceI, nonceR []byte) ([]byte, error) {
+	data := make([]byte, 0, len(sharedSecret)+len(nonceI)+len(nonceR))
+	data = append(data, sharedSecret...)
+	data = append(data, nonceI...)
+	data = append(data, nonceR...)
+	return PRF(oldPRF, oldSKD, data)
 }
 
 func DeriveIKESAKeyMaterial(hash crypto.Hash, skeyseed, nonceI, nonceR []byte, spiI, spiR uint64, length int) ([]byte, error) {

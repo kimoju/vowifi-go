@@ -345,12 +345,20 @@ func TestRuntimeInboundWireRoutesActiveOutboundCallByeAndUpdate(t *testing.T) {
 	}
 	defer peerConn.Close()
 
+	if len(voiceTransport.requests) == 0 {
+		t.Fatal("expected outbound INVITE request")
+	}
+	localTag := extractSIPHeaderTagRuntime(voiceTransport.requests[0].Headers["From"])
+	if localTag == "" {
+		t.Fatalf("missing local From tag in outbound INVITE From=%q", voiceTransport.requests[0].Headers["From"])
+	}
+
 	// Send network BYE matching the active outbound dialog to IMSInboundWireServer!
 	rawBye := strings.Join([]string{
 		"BYE sip:+18005550100@" + inboundAddr + " SIP/2.0",
 		"Via: SIP/2.0/UDP " + peerConn.LocalAddr().String() + ";branch=z9hG4bK-mo-bye-1",
 		"From: <sip:+18005551212@ims.mnc001.mcc001.3gppnetwork.org>;tag=ims-remote-tag",
-		"To: <sip:+18005550100@ims.mnc001.mcc001.3gppnetwork.org>;tag=vowifi-go",
+		"To: <sip:+18005550100@ims.mnc001.mcc001.3gppnetwork.org>;tag=" + localTag,
 		"Call-ID: mo-active-1",
 		"CSeq: 2 BYE",
 		"Max-Forwards: 70",

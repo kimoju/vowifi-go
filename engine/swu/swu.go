@@ -2,6 +2,7 @@ package swu
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"strings"
@@ -37,22 +38,29 @@ type IMSIdentity struct {
 }
 
 type TunnelConfig struct {
-	DeviceID       string
-	TraceID        string
-	Mode           string
-	EPDGAddress    string
-	EPDGSource     string
-	LocalInterface string
-	OuterLocalIP   string
-	InnerLocalIP   string
-	RemoteInnerIP  string
-	IMSI           string
-	MCC            string
-	MNC            string
-	IMEI           string
-	Identity       IMSIdentity
-	Proxy          *ProxyConfig
-	StartedAt      time.Time
+	DeviceID              string
+	TraceID               string
+	Mode                  string
+	EPDGAddress           string
+	EPDGSource            string
+	LocalInterface        string
+	OuterLocalIP          string
+	InnerLocalIP          string
+	RemoteInnerIP         string
+	IMSI                  string
+	MCC                   string
+	MNC                   string
+	IMEI                  string
+	Identity              IMSIdentity
+	Proxy                 *ProxyConfig
+	ExpectedResponderID   string
+	RootCAs               *x509.CertPool
+	EAPOnlyAuthentication bool
+	RequireResponderCert  bool
+	SendCertReq           bool
+	ExpectedNetworkName   string
+	LegacyEAPAKAIdentity  bool
+	StartedAt             time.Time
 }
 
 func (c TunnelConfig) NormalizedMode() string {
@@ -84,26 +92,28 @@ func (c TunnelConfig) Validate() error {
 }
 
 type TunnelResult struct {
-	Ready              bool
-	Mode               string
-	EPDGAddress        string
-	LocalInnerIP       string
-	LocalInnerIPv4     string
-	LocalInnerIPv6     string
-	LocalInnerIPs      []string
-	RemoteInnerIP      string
-	DNSServers         []string
-	PCSCFServers       []string
-	ESPEncryptionID    uint16
-	ESPIntegrityID     uint16
-	InitiatorSelectors []string
-	ResponderSelectors []string
-	IKEEstablished     bool
-	IPsecEstablished   bool
-	MOBIKESupported    bool
-	ChildSAIdentifier  string
-	Reason             string
-	EstablishedAt      time.Time
+	Ready                   bool
+	Mode                    string
+	EPDGAddress             string
+	LocalInnerIP            string
+	LocalInnerIPv4          string
+	LocalInnerIPv6          string
+	LocalInnerIPv6PrefixLen uint8
+	LocalInnerIPv6Prefix    string
+	LocalInnerIPs           []string
+	RemoteInnerIP           string
+	DNSServers              []string
+	PCSCFServers            []string
+	ESPEncryptionID         uint16
+	ESPIntegrityID          uint16
+	InitiatorSelectors      []string
+	ResponderSelectors      []string
+	IKEEstablished          bool
+	IPsecEstablished        bool
+	MOBIKESupported         bool
+	ChildSAIdentifier       string
+	Reason                  string
+	EstablishedAt           time.Time
 }
 
 func (r TunnelResult) IsReady() bool {
@@ -126,6 +136,8 @@ func isZeroTunnelResult(r TunnelResult) bool {
 		strings.TrimSpace(r.LocalInnerIP) == "" &&
 		strings.TrimSpace(r.LocalInnerIPv4) == "" &&
 		strings.TrimSpace(r.LocalInnerIPv6) == "" &&
+		r.LocalInnerIPv6PrefixLen == 0 &&
+		strings.TrimSpace(r.LocalInnerIPv6Prefix) == "" &&
 		len(r.LocalInnerIPs) == 0 &&
 		strings.TrimSpace(r.RemoteInnerIP) == "" &&
 		len(r.DNSServers) == 0 &&
@@ -183,6 +195,10 @@ type IKELivenessController interface {
 
 type ChildSARekeyController interface {
 	RekeyChildSA(context.Context) (TunnelResult, error)
+}
+
+type IKESARekeyController interface {
+	RekeyIKESA(context.Context) (TunnelResult, error)
 }
 
 type TunnelManager interface {

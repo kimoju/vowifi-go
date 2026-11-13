@@ -6,10 +6,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"sync"
 
+	"github.com/kimoju/vowifi-go/engine/swu/ikev2"
 	"golang.org/x/sys/unix"
 )
 
@@ -173,4 +175,26 @@ func tunDeviceError(ctx context.Context, err error) error {
 		return ErrPacketTunnelClosed
 	}
 	return err
+}
+
+func enableTransportKernelESPEncap(transport ikev2.InitTransport) error {
+	provider, ok := transport.(interface{ underlyingUDPConn() *net.UDPConn })
+	if !ok || provider == nil {
+		return nil
+	}
+	udpConn := provider.underlyingUDPConn()
+	if udpConn == nil {
+		return nil
+	}
+	rawConn, err := udpConn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var sockErr error
+	if ctrlErr := rawConn.Control(func(fd uintptr) {
+		sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_ENCAP, unix.UDP_ENCAP_ESPINUDP)
+	}); ctrlErr != nil {
+		return ctrlErr
+	}
+	return sockErr
 }

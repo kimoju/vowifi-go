@@ -254,6 +254,29 @@ func (t *RTPStreamStatsTracker) StatsAt(now time.Time) []RTPStreamStats {
 	return out
 }
 
+// TakeRTCPReportStats returns deterministic RTCP reception report snapshots and
+// advances the RFC 3550 Appendix A.3 interval baseline for FractionLost.
+func (t *RTPStreamStatsTracker) TakeRTCPReportStats() []RTPStreamStats {
+	return t.TakeRTCPReportStatsAt(time.Now())
+}
+
+// TakeRTCPReportStatsAt returns deterministic RTCP reception report snapshots at
+// now and advances each stream's priorExpected / priorReceived baseline so
+// subsequent RTCP reports compute per-interval FractionLost (RFC 3550 Appendix A.3).
+func (t *RTPStreamStatsTracker) TakeRTCPReportStatsAt(now time.Time) []RTPStreamStats {
+	if t == nil || len(t.streams) == 0 {
+		return nil
+	}
+	out := make([]RTPStreamStats, 0, len(t.streams))
+	for _, state := range t.streams {
+		out = append(out, state.takeReportSnapshotAt(now))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].SSRC < out[j].SSRC
+	})
+	return out
+}
+
 // StatsForSSRC returns a snapshot for one SSRC when the tracker has observed it.
 func (t *RTPStreamStatsTracker) StatsForSSRC(ssrc uint32) (RTPStreamStats, bool) {
 	return t.StatsForSSRCAt(ssrc, time.Now())
@@ -417,6 +440,8 @@ type rtpStreamStatsState struct {
 	stats         RTPStreamStats
 	baseSeq       uint32
 	maxSeq        uint32
+	priorExpected uint64
+	priorReceived uint64
 	seenSequences map[uint32]struct{}
 	seenRing      []uint32
 	seenWrite     int
@@ -517,15 +542,46 @@ func (s *rtpStreamStatsState) recalculateLoss() {
 	} else {
 		s.stats.LostPackets = 0
 	}
-	if expected == 0 || s.stats.LostPackets == 0 {
-		s.stats.FractionLost = 0
-		return
+	s.stats.FractionLost = s.intervalFractionLost(expected, s.stats.Packets)
+}
+
+func (s *rtpStreamStatsState) intervalFractionLost(expected, received uint64) uint8 {
+	if expected <= s.priorExpected {
+		return 0
 	}
-	fraction := s.stats.LostPackets * 256 / expected
+	expectedInterval := expected - s.priorExpected
+	var receivedInterval uint64
+	if received > s.priorReceived {
+		receivedInterval = received - s.priorReceived
+	}
+	if expectedInterval == 0 || receivedInterval >= expectedInterval {
+		return 0
+	}
+	lostInterval := expectedInterval - receivedInterval
+	fraction := lostInterval * 256 / expectedInterval
 	if fraction > 255 {
 		fraction = 255
 	}
-	s.stats.FractionLost = uint8(fraction)
+	return uint8(fraction)
+}
+
+func (s *rtpStreamStatsState) takeReportSnapshotAt(now time.Time) RTPStreamStats {
+	expected := uint64(s.maxSeq-s.baseSeq) + 1
+	s.stats.ExpectedPackets = expected
+	if expected > s.stats.Packets {
+		s.stats.LostPackets = expected - s.stats.Packets
+	} else {
+		s.stats.LostPackets = 0
+	}
+	intervalFraction := s.intervalFractionLost(expected, s.stats.Packets)
+	if expected > s.priorExpected {
+		s.stats.FractionLost = intervalFraction
+	}
+	snap := s.snapshotAt(now)
+	snap.FractionLost = intervalFraction
+	s.priorExpected = expected
+	s.priorReceived = s.stats.Packets
+	return snap
 }
 
 func (s *rtpStreamStatsState) snapshotAt(now time.Time) RTPStreamStats {

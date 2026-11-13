@@ -25,6 +25,7 @@ type IMSSMSTransport struct {
 	UserAgent            string
 	ContentType          string
 	SMSC                 string
+	SMSCRPAddress        string
 	UseCPIM              bool
 	IMDNNotifications    []string
 	DisableStatusReports bool
@@ -77,7 +78,8 @@ func (t IMSSMSTransport) SendIMSDeliveryReport(ctx context.Context, req IMSDeliv
 		CSeq:            1,
 		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
 	}
-	msg, err := voiceclient.BuildMessageRequest(cfg, firstNonEmpty(req.ContentType, IMS3GPPSMSContentType), req.Body)
+	contentType := firstNonEmpty(req.ContentType, IMS3GPPSMSContentType)
+	msg, err := voiceclient.BuildMessageRequest(cfg, contentType, req.Body)
 	if err != nil {
 		return IMSDeliveryReportResult{}, err
 	}
@@ -85,6 +87,9 @@ func (t IMSSMSTransport) SendIMSDeliveryReport(ctx context.Context, req IMSDeliv
 		msg.Headers["In-Reply-To"] = inReplyTo
 	}
 	msg.Headers["Request-Disposition"] = "no-fork"
+	if normalizedIMSMessageContentType(contentType) == IMS3GPPSMSContentType {
+		msg.Headers["Content-Transfer-Encoding"] = "binary"
+	}
 	resp, err := voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, msg)
 	handling := imsMessagingResponseHandlingFor(resp)
 	result := IMSDeliveryReportResult{
@@ -93,7 +98,7 @@ func (t IMSSMSTransport) SendIMSDeliveryReport(ctx context.Context, req IMSDeliv
 		RegistrationRecoveryNeeded: handling.RegistrationRecoveryNeeded,
 	}
 	if err != nil {
-		result.RegistrationRecoveryNeeded = true
+		result.RegistrationRecoveryNeeded = !errors.Is(err, context.Canceled)
 		return result, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -131,7 +136,12 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 	if cseq <= 0 {
 		cseq = 1
 	}
-	rpMR := nextIMSSMSMessageRef()
+	var rpMR byte
+	if req.Part.HasTPMR || req.Part.TPMR > 0 {
+		rpMR = byte(req.Part.TPMR & 0xff)
+	} else {
+		rpMR = nextIMSSMSMessageRef()
+	}
 	contentType, body, err := t.messagePayload(req, rpMR, localURI, peerURI, callID)
 	if err != nil {
 		return SMSSendResult{CallID: callID, RPMR: int(rpMR), State: "failed", ErrorText: err.Error()}, err
@@ -155,13 +165,23 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		if err != nil {
 			return SMSSendResult{State: "failed", ErrorText: err.Error()}, err
 		}
+		msg.Headers["Request-Disposition"] = "no-fork"
+		if normalizedIMSMessageContentType(contentType) == IMS3GPPSMSContentType {
+			msg.Headers["Content-Transfer-Encoding"] = "binary"
+		}
 		resp, err = voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, msg)
 		if err != nil {
 			handling := imsMessagingResponseHandlingFor(resp)
-			result := SMSSendResult{CallID: callID, RPMR: int(rpMR), SIPCode: resp.StatusCode, RetryAfter: handling.RetryAfter}
+			result := SMSSendResult{
+				CallID:     callID,
+				RPMR:       int(rpMR),
+				SIPCode:    resp.StatusCode,
+				RetryAfter: handling.RetryAfter,
+				Headers:    resp.Headers,
+			}
 			result.State = "failed"
 			result.ErrorText = err.Error()
-			result.RegistrationRecoveryNeeded = true
+			result.RegistrationRecoveryNeeded = !errors.Is(err, context.Canceled)
 			return result, err
 		}
 		if redirectRetries < maxIMSMessagingRedirects {
@@ -174,7 +194,13 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		break
 	}
 	handling := imsMessagingResponseHandlingFor(resp)
-	result := SMSSendResult{CallID: callID, RPMR: int(rpMR), SIPCode: handling.StatusCode, RetryAfter: handling.RetryAfter}
+	result := SMSSendResult{
+		CallID:     callID,
+		RPMR:       int(rpMR),
+		SIPCode:    handling.StatusCode,
+		RetryAfter: handling.RetryAfter,
+		Headers:    resp.Headers,
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		result.State = "failed"
 		result.ErrorText = handling.FailureText
@@ -210,12 +236,9 @@ func (t IMSSMSTransport) messagePayload(req SMSSendRequest, rpMR byte, localURI,
 	if err != nil {
 		return "", nil, err
 	}
-	rpSMSC := strings.TrimSpace(t.SMSC)
-	if rpSMSC != "" {
-		if _, rpAddrErr := encodeRPAddress(rpSMSC); rpAddrErr != nil {
-			// Non-numeric SIP PSI URIs still route via Request-URI; omit BCD RP-DA.
-			rpSMSC = ""
-		}
+	rpSMSC, err := t.resolveRPDestinationAddress()
+	if err != nil {
+		return "", nil, err
 	}
 	rpData, err := BuildSMSRPData(rpMR, rpSMSC, tpdu)
 	if err != nil {
@@ -223,13 +246,35 @@ func (t IMSSMSTransport) messagePayload(req SMSSendRequest, rpMR byte, localURI,
 	}
 	if t.UseCPIM {
 		messageHeaders := BuildIMSCPIMIMDNMessageHeaders(localURI, remoteURI, messageID, t.imdnNotifications())
-		cpim, err := BuildIMSCPIMMessageWithHeaders(messageHeaders, map[string][]string{"Content-Type": {contentType}}, rpData)
+		contentHeaders := map[string][]string{"Content-Type": {contentType}}
+		if normalizedIMSMessageContentType(contentType) == IMS3GPPSMSContentType {
+			contentHeaders["Content-Transfer-Encoding"] = []string{"binary"}
+		}
+		cpim, err := BuildIMSCPIMMessageWithHeaders(messageHeaders, contentHeaders, rpData)
 		if err != nil {
 			return "", nil, err
 		}
 		return IMSCPIMContentType, cpim, nil
 	}
 	return contentType, rpData, nil
+}
+
+func (t IMSSMSTransport) resolveRPDestinationAddress() (string, error) {
+	if explicit := strings.TrimSpace(t.SMSCRPAddress); explicit != "" {
+		if _, err := encodeRPAddress(explicit); err != nil {
+			return "", fmt.Errorf("invalid SMSC RP-DA address %q: %w", explicit, err)
+		}
+		return explicit, nil
+	}
+	if smsc := strings.TrimSpace(t.SMSC); smsc != "" {
+		if encoded, err := encodeRPAddress(smsc); err == nil && len(encoded) >= 2 {
+			return smsc, nil
+		}
+	}
+	// Per 3GPP TS 24.011 §7.3.1.2 / §8.2.5.2 and TS 24.341 §5.3.1.2, MO RP-DATA
+	// must include a non-empty BCD RP-Destination-Address (2..11 octets). When
+	// the SMSC is configured only as a SIP PSI URI or unset, encode dummy +0000000.
+	return "+0000000", nil
 }
 
 func (t IMSSMSTransport) imdnNotifications() []string {

@@ -47,39 +47,56 @@ func cloneE911ProxyConfig(p *ProxyConfig) *ProxyConfig {
 	return &cp
 }
 
+func cloneDefaultHTTPTransport() *http.Transport {
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		return base.Clone()
+	}
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
 func newStandardHTTPClient(proxy *ProxyConfig, timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = defaultE911HTTPTimeout
 	}
+	base := cloneDefaultHTTPTransport()
 	if !proxy.IsActive() {
-		return &http.Client{Timeout: timeout}
+		return &http.Client{
+			Timeout:   timeout,
+			Transport: base,
+		}
 	}
 	scheme, proxyURL, socksTarget, err := parseE911Proxy(proxy)
 	if err != nil {
+		base.Proxy = nil
+		base.DialContext = func(context.Context, string, string) (net.Conn, error) {
+			return nil, err
+		}
 		return &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				DialContext: func(context.Context, string, string) (net.Conn, error) {
-					return nil, err
-				},
-			},
+			Timeout:   timeout,
+			Transport: base,
 		}
 	}
 	if scheme == "http" || scheme == "https" {
+		base.Proxy = http.ProxyURL(proxyURL)
 		return &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
-			},
+			Timeout:   timeout,
+			Transport: base,
 		}
 	}
+	base.Proxy = nil
+	base.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialSOCKS5TCPConnect(ctx, socksTarget, addr)
+	}
 	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialSOCKS5TCPConnect(ctx, socksTarget, addr)
-			},
-		},
+		Timeout:   timeout,
+		Transport: base,
 	}
 }
 

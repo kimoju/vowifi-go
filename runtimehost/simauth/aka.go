@@ -123,7 +123,10 @@ func (p *AKAProvider) calculateAKAOnApp(app, fallbackAID, expectedPrefix string,
 		return AKAResult{}, err
 	}
 	resp, err := p.transmitUSIMAuth(ch, apdu)
-	if err == nil && resp.Success() {
+	if err != nil {
+		return AKAResult{}, err
+	}
+	if resp.Success() || isNonRetryableUSIMAuthStatus(resp.SW1, resp.SW2) {
 		return ParseUSIMAuthResponse(resp.Body, resp.SW1, resp.SW2)
 	}
 
@@ -133,9 +136,6 @@ func (p *AKAProvider) calculateAKAOnApp(app, fallbackAID, expectedPrefix string,
 	}
 	resp2, err2 := p.transmitUSIMAuth(ch, apdu)
 	if err2 != nil {
-		if err != nil {
-			return AKAResult{}, fmt.Errorf("%s AKA failed: first=%v second=%v", strings.ToUpper(app), err, err2)
-		}
 		return AKAResult{}, err2
 	}
 	return ParseUSIMAuthResponse(resp2.Body, resp2.SW1, resp2.SW2)
@@ -245,7 +245,16 @@ func BuildUSIMAuthAPDU(rand16, autn16 []byte, includeLe bool) ([]byte, error) {
 	return apdu, nil
 }
 
+func isNonRetryableUSIMAuthStatus(sw1, sw2 byte) bool {
+	return (sw1 == 0x98 && sw2 == 0x62) ||
+		(sw1 == 0x69 && (sw2 == 0x82 || sw2 == 0x83))
+}
+
 func ParseUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAResult, error) {
+	if sw1 == 0x98 && sw2 == 0x62 {
+		resp := Response{SW1: sw1, SW2: sw2}
+		return AKAResult{}, fmt.Errorf("%w: %w", swusim.NewMACFailureError(), newStatusError("USIM AUTHENTICATE", resp))
+	}
 	if sw1 != 0x90 || sw2 != 0x00 {
 		resp := Response{SW1: sw1, SW2: sw2}
 		return AKAResult{}, newStatusMessageError(fmt.Sprintf("APDU status is not 9000: %02X%02X", sw1, sw2), resp)
@@ -286,6 +295,8 @@ func ClassifyUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAAuthResponseInfo, 
 	result, err := ParseUSIMAuthResponse(body, sw1, sw2)
 	info.Result = cloneAKAResult(result)
 	switch {
+	case errors.Is(err, swusim.ErrAuthFailure):
+		info.Class = AKAAuthResponseClassMACFailure
 	case sw1 != 0x90 || sw2 != 0x00:
 		info.Class = AKAAuthResponseClassAPDUStatus
 	case err == nil:
@@ -295,8 +306,6 @@ func ClassifyUSIMAuthResponse(body []byte, sw1, sw2 byte) (AKAAuthResponseInfo, 
 		if fields, fieldsErr := ParseAUTS(result.AUTS); fieldsErr == nil {
 			info.AUTS = fields
 		}
-	case errors.Is(err, swusim.ErrAuthFailure):
-		info.Class = AKAAuthResponseClassMACFailure
 	}
 	return info, err
 }

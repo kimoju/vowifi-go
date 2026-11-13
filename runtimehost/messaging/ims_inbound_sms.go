@@ -3,15 +3,54 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
 	"net/textproto"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
+
+const IMSMessageSummaryContentType = "application/simple-message-summary"
+
+// MessageWaitingSummary represents a parsed RFC 3842 application/simple-message-summary payload.
+type MessageWaitingSummary struct {
+	MessagesWaiting bool
+	MessageAccount  string
+	VoiceNew        int
+	VoiceOld        int
+	VoiceUrgentNew  int
+	VoiceUrgentOld  int
+	FaxNew          int
+	FaxOld          int
+	MultimediaNew   int
+	MultimediaOld   int
+	TextNew         int
+	TextOld         int
+	NoneNew         int
+	NoneOld         int
+}
+
+// MessageWaitingEvent notifies subscribers of voicemail/MWI state changes from
+// 3GPP SMS DCS (0xC0/0xD0/0xE0), SMS UDH IEI 0x01, or SIP RFC 3842 NOTIFY/MESSAGE.
+type MessageWaitingEvent struct {
+	DevID          string
+	Source         string
+	Sender         string
+	Recipient      string
+	MessageAccount string
+	MessageType    string
+	Active         bool
+	Count          int
+	Discard        bool
+	Summary        *MessageWaitingSummary
+	Time           time.Time
+}
 
 type IMSMessageRequest struct {
 	FromURI     string
@@ -29,6 +68,7 @@ type IMSMessageResult struct {
 	RPDU               SMSRPDU
 	Incoming           *IncomingSMS
 	DeliveryReport     *SMSDeliveryReport
+	MessageWaiting     *MessageWaitingSummary
 	ReplyContentType   string
 	ReplyBody          []byte
 	UnsupportedContent bool
@@ -74,6 +114,7 @@ type smsConcatState struct {
 	timestamp              time.Time
 	protocolID             byte
 	dataCodingScheme       byte
+	dataCoding             SMSDataCodingInfo
 	userDataHeader         bool
 	userDataHeaderInfo     SMSUserDataHeaderInfo
 	moreMessagesToSend     bool
@@ -92,7 +133,7 @@ func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (
 		msg.Body = body
 		msg.Headers = omitIMSMessageHeader(msg.Headers, imsContentTransferEncodingHeader)
 	}
-	contentType := normalizedIMSMessageContentType(msg.ContentType)
+	contentType, contentTypeParams := parseIMSMessageContentType(msg.ContentType)
 	if strings.HasPrefix(contentType, "multipart/") {
 		return s.handleIMSMultipartMessage(ctx, msg)
 	}
@@ -101,10 +142,21 @@ func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (
 	}
 	switch contentType {
 	case "", "text/plain":
+		decodedText, err := decodeIMSTextPlainCharset(msg.Body, contentTypeParams["charset"])
+		if err != nil {
+			return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
+		}
+		var ts time.Time
+		if rawDate := strings.TrimSpace(imsHeaderValue(msg.Headers, imsInternalCPIMDateTimeHeader)); rawDate != "" {
+			if parsedTS, parseErr := parseIMSCPIMIMDNTime(rawDate); parseErr == nil {
+				ts = parsedTS
+			}
+		}
 		incoming := IncomingSMS{
 			Sender:    firstNonEmpty(msg.FromURI, "unknown"),
 			Recipient: msg.ToURI,
-			Content:   strings.ToValidUTF8(string(msg.Body), ""),
+			Content:   decodedText,
+			Timestamp: ts,
 		}
 		if err := s.HandleIncomingSMS(ctx, incoming); err != nil {
 			return IMSMessageResult{StatusCode: 400, Reason: err.Error(), Incoming: &incoming}, err
@@ -112,6 +164,12 @@ func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (
 		return IMSMessageResult{StatusCode: 200, Reason: "OK", Incoming: &incoming}, nil
 	case IMS3GPPSMSContentType:
 		return s.handleIMS3GPPSMS(ctx, msg)
+	case IMSMessageSummaryContentType:
+		summary, err := s.HandleIMSMessageSummaryNotify(ctx, msg.Body, msg.FromURI, msg.ToURI)
+		if err != nil {
+			return IMSMessageResult{StatusCode: 400, Reason: err.Error()}, err
+		}
+		return IMSMessageResult{StatusCode: 200, Reason: "OK", MessageWaiting: &summary}, nil
 	case imsIMDNContentType:
 		return s.handleIMSIMDNMessage(ctx, msg, IMSCPIMMessage{
 			Headers:     msg.Headers,
@@ -123,6 +181,8 @@ func (s *Service) HandleIMSMessage(ctx context.Context, msg IMSMessageRequest) (
 		return IMSMessageResult{StatusCode: 415, Reason: err.Error(), UnsupportedContent: true}, err
 	}
 }
+
+const imsInternalCPIMDateTimeHeader = "X-VoWiFi-CPIM-DateTime"
 
 func (s *Service) handleIMSMultipartMessage(ctx context.Context, msg IMSMessageRequest) (IMSMessageResult, error) {
 	boundary, err := imsMessageMultipartBoundary(msg.ContentType)
@@ -282,6 +342,7 @@ func imsMultipartContentPriorities() []string {
 	return []string{
 		IMSCPIMContentType,
 		IMS3GPPSMSContentType,
+		IMSMessageSummaryContentType,
 		imsIMDNContentType,
 		"text/plain",
 	}
@@ -355,11 +416,19 @@ func (s *Service) handleIMSCPIMMessage(ctx context.Context, msg IMSMessageReques
 	}
 	nested := msg
 	nested.ContentType = cpim.ContentType
+	if charset := strings.TrimSpace(cpim.ContentTypeParams["charset"]); charset != "" && !strings.Contains(strings.ToLower(nested.ContentType), "charset=") {
+		nested.ContentType = nested.ContentType + "; charset=" + charset
+	}
 	nested.Body = cpim.Body
-	nested.FromURI = firstNonEmpty(msg.FromURI, imsHeaderValue(cpim.Headers, "From"))
-	nested.ToURI = firstNonEmpty(msg.ToURI, imsHeaderValue(cpim.Headers, "To"))
+	nested.FromURI = firstNonEmpty(imsHeaderValue(cpim.Headers, "From"), msg.FromURI)
+	nested.ToURI = firstNonEmpty(imsHeaderValue(cpim.Headers, "To"), msg.ToURI)
+	if dt := firstNonEmpty(imsHeaderValue(cpim.Headers, "DateTime"), imsHeaderValue(cpim.Headers, "imdn.DateTime")); dt != "" {
+		nested.Headers = mergeIMSMessageHeaders(nested.Headers, map[string][]string{imsInternalCPIMDateTimeHeader: {dt}})
+	}
 	result, err := s.HandleIMSMessage(ctx, nested)
-	if len(result.ReplyBody) > 0 && strings.TrimSpace(result.ReplyContentType) != "" {
+	if len(result.ReplyBody) > 0 &&
+		strings.TrimSpace(result.ReplyContentType) != "" &&
+		normalizedIMSMessageContentType(result.ReplyContentType) != IMS3GPPSMSContentType {
 		reply, wrapErr := BuildIMSCPIMMessage(firstNonEmpty(nested.ToURI, msg.ToURI), firstNonEmpty(nested.FromURI, msg.FromURI), result.ReplyContentType, result.ReplyBody)
 		if wrapErr != nil {
 			return IMSMessageResult{StatusCode: 500, Reason: wrapErr.Error()}, wrapErr
@@ -434,7 +503,7 @@ func (s *Service) handleIMS3GPPSMS(ctx context.Context, msg IMSMessageRequest) (
 			InReplyTo: strings.TrimSpace(imsHeaderValue(msg.Headers, "In-Reply-To")),
 			CallID:    firstNonEmpty(msg.CallID, imsHeaderValue(msg.Headers, "Call-ID")),
 			RPMR:      int(rpdu.MR),
-			State:     "delivered",
+			State:     "sent",
 			SIPCode:   200,
 			ReportAt:  time.Time{},
 		}
@@ -474,22 +543,25 @@ func (s *Service) handleIMS3GPPSMS(ctx context.Context, msg IMSMessageRequest) (
 }
 
 func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rpdu SMSRPDU, out IMSMessageResult) (IMSMessageResult, error) {
+	// Per 3GPP TS 24.341 §5.3.2.4 & RFC 3428, a syntactically valid SIP MESSAGE
+	// carrying RP-DATA receives SIP 200 OK (empty body), while RP-layer errors
+	// are reported in a separate uplink SIP MESSAGE carrying RP-ERROR.
 	if len(rpdu.TPDU) == 0 {
 		err := errors.New("IMS SMS RP-DATA has no TPDU")
-		out.StatusCode = 400
-		out.Reason = err.Error()
+		out.StatusCode = 200
+		out.Reason = "OK"
 		out.ReplyContentType = IMS3GPPSMSContentType
-		out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseTemporaryFailure)
+		out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseInvalidMandatoryInfo)
 		return out, err
 	}
 	switch rpdu.TPDU[0] & 0x03 {
 	case 0x00:
 		deliver, err := ParseSMSDeliverTPDU(rpdu.TPDU)
 		if err != nil {
-			out.StatusCode = 400
-			out.Reason = err.Error()
+			out.StatusCode = 200
+			out.Reason = "OK"
 			out.ReplyContentType = IMS3GPPSMSContentType
-			out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseTemporaryFailure)
+			out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseInvalidMandatoryInfo)
 			return out, err
 		}
 		incoming := IncomingSMS{
@@ -516,8 +588,8 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 			incoming = assembled
 		}
 		if err := s.HandleIncomingSMS(ctx, incoming); err != nil {
-			out.StatusCode = 400
-			out.Reason = err.Error()
+			out.StatusCode = 200
+			out.Reason = "OK"
 			out.Incoming = &incoming
 			out.ReplyContentType = IMS3GPPSMSContentType
 			out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseTemporaryFailure)
@@ -530,10 +602,10 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 	case 0x02:
 		reportTPDU, err := ParseSMSStatusReportTPDU(rpdu.TPDU)
 		if err != nil {
-			out.StatusCode = 400
-			out.Reason = err.Error()
+			out.StatusCode = 200
+			out.Reason = "OK"
 			out.ReplyContentType = IMS3GPPSMSContentType
-			out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseTemporaryFailure)
+			out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseInvalidMandatoryInfo)
 			return out, err
 		}
 		report, err := s.handleIMSSMSStatusReport(ctx, msg, reportTPDU)
@@ -541,17 +613,18 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 		out.ReplyContentType = IMS3GPPSMSContentType
 		out.ReplyBody = BuildSMSRPAck(rpdu.MR)
 		if err != nil && !errors.Is(err, ErrDeliveryNotFound) {
-			out.StatusCode = 500
-			out.Reason = err.Error()
+			out.StatusCode = 200
+			out.Reason = "OK"
+			out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseTemporaryFailure)
 			return out, err
 		}
 		return out, nil
 	default:
 		err := errors.New("unsupported IMS SMS TPDU type")
-		out.StatusCode = 400
-		out.Reason = err.Error()
+		out.StatusCode = 200
+		out.Reason = "OK"
 		out.ReplyContentType = IMS3GPPSMSContentType
-		out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseTemporaryFailure)
+		out.ReplyBody = BuildSMSRPError(rpdu.MR, SMSRPCauseMessageTypeNonExistent)
 		return out, err
 	}
 }
@@ -563,7 +636,9 @@ func (s *Service) handleIMSSMSStatusReport(ctx context.Context, msg IMSMessageRe
 		RPMR:                  int(reportTPDU.Reference),
 		State:                 reportTPDU.State,
 		SIPCode:               200,
-		RPCause:               int(reportTPDU.Status),
+		RPCause:               0,
+		TPStatus:              int(reportTPDU.Status),
+		HasTPStatus:           true,
 		ReportAt:              reportTPDU.DoneAt,
 		ErrorText:             smsStatusReportError(reportTPDU),
 		Recipient:             reportTPDU.Recipient,
@@ -617,12 +692,20 @@ func (s *Service) collectSMSConcatPart(incoming IncomingSMS, concat SMSConcatInf
 		s.smsConcat[key] = state
 	}
 	state.updatedAt = now
+	if existing, exists := state.parts[concat.Seq]; exists && existing != incoming.Content {
+		// Different payload at the same (sender, ref, total, seq) means an 8-bit
+		// reference wrapped around after a previous incomplete multipart SMS.
+		state.parts = make(map[int]string, concat.Total)
+		state.firstSeen = now
+		state.timestamp = time.Time{}
+	}
 	if !incoming.Timestamp.IsZero() && (state.timestamp.IsZero() || concat.Seq == 1) {
 		state.timestamp = incoming.Timestamp
 	}
 	if concat.Seq == 1 || len(state.parts) == 0 {
 		state.protocolID = incoming.ProtocolID
 		state.dataCodingScheme = incoming.DataCodingScheme
+		state.dataCoding = incoming.DataCoding
 		state.userDataHeader = incoming.UserDataHeader
 		state.userDataHeaderInfo = incoming.UserDataHeaderInfo
 		state.moreMessagesToSend = incoming.MoreMessagesToSend
@@ -652,6 +735,7 @@ func (s *Service) collectSMSConcatPart(incoming IncomingSMS, concat SMSConcatInf
 	}
 	incoming.ProtocolID = state.protocolID
 	incoming.DataCodingScheme = state.dataCodingScheme
+	incoming.DataCoding = state.dataCoding
 	incoming.UserDataHeader = state.userDataHeader
 	incoming.UserDataHeaderInfo = state.userDataHeaderInfo
 	incoming.MoreMessagesToSend = state.moreMessagesToSend
@@ -710,4 +794,191 @@ func smsStatusReportError(report SMSStatusReport) string {
 func hexByte(v byte) string {
 	const digits = "0123456789abcdef"
 	return string([]byte{digits[v>>4], digits[v&0x0f]})
+}
+
+func decodeIMSTextPlainCharset(body []byte, charset string) (string, error) {
+	cs := strings.ToLower(strings.TrimSpace(charset))
+	switch cs {
+	case "", "utf-8", "utf8", "us-ascii", "ascii":
+		return strings.ToValidUTF8(string(body), ""), nil
+	case "iso-8859-1", "iso_8859-1", "latin1", "latin-1":
+		runes := make([]rune, len(body))
+		for i, b := range body {
+			runes[i] = rune(b)
+		}
+		return string(runes), nil
+	case "utf-16", "utf16":
+		if len(body) >= 2 && body[0] == 0xff && body[1] == 0xfe {
+			return decodeUTF16Bytes(body[2:], binary.LittleEndian)
+		}
+		if len(body) >= 2 && body[0] == 0xfe && body[1] == 0xff {
+			return decodeUTF16Bytes(body[2:], binary.BigEndian)
+		}
+		return decodeUTF16Bytes(body, binary.BigEndian)
+	case "utf-16be", "utf16be":
+		return decodeUTF16Bytes(body, binary.BigEndian)
+	case "utf-16le", "utf16le":
+		return decodeUTF16Bytes(body, binary.LittleEndian)
+	default:
+		return "", fmt.Errorf("unsupported text/plain charset: %s", charset)
+	}
+}
+
+func decodeUTF16Bytes(body []byte, order binary.ByteOrder) (string, error) {
+	if len(body)%2 != 0 {
+		return "", errors.New("UTF-16 text/plain payload has odd byte length")
+	}
+	units := make([]uint16, len(body)/2)
+	for i := 0; i < len(units); i++ {
+		units[i] = order.Uint16(body[i*2 : i*2+2])
+	}
+	return string(utf16.Decode(units)), nil
+}
+
+// ParseSimpleMessageSummary parses an RFC 3842 application/simple-message-summary payload.
+func ParseSimpleMessageSummary(body []byte) (MessageWaitingSummary, error) {
+	text := strings.ReplaceAll(string(body), "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	lines := strings.Split(text, "\n")
+	var out MessageWaitingSummary
+	foundMessagesWaiting := false
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		val = strings.TrimSpace(val)
+		switch key {
+		case "messages-waiting":
+			switch strings.ToLower(val) {
+			case "yes":
+				out.MessagesWaiting = true
+				foundMessagesWaiting = true
+			case "no":
+				out.MessagesWaiting = false
+				foundMessagesWaiting = true
+			default:
+				return MessageWaitingSummary{}, fmt.Errorf("invalid Messages-Waiting value: %q", val)
+			}
+		case "message-account":
+			out.MessageAccount = strings.Trim(strings.TrimSpace(val), "<>")
+		case "voice-message":
+			n, o, un, uo, err := parseMessageSummaryCounts(val)
+			if err != nil {
+				return MessageWaitingSummary{}, fmt.Errorf("voice-message: %w", err)
+			}
+			out.VoiceNew, out.VoiceOld, out.VoiceUrgentNew, out.VoiceUrgentOld = n, o, un, uo
+		case "fax-message":
+			n, o, _, _, err := parseMessageSummaryCounts(val)
+			if err != nil {
+				return MessageWaitingSummary{}, fmt.Errorf("fax-message: %w", err)
+			}
+			out.FaxNew, out.FaxOld = n, o
+		case "multimedia-message":
+			n, o, _, _, err := parseMessageSummaryCounts(val)
+			if err != nil {
+				return MessageWaitingSummary{}, fmt.Errorf("multimedia-message: %w", err)
+			}
+			out.MultimediaNew, out.MultimediaOld = n, o
+		case "text-message":
+			n, o, _, _, err := parseMessageSummaryCounts(val)
+			if err != nil {
+				return MessageWaitingSummary{}, fmt.Errorf("text-message: %w", err)
+			}
+			out.TextNew, out.TextOld = n, o
+		case "none":
+			n, o, _, _, err := parseMessageSummaryCounts(val)
+			if err != nil {
+				return MessageWaitingSummary{}, fmt.Errorf("none: %w", err)
+			}
+			out.NoneNew, out.NoneOld = n, o
+		}
+	}
+	if !foundMessagesWaiting {
+		return MessageWaitingSummary{}, errors.New("Messages-Waiting header missing in simple-message-summary")
+	}
+	return out, nil
+}
+
+func parseMessageSummaryCounts(value string) (newCount, oldCount, urgentNew, urgentOld int, err error) {
+	mainPart := strings.TrimSpace(value)
+	urgentPart := ""
+	if openIdx := strings.IndexByte(mainPart, '('); openIdx >= 0 {
+		closeIdx := strings.IndexByte(mainPart[openIdx+1:], ')')
+		if closeIdx < 0 {
+			return 0, 0, 0, 0, fmt.Errorf("unterminated urgent count %q", value)
+		}
+		urgentPart = strings.TrimSpace(mainPart[openIdx+1 : openIdx+1+closeIdx])
+		mainPart = strings.TrimSpace(mainPart[:openIdx])
+	}
+	newCount, oldCount, err = parseSlashPair(mainPart)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if urgentPart != "" {
+		urgentNew, urgentOld, err = parseSlashPair(urgentPart)
+		if err != nil {
+			return 0, 0, 0, 0, err
+		}
+	}
+	return newCount, oldCount, urgentNew, urgentOld, nil
+}
+
+func parseSlashPair(raw string) (int, int, error) {
+	left, right, ok := strings.Cut(strings.TrimSpace(raw), "/")
+	if !ok {
+		return 0, 0, fmt.Errorf("expected new/old counts in %q", raw)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(left))
+	if err != nil || n < 0 {
+		return 0, 0, fmt.Errorf("invalid new count in %q", raw)
+	}
+	o, err := strconv.Atoi(strings.TrimSpace(right))
+	if err != nil || o < 0 {
+		return 0, 0, fmt.Errorf("invalid old count in %q", raw)
+	}
+	return n, o, nil
+}
+
+// HandleIMSMessageSummaryNotify parses an RFC 3842 application/simple-message-summary
+// payload (from SIP NOTIFY Event: message-summary or SIP MESSAGE) and dispatches a
+// MessageWaitingEvent.
+func (s *Service) HandleIMSMessageSummaryNotify(ctx context.Context, body []byte, fromURI, toURI string) (MessageWaitingSummary, error) {
+	summary, err := ParseSimpleMessageSummary(body)
+	if err != nil {
+		return MessageWaitingSummary{}, err
+	}
+	if s != nil && s.dispatch != nil {
+		msgType := "voicemail"
+		count := summary.VoiceNew
+		if count == 0 && summary.FaxNew > 0 {
+			msgType = "fax"
+			count = summary.FaxNew
+		} else if count == 0 && summary.MultimediaNew > 0 {
+			msgType = "multimedia"
+			count = summary.MultimediaNew
+		} else if count == 0 && summary.TextNew > 0 {
+			msgType = "text"
+			count = summary.TextNew
+		}
+		summaryCopy := summary
+		s.dispatch.Dispatch(ctx, MessageWaitingEvent{
+			DevID:          s.deviceID,
+			Source:         "simple-message-summary",
+			Sender:         strings.TrimSpace(fromURI),
+			Recipient:      strings.TrimSpace(toURI),
+			MessageAccount: summary.MessageAccount,
+			MessageType:    msgType,
+			Active:         summary.MessagesWaiting,
+			Count:          count,
+			Summary:        &summaryCopy,
+			Time:           time.Now(),
+		})
+	}
+	return summary, nil
 }

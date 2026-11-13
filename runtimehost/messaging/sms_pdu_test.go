@@ -584,7 +584,8 @@ func TestParseSMSDeliverTPDUGSM7(t *testing.T) {
 }
 
 func TestParseSMSDeliverTPDUAlphanumericSender(t *testing.T) {
-	tpdu := mustHex(t, "0006D0C7F7FBCC2E0300006270502143650005E8329BFD06")
+	// Per 3GPP TS 23.040 §9.1.2.5, Address-Length for 6-septet "Google" (42 bits) is 11 semi-octets (0x0B).
+	tpdu := mustHex(t, "000BD0C7F7FBCC2E0300006270502143650005E8329BFD06")
 	deliver, err := ParseSMSDeliverTPDU(tpdu)
 	if err != nil {
 		t.Fatalf("ParseSMSDeliverTPDU() error = %v", err)

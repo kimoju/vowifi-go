@@ -51,10 +51,12 @@ type DialogRTPDTMFRequest struct {
 	StepMS         int
 	EndPacketCount int
 	Volume         uint8
+	HasVolume      bool
 	SequenceNumber uint16
 	Timestamp      uint32
 	SSRC           uint32
 	PayloadType    uint8
+	HasPayloadType bool
 	ClockRate      int
 }
 
@@ -77,6 +79,14 @@ type DialogAutoDTMFResult struct {
 }
 
 func (a *IMSOutboundAgent) SendDialogDTMF(ctx context.Context, req DialogDTMFRequest) (DialogDTMFResult, error) {
+	infoReq, err := BuildDialogDTMFInfoRequest(req)
+	if err != nil {
+		return DialogDTMFResult{Accepted: false, StatusCode: 400, Reason: err.Error()}, err
+	}
+	return a.SendDialogInfo(ctx, infoReq)
+}
+
+func (a *IMSInboundAgent) SendDialogDTMF(ctx context.Context, req DialogDTMFRequest) (DialogDTMFResult, error) {
 	infoReq, err := BuildDialogDTMFInfoRequest(req)
 	if err != nil {
 		return DialogDTMFResult{Accepted: false, StatusCode: 400, Reason: err.Error()}, err
@@ -206,10 +216,12 @@ func dialogRTPDTMFRelayRequest(req DialogRTPDTMFRequest) RTPRelayDTMFRequest {
 		StepMS:         req.StepMS,
 		EndPacketCount: req.EndPacketCount,
 		Volume:         req.Volume,
+		HasVolume:      req.HasVolume,
 		SequenceNumber: req.SequenceNumber,
 		Timestamp:      req.Timestamp,
 		SSRC:           req.SSRC,
 		PayloadType:    req.PayloadType,
+		HasPayloadType: req.HasPayloadType,
 		ClockRate:      req.ClockRate,
 	}
 }
