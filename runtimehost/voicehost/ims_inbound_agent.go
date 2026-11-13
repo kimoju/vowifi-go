@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
@@ -15,18 +16,105 @@ import (
 var ErrIMSInboundAgentNotReady = errors.New("ims inbound voice agent not ready")
 
 type IMSInboundAgent struct {
-	ClientTransport  voiceclient.SIPRequestTransport
-	Profile          voiceclient.IMSProfile
-	Registration     voiceclient.RegistrationBinding
-	ClientContactURI string
-	LocalContactURI  string
-	LocalTag         string
-	UserAgent        string
-	MediaRelay       *RTPRelayConfig
+	DeviceID             string
+	ClientTransport      voiceclient.SIPRequestTransport
+	Profile              voiceclient.IMSProfile
+	Registration         voiceclient.RegistrationBinding
+	ClientContactURI     string
+	ResolveClientContact func(deviceID string) (string, error)
+	LocalContactURI      string
+	LocalTag             string
+	UserAgent            string
+	MediaRelay           *RTPRelayConfig
+	OnDialogEvent        func(ctx context.Context, info DialogInfo, callerURI string, calleeURI string, statusCode int, reason string)
 
 	mu                     sync.Mutex
 	dialogs                map[string]imsInboundDialogState
 	nextPendingOfferSerial uint64
+}
+
+func (a *IMSInboundAgent) UpdateIMSRegistration(update IMSRegistrationUpdate) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if strings.TrimSpace(update.Profile.IMPU) != "" || strings.TrimSpace(update.Profile.IMPI) != "" {
+		a.Profile = update.Profile
+	}
+	if strings.TrimSpace(update.Registration.ContactURI) != "" {
+		a.Registration = update.Registration
+		a.LocalContactURI = update.Registration.ContactURI
+	}
+	if strings.TrimSpace(update.UserAgent) != "" {
+		a.UserAgent = strings.TrimSpace(update.UserAgent)
+	}
+	if update.MediaRelay != nil {
+		a.MediaRelay = update.MediaRelay
+	}
+}
+
+func (a *IMSInboundAgent) LocalContact() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return firstVoiceNonEmpty(a.LocalContactURI, a.Registration.ContactURI, a.Profile.IMPU)
+}
+
+func (a *IMSInboundAgent) DefaultLocalTag() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return strings.TrimSpace(a.LocalTag)
+}
+
+func (a *IMSInboundAgent) currentClientTransport() voiceclient.SIPRequestTransport {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	transport := a.ClientTransport
+	a.mu.Unlock()
+	return transport
+}
+
+func (a *IMSInboundAgent) roundTripClientRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) (voiceclient.SIPResponse, error) {
+	transport := a.currentClientTransport()
+	if transport == nil {
+		return voiceclient.SIPResponse{}, ErrIMSInboundAgentNotReady
+	}
+	return transport.RoundTripRequest(ctx, msg)
+}
+
+func (a *IMSInboundAgent) writeClientRequest(ctx context.Context, msg voiceclient.SIPRequestMessage) error {
+	transport := a.currentClientTransport()
+	if transport == nil {
+		return ErrIMSInboundAgentNotReady
+	}
+	return transport.WriteRequest(ctx, msg)
+}
+
+func (a *IMSInboundAgent) emitDialogEvent(ctx context.Context, callID string, callee string, state DialogState, callerURI string, calleeURI string, statusCode int, reason string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	cb := a.OnDialogEvent
+	devID := strings.TrimSpace(a.DeviceID)
+	a.mu.Unlock()
+	if cb == nil {
+		return
+	}
+	cb(ctx, DialogInfo{
+		DeviceID: devID,
+		CallID:   strings.TrimSpace(callID),
+		Callee:   strings.TrimSpace(callee),
+		State:    state,
+	}, strings.TrimSpace(callerURI), strings.TrimSpace(calleeURI), statusCode, strings.TrimSpace(reason))
 }
 
 type InboundCallRequest struct {
@@ -99,7 +187,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(req.CallID)
@@ -109,15 +197,37 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 	if _, ok := a.inboundDialog(callID); ok {
 		return a.handleInboundReinvite(ctx, req)
 	}
+	a.mu.Lock()
+	profile := a.Profile
+	registration := a.Registration
+	clientTarget := strings.TrimSpace(a.ClientContactURI)
+	resolveClientContact := a.ResolveClientContact
+	deviceID := firstVoiceNonEmpty(req.DeviceID, a.DeviceID)
+	localContactURI := a.LocalContactURI
+	localTag := a.LocalTag
+	userAgent := a.UserAgent
+	mediaRelay := effectiveMediaRelayForLocalIP(a.MediaRelay, profile.LocalIP)
+	a.mu.Unlock()
+
 	callerURI := strings.TrimSpace(req.CallerURI)
 	if callerURI == "" {
 		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "caller URI empty"}, errors.New("caller URI is empty")
 	}
-	calleeURI := firstVoiceNonEmpty(req.CalleeURI, a.Registration.PublicIdentity, a.Profile.IMPU)
+	calleeURI := firstVoiceNonEmpty(req.CalleeURI, registration.PublicIdentity, profile.IMPU)
 	if calleeURI == "" {
 		return InboundCallResult{Accepted: false, StatusCode: 400, Reason: "callee URI empty"}, errors.New("callee URI is empty")
 	}
-	clientTarget := strings.TrimSpace(a.ClientContactURI)
+	if clientTarget == "" && resolveClientContact != nil {
+		resolved, resolveErr := resolveClientContact(deviceID)
+		clientTarget = strings.TrimSpace(resolved)
+		if clientTarget == "" {
+			a.emitDialogEvent(ctx, callID, calleeURI, DialogStateTerminated, callerURI, calleeURI, 480, "Temporarily Unavailable")
+			if resolveErr != nil {
+				return InboundCallResult{Accepted: false, StatusCode: 480, Reason: "Temporarily Unavailable"}, resolveErr
+			}
+			return InboundCallResult{Accepted: false, StatusCode: 480, Reason: "Temporarily Unavailable"}, ErrIMSInboundAgentNotReady
+		}
+	}
 	if clientTarget == "" {
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client contact unavailable"}, ErrIMSInboundAgentNotReady
 	}
@@ -134,15 +244,15 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 			_ = relay.Close()
 		}
 	}()
-	if a.MediaRelay != nil {
-		createdRelay, relayErr := NewRTPRelaySessionForIMSRemote(ctx, *a.MediaRelay, remoteSDP)
+	if mediaRelay != nil {
+		createdRelay, relayErr := NewRTPRelaySessionForIMSRemote(ctx, *mediaRelay, remoteSDP)
 		if relayErr != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "RTP relay setup failed"}, relayErr
 		}
 		relay = createdRelay
 		offerBody = RewriteSDPMediaEndpoint(offerBody, relay.ClientEndpoint())
-		if a.MediaRelay.SRTP != nil {
-			negotiation, err := newInboundSDESRelayNegotiation(imsOfferBody, *a.MediaRelay.SRTP)
+		if mediaRelay.SRTP != nil {
+			negotiation, err := newInboundSDESRelayNegotiation(imsOfferBody, *mediaRelay.SRTP)
 			if err != nil {
 				return InboundCallResult{Accepted: false, StatusCode: 488, Reason: "RTP relay SRTP negotiation failed"}, err
 			}
@@ -151,18 +261,19 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		}
 	}
 	cfg := voiceclient.DialogRequestConfig{
-		Profile:         a.Profile,
+		Profile:         profile,
 		Registration:    voiceclient.RegistrationBinding{},
 		LocalURI:        callerURI,
-		ContactURI:      firstVoiceNonEmpty(a.LocalContactURI, a.Registration.ContactURI, a.Profile.IMPU),
+		ContactURI:      firstVoiceNonEmpty(localContactURI, registration.ContactURI, profile.IMPU),
 		RemoteURI:       calleeURI,
 		RemoteTargetURI: clientTarget,
 		CallID:          callID,
-		LocalTag:        firstVoiceNonEmpty(req.RemoteTag, a.LocalTag, "ims"),
+		LocalTag:        firstVoiceNonEmpty(req.RemoteTag, localTag, "ims"),
 		CSeq:            inboundCSeq(req.CSeq),
-		UserAgent:       firstVoiceNonEmpty(a.UserAgent, a.Profile.UserAgent, "vowifi-go"),
+		UserAgent:       firstVoiceNonEmpty(userAgent, profile.UserAgent, "vowifi-go"),
 	}
 	applyInboundSessionIntervalHeaders(&cfg, req.Headers)
+	a.emitDialogEvent(ctx, callID, calleeURI, DialogStateEarly, callerURI, calleeURI, 180, "Ringing")
 	var invite voiceclient.SIPRequestMessage
 	var resp voiceclient.SIPResponse
 	retriedSessionInterval := false
@@ -187,6 +298,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		}))
 		if err != nil {
 			a.deleteInboundDialog(callID)
+			a.emitDialogEvent(ctx, callID, calleeURI, DialogStateTerminated, callerURI, calleeURI, 503, "client INVITE failed")
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client INVITE failed"}, err
 		}
 		if resp.StatusCode == 422 && !retriedSessionInterval {
@@ -217,24 +329,30 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 		if resp.StatusCode >= 300 {
 			if err := a.ackRejectedClientInvite(ctx, cfg, invite, resp); err != nil {
 				a.deleteInboundDialog(callID)
+				a.emitDialogEvent(ctx, callID, calleeURI, DialogStateTerminated, callerURI, calleeURI, 500, "client INVITE canceled ACK failed")
 				return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "client INVITE canceled ACK failed"}, err
 			}
 		}
 		a.deleteInboundDialog(callID)
+		a.emitDialogEvent(ctx, callID, calleeURI, DialogStateTerminated, callerURI, calleeURI, 487, "Request Terminated")
 		return InboundCallResult{Accepted: false, StatusCode: 487, Reason: "Request Terminated"}, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp.StatusCode >= 300 {
 			if err := a.ackRejectedClientInvite(ctx, cfg, invite, resp); err != nil {
 				a.deleteInboundDialog(callID)
+				a.emitDialogEvent(ctx, callID, calleeURI, DialogStateTerminated, callerURI, calleeURI, 500, "client INVITE rejected ACK failed")
 				return InboundCallResult{Accepted: false, StatusCode: 500, Reason: "client INVITE rejected ACK failed"}, err
 			}
 		}
 		a.deleteInboundDialog(callID)
+		finalCode := inboundStatusCode(resp.StatusCode, 486)
+		finalReason := firstVoiceNonEmpty(resp.Reason, "Busy Here")
+		a.emitDialogEvent(ctx, callID, calleeURI, DialogStateTerminated, callerURI, calleeURI, finalCode, finalReason)
 		return InboundCallResult{
 			Accepted:   false,
-			StatusCode: inboundStatusCode(resp.StatusCode, 486),
-			Reason:     firstVoiceNonEmpty(resp.Reason, "Busy Here"),
+			StatusCode: finalCode,
+			Reason:     finalReason,
 			Headers:    firstValueSIPHeaders(resp.Headers),
 		}, nil
 	}
@@ -282,6 +400,7 @@ func (a *IMSInboundAgent) HandleInboundInvite(ctx context.Context, req InboundCa
 	applyInboundNegotiatedSessionInterval(&cfg, resp.Headers)
 	a.storeInboundDialog(callID, imsInboundDialogState{clientCfg: cfg, invite: cloneSIPRequestMessage(invite), inviteCSeq: cfg.CSeq, relay: relay, srtpNegotiation: srtpNegotiation})
 	closeRelayOnError = false
+	a.emitDialogEvent(ctx, callID, calleeURI, DialogStateEstablished, callerURI, calleeURI, inboundStatusCode(resp.StatusCode, 200), firstVoiceNonEmpty(resp.Reason, "OK"))
 	return InboundCallResult{
 		Accepted:   true,
 		StatusCode: inboundStatusCode(resp.StatusCode, 200),
@@ -437,7 +556,7 @@ func (a *IMSInboundAgent) AckInboundCall(ctx context.Context, info DialogInfo) e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return ErrIMSInboundAgentNotReady
 	}
 	state, ok := a.inboundDialog(info.CallID)
@@ -452,7 +571,7 @@ func (a *IMSInboundAgent) AckInboundCall(ctx context.Context, info DialogInfo) e
 	if err != nil {
 		return err
 	}
-	return a.ClientTransport.WriteRequest(ctx, ack)
+	return a.writeClientRequest(ctx, ack)
 }
 
 func (a *IMSInboundAgent) ackRejectedClientInvite(ctx context.Context, cfg voiceclient.DialogRequestConfig, invite voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
@@ -463,7 +582,7 @@ func (a *IMSInboundAgent) ackRejectedClientInvite(ctx context.Context, cfg voice
 		return err
 	}
 	copyDialogHeader(ack.Headers, invite.Headers, "Via")
-	return a.ClientTransport.WriteRequest(ctx, ack)
+	return a.writeClientRequest(ctx, ack)
 }
 
 func ensureInboundClientInviteVia(invite *voiceclient.SIPRequestMessage, cfg voiceclient.DialogRequestConfig) {
@@ -547,8 +666,13 @@ func (a *IMSInboundAgent) newInboundSDESRelayNegotiation(body []byte, state imsI
 }
 
 func (a *IMSInboundAgent) inboundSDESRelayConfig(state imsInboundDialogState) (RTPRelaySRTPConfig, bool) {
-	if a != nil && a.MediaRelay != nil && a.MediaRelay.SRTP != nil {
-		return *a.MediaRelay.SRTP, true
+	if a != nil {
+		a.mu.Lock()
+		mediaRelay := a.MediaRelay
+		a.mu.Unlock()
+		if mediaRelay != nil && mediaRelay.SRTP != nil {
+			return *mediaRelay.SRTP, true
+		}
 	}
 	if state.srtpNegotiation != nil {
 		return state.srtpNegotiation.cfg, true
@@ -649,7 +773,7 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(req.CallID)
@@ -705,7 +829,7 @@ func (a *IMSInboundAgent) HandleInboundUpdate(ctx context.Context, req InboundDi
 			state.srtpNegotiation = srtpNegotiation
 		}
 		a.storeInboundDialog(callID, state)
-		resp, err = a.ClientTransport.RoundTripRequest(ctx, update)
+		resp, err = a.roundTripClientRequest(ctx, update)
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client UPDATE failed"}, err
 		}
@@ -770,7 +894,7 @@ func (a *IMSInboundAgent) HandleInboundPrack(ctx context.Context, req InboundDia
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(req.CallID)
@@ -820,7 +944,7 @@ func (a *IMSInboundAgent) HandleInboundPrack(ctx context.Context, req InboundDia
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
 		a.storeInboundDialog(callID, state)
-		resp, err = a.ClientTransport.RoundTripRequest(ctx, prack)
+		resp, err = a.roundTripClientRequest(ctx, prack)
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client PRACK failed"}, err
 		}
@@ -881,7 +1005,7 @@ func (a *IMSInboundAgent) HandleInboundRefer(ctx context.Context, req InboundDia
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(req.CallID)
@@ -921,7 +1045,7 @@ func (a *IMSInboundAgent) HandleInboundRefer(ctx context.Context, req InboundDia
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
 		a.storeInboundDialog(callID, state)
-		resp, err = a.ClientTransport.RoundTripRequest(ctx, refer)
+		resp, err = a.roundTripClientRequest(ctx, refer)
 		if err != nil {
 			return InboundCallResult{Accepted: false, StatusCode: 503, Reason: "client REFER failed"}, err
 		}
@@ -950,7 +1074,7 @@ func (a *IMSInboundAgent) HandleInboundNotify(ctx context.Context, req InboundDi
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(req.CallID)
@@ -985,7 +1109,7 @@ func (a *IMSInboundAgent) HandleInboundNotify(ctx context.Context, req InboundDi
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
 		a.storeInboundDialog(callID, state)
-		resp, err = a.ClientTransport.RoundTripRequest(ctx, notify)
+		resp, err = a.roundTripClientRequest(ctx, notify)
 		if err != nil {
 			return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client NOTIFY failed"}, err
 		}
@@ -1018,7 +1142,7 @@ func (a *IMSInboundAgent) HandleInboundSubscribe(ctx context.Context, req Inboun
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(req.CallID)
@@ -1055,7 +1179,7 @@ func (a *IMSInboundAgent) HandleInboundSubscribe(ctx context.Context, req Inboun
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
 		a.storeInboundDialog(callID, state)
-		resp, err = a.ClientTransport.RoundTripRequest(ctx, subscribe)
+		resp, err = a.roundTripClientRequest(ctx, subscribe)
 		if err != nil {
 			return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client SUBSCRIBE failed"}, err
 		}
@@ -1096,7 +1220,7 @@ func (a *IMSInboundAgent) HandleInboundMessage(ctx context.Context, req IMSMessa
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(req.CallID)
@@ -1123,7 +1247,7 @@ func (a *IMSInboundAgent) HandleInboundMessage(ctx context.Context, req IMSMessa
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
 		a.storeInboundDialog(callID, state)
-		resp, err = a.ClientTransport.RoundTripRequest(ctx, msg)
+		resp, err = a.roundTripClientRequest(ctx, msg)
 		if err != nil {
 			return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client MESSAGE failed"}, err
 		}
@@ -1156,7 +1280,7 @@ func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequ
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(req.CallID)
@@ -1183,7 +1307,7 @@ func (a *IMSInboundAgent) HandleInboundInfo(ctx context.Context, req IMSInfoRequ
 		state.clientCfg.CSeq = maxInboundCSeq(state.clientCfg.CSeq, cfg.CSeq)
 		state.clientCfg.RemoteTargetURI = cfg.RemoteTargetURI
 		a.storeInboundDialog(callID, state)
-		resp, err = a.ClientTransport.RoundTripRequest(ctx, info)
+		resp, err = a.roundTripClientRequest(ctx, info)
 		if err != nil {
 			return IMSInfoResult{Handled: true, StatusCode: 503, Reason: "client INFO failed"}, err
 		}
@@ -1216,7 +1340,7 @@ func (a *IMSInboundAgent) CancelInboundCall(ctx context.Context, info DialogInfo
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(info.CallID)
@@ -1235,7 +1359,7 @@ func (a *IMSInboundAgent) CancelInboundCallWithResult(ctx context.Context, info 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return DialogInfoResult{Accepted: false, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(info.CallID)
@@ -1255,7 +1379,7 @@ func (a *IMSInboundAgent) CancelInboundCallWithResult(ctx context.Context, info 
 	}
 	applyDialogUpdateHeaders(cancel.Headers, info.Headers)
 	copyDialogHeader(cancel.Headers, state.invite.Headers, "Via")
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, cancel)
+	resp, err := a.roundTripClientRequest(ctx, cancel)
 	if err != nil {
 		return DialogInfoResult{Accepted: false, StatusCode: 503, Reason: "client CANCEL failed"}, err
 	}
@@ -1284,7 +1408,7 @@ func (a *IMSInboundAgent) EndInboundCall(ctx context.Context, info DialogInfo) e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(info.CallID)
@@ -1308,7 +1432,7 @@ func (a *IMSInboundAgent) EndInboundCallWithResult(ctx context.Context, info Dia
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if a == nil || a.ClientTransport == nil {
+	if a == nil || a.currentClientTransport() == nil {
 		return DialogInfoResult{Accepted: false, StatusCode: 503, Reason: "client voice transport unavailable"}, ErrIMSInboundAgentNotReady
 	}
 	callID := strings.TrimSpace(info.CallID)
@@ -1332,7 +1456,7 @@ func (a *IMSInboundAgent) EndInboundCallWithResult(ctx context.Context, info Dia
 	applyDialogUpdateHeaders(bye.Headers, info.Headers)
 	state.clientCfg = cfg
 	a.storeInboundDialog(callID, state)
-	resp, err := a.ClientTransport.RoundTripRequest(ctx, bye)
+	resp, err := a.roundTripClientRequest(ctx, bye)
 	if err != nil {
 		return DialogInfoResult{Accepted: false, StatusCode: 503, Reason: "client BYE failed"}, err
 	}
@@ -1352,6 +1476,7 @@ func (a *IMSInboundAgent) EndInboundCallWithResult(ctx context.Context, info Dia
 		return result, fmt.Errorf("client BYE rejected: %d %s", resp.StatusCode, strings.TrimSpace(resp.Reason))
 	}
 	a.closeInboundDialog(callID)
+	a.emitDialogEvent(ctx, callID, cfg.RemoteURI, DialogStateTerminated, cfg.LocalURI, cfg.RemoteURI, 200, "remote BYE")
 	return result, nil
 }
 
@@ -1537,11 +1662,56 @@ func (a *IMSInboundAgent) closeInboundDialog(callID string) {
 	a.deleteInboundDialog(callID)
 }
 
+func (a *IMSInboundAgent) TerminateAllDialogs(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.mu.Lock()
+	transport := a.ClientTransport
+	snapshots := make(map[string]imsInboundDialogState, len(a.dialogs))
+	for callID, state := range a.dialogs {
+		snapshots[callID] = state
+	}
+	a.dialogs = nil
+	a.mu.Unlock()
+
+	var errs []error
+	for callID, state := range snapshots {
+		if transport != nil && !state.canceled {
+			termCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			if state.early {
+				if cancelReq, buildErr := voiceclient.BuildCancelRequestWithBody(state.clientCfg, "", nil); buildErr == nil {
+					copyDialogHeader(cancelReq.Headers, state.invite.Headers, "Via")
+					_, _ = transport.RoundTripRequest(termCtx, cancelReq)
+				}
+			} else {
+				byeCfg := state.clientCfg
+				byeCfg.CSeq = nextInboundClientCSeq(byeCfg.CSeq)
+				if byeReq, buildErr := voiceclient.BuildByeRequestWithBody(byeCfg, "", nil); buildErr == nil {
+					_, _ = transport.RoundTripRequest(termCtx, byeReq)
+				}
+			}
+			cancel()
+		}
+		if state.relay != nil {
+			if closeErr := state.relay.Close(); closeErr != nil {
+				errs = append(errs, closeErr)
+			}
+		}
+		a.emitDialogEvent(ctx, callID, state.clientCfg.RemoteURI, DialogStateTerminated, state.clientCfg.LocalURI, state.clientCfg.RemoteURI, 200, "runtime stopped")
+	}
+	return errors.Join(errs...)
+}
+
 func (a *IMSInboundAgent) roundTripClientInvite(ctx context.Context, invite voiceclient.SIPRequestMessage, onProvisional func(voiceclient.SIPResponse) error) (voiceclient.SIPResponse, error) {
-	if a == nil || a.ClientTransport == nil {
+	transport := a.currentClientTransport()
+	if a == nil || transport == nil {
 		return voiceclient.SIPResponse{}, ErrIMSInboundAgentNotReady
 	}
-	if inviteTransport, ok := a.ClientTransport.(voiceclient.SIPInviteTransport); ok {
+	if inviteTransport, ok := transport.(voiceclient.SIPInviteTransport); ok {
 		return inviteTransport.RoundTripInvite(ctx, invite, func(_ context.Context, _ voiceclient.SIPRequestMessage, resp voiceclient.SIPResponse) error {
 			if onProvisional == nil {
 				return nil
@@ -1549,5 +1719,5 @@ func (a *IMSInboundAgent) roundTripClientInvite(ctx context.Context, invite voic
 			return onProvisional(resp)
 		})
 	}
-	return a.ClientTransport.RoundTripRequest(ctx, invite)
+	return transport.RoundTripRequest(ctx, invite)
 }

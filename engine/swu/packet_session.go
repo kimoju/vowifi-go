@@ -2,15 +2,24 @@ package swu
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/kimoju/vowifi-go/engine/swu/esp"
 	"github.com/kimoju/vowifi-go/engine/swu/ikev2"
+)
+
+const (
+	defaultChildSARekeyGracePeriod = 15 * time.Second
+	defaultPacketMaintInterval     = 5 * time.Second
+	espSequenceRekeyThreshold      = uint32(0xE0000000)
 )
 
 var (
@@ -319,38 +328,64 @@ type PacketTunnelReadSession interface {
 	ReadInnerPacket(context.Context) (PacketTunnelPacket, error)
 }
 
+type PeerIKERequestOutcome struct {
+	Response    []byte
+	CloseReason string
+}
+
+type PeerIKERequestHandler func(context.Context, []byte) (PeerIKERequestOutcome, error)
+
 type PacketSessionConfig struct {
-	Result        TunnelResult
-	ChildSA       ikev2.ChildSAResult
-	OutboundSA    *esp.SA
-	InboundSA     *esp.SA
-	Transport     ESPPacketTransport
-	Random        io.Reader
-	MOBIKEHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
-	RekeyHandler  ChildSARekeyHandler
-	RekeyPolicy   ChildSARekeyPolicy
-	MOBIKENAT     *MOBIKENATState
-	Liveness      *IKELivenessState
-	DPDHandler    func(context.Context) error
-	CloseHandler  func(context.Context) error
+	Result                TunnelResult
+	ChildSA               ikev2.ChildSAResult
+	OutboundSA            *esp.SA
+	InboundSA             *esp.SA
+	Transport             ESPPacketTransport
+	Random                io.Reader
+	MOBIKEHandler         func(context.Context, MOBIKERequest) (MOBIKEResult, error)
+	RekeyHandler          ChildSARekeyHandler
+	ChildSADeleteHandler  func(context.Context, []byte) error
+	PeerIKERequestHandler PeerIKERequestHandler
+	IKEInit               ikev2.InitResult
+	IKEKeys               ikev2.IKEKeys
+	RekeyPolicy           ChildSARekeyPolicy
+	RekeyGracePeriod      time.Duration
+	MOBIKENAT             *MOBIKENATState
+	Liveness              *IKELivenessState
+	DPDHandler            func(context.Context) error
+	CloseHandler          func(context.Context) error
+	BackgroundMaintenance bool
+	MaintenanceInterval   time.Duration
 }
 
 type PacketSession struct {
-	mu            sync.Mutex
-	result        TunnelResult
-	outbound      *esp.SA
-	inbound       *esp.SA
-	transport     ESPPacketTransport
-	random        io.Reader
-	mobikeHandler func(context.Context, MOBIKERequest) (MOBIKEResult, error)
-	rekeyHandler  ChildSARekeyHandler
-	rekeyState    *ChildSARekeyState
-	mobikeNAT     *MOBIKENATState
-	liveness      *IKELivenessState
-	dpdHandler    func(context.Context) error
-	closeHandler  func(context.Context) error
-	stats         PacketTunnelStats
-	closed        bool
+	mu                   sync.Mutex
+	result               TunnelResult
+	outbound             *esp.SA
+	inbound              *esp.SA
+	prevInbound          *esp.SA
+	prevInboundUntil     time.Time
+	rekeyGracePeriod     time.Duration
+	transport            ESPPacketTransport
+	random               io.Reader
+	mobikeHandler        func(context.Context, MOBIKERequest) (MOBIKEResult, error)
+	rekeyHandler         ChildSARekeyHandler
+	childSADeleteHandler func(context.Context, []byte) error
+	peerIKEHandler       PeerIKERequestHandler
+	ikeInit              ikev2.InitResult
+	ikeKeys              ikev2.IKEKeys
+	trackedChild         ikev2.ChildSAResult
+	rekeyState           *ChildSARekeyState
+	mobikeNAT            *MOBIKENATState
+	liveness             *IKELivenessState
+	dpdHandler           func(context.Context) error
+	closeHandler         func(context.Context) error
+	maintCancel          context.CancelFunc
+	maintDone            chan struct{}
+	ikeReqCancel         context.CancelFunc
+	ikeReqDone           chan struct{}
+	stats                PacketTunnelStats
+	closed               bool
 }
 
 var (
@@ -389,20 +424,225 @@ func NewPacketSession(cfg PacketSessionConfig) (*PacketSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PacketSession{
-		result:        result,
-		outbound:      outbound,
-		inbound:       inbound,
-		transport:     cfg.Transport,
-		random:        cfg.Random,
-		mobikeHandler: cfg.MOBIKEHandler,
-		rekeyHandler:  cfg.RekeyHandler,
-		rekeyState:    rekeyState,
-		mobikeNAT:     cfg.MOBIKENAT,
-		liveness:      cfg.Liveness,
-		dpdHandler:    cfg.DPDHandler,
-		closeHandler:  cfg.CloseHandler,
+	gracePeriod := cfg.RekeyGracePeriod
+	if gracePeriod <= 0 {
+		gracePeriod = defaultChildSARekeyGracePeriod
+	}
+	session := &PacketSession{
+		result:               result,
+		outbound:             outbound,
+		inbound:              inbound,
+		rekeyGracePeriod:     gracePeriod,
+		transport:            cfg.Transport,
+		random:               cfg.Random,
+		mobikeHandler:        cfg.MOBIKEHandler,
+		rekeyHandler:         cfg.RekeyHandler,
+		childSADeleteHandler: cfg.ChildSADeleteHandler,
+		peerIKEHandler:       cfg.PeerIKERequestHandler,
+		ikeInit:              cfg.IKEInit,
+		ikeKeys:              cfg.IKEKeys,
+		trackedChild:         cfg.ChildSA,
+		rekeyState:           rekeyState,
+		mobikeNAT:            cfg.MOBIKENAT,
+		liveness:             cfg.Liveness,
+		dpdHandler:           cfg.DPDHandler,
+		closeHandler:         cfg.CloseHandler,
+	}
+	if session.peerIKEHandler == nil && ikeKeysUsable(cfg.IKEKeys) && cfg.IKEInit.InitiatorSPI != 0 && cfg.IKEInit.ResponderSPI != 0 {
+		session.peerIKEHandler = session.defaultHandlePeerIKERequest
+	}
+	if session.peerIKEHandler != nil {
+		if reqReceiver, ok := cfg.Transport.(ikeRequestReceiver); ok {
+			if msgSender, ok := cfg.Transport.(ikeMessageSender); ok {
+				reqCtx, cancelReq := context.WithCancel(context.Background())
+				session.ikeReqCancel = cancelReq
+				session.ikeReqDone = make(chan struct{})
+				go session.inboundIKERequestLoop(reqCtx, reqReceiver, msgSender)
+			}
+		}
+	}
+	if cfg.BackgroundMaintenance {
+		interval := cfg.MaintenanceInterval
+		if interval <= 0 {
+			interval = defaultPacketMaintInterval
+		}
+		maintCtx, cancel := context.WithCancel(context.Background())
+		session.maintCancel = cancel
+		session.maintDone = make(chan struct{})
+		go session.maintenanceLoop(maintCtx, interval)
+	}
+	return session, nil
+}
+
+func (s *PacketSession) inboundIKERequestLoop(ctx context.Context, receiver ikeRequestReceiver, sender ikeMessageSender) {
+	defer close(s.ikeReqDone)
+	for {
+		raw, err := receiver.ReadIKERequest(ctx)
+		if err != nil {
+			return
+		}
+		s.mu.Lock()
+		closed := s.closed
+		handler := s.peerIKEHandler
+		s.mu.Unlock()
+		if closed || handler == nil {
+			return
+		}
+		outcome, err := handler(ctx, raw)
+		if err != nil {
+			continue
+		}
+		s.RecordIKELivenessInbound(time.Now())
+		if len(outcome.Response) > 0 {
+			sendCtx, cancelSend := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = sender.SendIKEMessage(sendCtx, outcome.Response)
+			cancelSend()
+		}
+		if outcome.CloseReason != "" {
+			s.handlePeerDelete(outcome.CloseReason)
+			return
+		}
+	}
+}
+
+func (s *PacketSession) defaultHandlePeerIKERequest(_ context.Context, raw []byte) (PeerIKERequestOutcome, error) {
+	s.mu.Lock()
+	init := s.ikeInit
+	keys := s.ikeKeys
+	child := s.trackedChild
+	random := s.random
+	s.mu.Unlock()
+	return processPeerInformationalRequest(raw, init, keys, child, random)
+}
+
+func processPeerInformationalRequest(raw []byte, init ikev2.InitResult, keys ikev2.IKEKeys, child ikev2.ChildSAResult, random io.Reader) (PeerIKERequestOutcome, error) {
+	hdr, err := ikev2.ParseHeader(raw)
+	if err != nil {
+		return PeerIKERequestOutcome{}, err
+	}
+	if hdr.Flags&ikev2.FlagResponse != 0 {
+		return PeerIKERequestOutcome{}, fmt.Errorf("%w: unexpected response flag", ikev2.ErrInvalidInformational)
+	}
+	if hdr.ExchangeType != ikev2.ExchangeINFORMATIONAL {
+		return PeerIKERequestOutcome{}, fmt.Errorf("%w: unsupported peer exchange %d", ikev2.ErrInvalidInformational, hdr.ExchangeType)
+	}
+	_, content, err := ikev2.ParseInformationalRequestContentFrom(raw, init, keys, hdr.MessageID, false)
+	if err != nil {
+		return PeerIKERequestOutcome{}, err
+	}
+	plan, err := ikev2.PlanInformationalRecovery(content, child)
+	if err != nil {
+		return PeerIKERequestOutcome{}, err
+	}
+	iv, err := ikev2.RandomIV(randomWithCryptoFallback(random), keys.Profile)
+	if err != nil {
+		return PeerIKERequestOutcome{}, err
+	}
+	_, respBytes, err := ikev2.BuildInformationalResponseFrom(init, keys, hdr.MessageID, true, plan.Response.Payloads, iv)
+	if err != nil {
+		return PeerIKERequestOutcome{}, err
+	}
+	var closeReason string
+	switch {
+	case plan.DeleteIKE:
+		closeReason = "peer deleted ike sa"
+	case plan.DeleteCurrentChild:
+		closeReason = "peer deleted child sa"
+	}
+	return PeerIKERequestOutcome{
+		Response:    respBytes,
+		CloseReason: closeReason,
 	}, nil
+}
+
+func randomWithCryptoFallback(r io.Reader) io.Reader {
+	if r == nil {
+		return rand.Reader
+	}
+	return &cryptoFallbackReader{primary: r}
+}
+
+type cryptoFallbackReader struct {
+	primary io.Reader
+}
+
+func (r *cryptoFallbackReader) Read(p []byte) (int, error) {
+	if r != nil && r.primary != nil {
+		n, err := r.primary.Read(p)
+		if n == len(p) {
+			return n, nil
+		}
+		if err == nil && n > 0 {
+			rest, fillErr := io.ReadFull(rand.Reader, p[n:])
+			return n + rest, fillErr
+		}
+	}
+	return rand.Reader.Read(p)
+}
+
+func (s *PacketSession) handlePeerDelete(reason string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	s.result.Ready = false
+	s.result.IKEEstablished = false
+	s.result.IPsecEstablished = false
+	s.result.Reason = firstPacketNonEmpty(reason, "peer deleted tunnel")
+	maintCancel := s.maintCancel
+	transport := s.transport
+	s.mu.Unlock()
+
+	if maintCancel != nil {
+		maintCancel()
+	}
+	if closer, ok := transport.(ESPPacketTransportCloser); ok {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = closer.Close(cleanupCtx)
+		cancel()
+	}
+}
+
+func (s *PacketSession) maintenanceLoop(ctx context.Context, interval time.Duration) {
+	defer close(s.maintDone)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			_, _ = s.AdvanceIKELiveness(ctx, now)
+			_, _ = s.RunChildSARekeyDue(ctx, now)
+		}
+	}
+}
+
+func (s *PacketSession) hasBackgroundMaintenance() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maintCancel != nil
+}
+
+func (s *PacketSession) proxyRouteIPs() []net.IP {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	transport := s.transport
+	s.mu.Unlock()
+	if provider, ok := transport.(proxyRouteIPProvider); ok {
+		return provider.proxyRouteIPs()
+	}
+	return nil
 }
 
 func NextHeaderForInnerPacket(packet []byte) (uint8, error) {
@@ -461,12 +701,29 @@ func (s *PacketSession) rekeyChildSA(ctx context.Context, rekeyedAt time.Time) (
 		return TunnelResult{}, err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return TunnelResult{}, ErrPacketTunnelClosed
 	}
+	oldInbound := s.inbound
+	var oldLocalSPI []byte
+	if oldInbound != nil && oldInbound.SPI != 0 {
+		var spiBuf [4]byte
+		binary.BigEndian.PutUint32(spiBuf[:], oldInbound.SPI)
+		oldLocalSPI = spiBuf[:]
+	}
+	gracePeriod := s.rekeyGracePeriod
+	if gracePeriod <= 0 {
+		gracePeriod = defaultChildSARekeyGracePeriod
+	}
+	if oldInbound != nil && oldInbound.SPI != inbound.SPI {
+		s.prevInbound = oldInbound
+		s.prevInboundUntil = time.Now().Add(gracePeriod)
+	}
+	deleteHandler := s.childSADeleteHandler
 	s.outbound = outbound
 	s.inbound = inbound
+	s.trackedChild = child
 	s.result.IKEEstablished = true
 	s.result.IPsecEstablished = true
 	s.result.Ready = true
@@ -475,16 +732,30 @@ func (s *PacketSession) rekeyChildSA(ctx context.Context, rekeyedAt time.Time) (
 	if s.rekeyState != nil {
 		s.rekeyState.RecordRekey(rekeyedAt)
 	}
-	if local := firstPacketNonEmpty(
-		childConfigurationAddress(child, ikev2.ConfigInternalIPv4Address),
-		childConfigurationAddress(child, ikev2.ConfigInternalIPv6Address),
-	); local != "" {
+	v4 := childConfigurationAddress(child, ikev2.ConfigInternalIPv4Address)
+	v6 := childConfigurationAddress(child, ikev2.ConfigInternalIPv6Address)
+	if v4 != "" {
+		s.result.LocalInnerIPv4 = v4
+	}
+	if v6 != "" {
+		s.result.LocalInnerIPv6 = v6
+	}
+	if v4 != "" || v6 != "" {
+		s.result.LocalInnerIPs = mergeInnerIPStrings(s.result.LocalInnerIPv4, s.result.LocalInnerIPv6, childConfigurationIPStrings(child, ikev2.ConfigInternalIPv4Address), childConfigurationIPStrings(child, ikev2.ConfigInternalIPv6Address))
+	}
+	if local := firstPacketNonEmpty(v4, v6); local != "" {
 		s.result.LocalInnerIP = local
 	}
 	if dns := childConfigurationDNS(child); len(dns) > 0 {
 		s.result.DNSServers = dns
 	}
-	return cloneTunnelResult(s.result), nil
+	updatedResult := cloneTunnelResult(s.result)
+	s.mu.Unlock()
+
+	if deleteHandler != nil && len(oldLocalSPI) == 4 {
+		_ = deleteHandler(ctx, oldLocalSPI)
+	}
+	return updatedResult, nil
 }
 
 func (s *PacketSession) AdvanceChildSARekey(ctx context.Context, now time.Time) (ChildSARekeyDecision, error) {
@@ -502,11 +773,21 @@ func (s *PacketSession) AdvanceChildSARekey(ctx context.Context, now time.Time) 
 		s.mu.Unlock()
 		return ChildSARekeyDecision{}, ErrPacketTunnelClosed
 	}
-	if s.rekeyState == nil {
-		s.mu.Unlock()
-		return ChildSARekeyDecision{Action: ChildSARekeyNoAction, Reason: "rekey disabled"}, nil
+	seqExhausting := s.outbound != nil && s.outbound.Sequence >= espSequenceRekeyThreshold && s.rekeyHandler != nil
+	var decision ChildSARekeyDecision
+	if s.rekeyState != nil {
+		decision = s.rekeyState.Advance(now)
+	} else {
+		decision = ChildSARekeyDecision{Action: ChildSARekeyNoAction, Reason: "rekey disabled"}
 	}
-	decision := s.rekeyState.Advance(now)
+	if seqExhausting && decision.Action != ChildSARekeyDue {
+		if now.IsZero() {
+			now = time.Now()
+		}
+		decision.Action = ChildSARekeyDue
+		decision.DueAt = now
+		decision.Reason = "esp sequence number approaching exhaustion"
+	}
 	s.mu.Unlock()
 	if decision.Action != ChildSARekeyDue {
 		return decision, nil
@@ -532,7 +813,13 @@ func (s *PacketSession) NextChildSARekeyDue() (time.Time, bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.rekeyState == nil {
+	if s.closed {
+		return time.Time{}, false
+	}
+	if s.outbound != nil && s.outbound.Sequence >= espSequenceRekeyThreshold && s.rekeyHandler != nil {
+		return time.Now(), true
+	}
+	if s.rekeyState == nil {
 		return time.Time{}, false
 	}
 	return s.rekeyState.NextDue()
@@ -819,15 +1106,37 @@ func (s *PacketSession) Close(ctx context.Context) error {
 		return nil
 	}
 	s.closed = true
+	maintCancel := s.maintCancel
+	maintDone := s.maintDone
+	ikeReqCancel := s.ikeReqCancel
+	ikeReqDone := s.ikeReqDone
 	handler := s.closeHandler
 	transport := s.transport
 	s.mu.Unlock()
+	if maintCancel != nil {
+		maintCancel()
+	}
+	if maintDone != nil {
+		<-maintDone
+	}
+	if ikeReqCancel != nil {
+		ikeReqCancel()
+	}
+	if ikeReqDone != nil {
+		<-ikeReqDone
+	}
+	closeCtx := ctx
+	var cancel context.CancelFunc
+	if closeCtx.Err() != nil {
+		closeCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
 	var err error
 	if handler != nil {
-		err = handler(ctx)
+		err = handler(closeCtx)
 	}
 	if closer, ok := transport.(ESPPacketTransportCloser); ok {
-		if closeErr := closer.Close(ctx); err == nil {
+		if closeErr := closer.Close(closeCtx); err == nil {
 			err = closeErr
 		}
 	}
@@ -919,9 +1228,31 @@ func (s *PacketSession) ReceiveESPPacket(ctx context.Context, packet []byte) (Pa
 		return PacketTunnelPacket{}, fmt.Errorf("%w: inbound sa is nil", ErrInvalidPacketTunnel)
 	}
 	out, err := s.inbound.Open(packetCopy)
+	if err != nil && s.prevInbound != nil {
+		if !s.prevInboundUntil.IsZero() && !time.Now().Before(s.prevInboundUntil) {
+			s.prevInbound = nil
+			s.prevInboundUntil = time.Time{}
+		} else if prevOut, prevErr := s.prevInbound.Open(packetCopy); prevErr == nil {
+			out = prevOut
+			err = nil
+		}
+	}
 	if err != nil {
 		s.recordInboundErrorLocked(err)
 		return PacketTunnelPacket{}, err
+	}
+	// RFC 4303 §2.6 Traffic Flow Confidentiality dummy packet (IPPROTO_NONE = 59).
+	if out.NextHeader == esp.NextHeaderNoNext {
+		s.stats.InboundESPPackets++
+		s.stats.InboundESPBytes += uint64(len(packetCopy))
+		if s.liveness != nil {
+			s.liveness.RecordInbound(time.Now())
+		}
+		return PacketTunnelPacket{
+			SPI:        out.SPI,
+			Sequence:   out.Sequence,
+			NextHeader: out.NextHeader,
+		}, nil
 	}
 	if err := validateInnerPacketNextHeader(out.NextHeader, out.Payload); err != nil {
 		s.recordInboundErrorLocked(err)
@@ -950,28 +1281,37 @@ func (s *PacketSession) ReadInnerPacket(ctx context.Context) (PacketTunnelPacket
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := contextReady(ctx); err != nil {
-		s.recordInboundError(err)
-		return PacketTunnelPacket{}, err
-	}
-	s.mu.Lock()
-	if s.closed {
+	for {
+		if err := contextReady(ctx); err != nil {
+			s.recordInboundError(err)
+			return PacketTunnelPacket{}, err
+		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return PacketTunnelPacket{}, ErrPacketTunnelClosed
+		}
+		receiver, ok := s.transport.(ESPPacketReceiver)
 		s.mu.Unlock()
-		return PacketTunnelPacket{}, ErrPacketTunnelClosed
+		if !ok {
+			err := fmt.Errorf("%w: transport cannot read ESP packets", ErrInvalidPacketTunnel)
+			s.recordInboundError(err)
+			return PacketTunnelPacket{}, err
+		}
+		packet, err := receiver.ReadESPPacket(ctx)
+		if err != nil {
+			s.recordInboundError(err)
+			return PacketTunnelPacket{}, err
+		}
+		decoded, err := s.ReceiveESPPacket(ctx, packet)
+		if err != nil {
+			return PacketTunnelPacket{}, err
+		}
+		if decoded.NextHeader == esp.NextHeaderNoNext {
+			continue
+		}
+		return decoded, nil
 	}
-	receiver, ok := s.transport.(ESPPacketReceiver)
-	s.mu.Unlock()
-	if !ok {
-		err := fmt.Errorf("%w: transport cannot read ESP packets", ErrInvalidPacketTunnel)
-		s.recordInboundError(err)
-		return PacketTunnelPacket{}, err
-	}
-	packet, err := receiver.ReadESPPacket(ctx)
-	if err != nil {
-		s.recordInboundError(err)
-		return PacketTunnelPacket{}, err
-	}
-	return s.ReceiveESPPacket(ctx, packet)
 }
 
 func (s *PacketSession) PacketStats() PacketTunnelStats {

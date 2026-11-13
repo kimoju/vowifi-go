@@ -78,6 +78,7 @@ type IKELivenessState struct {
 	lastDPDProbe     time.Time
 	outstandingDPD   bool
 	probeID          uint32
+	failedProbeID    uint32
 	missedDPDProbes  int
 	dead             bool
 	keepaliveEnabled bool
@@ -116,6 +117,7 @@ func (s *IKELivenessState) RecordInbound(at time.Time) {
 		s.lastInbound = at
 	}
 	s.outstandingDPD = false
+	s.failedProbeID = 0
 	s.missedDPDProbes = 0
 	s.dead = false
 }
@@ -146,9 +148,14 @@ func (s *IKELivenessState) RecordLivenessResult(at time.Time, ok bool) {
 	if !s.outstandingDPD || s.dead {
 		return
 	}
+	if s.probeID != 0 && s.failedProbeID == s.probeID {
+		return
+	}
+	s.failedProbeID = s.probeID
 	s.missedDPDProbes++
 	if s.missedDPDProbes >= s.cfg.MaxMissedDPDProbes {
 		s.dead = true
+		s.outstandingDPD = false
 	}
 }
 
@@ -201,9 +208,13 @@ func (s *IKELivenessState) advanceDPD(now time.Time) IKELivenessDecision {
 		if now.Before(deadline) {
 			return s.decision(now, IKELivenessNoAction, "waiting for dpd response")
 		}
-		s.missedDPDProbes++
+		if s.probeID == 0 || s.failedProbeID != s.probeID {
+			s.failedProbeID = s.probeID
+			s.missedDPDProbes++
+		}
 		if s.missedDPDProbes >= s.cfg.MaxMissedDPDProbes {
 			s.dead = true
+			s.outstandingDPD = false
 			return s.decision(now, IKELivenessDeclareDead, "dpd retry budget exhausted")
 		}
 		return s.sendDPD(now, "dpd response timeout")

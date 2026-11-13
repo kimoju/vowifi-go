@@ -63,6 +63,18 @@ type USSDUpdated struct {
 	Time      time.Time
 }
 
+type VoiceCallEvent struct {
+	DevID      string
+	CallID     string
+	Direction  string
+	State      string
+	Caller     string
+	Callee     string
+	StatusCode int
+	Reason     string
+	Time       time.Time
+}
+
 type LocalNumberLearned struct {
 	DevID  string
 	IMSI   string

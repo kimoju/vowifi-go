@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrInvalidIMSSecurityXFRMPlan marks an install request that cannot be mapped to Linux XFRM.
@@ -168,9 +169,9 @@ func (i *LinuxIMSSecurityXFRMInstaller) Apply(ctx context.Context, req IMSSecuri
 }
 
 func (i *LinuxIMSSecurityXFRMInstaller) Cleanup(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	_ = ctx
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	i.mu.Lock()
 	states := append([]IMSSecurityAssociationXFRMState(nil), i.states...)
 	i.mu.Unlock()
@@ -178,7 +179,7 @@ func (i *LinuxIMSSecurityXFRMInstaller) Cleanup(ctx context.Context) error {
 	var err error
 	runner := imssSecurityXFRMRunner(i.Runner)
 	for idx := len(states) - 1; idx >= 0; idx-- {
-		err = errors.Join(err, cleanupIMSSecurityXFRMState(ctx, runner, states[idx]))
+		err = errors.Join(err, cleanupIMSSecurityXFRMState(cleanupCtx, runner, states[idx]))
 	}
 	if err != nil {
 		return err
@@ -203,7 +204,9 @@ func applyIMSSecurityXFRMPlan(ctx context.Context, runner IMSSecurityXFRMCommand
 	state := IMSSecurityAssociationXFRMState{Plan: plan}
 	for _, command := range plan.Commands {
 		if err := runner.RunIP(ctx, command.Args...); err != nil {
-			rollbackErr := runIMSSecurityXFRMUndo(ctx, runner, state.undo)
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			rollbackErr := runIMSSecurityXFRMUndo(cleanupCtx, runner, state.undo)
+			cancel()
 			if rollbackErr != nil {
 				return state, errors.Join(err, rollbackErr)
 			}
@@ -375,7 +378,7 @@ func imssSecurityXFRMServerStateCommand(params imsSecurityXFRMParams, outbound b
 		src, dst, spi = params.remoteAddress, params.localAddress, params.serverInboundSPI
 	}
 	args := []string{
-		"xfrm", "state", "add", "src", src, "dst", dst, "proto", "esp", "spi", spi,
+		"xfrm", "state", "update", "src", src, "dst", dst, "proto", "esp", "spi", spi,
 		"reqid", params.serverReqID, "mode", params.mode,
 		"auth-trunc", params.authAlgorithm, params.authKey, params.authTruncBits,
 		"enc", params.encAlgorithm, params.encKey,
@@ -390,7 +393,7 @@ func imssSecurityXFRMStateCommand(params imsSecurityXFRMParams, outbound bool) I
 		src, dst, spi = params.remoteAddress, params.localAddress, params.inboundSPI
 	}
 	args := []string{
-		"xfrm", "state", "add",
+		"xfrm", "state", "update",
 		"src", src,
 		"dst", dst,
 		"proto", "esp",
@@ -410,7 +413,7 @@ func imssSecurityXFRMPolicyCommand(params imsSecurityXFRMParams, dir string) IMS
 		src, dst, sport, dport = params.remoteAddress, params.localAddress, params.inboundRemotePort, params.inboundLocalPort
 	}
 	args := []string{
-		"xfrm", "policy", "add",
+		"xfrm", "policy", "update",
 		"src", src,
 		"dst", dst,
 		"proto", "udp",
@@ -437,7 +440,7 @@ func imssSecurityXFRMServerPolicyCommand(params imsSecurityXFRMParams, dir strin
 		src, dst, sport, dport = params.remoteAddress, params.localAddress, params.serverRemotePort, params.serverLocalPort
 	}
 	selector := []string{"src", src, "dst", dst, "proto", "udp", "sport", sport, "dport", dport}
-	args := append([]string{"xfrm", "policy", "add"}, selector...)
+	args := append([]string{"xfrm", "policy", "update"}, selector...)
 	args = append(args, "dir", dir)
 	args = append(args, imssSecurityXFRMPolicyTemplate(src, dst, params.serverReqID, params.mode, dir)...)
 	undo := append([]string{"xfrm", "policy", "delete"}, selector...)

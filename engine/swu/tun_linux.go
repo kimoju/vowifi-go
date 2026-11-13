@@ -37,9 +37,13 @@ func OpenTUNDevice(cfg TUNDeviceConfig) (*TUNDevice, error) {
 	if path == "" {
 		path = defaultTUNDevicePath
 	}
-	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open %s: %v", ErrInvalidPacketTunnel, path, err)
+	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("%w: set nonblock %s: %v", ErrInvalidPacketTunnel, path, err)
 	}
 	file := os.NewFile(uintptr(fd), path)
 	if file == nil {

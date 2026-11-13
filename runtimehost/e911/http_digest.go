@@ -13,17 +13,24 @@ import (
 	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 )
 
-const maxEntitlementHTTPDigestRetries = 2
+const (
+	maxEntitlementHTTPDigestRetries = 4
+	maxDigestAttempts               = 4
+)
 
 func doEntitlementWithHTTPDigest(ctx context.Context, client HTTPClient, trace TraceSink, httpReq *HTTPRequest, req Request) (*HTTPResponse, error) {
 	current := cloneHTTPRequest(httpReq)
+	if current.Context == nil {
+		current.Context = ctx
+	}
+	sentNormalAuth := make(map[string]bool, 2)
 	for attempt := 0; ; attempt++ {
 		resp, err := doEntitlement(ctx, client, trace, current)
 		if err == nil {
 			return resp, nil
 		}
 		var challengeErr *HTTPAuthenticationChallengeError
-		if !errors.As(err, &challengeErr) || attempt >= maxEntitlementHTTPDigestRetries {
+		if !errors.As(err, &challengeErr) || attempt >= maxDigestAttempts {
 			return nil, err
 		}
 		auth, syncFailure, stale, buildErr := buildEntitlementHTTPDigestAuthorization(current, req, challengeErr)
@@ -33,14 +40,11 @@ func doEntitlementWithHTTPDigest(ctx context.Context, client HTTPClient, trace T
 			}
 			return nil, buildErr
 		}
-		current = entitlementRequestWithAuthorization(current, auth)
-		if !syncFailure && !stale {
-			resp, err = doEntitlement(ctx, client, trace, current)
-			if err == nil {
-				return resp, nil
-			}
+		if sentNormalAuth[auth.HeaderName] && !stale {
 			return nil, err
 		}
+		current = entitlementRequestWithAuthorization(current, auth)
+		sentNormalAuth[auth.HeaderName] = !syncFailure
 	}
 }
 
@@ -329,10 +333,12 @@ func cloneHTTPRequest(req *HTTPRequest) *HTTPRequest {
 		return &HTTPRequest{}
 	}
 	return &HTTPRequest{
+		Context: req.Context,
 		Method:  req.Method,
 		URL:     req.URL,
 		Headers: append([]HeaderPair(nil), req.Headers...),
 		Body:    append([]byte(nil), req.Body...),
+		Proxy:   cloneE911ProxyConfig(req.Proxy),
 	}
 }
 

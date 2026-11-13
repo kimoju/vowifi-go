@@ -97,7 +97,9 @@ func (m LinuxXFRMManager) Apply(ctx context.Context, cfg KernelXFRMConfig) (Kern
 	var state KernelXFRMState
 	for _, command := range commands {
 		if err := runner.RunIP(ctx, command.args...); err != nil {
-			rollbackErr := runIPUndo(ctx, runner, state.undo)
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), defaultSWUCleanupTimeout)
+			rollbackErr := runIPUndo(cleanupCtx, runner, state.undo)
+			cancel()
 			if rollbackErr != nil {
 				return state, errors.Join(err, rollbackErr)
 			}
@@ -111,14 +113,13 @@ func (m LinuxXFRMManager) Apply(ctx context.Context, cfg KernelXFRMConfig) (Kern
 }
 
 func (m LinuxXFRMManager) Cleanup(ctx context.Context, state KernelXFRMState) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	cleanupCtx, cancel := independentCleanupContext(ctx)
+	defer cancel()
 	runner := m.Runner
 	if runner == nil {
 		runner = ExecIPCommandRunner{}
 	}
-	return runIPUndo(ctx, runner, state.undo)
+	return runIPUndo(cleanupCtx, runner, state.undo)
 }
 
 // KernelXFRMConfigFromIKE builds a validated XFRM config without applying kernel state.

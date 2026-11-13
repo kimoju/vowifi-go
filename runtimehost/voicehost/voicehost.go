@@ -327,6 +327,52 @@ func (g *Gateway) RegisterAgent(deviceID string, agent Agent) {
 	g.mu.Unlock()
 }
 
+func (g *Gateway) UnregisterAgent(deviceID string) {
+	if g == nil || strings.TrimSpace(deviceID) == "" {
+		return
+	}
+	devID := strings.TrimSpace(deviceID)
+	g.mu.Lock()
+	delete(g.agents, devID)
+	for callID, dialog := range g.dialogs {
+		if dialog.DeviceID == devID && dialog.State != DialogStateTerminated {
+			dialog.State = DialogStateTerminated
+			g.dialogs[callID] = dialog
+		}
+	}
+	g.mu.Unlock()
+}
+
+func (g *Gateway) ClientContact(deviceID string) (string, string, string, error) {
+	if g == nil {
+		return "", "", "", errors.New("voice gateway is nil")
+	}
+	g.mu.RLock()
+	client := g.client
+	g.mu.RUnlock()
+	if client == nil {
+		return "", "", "", errors.New("voice client adapter is nil")
+	}
+	return client.GetClientContact(strings.TrimSpace(deviceID))
+}
+
+func (g *Gateway) RecordDialog(info DialogInfo) {
+	g.recordDialog(info)
+}
+
+func (g *Gateway) MarkDialogTerminated(callID string) {
+	if g == nil || strings.TrimSpace(callID) == "" {
+		return
+	}
+	id := strings.TrimSpace(callID)
+	g.mu.Lock()
+	if dialog, ok := g.dialogs[id]; ok {
+		dialog.State = DialogStateTerminated
+		g.dialogs[id] = dialog
+	}
+	g.mu.Unlock()
+}
+
 func (g *Gateway) GetAgent(deviceID string) Agent {
 	if g == nil {
 		return nil

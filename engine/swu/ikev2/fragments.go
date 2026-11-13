@@ -6,7 +6,11 @@ import (
 	"fmt"
 )
 
-const encryptedFragmentBodyHeaderLength = 4
+const (
+	encryptedFragmentBodyHeaderLength = 4
+	MaxEncryptedFragments             = 64
+	MaxReassembledEncryptedSize       = 64 * 1024
+)
 
 var ErrInvalidEncryptedFragment = errors.New("invalid ikev2 encrypted fragment payload")
 
@@ -22,6 +26,9 @@ func (f EncryptedFragment) MarshalBinary() ([]byte, error) {
 	}
 	if f.TotalFragments == 0 {
 		return nil, fmt.Errorf("%w: total fragments is zero", ErrInvalidEncryptedFragment)
+	}
+	if f.TotalFragments > MaxEncryptedFragments {
+		return nil, fmt.Errorf("%w: total fragments %d exceeds maximum %d", ErrInvalidEncryptedFragment, f.TotalFragments, MaxEncryptedFragments)
 	}
 	if f.FragmentNumber > f.TotalFragments {
 		return nil, fmt.Errorf("%w: fragment %d > total %d", ErrInvalidEncryptedFragment, f.FragmentNumber, f.TotalFragments)
@@ -51,13 +58,20 @@ func ParseEncryptedFragment(data []byte) (EncryptedFragment, error) {
 	if totalFragments == 0 {
 		return EncryptedFragment{}, fmt.Errorf("%w: total fragments is zero", ErrInvalidEncryptedFragment)
 	}
+	if totalFragments > MaxEncryptedFragments {
+		return EncryptedFragment{}, fmt.Errorf("%w: total fragments %d exceeds maximum %d", ErrInvalidEncryptedFragment, totalFragments, MaxEncryptedFragments)
+	}
 	if fragmentNumber > totalFragments {
 		return EncryptedFragment{}, fmt.Errorf("%w: fragment %d > total %d", ErrInvalidEncryptedFragment, fragmentNumber, totalFragments)
+	}
+	payload := data[encryptedFragmentBodyHeaderLength:]
+	if len(payload) > MaxReassembledEncryptedSize {
+		return EncryptedFragment{}, fmt.Errorf("%w: fragment size %d exceeds maximum %d", ErrInvalidEncryptedFragment, len(payload), MaxReassembledEncryptedSize)
 	}
 	return EncryptedFragment{
 		FragmentNumber: fragmentNumber,
 		TotalFragments: totalFragments,
-		EncryptedData:  append([]byte(nil), data[encryptedFragmentBodyHeaderLength:]...),
+		EncryptedData:  append([]byte(nil), payload...),
 	}, nil
 }
 
@@ -67,4 +81,75 @@ func EncryptedFragmentPayload(nextPayload uint8, fragment EncryptedFragment) (Pa
 		return Payload{}, err
 	}
 	return Payload{Type: PayloadSKF, NextPayload: nextPayload, Body: body}, nil
+}
+
+// EncryptedFragmentAssembler bounds fragment count and total reassembled size
+// per RFC 7383 to prevent memory exhaustion from untrusted SKF payloads.
+type EncryptedFragmentAssembler struct {
+	MaxFragments uint16
+	MaxSize      int
+
+	total     uint16
+	received  int
+	totalSize int
+	parts     [][]byte
+}
+
+func (a *EncryptedFragmentAssembler) Add(fragment EncryptedFragment) ([]byte, bool, error) {
+	if fragment.FragmentNumber == 0 || fragment.TotalFragments == 0 || fragment.FragmentNumber > fragment.TotalFragments || len(fragment.EncryptedData) == 0 {
+		return nil, false, fmt.Errorf("%w: invalid fragment metadata", ErrInvalidEncryptedFragment)
+	}
+	maxFragments := a.MaxFragments
+	if maxFragments == 0 {
+		maxFragments = MaxEncryptedFragments
+	}
+	if fragment.TotalFragments > maxFragments {
+		return nil, false, fmt.Errorf("%w: total fragments %d exceeds maximum %d", ErrInvalidEncryptedFragment, fragment.TotalFragments, maxFragments)
+	}
+	maxSize := a.MaxSize
+	if maxSize <= 0 {
+		maxSize = MaxReassembledEncryptedSize
+	}
+	if a.total == 0 {
+		a.total = fragment.TotalFragments
+		a.parts = make([][]byte, int(a.total))
+	} else if fragment.TotalFragments != a.total {
+		return nil, false, fmt.Errorf("%w: total fragments %d != %d", ErrInvalidEncryptedFragment, fragment.TotalFragments, a.total)
+	}
+	idx := int(fragment.FragmentNumber - 1)
+	if a.parts[idx] != nil {
+		// Ignore duplicate retransmitted fragment per RFC 7383 §2.6.
+		return nil, false, nil
+	}
+	if a.totalSize+len(fragment.EncryptedData) > maxSize {
+		return nil, false, fmt.Errorf("%w: reassembled size %d exceeds maximum %d", ErrInvalidEncryptedFragment, a.totalSize+len(fragment.EncryptedData), maxSize)
+	}
+	a.parts[idx] = append([]byte(nil), fragment.EncryptedData...)
+	a.totalSize += len(fragment.EncryptedData)
+	a.received++
+	if a.received < int(a.total) {
+		return nil, false, nil
+	}
+	out := make([]byte, 0, a.totalSize)
+	for _, part := range a.parts {
+		out = append(out, part...)
+	}
+	return out, true, nil
+}
+
+func ReassembleEncryptedFragments(fragments []EncryptedFragment) ([]byte, error) {
+	if len(fragments) == 0 {
+		return nil, fmt.Errorf("%w: no fragments provided", ErrInvalidEncryptedFragment)
+	}
+	var assembler EncryptedFragmentAssembler
+	for _, f := range fragments {
+		out, complete, err := assembler.Add(f)
+		if err != nil {
+			return nil, err
+		}
+		if complete {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("%w: incomplete fragment set (%d/%d)", ErrInvalidEncryptedFragment, assembler.received, assembler.total)
 }

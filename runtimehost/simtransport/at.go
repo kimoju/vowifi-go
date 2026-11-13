@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,8 +17,9 @@ var (
 	hexTokenRE = regexp.MustCompile(`(?i)"([0-9a-f]+)"`)
 	apduLineRE = regexp.MustCompile(`(?im)^\s*\+(?:CGLA|CSIM):\s*\d+\s*,\s*(?:"([0-9a-fA-F]*)"|([0-9a-fA-F]+))\s*$`)
 	cmeErrorRE = regexp.MustCompile(`(?i)\+CME ERROR:\s*([^\r\n]+)`)
-	cchoLineRE = regexp.MustCompile(`(?im)^\s*\+CCHO:\s*(\d+)\s*$`)
+	cchoLineRE = regexp.MustCompile(`(?im)^\s*\+CCHO:\s*(\d+)\b`)
 	crsmLineRE = regexp.MustCompile(`(?im)^\s*\+CRSM:\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(?:"([0-9a-fA-F]*)"|([0-9a-fA-F]+)))?\s*$`)
+	cscaLineRE = regexp.MustCompile(`(?im)^\s*\+CSCA:\s*"([^"]+)"(?:\s*,\s*(\d+))?\s*$`)
 	intTokenRE = regexp.MustCompile(`[-+]?\d+`)
 )
 
@@ -28,6 +30,23 @@ type ATCommander interface {
 type Adapter struct {
 	Control ATCommander
 	Timeout time.Duration
+
+	cmdMu     sync.Mutex
+	sessionMu sync.Mutex
+}
+
+func (a *Adapter) LockLogicalChannelSession() func() {
+	if a == nil {
+		return func() {}
+	}
+	a.sessionMu.Lock()
+	return a.sessionMu.Unlock
+}
+
+func (a *Adapter) execAT(cmd string, timeout time.Duration) (string, error) {
+	a.cmdMu.Lock()
+	defer a.cmdMu.Unlock()
+	return a.Control.ExecuteATSilent(cmd, timeout)
 }
 
 type APDUResult struct {
@@ -75,7 +94,7 @@ func (a *Adapter) ExecuteATSilent(cmd string, timeout time.Duration) (string, er
 	if a == nil || a.Control == nil {
 		return "", errors.New("nil AT control")
 	}
-	return a.Control.ExecuteATSilent(cmd, timeout)
+	return a.execAT(cmd, timeout)
 }
 
 func (a *Adapter) OpenLogicalChannel(aid string) (int, error) {
@@ -86,7 +105,7 @@ func (a *Adapter) OpenLogicalChannel(aid string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid AID: %w", err)
 	}
-	out, err := a.Control.ExecuteATSilent(`AT+CCHO="`+aid+`"`, a.timeout())
+	out, err := a.execAT(`AT+CCHO="`+aid+`"`, a.timeout())
 	if err != nil {
 		return 0, err
 	}
@@ -94,7 +113,7 @@ func (a *Adapter) OpenLogicalChannel(aid string) (int, error) {
 		return 0, err
 	}
 	channel, ok := parseCCHOChannel(out)
-	if !ok || channel < 0 {
+	if !ok || channel <= 0 {
 		return 0, fmt.Errorf("parse CCHO channel from %q", compactAT(out))
 	}
 	return channel, nil
@@ -104,10 +123,10 @@ func (a *Adapter) CloseLogicalChannel(channel int) error {
 	if a == nil || a.Control == nil {
 		return errors.New("nil AT control")
 	}
-	if channel < 0 {
+	if channel <= 0 {
 		return fmt.Errorf("invalid logical channel: %d", channel)
 	}
-	out, err := a.Control.ExecuteATSilent(fmt.Sprintf("AT+CCHC=%d", channel), a.timeout())
+	out, err := a.execAT(fmt.Sprintf("AT+CCHC=%d", channel), a.timeout())
 	if err != nil {
 		return err
 	}
@@ -140,7 +159,7 @@ func (a *Adapter) transmitAPDUOnce(channel int, apdu string) (APDUResult, error)
 	} else {
 		cmd = fmt.Sprintf(`AT+CSIM=%d,"%s"`, len(apdu), apdu)
 	}
-	out, err := a.Control.ExecuteATSilent(cmd, a.timeout())
+	out, err := a.execAT(cmd, a.timeout())
 	if err != nil {
 		return APDUResult{}, err
 	}
@@ -218,7 +237,7 @@ func (a *Adapter) ReadIMEI() (string, error) {
 	commands := []string{"AT+CGSN", "AT+CGSN=1", "AT+GSN"}
 	var errs []error
 	for _, cmd := range commands {
-		out, err := a.Control.ExecuteATSilent(cmd, a.timeout())
+		out, err := a.execAT(cmd, a.timeout())
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", cmd, err))
 			continue
@@ -241,7 +260,7 @@ func (a *Adapter) ReadIMSI() (string, error) {
 	if a == nil || a.Control == nil {
 		return "", errors.New("nil AT control")
 	}
-	out, err := a.Control.ExecuteATSilent("AT+CIMI", a.timeout())
+	out, err := a.execAT("AT+CIMI", a.timeout())
 	if err != nil {
 		return "", err
 	}
@@ -253,6 +272,68 @@ func (a *Adapter) ReadIMSI() (string, error) {
 		return "", fmt.Errorf("parse IMSI from %q", compactAT(out))
 	}
 	return imsi, nil
+}
+
+// ReadSMSC queries the service centre address through the standard AT+CSCA? command.
+func (a *Adapter) ReadSMSC() (string, error) {
+	if a == nil || a.Control == nil {
+		return "", errors.New("nil AT control")
+	}
+	out, err := a.execAT("AT+CSCA?", a.timeout())
+	if err != nil {
+		return "", err
+	}
+	if err := parseATError(out); err != nil {
+		return "", err
+	}
+	smsc, ok := ExtractSMSC(out)
+	if !ok {
+		return "", fmt.Errorf("parse SMSC from %q", compactAT(out))
+	}
+	return smsc, nil
+}
+
+// ExtractSMSC parses a 3GPP TS 27.005 +CSCA response line.
+func ExtractSMSC(out string) (string, bool) {
+	m := cscaLineRE.FindStringSubmatch(out)
+	if len(m) == 0 {
+		return "", false
+	}
+	addr := strings.TrimSpace(m[1])
+	if decoded, ok := tryDecodeCSCAUCS2Hex(addr); ok {
+		addr = decoded
+	}
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", false
+	}
+	if len(m) > 2 && strings.TrimSpace(m[2]) != "" && !strings.HasPrefix(addr, "+") && !strings.Contains(addr, ":") && !strings.Contains(addr, "@") {
+		if tosca, err := strconv.Atoi(strings.TrimSpace(m[2])); err == nil && (tosca&0x70) == 0x10 {
+			addr = "+" + addr
+		}
+	}
+	return addr, true
+}
+
+func tryDecodeCSCAUCS2Hex(value string) (string, bool) {
+	if len(value) < 8 || len(value)%4 != 0 || !looksHex(value) {
+		return "", false
+	}
+	if !strings.HasPrefix(strings.ToUpper(value), "002B") && !strings.HasPrefix(strings.ToUpper(value), "003") {
+		return "", false
+	}
+	raw, err := hex.DecodeString(value)
+	if err != nil {
+		return "", false
+	}
+	var out strings.Builder
+	for i := 0; i+1 < len(raw); i += 2 {
+		if raw[i] != 0x00 || raw[i+1] < 0x20 || raw[i+1] > 0x7E {
+			return "", false
+		}
+		out.WriteByte(raw[i+1])
+	}
+	return out.String(), out.Len() > 0
 }
 
 func ParseAPDUResult(out string) (APDUResult, error) {
@@ -332,7 +413,7 @@ func (a *Adapter) runCRSM(command, fileID, p1, p2, p3 int, data, pathID string) 
 		}
 		cmd += fmt.Sprintf(`,"%s"`, path)
 	}
-	out, err := a.Control.ExecuteATSilent(cmd, a.timeout())
+	out, err := a.execAT(cmd, a.timeout())
 	if err != nil {
 		return CRSMResult{}, err
 	}
@@ -443,9 +524,24 @@ func validIMSIRun(run string) string {
 func parseCCHOChannel(out string) (int, bool) {
 	if m := cchoLineRE.FindStringSubmatch(out); len(m) == 2 {
 		n, err := strconv.Atoi(m[1])
-		return n, err == nil
+		if err != nil || n <= 0 {
+			return 0, false
+		}
+		return n, true
 	}
-	return parseFirstInt(out)
+	for _, line := range atLines(out) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.EqualFold(line, "OK") || isATCommandEcho(line) {
+			continue
+		}
+		if n, ok := parseFirstInt(line); ok {
+			if n <= 0 {
+				return 0, false
+			}
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 func parseCRSMStatusByte(value string) (byte, error) {

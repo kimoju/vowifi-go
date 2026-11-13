@@ -54,6 +54,8 @@ type TUNTunnelManagerConfig struct {
 	Routes                 []TUNRoute
 	Rules                  []TUNRule
 	OnPumpError            func(PacketPumpDirection, error)
+	MaintenanceInterval    time.Duration
+	DisableMaintenance     bool
 }
 
 type TUNTunnelManager struct {
@@ -68,12 +70,16 @@ type TUNPacketTunnelSession struct {
 	routingState   TUNRoutingState
 	routingApplied bool
 	result         TunnelResult
+	maintCancel    context.CancelFunc
+	maintDone      chan struct{}
 	closed         bool
 }
 
 var _ TunnelManager = (*TUNTunnelManager)(nil)
 var _ TunnelSession = (*TUNPacketTunnelSession)(nil)
 var _ ChildSARekeyScheduler = (*TUNPacketTunnelSession)(nil)
+var _ IKELivenessController = (*TUNPacketTunnelSession)(nil)
+var _ MOBIKENATObserver = (*TUNPacketTunnelSession)(nil)
 
 func NewTUNTunnelManager(cfg TUNTunnelManagerConfig) *TUNTunnelManager {
 	return &TUNTunnelManager{Config: cfg}
@@ -95,38 +101,54 @@ func (m *TUNTunnelManager) EstablishTunnel(ctx context.Context, cfg TunnelConfig
 	if base == nil {
 		return nil, fmt.Errorf("%w: base manager is nil", ErrInvalidTUNTunnelManager)
 	}
-	baseSession, err := base.EstablishTunnel(ctx, cfg)
+	baseCfg := cfg
+	if baseCfg.NormalizedMode() == DataplaneModeKernel && baseCfg.Proxy.IsActive() {
+		baseCfg.Mode = DataplaneModeUserspace
+	}
+	baseSession, err := base.EstablishTunnel(ctx, baseCfg)
 	if err != nil {
 		return nil, err
 	}
 	packetSession, ok := baseSession.(PacketTunnelReadSession)
 	if !ok {
-		_ = baseSession.Close(ctx)
+		cleanupCtx, cancel := independentCleanupContext(ctx)
+		_ = baseSession.Close(cleanupCtx)
+		cancel()
 		return nil, fmt.Errorf("%w: base session cannot read packet tunnel traffic", ErrInvalidTUNTunnelManager)
 	}
 	result := completeTUNResult(packetSession.Result())
-	device, iface, err := m.openDevice(ctx, cfg, result)
+	device, iface, err := m.openDevice(ctx, baseCfg, result)
 	if err != nil {
-		_ = packetSession.Close(ctx)
+		cleanupCtx, cancel := independentCleanupContext(ctx)
+		_ = packetSession.Close(cleanupCtx)
+		cancel()
 		return nil, err
 	}
 	routing := m.Config.RoutingManager
 	if routing == nil {
 		routing = LinuxTUNRoutingManager{}
 	}
+	var extraProxyIPs []net.IP
+	if provider, ok := packetSession.(proxyRouteIPProvider); ok {
+		extraProxyIPs = provider.proxyRouteIPs()
+	}
 	var routingState TUNRoutingState
 	routingApplied := false
 	if !m.Config.DisableRouting {
-		routingCfg, err := m.routingConfig(ctx, cfg, result, iface)
+		routingCfg, err := m.routingConfigWithSessionIPs(ctx, baseCfg, result, iface, extraProxyIPs)
 		if err != nil {
-			_ = closeInnerPacketDevice(ctx, device)
-			_ = packetSession.Close(ctx)
+			cleanupCtx, cancel := independentCleanupContext(ctx)
+			_ = closeInnerPacketDevice(cleanupCtx, device)
+			_ = packetSession.Close(cleanupCtx)
+			cancel()
 			return nil, err
 		}
 		routingState, err = routing.Apply(ctx, routingCfg)
 		if err != nil {
-			_ = closeInnerPacketDevice(ctx, device)
-			_ = packetSession.Close(ctx)
+			cleanupCtx, cancel := independentCleanupContext(ctx)
+			_ = closeInnerPacketDevice(cleanupCtx, device)
+			_ = packetSession.Close(cleanupCtx)
+			cancel()
 			return nil, err
 		}
 		routingApplied = true
@@ -137,28 +159,65 @@ func (m *TUNTunnelManager) EstablishTunnel(ctx context.Context, cfg TunnelConfig
 		OnError: m.Config.OnPumpError,
 	})
 	if err != nil {
+		cleanupCtx, cancel := independentCleanupContext(ctx)
 		if routingApplied {
-			_ = routing.Cleanup(ctx, routingState)
+			_ = routing.Cleanup(cleanupCtx, routingState)
 		}
-		_ = closeInnerPacketDevice(ctx, device)
-		_ = packetSession.Close(ctx)
+		_ = closeInnerPacketDevice(cleanupCtx, device)
+		_ = packetSession.Close(cleanupCtx)
+		cancel()
 		return nil, err
 	}
 	if err := pump.Start(context.Background()); err != nil {
+		cleanupCtx, cancel := independentCleanupContext(ctx)
 		if routingApplied {
-			_ = routing.Cleanup(ctx, routingState)
+			_ = routing.Cleanup(cleanupCtx, routingState)
 		}
-		_ = pump.Close(ctx)
+		_ = pump.Close(cleanupCtx)
+		cancel()
 		return nil, err
 	}
-	return &TUNPacketTunnelSession{
+	tunSession := &TUNPacketTunnelSession{
 		base:           packetSession,
 		pump:           pump,
 		routing:        routing,
 		routingState:   routingState,
 		routingApplied: routingApplied,
 		result:         result,
-	}, nil
+	}
+	if !m.Config.DisableMaintenance && !baseHasBackgroundMaintenance(packetSession) {
+		interval := m.Config.MaintenanceInterval
+		if interval <= 0 {
+			interval = defaultPacketMaintInterval
+		}
+		maintCtx, cancel := context.WithCancel(context.Background())
+		tunSession.maintCancel = cancel
+		tunSession.maintDone = make(chan struct{})
+		go tunSession.maintenanceLoop(maintCtx, interval)
+	}
+	return tunSession, nil
+}
+
+func baseHasBackgroundMaintenance(base PacketTunnelReadSession) bool {
+	if checker, ok := base.(interface{ hasBackgroundMaintenance() bool }); ok {
+		return checker.hasBackgroundMaintenance()
+	}
+	return false
+}
+
+func (s *TUNPacketTunnelSession) maintenanceLoop(ctx context.Context, interval time.Duration) {
+	defer close(s.maintDone)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			_, _ = s.AdvanceIKELiveness(ctx, now)
+			_, _ = s.RunChildSARekeyDue(ctx, now)
+		}
+	}
 }
 
 func (m *TUNTunnelManager) openDevice(ctx context.Context, cfg TunnelConfig, result TunnelResult) (InnerPacketDevice, string, error) {
@@ -189,33 +248,53 @@ func (m *TUNTunnelManager) openDevice(ctx context.Context, cfg TunnelConfig, res
 }
 
 func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, result TunnelResult, iface string) (TUNRoutingConfig, error) {
+	return m.routingConfigWithSessionIPs(ctx, cfg, result, iface, nil)
+}
+
+func (m *TUNTunnelManager) routingConfigWithSessionIPs(ctx context.Context, cfg TunnelConfig, result TunnelResult, iface string, extraProxyIPs []net.IP) (TUNRoutingConfig, error) {
 	if m.Config.RoutingConfigFactory != nil {
 		return m.Config.RoutingConfigFactory(cfg, result, iface)
 	}
 	addresses := append([]string(nil), m.Config.Addresses...)
-	if len(addresses) == 0 && strings.TrimSpace(result.LocalInnerIP) != "" {
-		addresses = append(addresses, strings.TrimSpace(result.LocalInnerIP))
+	if len(addresses) == 0 {
+		addresses = innerAddressesForTUN(result)
 	}
 	routes := cloneTUNRoutes(m.Config.Routes)
 	rules := cloneTUNRules(m.Config.Rules)
 	if m.Config.IsolateHostRouting && len(routes) == 0 && len(rules) == 0 {
-		source, err := isolatedTUNSourcePrefix(result.LocalInnerIP)
-		if err != nil {
-			return TUNRoutingConfig{}, err
+		candidates := innerAddressesForTUN(result)
+		if len(candidates) == 0 {
+			candidates = []string{strings.TrimSpace(result.LocalInnerIP)}
 		}
 		table, priority := isolatedTUNRoutingIdentity(iface)
-		destination := "default"
-		if prefix, parseErr := netip.ParsePrefix(source); parseErr == nil && prefix.Addr().Is6() {
-			destination = "::/0"
+		seenDest := make(map[string]bool)
+		for _, candidate := range candidates {
+			source, err := isolatedTUNSourcePrefix(candidate)
+			if err != nil {
+				return TUNRoutingConfig{}, err
+			}
+			destination := "default"
+			if prefix, parseErr := netip.ParsePrefix(source); parseErr == nil && prefix.Addr().Is6() {
+				destination = "::/0"
+			}
+			if !seenDest[destination] {
+				seenDest[destination] = true
+				routes = append(routes, TUNRoute{Destination: destination, Table: table})
+			}
+			rules = append(rules, TUNRule{Priority: priority, From: source, Table: table})
 		}
-		routes = append(routes, TUNRoute{Destination: destination, Table: table})
-		rules = append(rules, TUNRule{Priority: priority, From: source, Table: table})
 	} else if m.Config.DefaultRoutes && len(routes) == 0 {
-		routes = append(routes, TUNRoute{Destination: "default"})
+		hasV4, hasV6 := addressFamiliesForTUN(addresses)
+		if hasV4 || !hasV6 {
+			routes = append(routes, TUNRoute{Destination: "default"})
+		}
+		if hasV6 {
+			routes = append(routes, TUNRoute{Destination: "::/0"})
+		}
 	}
 	exclusions := cloneEPDGRouteExclusions(m.Config.EPDGRouteExclusions)
 	if m.Config.ProtectEPDGRoutes {
-		defaultExclusions, err := m.defaultEPDGRouteExclusions(ctx, cfg, result, routes)
+		defaultExclusions, err := m.defaultEPDGRouteExclusionsWithExtra(ctx, cfg, result, routes, extraProxyIPs)
 		if err != nil {
 			return TUNRoutingConfig{}, err
 		}
@@ -229,6 +308,39 @@ func (m *TUNTunnelManager) routingConfig(ctx context.Context, cfg TunnelConfig, 
 		Routes:              routes,
 		Rules:               rules,
 	}, nil
+}
+
+func innerAddressesForTUN(result TunnelResult) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	for _, addr := range result.LocalInnerIPs {
+		add(addr)
+	}
+	add(result.LocalInnerIPv4)
+	add(result.LocalInnerIPv6)
+	add(result.LocalInnerIP)
+	return out
+}
+
+func addressFamiliesForTUN(addresses []string) (hasV4 bool, hasV6 bool) {
+	for _, item := range addresses {
+		if addr, ok := parseInnerIPFamily(item); ok {
+			if addr.Is4() {
+				hasV4 = true
+			} else if addr.Is6() {
+				hasV6 = true
+			}
+		}
+	}
+	return hasV4, hasV6
 }
 
 func isolatedTUNSourcePrefix(value string) (string, error) {
@@ -264,13 +376,35 @@ func isolatedTUNRoutingIdentity(iface string) (table string, priority int) {
 }
 
 func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg TunnelConfig, result TunnelResult, routes []TUNRoute) ([]EPDGRouteExclusion, error) {
-	host := tunnelAddressHost(firstPacketNonEmpty(result.EPDGAddress, cfg.EPDGAddress))
-	if host == "" {
+	return m.defaultEPDGRouteExclusionsWithExtra(ctx, cfg, result, routes, nil)
+}
+
+func (m *TUNTunnelManager) defaultEPDGRouteExclusionsWithExtra(ctx context.Context, cfg TunnelConfig, result TunnelResult, routes []TUNRoute, extraIPs []net.IP) ([]EPDGRouteExclusion, error) {
+	if len(routes) == 0 {
 		return nil, nil
 	}
-	ips, err := m.resolveEPDGRouteIPs(ctx, host)
-	if err != nil {
-		return nil, err
+	var ips []net.IP
+	if cfg.Proxy.IsActive() {
+		parsedProxy, err := parseSOCKS5ProxyConfig(cfg.Proxy)
+		if err != nil {
+			return nil, err
+		}
+		resolvedProxyIPs, err := m.resolveEPDGRouteIPs(ctx, parsedProxy.Host)
+		if err != nil {
+			return nil, err
+		}
+		ips = append(ips, resolvedProxyIPs...)
+		ips = append(ips, extraIPs...)
+	} else {
+		host := tunnelAddressHost(firstPacketNonEmpty(result.EPDGAddress, cfg.EPDGAddress))
+		if host == "" {
+			return nil, nil
+		}
+		resolvedIPs, err := m.resolveEPDGRouteIPs(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		ips = append(ips, resolvedIPs...)
 	}
 	if len(ips) == 0 {
 		return nil, nil
@@ -288,9 +422,15 @@ func (m *TUNTunnelManager) defaultEPDGRouteExclusions(ctx context.Context, cfg T
 			continue
 		}
 		seen[key] = true
+		outerSource := strings.TrimSpace(cfg.OuterLocalIP)
+		if outerSource != "" {
+			if srcIP := normalizedMOBIKEIP(net.ParseIP(outerSource)); srcIP != nil && (srcIP.To4() != nil) != (normalized.To4() != nil) {
+				outerSource = ""
+			}
+		}
 		outer := EPDGOuterRoute{
 			InterfaceName: strings.TrimSpace(cfg.LocalInterface),
-			Source:        strings.TrimSpace(cfg.OuterLocalIP),
+			Source:        outerSource,
 		}
 		if outer.InterfaceName == "" {
 			resolver := m.Config.EPDGOuterRouteResolver
@@ -325,7 +465,11 @@ func resolveSystemEPDGOuterRoute(ctx context.Context, ip net.IP) (EPDGOuterRoute
 	if normalized == nil {
 		return EPDGOuterRoute{}, fmt.Errorf("%w: invalid ePDG route address", ErrInvalidTUNTunnelManager)
 	}
-	output, err := exec.CommandContext(ctx, "ip", "-j", "route", "get", normalized.String()).Output()
+	args := []string{"-j", "route", "get", normalized.String()}
+	if normalized.To4() == nil {
+		args = []string{"-6", "-j", "route", "get", normalized.String()}
+	}
+	output, err := exec.CommandContext(ctx, "ip", args...).Output()
 	if err != nil {
 		return EPDGOuterRoute{}, fmt.Errorf("%w: resolve ePDG outer route: %v", ErrInvalidTUNTunnelManager, err)
 	}
@@ -371,21 +515,50 @@ func (m *TUNTunnelManager) resolveEPDGRouteIPs(ctx context.Context, host string)
 	return ips, nil
 }
 
+func isDefaultRouteDestination(destination string) bool {
+	switch normalizeRouteDestinationForRoutingTables(destination) {
+	case "default", "0.0.0.0/0", "::/0":
+		return true
+	default:
+		return false
+	}
+}
+
 func routingTablesForRoutes(routes []TUNRoute) []string {
-	seen := map[string]bool{}
-	var out []string
+	if len(routes) == 0 {
+		return nil
+	}
+	hasDefault := false
 	for _, route := range routes {
-		if normalizeRouteDestinationForRoutingTables(route.Destination) != "default" {
+		if isDefaultRouteDestination(route.Destination) {
+			hasDefault = true
+			break
+		}
+	}
+	seen := map[string]bool{}
+	var nonMain []string
+	targetsMain := false
+	for _, route := range routes {
+		if hasDefault && !isDefaultRouteDestination(route.Destination) {
 			continue
 		}
 		table := strings.TrimSpace(route.Table)
-		if table == "" || seen[table] {
+		if table == "" || strings.EqualFold(table, "main") {
+			targetsMain = true
 			continue
 		}
-		seen[table] = true
-		out = append(out, table)
+		if !seen[table] {
+			seen[table] = true
+			nonMain = append(nonMain, table)
+		}
 	}
-	return out
+	if len(nonMain) == 0 {
+		return nil
+	}
+	if targetsMain {
+		return append([]string{"main"}, nonMain...)
+	}
+	return nonMain
 }
 
 func normalizeRouteDestinationForRoutingTables(destination string) string {
@@ -512,6 +685,88 @@ func (s *TUNPacketTunnelSession) setResult(result TunnelResult) TunnelResult {
 	return cloneTunnelResult(s.result)
 }
 
+func (s *TUNPacketTunnelSession) ObserveMOBIKENAT(ctx context.Context, obs MOBIKENATObservation) (MOBIKENATChange, MOBIKEResult, error) {
+	if s == nil || s.base == nil {
+		return MOBIKENATChange{}, MOBIKEResult{}, ErrInvalidTUNTunnelManager
+	}
+	observer, ok := s.base.(MOBIKENATObserver)
+	if !ok {
+		return MOBIKENATChange{}, MOBIKEResult{}, fmt.Errorf("%w: base session cannot observe mobike nat", ErrInvalidTUNTunnelManager)
+	}
+	change, res, err := observer.ObserveMOBIKENAT(ctx, obs)
+	if err != nil {
+		return change, res, err
+	}
+	if change.RequiresMOBIKEUpdate {
+		s.refreshResultFromBase()
+	}
+	return change, res, nil
+}
+
+func (s *TUNPacketTunnelSession) MOBIKENATSnapshot() (MOBIKENATEndpoint, time.Time) {
+	if s == nil || s.base == nil {
+		return MOBIKENATEndpoint{}, time.Time{}
+	}
+	observer, ok := s.base.(MOBIKENATObserver)
+	if !ok {
+		return MOBIKENATEndpoint{}, time.Time{}
+	}
+	return observer.MOBIKENATSnapshot()
+}
+
+func (s *TUNPacketTunnelSession) AdvanceIKELiveness(ctx context.Context, now time.Time) (IKELivenessDecision, error) {
+	if s == nil || s.base == nil {
+		return IKELivenessDecision{}, ErrInvalidTUNTunnelManager
+	}
+	controller, ok := s.base.(IKELivenessController)
+	if !ok {
+		return IKELivenessDecision{Action: IKELivenessNoAction, Reason: "liveness disabled"}, nil
+	}
+	decision, err := controller.AdvanceIKELiveness(ctx, now)
+	if decision.Dead || decision.Action == IKELivenessDeclareDead {
+		s.refreshResultFromBase()
+	}
+	return decision, err
+}
+
+func (s *TUNPacketTunnelSession) RecordIKELivenessInbound(at time.Time) {
+	if s == nil || s.base == nil {
+		return
+	}
+	if controller, ok := s.base.(IKELivenessController); ok {
+		controller.RecordIKELivenessInbound(at)
+	}
+}
+
+func (s *TUNPacketTunnelSession) RecordIKELivenessOutbound(at time.Time) {
+	if s == nil || s.base == nil {
+		return
+	}
+	if controller, ok := s.base.(IKELivenessController); ok {
+		controller.RecordIKELivenessOutbound(at)
+	}
+}
+
+func (s *TUNPacketTunnelSession) RecordIKELivenessResult(at time.Time, okResult bool) {
+	if s == nil || s.base == nil {
+		return
+	}
+	if controller, ok := s.base.(IKELivenessController); ok {
+		controller.RecordIKELivenessResult(at, okResult)
+	}
+}
+
+func (s *TUNPacketTunnelSession) IKELivenessSnapshot() IKELivenessSnapshot {
+	if s == nil || s.base == nil {
+		return IKELivenessSnapshot{}
+	}
+	controller, ok := s.base.(IKELivenessController)
+	if !ok {
+		return IKELivenessSnapshot{}
+	}
+	return controller.IKELivenessSnapshot()
+}
+
 func (s *TUNPacketTunnelSession) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
@@ -525,11 +780,20 @@ func (s *TUNPacketTunnelSession) Close(ctx context.Context) error {
 		return nil
 	}
 	s.closed = true
+	maintCancel := s.maintCancel
+	maintDone := s.maintDone
 	pump := s.pump
 	routing := s.routing
 	routingState := s.routingState
 	routingApplied := s.routingApplied
 	s.mu.Unlock()
+
+	if maintCancel != nil {
+		maintCancel()
+	}
+	if maintDone != nil {
+		<-maintDone
+	}
 
 	var err error
 	if routingApplied && routing != nil {
@@ -541,7 +805,9 @@ func (s *TUNPacketTunnelSession) Close(ctx context.Context) error {
 		cancelCleanup()
 	}
 	if pump != nil {
-		err = errors.Join(err, pump.Close(ctx))
+		cleanupCtx, cancelPump := independentCleanupContext(ctx)
+		err = errors.Join(err, pump.Close(cleanupCtx))
+		cancelPump()
 	}
 	return err
 }

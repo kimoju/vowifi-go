@@ -38,6 +38,7 @@ type RTPRelayConfig struct {
 	RTPQualityHandler   RTPRelayQualityHandler
 	RTPQualityConfig    RTPRelayQualityConfig
 	RTCPReportSchedule  RTPRelayRTCPReportScheduleConfig
+	implicitIMSListenIP bool
 }
 
 type RTPRelayTransform func([]byte) ([]byte, error)
@@ -398,13 +399,16 @@ func newRTPRelaySession(ctx context.Context, cfg RTPRelayConfig) (*RTPRelaySessi
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	clientListenIP := firstVoiceNonEmpty(cfg.ClientListenIP, "0.0.0.0")
 	imsListenIP := firstVoiceNonEmpty(cfg.IMSListenIP, clientListenIP)
 	clientConn, err := listenUDP(clientListenIP, cfg.ClientPort)
 	if err != nil {
 		return nil, err
 	}
-	imsConn, err := listenUDP(imsListenIP, cfg.IMSPort)
+	imsConn, imsListenIP, err := listenIMSUDP(imsListenIP, cfg.IMSPort, cfg.implicitIMSListenIP)
 	if err != nil {
 		_ = clientConn.Close()
 		return nil, err
@@ -415,14 +419,14 @@ func newRTPRelaySession(ctx context.Context, cfg RTPRelayConfig) (*RTPRelaySessi
 		_ = imsConn.Close()
 		return nil, err
 	}
-	imsRTCPConn, err := listenUDP(imsListenIP, cfg.IMSRTCPPort)
+	imsRTCPConn, _, err := listenIMSUDP(imsListenIP, cfg.IMSRTCPPort, cfg.implicitIMSListenIP)
 	if err != nil {
 		_ = clientConn.Close()
 		_ = imsConn.Close()
 		_ = clientRTCPConn.Close()
 		return nil, err
 	}
-	childCtx, cancel := context.WithCancel(ctx)
+	childCtx, cancel := context.WithCancel(context.Background())
 	s := &RTPRelaySession{
 		clientConn:           clientConn,
 		imsConn:              imsConn,
@@ -1315,18 +1319,29 @@ func (s *RTPRelaySession) SendSenderReport(ctx context.Context, req RTPRelaySend
 	})
 }
 
+func (s *RTPRelaySession) isClosed() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.RLock()
+	closed := s.closed
+	s.mu.RUnlock()
+	return closed
+}
+
 func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn, target func() *net.UDPAddr, allow func() bool, packets, bytes, drops *atomic.Uint64, transformSelector rtpRelayTransformSelector, rtcpDirection RTCPFeedbackDirection, dtmfDirection RTPDTMFDirection, dtmfPayloads, dtmfTargetPayloads func() map[uint8]int, rtpStatsDirection RTPDTMFDirection, rtpClockRate int) {
 	defer s.wg.Done()
 	buf := make([]byte, s.bufferSize)
 	for {
 		n, _, err := src.ReadFromUDP(buf)
 		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || s.isClosed() {
 				return
 			}
+			if isTransientRelayUDPError(err) {
+				continue
+			}
+			return
 		}
 		dst := target()
 		if dst == nil {
@@ -1359,12 +1374,20 @@ func (s *RTPRelaySession) forwardLoop(ctx context.Context, src, out *net.UDPConn
 			}
 			packet = s.processRTPDTMF(dtmfDirection, packet, dtmfPayloads(), targetPayloads)
 		}
+		pktLen := uint64(len(packet))
+		packets.Add(1)
+		bytes.Add(pktLen)
 		if _, err := out.WriteToUDP(packet, dst); err != nil {
+			packets.Add(^uint64(0))
+			if pktLen > 0 {
+				bytes.Add(^uint64(pktLen - 1))
+			}
 			drops.Add(1)
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || s.isClosed() {
+				return
+			}
 			continue
 		}
-		packets.Add(1)
-		bytes.Add(uint64(len(packet)))
 	}
 }
 
@@ -2123,11 +2146,61 @@ func (s *RTPRelaySession) imsRTCPPort() int {
 }
 
 func listenUDP(host string, port int) (*net.UDPConn, error) {
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(strings.TrimSpace(host), strconv.Itoa(port)))
+	trimmed := strings.TrimSpace(host)
+	network := "udp"
+	if ip := net.ParseIP(trimmed); ip != nil {
+		if ip.To4() != nil {
+			network = "udp4"
+		} else {
+			network = "udp6"
+		}
+	}
+	addr, err := net.ResolveUDPAddr(network, net.JoinHostPort(trimmed, strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}
-	return net.ListenUDP("udp", addr)
+	return net.ListenUDP(network, addr)
+}
+
+func listenIMSUDP(host string, port int, allowImplicitFallback bool) (*net.UDPConn, string, error) {
+	conn, err := listenUDP(host, port)
+	if err == nil {
+		return conn, host, nil
+	}
+	if !allowImplicitFallback || !strings.Contains(strings.ToLower(err.Error()), "cannot assign requested address") {
+		return nil, host, err
+	}
+	fallbackHost := "0.0.0.0"
+	if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil && ip.To4() == nil {
+		fallbackHost = "::"
+	}
+	conn, fallbackErr := listenUDP(fallbackHost, port)
+	if fallbackErr != nil {
+		return nil, host, err
+	}
+	return conn, fallbackHost, nil
+}
+
+func isTransientRelayUDPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "host unreachable") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "network is down") ||
+		strings.Contains(msg, "host is down") ||
+		strings.Contains(msg, "message too long") ||
+		strings.Contains(msg, "no buffer space available") ||
+		strings.Contains(msg, "resource temporarily unavailable") ||
+		strings.Contains(msg, "interrupted system call")
 }
 
 func udpLocalPort(conn *net.UDPConn) int {

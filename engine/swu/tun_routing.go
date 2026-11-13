@@ -9,7 +9,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
+
+const defaultSWUCleanupTimeout = 5 * time.Second
+
+func independentCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx != nil && ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.Background(), defaultSWUCleanupTimeout)
+}
 
 var ErrInvalidTUNRouting = errors.New("invalid swu tun routing")
 
@@ -120,7 +130,9 @@ func (m LinuxTUNRoutingManager) Apply(ctx context.Context, cfg TUNRoutingConfig)
 			applyErr = runner.RunIP(ctx, command.args...)
 		}
 		if applyErr != nil {
-			rollbackErr := runIPUndo(ctx, runner, state.undo)
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), defaultSWUCleanupTimeout)
+			rollbackErr := runIPUndo(cleanupCtx, runner, state.undo)
+			cancel()
 			if rollbackErr != nil {
 				return state, errors.Join(applyErr, rollbackErr)
 			}
@@ -134,14 +146,13 @@ func (m LinuxTUNRoutingManager) Apply(ctx context.Context, cfg TUNRoutingConfig)
 }
 
 func (m LinuxTUNRoutingManager) Cleanup(ctx context.Context, state TUNRoutingState) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	cleanupCtx, cancel := independentCleanupContext(ctx)
+	defer cancel()
 	runner := m.Runner
 	if runner == nil {
 		runner = ExecIPCommandRunner{}
 	}
-	return runIPUndo(ctx, runner, state.undo)
+	return runIPUndo(cleanupCtx, runner, state.undo)
 }
 
 type ipCommand struct {

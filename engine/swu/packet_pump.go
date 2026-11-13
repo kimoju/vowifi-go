@@ -5,8 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"os"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/kimoju/vowifi-go/engine/swu/esp"
 )
 
 var ErrInvalidPacketPump = errors.New("invalid swu packet pump")
@@ -184,6 +189,10 @@ func (p *PacketPump) deviceToESP(ctx context.Context) {
 				p.requestStop()
 				return
 			}
+			if isNonFatalPacketPumpError(err) {
+				p.recordNonFatalError(PacketPumpDeviceToESP, err, func(stats *PacketPumpStats) { stats.DeviceReadErrors++ })
+				continue
+			}
 			p.recordError(PacketPumpDeviceToESP, err, func(stats *PacketPumpStats) { stats.DeviceReadErrors++ })
 			return
 		}
@@ -197,6 +206,10 @@ func (p *PacketPump) deviceToESP(ctx context.Context) {
 			if p.isNormalStop(ctx, err) {
 				p.requestStop()
 				return
+			}
+			if isNonFatalPacketPumpError(err) {
+				p.recordNonFatalError(PacketPumpDeviceToESP, err, func(stats *PacketPumpStats) { stats.ESPSendErrors++ })
+				continue
 			}
 			p.recordError(PacketPumpDeviceToESP, err, func(stats *PacketPumpStats) { stats.ESPSendErrors++ })
 			return
@@ -217,6 +230,10 @@ func (p *PacketPump) espToDevice(ctx context.Context) {
 				p.requestStop()
 				return
 			}
+			if isNonFatalPacketPumpError(err) {
+				p.recordNonFatalError(PacketPumpESPToDevice, err, func(stats *PacketPumpStats) { stats.ESPReadErrors++ })
+				continue
+			}
 			p.recordError(PacketPumpESPToDevice, err, func(stats *PacketPumpStats) { stats.ESPReadErrors++ })
 			return
 		}
@@ -227,6 +244,10 @@ func (p *PacketPump) espToDevice(ctx context.Context) {
 			if p.isNormalStop(ctx, err) {
 				p.requestStop()
 				return
+			}
+			if isNonFatalPacketPumpError(err) {
+				p.recordNonFatalError(PacketPumpESPToDevice, err, func(stats *PacketPumpStats) { stats.DeviceWriteErrors++ })
+				continue
 			}
 			p.recordError(PacketPumpESPToDevice, err, func(stats *PacketPumpStats) { stats.DeviceWriteErrors++ })
 			return
@@ -299,6 +320,17 @@ func (p *PacketPump) recordError(direction PacketPumpDirection, err error, updat
 	})
 }
 
+func (p *PacketPump) recordNonFatalError(direction PacketPumpDirection, err error, update func(*PacketPumpStats)) {
+	p.mu.Lock()
+	if update != nil {
+		update(&p.stats)
+	}
+	p.mu.Unlock()
+	if p.onError != nil {
+		p.onError(direction, err)
+	}
+}
+
 func (p *PacketPump) requestStop() {
 	p.mu.Lock()
 	cancel := p.cancel
@@ -313,6 +345,29 @@ func (p *PacketPump) isNormalStop(ctx context.Context, err error) bool {
 		errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrClosed) ||
 		errors.Is(err, ErrPacketTunnelClosed) ||
 		(ctx != nil && ctx.Err() != nil)
+}
+
+func isNonFatalPacketPumpError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, esp.ErrReplay) ||
+		errors.Is(err, esp.ErrInvalidPacket) ||
+		errors.Is(err, ErrUnsupportedInnerPacket) ||
+		errors.Is(err, syscall.ENOBUFS) ||
+		errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EWOULDBLOCK) ||
+		errors.Is(err, syscall.EINTR) ||
+		errors.Is(err, syscall.EMSGSIZE) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }

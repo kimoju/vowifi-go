@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+
+	"github.com/kimoju/vowifi-go/runtimehost/carrier"
 )
 
 const (
@@ -24,12 +26,22 @@ type EAPAKAPermanentIdentity struct {
 
 // FormatEAPAKAPermanentIdentity formats an EAP-AKA permanent NAI.
 func FormatEAPAKAPermanentIdentity(imsi, mcc, mnc string) (string, error) {
-	return formatEAPAKAPermanentIdentity(EAPAKAPermanentIdentityPrefix, imsi, mcc, mnc)
+	return formatEAPAKAPermanentIdentity(EAPAKAPermanentIdentityPrefix, imsi, mcc, mnc, nil)
+}
+
+// FormatEAPAKAPermanentIdentityWithAD formats an EAP-AKA permanent NAI using EF_AD when MNC is omitted.
+func FormatEAPAKAPermanentIdentityWithAD(imsi, mcc, mnc string, efAD []byte) (string, error) {
+	return formatEAPAKAPermanentIdentity(EAPAKAPermanentIdentityPrefix, imsi, mcc, mnc, efAD)
 }
 
 // FormatEAPAKAPrimePermanentIdentity formats an EAP-AKA' permanent NAI.
 func FormatEAPAKAPrimePermanentIdentity(imsi, mcc, mnc string) (string, error) {
-	return formatEAPAKAPermanentIdentity(EAPAKAPrimePermanentIdentityPrefix, imsi, mcc, mnc)
+	return formatEAPAKAPermanentIdentity(EAPAKAPrimePermanentIdentityPrefix, imsi, mcc, mnc, nil)
+}
+
+// FormatEAPAKAPrimePermanentIdentityWithAD formats an EAP-AKA' permanent NAI using EF_AD when MNC is omitted.
+func FormatEAPAKAPrimePermanentIdentityWithAD(imsi, mcc, mnc string, efAD []byte) (string, error) {
+	return formatEAPAKAPermanentIdentity(EAPAKAPrimePermanentIdentityPrefix, imsi, mcc, mnc, efAD)
 }
 
 // ParseEAPAKAPermanentIdentity parses an EAP-AKA or EAP-AKA' permanent NAI.
@@ -204,26 +216,29 @@ func MNCLengthFromAD(ad []byte) (int, bool) {
 	return mncLen, true
 }
 
-func formatEAPAKAPermanentIdentity(prefix byte, imsi, mcc, mnc string) (string, error) {
-	imsi, mcc, mnc, realm, err := normalizeEAPAKAIdentityParts(imsi, mcc, mnc)
+func formatEAPAKAPermanentIdentity(prefix byte, imsi, mcc, mnc string, efAD []byte) (string, error) {
+	imsi, mcc, mnc, realm, err := normalizeEAPAKAIdentityParts(imsi, mcc, mnc, efAD)
 	if err != nil {
 		return "", err
 	}
 	return string([]byte{prefix}) + imsi + "@" + realm, nil
 }
 
-func normalizeEAPAKAIdentityParts(imsi, mcc, mnc string) (string, string, string, string, error) {
+func normalizeEAPAKAIdentityParts(imsi, mcc, mnc string, efAD []byte) (string, string, string, string, error) {
 	imsi = strings.TrimSpace(imsi)
 	mcc = strings.TrimSpace(mcc)
 	mnc = strings.TrimSpace(mnc)
 	if err := validateDecimalDigits("IMSI", imsi, 5, 15); err != nil {
 		return "", "", "", "", err
 	}
-	if mcc == "" && len(imsi) >= 3 {
-		mcc = imsi[:3]
-	}
-	if mnc == "" && len(imsi) >= 6 {
-		mnc = imsi[3:6]
+	if mcc == "" || mnc == "" {
+		derivedMCC, derivedMNC := carrier.DerivePLMNFromIMSIWithAD(imsi, efAD)
+		if mcc == "" {
+			mcc = derivedMCC
+		}
+		if mnc == "" {
+			mnc = derivedMNC
+		}
 	}
 	if err := validateDecimalDigits("MCC", mcc, 3, 3); err != nil {
 		return "", "", "", "", err
@@ -379,4 +394,68 @@ func appendBCDDigit(out *[]byte, nibble byte) bool {
 	}
 	*out = append(*out, '0'+nibble)
 	return true
+}
+
+// DecodeUSIMSMSP decodes the TS-Service Centre Address (SMSC) from a USIM
+// EF_SMSP (0x6F42, 3GPP TS 31.102 §4.2.25) linear-fixed record.
+func DecodeUSIMSMSP(raw []byte) (string, error) {
+	if len(raw) < 28 {
+		return "", fmt.Errorf("EF_SMSP record too short: %d bytes", len(raw))
+	}
+	params := raw[len(raw)-28:]
+	// Bit 1 (0x02) == 0 means TS-Service Centre Address is present.
+	if params[0]&0x02 != 0 {
+		return "", fmt.Errorf("EF_SMSP service centre address marked absent")
+	}
+	sca := params[13:25]
+	addrLen := int(sca[0])
+	if addrLen <= 1 || addrLen > 11 || addrLen == 0xFF {
+		return "", fmt.Errorf("EF_SMSP service centre address length invalid: %d", addrLen)
+	}
+	toa := sca[1]
+	bcd := sca[2 : 1+addrLen]
+	var out strings.Builder
+	if toa&0x70 == 0x10 {
+		out.WriteByte('+')
+	}
+	digits := 0
+	for _, octet := range bcd {
+		for _, nibble := range []byte{octet & 0x0F, (octet >> 4) & 0x0F} {
+			if nibble == 0x0F {
+				if digits == 0 {
+					return "", fmt.Errorf("EF_SMSP service centre address has no digits")
+				}
+				return out.String(), nil
+			}
+			d, ok := decodeSMSPBCDDigit(nibble)
+			if !ok {
+				return "", fmt.Errorf("EF_SMSP invalid BCD nibble 0x%X", nibble)
+			}
+			out.WriteByte(d)
+			digits++
+		}
+	}
+	if digits == 0 {
+		return "", fmt.Errorf("EF_SMSP service centre address has no digits")
+	}
+	return out.String(), nil
+}
+
+func decodeSMSPBCDDigit(nibble byte) (byte, bool) {
+	switch {
+	case nibble <= 9:
+		return '0' + nibble, true
+	case nibble == 0x0A:
+		return '*', true
+	case nibble == 0x0B:
+		return '#', true
+	case nibble == 0x0C:
+		return 'a', true
+	case nibble == 0x0D:
+		return 'b', true
+	case nibble == 0x0E:
+		return 'c', true
+	default:
+		return 0, false
+	}
 }

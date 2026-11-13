@@ -81,12 +81,18 @@ func (s *kernelTunnelSession) Close(ctx context.Context) error {
 	closeHandler := s.closeHandler
 	s.mu.Unlock()
 
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), defaultSWUCleanupTimeout)
+	defer cancel()
+	if ctx != nil && ctx.Err() == nil {
+		cleanupCtx = ctx
+	}
+
 	var err error
 	if closeHandler != nil {
-		err = closeHandler(ctx)
+		err = closeHandler(cleanupCtx)
 	}
 	if xfrmManager != nil {
-		err = errors.Join(err, xfrmManager.Cleanup(ctx, xfrmState))
+		err = errors.Join(err, xfrmManager.Cleanup(cleanupCtx, xfrmState))
 	}
 	return err
 }

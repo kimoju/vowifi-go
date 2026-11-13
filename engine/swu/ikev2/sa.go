@@ -97,6 +97,9 @@ func Default3GPPIKEProposal() SecurityAssociation {
 			{Type: TransformINTEG, ID: INTEG_HMAC_SHA2_256_128},
 			{Type: TransformINTEG, ID: INTEG_HMAC_SHA1_96},
 			{Type: TransformDHRGroup, ID: DHGroup2048BitMODP},
+			{Type: TransformDHRGroup, ID: DHGroup256BitECP},
+			{Type: TransformDHRGroup, ID: DHGroup384BitECP},
+			{Type: TransformDHRGroup, ID: DHGroupCurve25519},
 		},
 	}}}
 }

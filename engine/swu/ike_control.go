@@ -55,9 +55,10 @@ func NewIKECloseHandler(cfg IKECloseConfig) (func(context.Context) error, error)
 			return nil, fmt.Errorf("%w: %v", ErrInvalidIKEControl, err)
 		}
 	}
+	retransmitTransport := newRetransmittingIKETransport(cfg.Transport, defaultIKEControlMaxRetransmits)
 	return func(ctx context.Context) error {
 		_, err := ikev2.RunInformationalExchange(ctx, ikev2.InformationalConfig{
-			Transport: cfg.Transport,
+			Transport: retransmitTransport,
 			Init:      cfg.Init,
 			Keys:      cfg.Keys,
 			MessageID: cfg.NextMessageID,
@@ -80,6 +81,7 @@ func NewIKEMOBIKEHandler(cfg IKEMOBIKEConfig) (func(context.Context, MOBIKEReque
 	if err != nil {
 		return nil, err
 	}
+	retransmitTransport := newRetransmittingIKETransport(cfg.Transport, defaultIKEControlMaxRetransmits)
 	return func(ctx context.Context, req MOBIKERequest) (MOBIKEResult, error) {
 		payloads, err := mobikeUpdatePayloads(cfg, additional, req)
 		if err != nil {
@@ -87,7 +89,7 @@ func NewIKEMOBIKEHandler(cfg IKEMOBIKEConfig) (func(context.Context, MOBIKEReque
 		}
 		err = messageIDs.exchange(func(messageID uint32) error {
 			res, err := ikev2.RunInformationalExchange(ctx, ikev2.InformationalConfig{
-				Transport: cfg.Transport,
+				Transport: retransmitTransport,
 				Init:      cfg.Init,
 				Keys:      cfg.Keys,
 				MessageID: messageID,
@@ -244,4 +246,47 @@ func cloneIPs(in []net.IP) []net.IP {
 		}
 	}
 	return out
+}
+
+const defaultIKEControlMaxRetransmits = 2
+
+type retransmittingIKETransport struct {
+	base           ikev2.InitTransport
+	maxRetransmits int
+}
+
+func newRetransmittingIKETransport(base ikev2.InitTransport, maxRetransmits int) ikev2.InitTransport {
+	if base == nil {
+		return nil
+	}
+	switch base.(type) {
+	case *retransmittingIKETransport, ikev2.UDPTransport, *ikev2.UDPTransport, *ikev2.PersistentUDPTransport:
+		return base
+	}
+	if maxRetransmits <= 0 {
+		return base
+	}
+	return &retransmittingIKETransport{base: base, maxRetransmits: maxRetransmits}
+}
+
+func (t *retransmittingIKETransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var lastErr error
+	for attempt := 0; attempt <= t.maxRetransmits; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		resp, err := t.base.ExchangeIKE(ctx, request)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() || ctx.Err() != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
 }

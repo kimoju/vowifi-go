@@ -15,6 +15,8 @@ import (
 
 type IMSInboundWireServer struct {
 	Agent                       *IMSInboundAgent
+	OutboundAgent               *IMSOutboundAgent
+	OutboundDialogHandler       IMSOutboundDialogHandler
 	MessageHandler              IMSMessageHandler
 	MessageDeliveryReportSender IMSMessageDeliveryReportSender
 	ResponsePacketHandler       SIPResponsePacketHandler
@@ -107,14 +109,17 @@ func (s *IMSInboundWireServer) ServePacket(ctx context.Context, pc net.PacketCon
 	buf := make([]byte, 65535)
 	for {
 		if err := pc.SetReadDeadline(time.Now().Add(s.readTimeout())); err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			return err
 		}
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			if isTimeout(err) {
+			if isTimeout(err) || isTransientInboundPacketError(err) {
 				continue
 			}
 			return err
@@ -122,6 +127,46 @@ func (s *IMSInboundWireServer) ServePacket(ctx context.Context, pc net.PacketCon
 		raw := append([]byte(nil), buf[:n]...)
 		go s.handlePacket(ctx, pc, addr, raw)
 	}
+}
+
+func (s *IMSInboundWireServer) ServePacketAndListener(ctx context.Context, pc net.PacketConn, ln net.Listener) error {
+	if pc == nil {
+		return s.ServeListener(ctx, ln)
+	}
+	if ln == nil {
+		return s.ServePacket(ctx, pc)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errCh <- s.ServePacket(childCtx, pc)
+	}()
+	go func() {
+		defer wg.Done()
+		errCh <- s.ServeListener(childCtx, ln)
+	}()
+
+	var firstErr error
+	for i := 0; i < 2; i++ {
+		err := <-errCh
+		if err != nil && firstErr == nil && ctx.Err() == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return nil
+	}
+	return firstErr
 }
 
 func (s *IMSInboundWireServer) ServeListener(ctx context.Context, ln net.Listener) error {
@@ -189,6 +234,9 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 		responses, err = s.handleInvite(ctx, req, key, emit)
 	case "ACK":
 		s.stopInviteFinalRetransmission(req)
+		if h := s.outboundDialogHandler(); h != nil && h.AckOutboundReinvite(ctx, wireCallID(req)) {
+			return nil, nil
+		}
 		if s == nil || s.Agent == nil {
 			return nil, ErrIMSInboundAgentNotReady
 		}
@@ -262,6 +310,19 @@ func (s *IMSInboundWireServer) handleRequest(ctx context.Context, req voiceclien
 	return responses, err
 }
 
+func (s *IMSInboundWireServer) outboundDialogHandler() IMSOutboundDialogHandler {
+	if s == nil {
+		return nil
+	}
+	if s.OutboundDialogHandler != nil {
+		return s.OutboundDialogHandler
+	}
+	if s.OutboundAgent != nil {
+		return s.OutboundAgent
+	}
+	return nil
+}
+
 func (s *IMSInboundWireServer) handleInfo(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
 	infoReq := IMSInfoRequest{
 		URI:         strings.TrimSpace(req.URI),
@@ -273,6 +334,11 @@ func (s *IMSInboundWireServer) handleInfo(ctx context.Context, req voiceclient.S
 		InfoPackage: firstVoiceHeader(req.Headers, "Info-Package"),
 		Body:        append([]byte(nil), req.Body...),
 		Headers:     cloneSIPHeaders(req.Headers),
+	}
+	if h := s.outboundDialogHandler(); h != nil {
+		if result, matched, err := h.HandleOutboundInfo(ctx, infoReq); matched {
+			return s.infoResultResponse(result, err), err
+		}
 	}
 	if s != nil && s.InfoHandler != nil {
 		result, err := s.InfoHandler.HandleIMSInfo(ctx, infoReq)
@@ -336,10 +402,10 @@ func isUSSDInfoRequest(req IMSInfoRequest) bool {
 }
 
 func (s *IMSInboundWireServer) tryHandleBye(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error, bool) {
-	if s == nil || s.ByeHandler == nil {
+	if s == nil {
 		return nil, nil, false
 	}
-	result, err := s.ByeHandler.HandleIMSBye(ctx, IMSByeRequest{
+	byeReq := IMSByeRequest{
 		URI:         strings.TrimSpace(req.URI),
 		FromURI:     wireHeaderURI(req, "From"),
 		ToURI:       wireCalleeURI(req),
@@ -348,10 +414,23 @@ func (s *IMSInboundWireServer) tryHandleBye(ctx context.Context, req voiceclient
 		ContentType: firstVoiceHeader(req.Headers, "Content-Type"),
 		Body:        append([]byte(nil), req.Body...),
 		Headers:     cloneSIPHeaders(req.Headers),
-	})
+	}
+	if h := s.outboundDialogHandler(); h != nil {
+		if result, matched, err := h.HandleOutboundBye(ctx, byeReq); matched {
+			return s.byeResultResponse(result, err), err, true
+		}
+	}
+	if s.ByeHandler == nil {
+		return nil, nil, false
+	}
+	result, err := s.ByeHandler.HandleIMSBye(ctx, byeReq)
 	if !result.Handled && err == nil {
 		return nil, nil, false
 	}
+	return s.byeResultResponse(result, err), err, true
+}
+
+func (s *IMSInboundWireServer) byeResultResponse(result IMSByeResult, err error) []IMSInboundWireResponse {
 	resp := wireResponse(inboundStatusCode(result.StatusCode, 200), firstVoiceNonEmpty(result.Reason, "OK"))
 	if err != nil && result.StatusCode <= 0 {
 		resp = wireResponse(500, firstVoiceNonEmpty(result.Reason, err.Error(), "Server Internal Error"))
@@ -365,7 +444,7 @@ func (s *IMSInboundWireServer) tryHandleBye(ctx context.Context, req voiceclient
 		resp.Body = append([]byte(nil), result.Body...)
 		resp.Headers["Content-Type"] = firstVoiceNonEmpty(result.ContentType, "application/octet-stream")
 	}
-	return []IMSInboundWireResponse{s.withResponseHeaders(resp)}, err, true
+	return []IMSInboundWireResponse{s.withResponseHeaders(resp)}
 }
 
 func (s *IMSInboundWireServer) handleMessage(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
@@ -430,16 +509,26 @@ func cloneIMSMessageDeliveryReport(in IMSMessageDeliveryReport) IMSMessageDelive
 }
 
 func (s *IMSInboundWireServer) handleUpdate(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
-	if s == nil || s.Agent == nil {
-		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
-	}
-	result, err := s.Agent.HandleInboundUpdate(ctx, InboundDialogRequest{
+	dialogReq := InboundDialogRequest{
 		CallID:  wireCallID(req),
 		CSeq:    wireCSeq(req),
 		RawSDP:  append([]byte(nil), req.Body...),
 		Headers: cloneSIPHeaders(req.Headers),
 		RAck:    firstVoiceHeader(req.Headers, "RAck"),
-	})
+	}
+	if h := s.outboundDialogHandler(); h != nil {
+		if result, matched, err := h.HandleOutboundUpdate(ctx, dialogReq); matched {
+			return s.updateResultResponse(result), err
+		}
+	}
+	if s == nil || s.Agent == nil {
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+	}
+	result, err := s.Agent.HandleInboundUpdate(ctx, dialogReq)
+	return s.updateResultResponse(result), err
+}
+
+func (s *IMSInboundWireServer) updateResultResponse(result InboundCallResult) []IMSInboundWireResponse {
 	final := wireResponse(inboundStatusCode(result.StatusCode, 500), firstVoiceNonEmpty(result.Reason, "Server Internal Error"))
 	if result.Accepted {
 		final.StatusCode = inboundStatusCode(result.StatusCode, 200)
@@ -451,7 +540,7 @@ func (s *IMSInboundWireServer) handleUpdate(ctx context.Context, req voiceclient
 		final.Headers["Contact"] = "<" + s.contactURI() + ">"
 	}
 	applyInboundWireResultHeaders(final.Headers, result.Headers)
-	return []IMSInboundWireResponse{s.withResponseHeaders(final)}, err
+	return []IMSInboundWireResponse{s.withResponseHeaders(final)}
 }
 
 func (s *IMSInboundWireServer) handlePrack(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
@@ -503,10 +592,7 @@ func (s *IMSInboundWireServer) handleRefer(ctx context.Context, req voiceclient.
 }
 
 func (s *IMSInboundWireServer) handleNotify(ctx context.Context, req voiceclient.SIPIncomingRequest) ([]IMSInboundWireResponse, error) {
-	if s == nil || s.Agent == nil {
-		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
-	}
-	result, err := s.Agent.HandleInboundNotify(ctx, InboundDialogRequest{
+	dialogReq := InboundDialogRequest{
 		CallID:            wireCallID(req),
 		CSeq:              wireCSeq(req),
 		ContentType:       firstVoiceHeader(req.Headers, "Content-Type"),
@@ -514,7 +600,16 @@ func (s *IMSInboundWireServer) handleNotify(ctx context.Context, req voiceclient
 		Headers:           cloneSIPHeaders(req.Headers),
 		Event:             firstVoiceHeader(req.Headers, "Event"),
 		SubscriptionState: firstVoiceHeader(req.Headers, "Subscription-State"),
-	})
+	}
+	if h := s.outboundDialogHandler(); h != nil {
+		if result, matched, err := h.HandleOutboundNotify(ctx, dialogReq); matched {
+			return s.infoResultResponse(result, err), err
+		}
+	}
+	if s == nil || s.Agent == nil {
+		return []IMSInboundWireResponse{s.withResponseHeaders(wireResponse(503, "Service Unavailable"))}, ErrIMSInboundAgentNotReady
+	}
+	result, err := s.Agent.HandleInboundNotify(ctx, dialogReq)
 	return s.infoResultResponse(result, err), err
 }
 
@@ -604,10 +699,7 @@ func (s *IMSInboundWireServer) handleInvite(ctx context.Context, req voiceclient
 }
 
 func (s *IMSInboundWireServer) handleInviteFinal(ctx context.Context, req voiceclient.SIPIncomingRequest, onProvisional func(InboundCallResult) error) (IMSInboundWireResponse, error) {
-	if s == nil || s.Agent == nil {
-		return s.withResponseHeaders(wireResponse(503, "Service Unavailable")), ErrIMSInboundAgentNotReady
-	}
-	result, err := s.Agent.HandleInboundInvite(ctx, InboundCallRequest{
+	callReq := InboundCallRequest{
 		CallID:          wireCallID(req),
 		CallerURI:       wireHeaderURI(req, "From"),
 		CalleeURI:       wireCalleeURI(req),
@@ -617,7 +709,16 @@ func (s *IMSInboundWireServer) handleInviteFinal(ctx context.Context, req voicec
 		RawSDP:          append([]byte(nil), req.Body...),
 		Headers:         cloneSIPHeaders(req.Headers),
 		onProvisional:   onProvisional,
-	})
+	}
+	if h := s.outboundDialogHandler(); h != nil {
+		if result, matched, err := h.HandleOutboundReinvite(ctx, callReq); matched {
+			return s.inviteResultResponse(result, 500, "Server Internal Error"), err
+		}
+	}
+	if s == nil || s.Agent == nil {
+		return s.withResponseHeaders(wireResponse(503, "Service Unavailable")), ErrIMSInboundAgentNotReady
+	}
+	result, err := s.Agent.HandleInboundInvite(ctx, callReq)
 	return s.inviteResultResponse(result, 500, "Server Internal Error"), err
 }
 
@@ -828,7 +929,7 @@ func (s *IMSInboundWireServer) optionsResponse() IMSInboundWireResponse {
 
 func (s *IMSInboundWireServer) allowHeader() string {
 	allow := "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, REFER, NOTIFY, SUBSCRIBE, OPTIONS"
-	if s != nil && s.InfoHandler != nil {
+	if s != nil && (s.InfoHandler != nil || s.Agent != nil || s.outboundDialogHandler() != nil) {
 		allow += ", INFO"
 	}
 	if s != nil && (s.MessageHandler != nil || s.Agent != nil) {
@@ -861,7 +962,7 @@ func (s *IMSInboundWireServer) contactURI() string {
 	}
 	contact := firstVoiceNonEmpty(s.ContactURI)
 	if contact == "" && s.Agent != nil {
-		contact = firstVoiceNonEmpty(s.Agent.LocalContactURI, s.Agent.Registration.ContactURI, s.Agent.Profile.IMPU)
+		contact = s.Agent.LocalContact()
 	}
 	if contact == "" {
 		contact = "sip:vowifi-go@127.0.0.1:5060"
@@ -875,7 +976,7 @@ func (s *IMSInboundWireServer) localTag() string {
 	}
 	tag := firstVoiceNonEmpty(s.LocalTag)
 	if tag == "" && s.Agent != nil {
-		tag = firstVoiceNonEmpty(s.Agent.LocalTag)
+		tag = s.Agent.DefaultLocalTag()
 	}
 	return firstVoiceNonEmpty(tag, "vowifi-go")
 }
@@ -964,10 +1065,18 @@ func (s *IMSInboundWireServer) startInviteFinalRetransmission(ctx context.Contex
 	}
 	s.inviteRetransmits[key] = entry
 	s.mu.Unlock()
-	go s.runWireResponseRetransmission(childCtx, key, entry.done, pc, addr, req, resp, s.inviteFinalT1(), s.inviteFinalT2(), s.removeInviteFinalRetransmission)
+	go s.runWireResponseRetransmission(childCtx, key, entry.done, pc, addr, req, resp, s.inviteFinalT1(), s.inviteFinalT2(), s.removeInviteFinalRetransmission, func() {
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 && s.Agent != nil {
+			callID := wireCallID(req)
+			if s.Agent.hasInboundDialog(callID) {
+				s.Agent.closeInboundDialog(callID)
+				s.Agent.emitDialogEvent(context.Background(), callID, wireCalleeURI(req), DialogStateTerminated, wireHeaderURI(req, "From"), wireCalleeURI(req), 408, "ACK timeout")
+			}
+		}
+	})
 }
 
-func (s *IMSInboundWireServer) runWireResponseRetransmission(ctx context.Context, key string, done chan struct{}, pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse, firstInterval time.Duration, maxInterval time.Duration, remove func(string, chan struct{})) {
+func (s *IMSInboundWireServer) runWireResponseRetransmission(ctx context.Context, key string, done chan struct{}, pc net.PacketConn, addr net.Addr, req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse, firstInterval time.Duration, maxInterval time.Duration, remove func(string, chan struct{}), onTimeout func()) {
 	defer close(done)
 	defer remove(key, done)
 	interval := firstInterval
@@ -990,6 +1099,9 @@ func (s *IMSInboundWireServer) runWireResponseRetransmission(ctx context.Context
 		case <-ctx.Done():
 			return
 		case <-deadline.C:
+			if ctx.Err() == nil && onTimeout != nil {
+				onTimeout()
+			}
 			return
 		case <-timer.C:
 			_ = writePacketSIPResponse(pc, addr, req, resp)
@@ -1044,7 +1156,7 @@ func (s *IMSInboundWireServer) startReliableProvisionalRetransmission(ctx contex
 	}
 	s.reliable1xxRetransmit[key] = entry
 	s.mu.Unlock()
-	go s.runWireResponseRetransmission(childCtx, key, entry.done, pc, addr, req, resp, s.reliable1xxT1(), s.reliable1xxT2(), s.removeReliableProvisionalRetransmission)
+	go s.runWireResponseRetransmission(childCtx, key, entry.done, pc, addr, req, resp, s.reliable1xxT1(), s.reliable1xxT2(), s.removeReliableProvisionalRetransmission, nil)
 }
 
 func (s *IMSInboundWireServer) trackReliableProvisional(req voiceclient.SIPIncomingRequest, resp IMSInboundWireResponse) {
@@ -1643,4 +1755,17 @@ func isTimeout(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isTransientInboundPacketError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "host unreachable") ||
+		strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "message too long") ||
+		strings.Contains(msg, "no buffer space available") ||
+		strings.Contains(msg, "resource temporarily unavailable")
 }

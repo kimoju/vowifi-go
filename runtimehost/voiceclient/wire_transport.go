@@ -1244,10 +1244,15 @@ func parseSIPHeaders(lines []string) (map[string][]string, error) {
 	return headers, nil
 }
 
+const (
+	maxSIPStreamHeaderBytes = 64 << 10
+	maxSIPStreamBodyBytes   = 1 << 20
+)
+
 func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 	var raw []byte
 	for {
-		line, err := r.ReadBytes('\n')
+		line, err := readBoundedSIPLine(r, maxSIPStreamHeaderBytes-len(raw))
 		if err != nil {
 			return nil, err
 		}
@@ -1255,6 +1260,9 @@ func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 			continue
 		}
 		raw = append(raw, line...)
+		if len(raw) > maxSIPStreamHeaderBytes {
+			return nil, fmt.Errorf("%w: SIP header exceeds %d bytes", ErrInvalidSIPMessage, maxSIPStreamHeaderBytes)
+		}
 		if bytes.HasSuffix(raw, []byte("\r\n\r\n")) || bytes.HasSuffix(raw, []byte("\n\n")) {
 			break
 		}
@@ -1272,6 +1280,9 @@ func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 		return nil, err
 	}
 	if ok && n > 0 {
+		if n > maxSIPStreamBodyBytes {
+			return nil, fmt.Errorf("%w: content length %d exceeds maximum %d", ErrInvalidSIPMessage, n, maxSIPStreamBodyBytes)
+		}
 		body := make([]byte, n)
 		if _, err := io.ReadFull(r, body); err != nil {
 			return nil, err
@@ -1279,6 +1290,27 @@ func readSIPStreamMessage(r *bufio.Reader) ([]byte, error) {
 		raw = append(raw, body...)
 	}
 	return raw, nil
+}
+
+func readBoundedSIPLine(r *bufio.Reader, maxBytes int) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("%w: SIP header exceeds %d bytes", ErrInvalidSIPMessage, maxSIPStreamHeaderBytes)
+	}
+	var line []byte
+	for {
+		frag, err := r.ReadSlice('\n')
+		line = append(line, frag...)
+		if len(line) > maxBytes {
+			return nil, fmt.Errorf("%w: SIP header line exceeds %d bytes", ErrInvalidSIPMessage, maxSIPStreamHeaderBytes)
+		}
+		if err == nil {
+			return line, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return nil, err
+	}
 }
 
 func isSIPBlankLine(line []byte) bool {
@@ -1563,4 +1595,139 @@ func firstHeaderValue(headers map[string]string, name string) string {
 		}
 	}
 	return ""
+}
+
+func rewriteSIPURIPort(uri string, port int) string {
+	if port <= 0 || port > 65535 {
+		return strings.TrimSpace(uri)
+	}
+	trimmed := strings.TrimSpace(uri)
+	if trimmed == "" || trimmed == "*" {
+		return trimmed
+	}
+	angleWrapped := strings.HasPrefix(trimmed, "<") && strings.HasSuffix(trimmed, ">")
+	core := strings.Trim(trimmed, "<>")
+	params := ""
+	if idx := indexOutsideBrackets(core, ';'); idx >= 0 {
+		params = core[idx:]
+		core = core[:idx]
+	} else if idx := indexOutsideBrackets(core, '?'); idx >= 0 {
+		params = core[idx:]
+		core = core[:idx]
+	}
+	colon := strings.IndexByte(core, ':')
+	if colon <= 0 {
+		return trimmed
+	}
+	scheme := core[:colon+1]
+	rest := core[colon+1:]
+	userPrefix := ""
+	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+		userPrefix = rest[:at+1]
+		rest = rest[at+1:]
+	}
+	host := parseSIPHostOnly(rest)
+	if host == "" {
+		return trimmed
+	}
+	formattedHost := host
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		formattedHost = "[" + host + "]"
+	}
+	rebuilt := scheme + userPrefix + formattedHost + ":" + strconv.Itoa(port) + params
+	if angleWrapped {
+		return "<" + rebuilt + ">"
+	}
+	return rebuilt
+}
+
+func rewriteSIPURIHost(uri string, host string) string {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" {
+		return strings.TrimSpace(uri)
+	}
+	trimmed := strings.TrimSpace(uri)
+	if trimmed == "" || trimmed == "*" {
+		return trimmed
+	}
+	angleWrapped := strings.HasPrefix(trimmed, "<") && strings.HasSuffix(trimmed, ">")
+	core := strings.Trim(trimmed, "<>")
+	params := ""
+	if idx := indexOutsideBrackets(core, ';'); idx >= 0 {
+		params = core[idx:]
+		core = core[:idx]
+	} else if idx := indexOutsideBrackets(core, '?'); idx >= 0 {
+		params = core[idx:]
+		core = core[:idx]
+	}
+	colon := strings.IndexByte(core, ':')
+	if colon <= 0 {
+		return trimmed
+	}
+	scheme := core[:colon+1]
+	rest := core[colon+1:]
+	userPrefix := ""
+	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+		userPrefix = rest[:at+1]
+		rest = rest[at+1:]
+	}
+	_, portSuffix := splitSIPHostAndPortSuffix(rest)
+	formattedHost := host
+	if strings.Contains(host, ":") {
+		formattedHost = "[" + host + "]"
+	}
+	rebuilt := scheme + userPrefix + formattedHost + portSuffix + params
+	if angleWrapped {
+		return "<" + rebuilt + ">"
+	}
+	return rebuilt
+}
+
+func parseSIPHostOnly(hostport string) string {
+	host, _ := splitSIPHostAndPortSuffix(hostport)
+	return host
+}
+
+func splitSIPHostAndPortSuffix(hostport string) (string, string) {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return "", ""
+	}
+	if strings.HasPrefix(hostport, "[") {
+		end := strings.IndexByte(hostport, ']')
+		if end < 0 {
+			return strings.Trim(hostport, "[]"), ""
+		}
+		host := hostport[1:end]
+		rest := hostport[end+1:]
+		if strings.HasPrefix(rest, ":") {
+			return host, rest
+		}
+		return host, ""
+	}
+	if strings.Count(hostport, ":") == 1 {
+		h, p, ok := strings.Cut(hostport, ":")
+		if ok && p != "" {
+			return h, ":" + p
+		}
+		return h, ""
+	}
+	return hostport, ""
+}
+
+func indexOutsideBrackets(s string, target byte) int {
+	inBracket := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '[':
+			inBracket = true
+		case ']':
+			inBracket = false
+		case target:
+			if !inBracket {
+				return i
+			}
+		}
+	}
+	return -1
 }

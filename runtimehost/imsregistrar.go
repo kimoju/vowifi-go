@@ -12,10 +12,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kimoju/vowifi-go/engine/swu"
 	"github.com/kimoju/vowifi-go/runtimehost/carrier"
 	"github.com/kimoju/vowifi-go/runtimehost/identity"
 	"github.com/kimoju/vowifi-go/runtimehost/messaging"
 	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
+	"github.com/kimoju/vowifi-go/runtimehost/voicehost"
 )
 
 type IMSRegisterTransportFactory func(IMSRegistrationConfig, voiceclient.IMSProfile, string, string) voiceclient.SIPRegisterTransport
@@ -138,6 +140,28 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 	if registrarURI == "" {
 		return IMSRegistrationResult{}, errors.New("IMS registrar URI is empty")
 	}
+	var preResolvedTargets []string
+	if strings.TrimSpace(r.ContactHost) == "" && r.Transport == nil && r.TransportFactory == nil && strings.TrimSpace(r.ServerAddr) == "" {
+		ipv4, ipv6, _ := tunnelInnerAddresses(cfg.Tunnel)
+		if ipv4 != "" && ipv6 != "" && !r.hasStaticTargetIPFamilyHint(cfg, registrarURI) {
+			if resolver := r.resolverForConfig(cfg); resolver != nil {
+				netName := strings.TrimSpace(r.Network)
+				if netName == "" {
+					netName = "udp"
+				}
+				if candResolver, ok := resolver.(voiceclient.SIPServerCandidateResolver); ok {
+					preResolvedTargets, _ = candResolver.ResolveSIPServers(ctx, netName, registrarURI)
+				} else if single, rErr := resolver.ResolveSIPServer(ctx, netName, registrarURI); rErr == nil && strings.TrimSpace(single) != "" {
+					preResolvedTargets = []string{strings.TrimSpace(single)}
+				}
+				if len(preResolvedTargets) > 0 {
+					if matched := matchDualStackLocalIPForTarget(preResolvedTargets[0], ipv4, ipv6); matched != "" {
+						profile.LocalIP = matched
+					}
+				}
+			}
+		}
+	}
 	contactURI := firstRuntimeNonEmpty(r.ContactURI, r.contactURIForProfile(profile))
 	if contactURI == "" {
 		return IMSRegistrationResult{}, errors.New("IMS contact URI is empty")
@@ -148,7 +172,10 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		transport = r.TransportFactory(cfg, profile, registrarURI, contactURI)
 	}
 	if transport == nil {
-		defaultFlow = r.defaultSIPFlow(cfg)
+		defaultFlow = r.defaultSIPFlowForLocalIP(cfg, profile.LocalIP)
+		if len(preResolvedTargets) > 0 {
+			defaultFlow.Targets = append([]string(nil), preResolvedTargets...)
+		}
 		transport = defaultFlow
 	}
 	expires := r.Expires
@@ -173,7 +200,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 				}
 				if transport == nil {
 					if defaultFlow == nil {
-						defaultFlow = r.defaultSIPFlow(cfg)
+						defaultFlow = r.defaultSIPFlowForLocalIP(cfg, profile.LocalIP)
 					}
 					transport = defaultFlow
 				}
@@ -193,6 +220,20 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 			return imsRegisterFailureResult(result, profile, err), err
 		}
 	}
+	if defaultFlow != nil && strings.TrimSpace(r.ContactHost) == "" {
+		ipv4, ipv6, _ := tunnelInnerAddresses(cfg.Tunnel)
+		if ipv4 != "" && ipv6 != "" {
+			localHost, remoteHost := defaultFlow.SecurityAssociationAddresses()
+			if matched := matchDualStackLocalIPForTarget(remoteHost, ipv4, ipv6); matched != "" {
+				profile.LocalIP = matched
+			} else if localHost == ipv4 || localHost == ipv6 {
+				profile.LocalIP = localHost
+			}
+		}
+	}
+	effectiveContactURI := firstRuntimeNonEmpty(result.Binding.ContactURI, contactURI)
+	registerSession.Profile = profile
+	registerSession.ContactURI = effectiveContactURI
 	registeredAt := time.Now()
 	expiresAt, refreshDelay, nextRefreshAt := imsRegistrationSchedule(r, result.Binding, registerSession, registeredAt, result.Registered)
 	voiceTransport := r.voiceTransport(cfg, profile, result.Binding, defaultFlow)
@@ -219,7 +260,7 @@ func (r WireIMSRegistrar) RegisterIMS(ctx context.Context, cfg IMSRegistrationCo
 		VoiceTransport: voiceTransport,
 		SMSTransport:   smsTransport,
 		USSDTransport:  ussdTransport,
-		Inbound:        r.inboundConfig(cfg, profile, contactURI, result.Binding, defaultFlow),
+		Inbound:        r.inboundConfig(cfg, profile, effectiveContactURI, result.Binding, defaultFlow),
 		Close:          closeRegistration,
 		Recover:        recoverRegistration,
 	}, nil
@@ -248,31 +289,173 @@ func (r WireIMSRegistrar) voiceTransport(cfg IMSRegistrationConfig, profile voic
 }
 
 func (r WireIMSRegistrar) defaultSIPFlow(cfg IMSRegistrationConfig) *voiceclient.WireSIPFlow {
-	return &voiceclient.WireSIPFlow{
+	return r.defaultSIPFlowForLocalIP(cfg, "")
+}
+
+func (r WireIMSRegistrar) defaultSIPFlowForLocalIP(cfg IMSRegistrationConfig, preferredLocalIP string) *voiceclient.WireSIPFlow {
+	ipv4, ipv6, _ := tunnelInnerAddresses(cfg.Tunnel)
+	flow := &voiceclient.WireSIPFlow{
 		Network:               r.Network,
 		ServerAddr:            r.ServerAddr,
-		LocalAddr:             r.localAddrForConfig(cfg),
+		LocalIPv4:             ipv4,
+		LocalIPv6:             ipv6,
 		Resolver:              r.resolverForConfig(cfg),
 		Timeout:               r.Timeout,
 		RetransmitInterval:    r.RetransmitInterval,
 		MaxRetransmitInterval: r.MaxRetransmitInterval,
 		MaxRetransmits:        r.MaxRetransmits,
 	}
+	flow.LocalAddr = r.localAddrForConfigWithFlow(cfg, preferredLocalIP, flow)
+	return flow
 }
 
 func (r WireIMSRegistrar) localAddrForConfig(cfg IMSRegistrationConfig) string {
+	return r.localAddrForConfigWithFlow(cfg, "", nil)
+}
+
+func (r WireIMSRegistrar) localAddrForConfigWithFlow(cfg IMSRegistrationConfig, preferredLocalIP string, flow *voiceclient.WireSIPFlow) string {
 	if local := strings.TrimSpace(r.LocalAddr); local != "" {
 		return local
 	}
-	host := normalizedRuntimeIPHost(firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP))
+	host := normalizedRuntimeIPHost(firstRuntimeNonEmpty(r.ContactHost, preferredLocalIP, r.selectLocalInnerIP(cfg)))
 	if host == "" || !runtimeIPHostIsAssigned(host) {
 		return ""
 	}
 	port := 0
 	if r.SecurityPlanInstaller != nil {
-		port = voiceclient.DefaultSecurityClientAgreement(nil).PortClient
+		if flow != nil {
+			port, _ = flow.EnsureSecurityClientPorts(host)
+		} else {
+			portC, _, release := voiceclient.AllocateSecurityClientPorts(host, 0, 0)
+			if release != nil {
+				release()
+			}
+			port = portC
+		}
 	}
 	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+func tunnelInnerAddresses(tunnel swu.TunnelResult) (ipv4, ipv6 string, all []string) {
+	add := func(raw string) {
+		h := normalizedRuntimeIPHost(raw)
+		if h == "" {
+			return
+		}
+		addr, err := netip.ParseAddr(h)
+		if err != nil {
+			return
+		}
+		addr = addr.Unmap()
+		s := addr.String()
+		if addr.Is4() && ipv4 == "" {
+			ipv4 = s
+		}
+		if addr.Is6() && ipv6 == "" {
+			ipv6 = s
+		}
+		for _, existing := range all {
+			if existing == s {
+				return
+			}
+		}
+		all = append(all, s)
+	}
+	add(tunnel.LocalInnerIPv4)
+	add(tunnel.LocalInnerIPv6)
+	for _, item := range tunnel.LocalInnerIPs {
+		add(item)
+	}
+	add(tunnel.LocalInnerIP)
+	return ipv4, ipv6, all
+}
+
+func (r WireIMSRegistrar) hasStaticTargetIPFamilyHint(cfg IMSRegistrationConfig, registrarURI string) bool {
+	netLower := strings.ToLower(strings.TrimSpace(r.Network))
+	if strings.HasSuffix(netLower, "4") || strings.HasSuffix(netLower, "6") {
+		return true
+	}
+	for _, candidate := range append([]string{r.LocalAddr, r.ServerAddr, registrarURI}, runtimePCSCFCandidates(cfg)...) {
+		if _, ok := runtimeEndpointIPIsV6(candidate); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func matchDualStackLocalIPForTarget(target, ipv4, ipv6 string) string {
+	isV6, ok := runtimeEndpointIPIsV6(target)
+	if !ok {
+		return ""
+	}
+	if isV6 && ipv6 != "" {
+		return ipv6
+	}
+	if !isV6 && ipv4 != "" {
+		return ipv4
+	}
+	return ""
+}
+
+func runtimeEndpointIPIsV6(raw string) (bool, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return false, false
+	}
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "sip:") {
+		s = s[4:]
+	} else if strings.HasPrefix(lower, "sips:") {
+		s = s[5:]
+	}
+	if semi := strings.IndexByte(s, ';'); semi >= 0 {
+		s = s[:semi]
+	}
+	if at := strings.LastIndexByte(s, '@'); at >= 0 {
+		s = s[at+1:]
+	}
+	host := s
+	if strings.HasPrefix(s, "[") {
+		if end := strings.IndexByte(s, ']'); end > 0 {
+			host = s[1:end]
+		}
+	} else if h, _, err := net.SplitHostPort(s); err == nil {
+		host = h
+	}
+	addr, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(host), "[]"))
+	if err != nil {
+		return false, false
+	}
+	return addr.Unmap().Is6(), true
+}
+
+func (r WireIMSRegistrar) selectLocalInnerIP(cfg IMSRegistrationConfig) string {
+	if explicit := normalizedRuntimeIPHost(r.ContactHost); explicit != "" {
+		return explicit
+	}
+	ipv4, ipv6, _ := tunnelInnerAddresses(cfg.Tunnel)
+	if ipv4 == "" && ipv6 == "" {
+		return normalizedRuntimeIPHost(cfg.Tunnel.LocalInnerIP)
+	}
+	if ipv4 != "" && ipv6 == "" {
+		return ipv4
+	}
+	if ipv6 != "" && ipv4 == "" {
+		return ipv6
+	}
+	netLower := strings.ToLower(strings.TrimSpace(r.Network))
+	if strings.HasSuffix(netLower, "6") {
+		return ipv6
+	}
+	if strings.HasSuffix(netLower, "4") {
+		return ipv4
+	}
+	for _, candidate := range append([]string{r.LocalAddr, r.ServerAddr, r.RegistrarURI}, runtimePCSCFCandidates(cfg)...) {
+		if matched := matchDualStackLocalIPForTarget(candidate, ipv4, ipv6); matched != "" {
+			return matched
+		}
+	}
+	return normalizedRuntimeIPHost(firstRuntimeNonEmpty(cfg.Tunnel.LocalInnerIP, ipv4, ipv6))
 }
 
 func runtimeIPHostIsAssigned(host string) bool {
@@ -297,7 +480,11 @@ func runtimeIPHostIsAssigned(host string) bool {
 }
 
 func (r WireIMSRegistrar) inboundConfig(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, contactURI string, binding voiceclient.RegistrationBinding, flow *voiceclient.WireSIPFlow) *IMSInboundConfig {
-	host := normalizedRuntimeIPHost(firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, cfg.Tunnel.LocalInnerIP))
+	effectiveContactURI := firstRuntimeNonEmpty(strings.TrimSpace(binding.ContactURI), strings.TrimSpace(contactURI))
+	host := normalizedRuntimeIPHost(firstRuntimeNonEmpty(r.ContactHost, profile.LocalIP, r.selectLocalInnerIP(cfg)))
+	if uriHost := sipURIHostLiteral(effectiveContactURI); uriHost != "" {
+		host = uriHost
+	}
 	if host == "" {
 		return nil
 	}
@@ -305,8 +492,20 @@ func (r WireIMSRegistrar) inboundConfig(cfg IMSRegistrationConfig, profile voice
 	if port <= 0 {
 		port = 5060
 	}
-	if agreements := voiceclient.ParseSecurityAgreements([]string{binding.SecurityClient}); len(agreements) > 0 && agreements[0].PortServer > 0 {
-		port = agreements[0].PortServer
+	if uriPort := sipURIPortNumber(effectiveContactURI); uriPort > 0 {
+		port = uriPort
+	}
+	if len(binding.SecurityServer) > 0 && strings.TrimSpace(binding.SecurityAgreement.Protocol) != "" {
+		if agreements := voiceclient.ParseSecurityAgreements([]string{binding.SecurityClient}); len(agreements) > 0 {
+			if _, ok := voiceclient.SelectSecurityAgreementForClients(binding.SecurityServer, agreements); ok {
+				for _, client := range agreements {
+					if _, matched := voiceclient.SelectSecurityAgreement(binding.SecurityServer, client); matched && client.PortServer > 0 {
+						port = client.PortServer
+						break
+					}
+				}
+			}
+		}
 	}
 	var packet net.PacketConn
 	if flow != nil {
@@ -316,7 +515,7 @@ func (r WireIMSRegistrar) inboundConfig(cfg IMSRegistrationConfig, profile voice
 				return &IMSInboundConfig{
 					Network:               networkForPacketAddr(local),
 					LocalAddr:             local.String(),
-					ContactURI:            strings.TrimSpace(contactURI),
+					ContactURI:            effectiveContactURI,
 					UserAgent:             firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
 					PacketConn:            packet,
 					ResponsePacketHandler: flow,
@@ -338,12 +537,72 @@ func (r WireIMSRegistrar) inboundConfig(cfg IMSRegistrationConfig, profile voice
 		// cannot be represented by a separate listener yet.
 		return nil
 	}
-	return &IMSInboundConfig{
-		Network:    network,
-		LocalAddr:  net.JoinHostPort(host, strconv.Itoa(port)),
-		ContactURI: strings.TrimSpace(contactURI),
-		UserAgent:  firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
+	var responseHandler voicehost.SIPResponsePacketHandler
+	if flow != nil {
+		responseHandler = flow
 	}
+	return &IMSInboundConfig{
+		Network:               network,
+		LocalAddr:             net.JoinHostPort(host, strconv.Itoa(port)),
+		ContactURI:            effectiveContactURI,
+		UserAgent:             firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
+		ResponsePacketHandler: responseHandler,
+	}
+}
+
+func sipURIHostLiteral(uri string) string {
+	s := strings.Trim(strings.TrimSpace(uri), "<>")
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "sip:") {
+		s = s[4:]
+	} else if strings.HasPrefix(lower, "sips:") {
+		s = s[5:]
+	} else {
+		return ""
+	}
+	if semi := strings.IndexByte(s, ';'); semi >= 0 {
+		s = s[:semi]
+	}
+	if at := strings.LastIndexByte(s, '@'); at >= 0 {
+		s = s[at+1:]
+	}
+	host := s
+	if strings.HasPrefix(s, "[") {
+		if end := strings.IndexByte(s, ']'); end > 0 {
+			host = s[1:end]
+		}
+	} else if h, _, err := net.SplitHostPort(s); err == nil {
+		host = h
+	}
+	addr, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(host), "[]"))
+	if err != nil {
+		return ""
+	}
+	return addr.Unmap().String()
+}
+
+func sipURIPortNumber(uri string) int {
+	s := strings.Trim(strings.TrimSpace(uri), "<>")
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "sip:") {
+		s = s[4:]
+	} else if strings.HasPrefix(lower, "sips:") {
+		s = s[5:]
+	} else {
+		return 0
+	}
+	if semi := strings.IndexByte(s, ';'); semi >= 0 {
+		s = s[:semi]
+	}
+	if at := strings.LastIndexByte(s, '@'); at >= 0 {
+		s = s[at+1:]
+	}
+	if _, portStr, err := net.SplitHostPort(s); err == nil {
+		if p, pErr := strconv.Atoi(portStr); pErr == nil && p > 0 && p <= 65535 {
+			return p
+		}
+	}
+	return 0
 }
 
 func networkForPacketAddr(addr net.Addr) string {
@@ -483,11 +742,18 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 	if r.Resolver != nil {
 		return r.Resolver
 	}
+	_, _, allLocalIPs := tunnelInnerAddresses(cfg.Tunnel)
+	var extraLocalIPs []string
+	if len(allLocalIPs) > 1 {
+		extraLocalIPs = allLocalIPs
+	}
+	localIP := r.selectLocalInnerIP(cfg)
 	if candidates := runtimePCSCFCandidates(cfg); len(candidates) > 0 {
 		return preparedPCSCFResolver{
 			Candidates: candidates,
 			DNSServers: append([]string(nil), cfg.Tunnel.DNSServers...),
-			LocalIP:    normalizedRuntimeIPHost(cfg.Tunnel.LocalInnerIP),
+			LocalIP:    localIP,
+			LocalIPs:   extraLocalIPs,
 			Timeout:    r.Timeout,
 		}
 	}
@@ -496,7 +762,8 @@ func (r WireIMSRegistrar) resolverForConfig(cfg IMSRegistrationConfig) voiceclie
 	}
 	return voiceclient.NetSIPResolver{
 		DNSServers:        append([]string(nil), cfg.Tunnel.DNSServers...),
-		LocalIP:           normalizedRuntimeIPHost(cfg.Tunnel.LocalInnerIP),
+		LocalIP:           localIP,
+		LocalIPs:          extraLocalIPs,
 		Timeout:           r.Timeout,
 		RequireResolvedIP: true,
 	}
@@ -511,6 +778,7 @@ type preparedPCSCFResolver struct {
 	Candidates []string
 	DNSServers []string
 	LocalIP    string
+	LocalIPs   []string
 	Timeout    time.Duration
 }
 
@@ -529,6 +797,7 @@ func (r preparedPCSCFResolver) ResolveSIPServers(ctx context.Context, network, u
 	resolver := voiceclient.NetSIPResolver{
 		DNSServers:        append([]string(nil), r.DNSServers...),
 		LocalIP:           normalizedRuntimeIPHost(r.LocalIP),
+		LocalIPs:          append([]string(nil), r.LocalIPs...),
 		Timeout:           r.Timeout,
 		RequireResolvedIP: len(r.DNSServers) > 0,
 	}
@@ -865,6 +1134,7 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 		return err
 	}
 	m.mu.Lock()
+	notifyUpdate := false
 	if result.Refreshed {
 		m.registered = true
 		m.statusCode = result.StatusCode
@@ -875,8 +1145,13 @@ func (m *imsRegistrationMaintenance) refresh(ctx context.Context) error {
 		m.authHeader = result.AuthHeader
 		m.authHeaderName = result.AuthHeaderName
 		m.authState = result.AuthState
+		notifyUpdate = true
 	}
+	onUpdate := m.runtimeConfig.OnRegistrationUpdate
 	m.mu.Unlock()
+	if notifyUpdate && onUpdate != nil {
+		onUpdate(m.result("IMS registration refreshed"))
+	}
 	return nil
 }
 
@@ -937,6 +1212,18 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	m.recoveryState.LastSwitchedTarget = switchedTarget
 	session := m.session
 	session.CallID = imsRecoveryCallID(session.CallID, m.recoveryCount)
+	if len(session.SecurityClients) == 0 && strings.TrimSpace(m.binding.SecurityClient) != "" {
+		if prevClients := voiceclient.ParseSecurityAgreements([]string{m.binding.SecurityClient}); len(prevClients) > 0 {
+			preserved := make([]voiceclient.SecurityAgreement, 0, len(prevClients))
+			for _, ag := range prevClients {
+				ag.SPIClient = 0
+				ag.SPIServer = 0
+				ag.Raw = ""
+				preserved = append(preserved, ag)
+			}
+			session.SecurityClients = preserved
+		}
+	}
 	m.mu.Unlock()
 
 	result, err := session.Register(ctx)
@@ -962,6 +1249,22 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 		m.mu.Unlock()
 		return nil
 	}
+	if m.flow != nil && strings.TrimSpace(m.config.ContactHost) == "" {
+		ipv4, ipv6, _ := tunnelInnerAddresses(m.runtimeConfig.Tunnel)
+		if ipv4 != "" && ipv6 != "" {
+			localHost, remoteHost := m.flow.SecurityAssociationAddresses()
+			if matched := matchDualStackLocalIPForTarget(remoteHost, ipv4, ipv6); matched != "" {
+				m.profile.LocalIP = matched
+				session.Profile.LocalIP = matched
+			} else if localHost == ipv4 || localHost == ipv6 {
+				m.profile.LocalIP = localHost
+				session.Profile.LocalIP = localHost
+			}
+		}
+	}
+	if result.Binding.ContactURI != "" {
+		session.ContactURI = result.Binding.ContactURI
+	}
 	m.session = session
 	m.registered = true
 	m.statusCode = result.StatusCode
@@ -973,7 +1276,11 @@ func (m *imsRegistrationMaintenance) recoverRegistration(ctx context.Context, ca
 	m.authHeaderName = result.AuthHeaderName
 	m.authState = result.AuthState
 	m.recordRecoverySuccessLocked()
+	onUpdate := m.runtimeConfig.OnRegistrationUpdate
 	m.mu.Unlock()
+	if onUpdate != nil {
+		onUpdate(m.result("IMS registration recovered"))
+	}
 	return nil
 }
 
@@ -1197,7 +1504,32 @@ func (r WireIMSRegistrar) smsTransport(cfg IMSRegistrationConfig, profile voicec
 		Registration: binding,
 		Domain:       profile.Domain,
 		UserAgent:    firstRuntimeNonEmpty(r.UserAgent, profile.UserAgent),
+		SMSC:         resolveIMSRegistrationSMSC(cfg),
 	}
+}
+
+func resolveIMSRegistrationSMSC(cfg IMSRegistrationConfig) string {
+	if smsc := strings.TrimSpace(cfg.Profile.SMSC); smsc != "" {
+		return smsc
+	}
+	if cfg.Prepared != nil {
+		if smsc := strings.TrimSpace(cfg.Prepared.Profile.SMSC); smsc != "" {
+			return smsc
+		}
+	}
+	if cfg.Access != nil {
+		if reader, ok := cfg.Access.(interface{ GetSMSC() (string, error) }); ok {
+			if smsc, err := reader.GetSMSC(); err == nil && strings.TrimSpace(smsc) != "" {
+				return strings.TrimSpace(smsc)
+			}
+		}
+		if reader, ok := cfg.Access.(interface{ QuerySMSC() (string, error) }); ok {
+			if smsc, err := reader.QuerySMSC(); err == nil && strings.TrimSpace(smsc) != "" {
+				return strings.TrimSpace(smsc)
+			}
+		}
+	}
+	return ""
 }
 
 func (r WireIMSRegistrar) ussdTransport(cfg IMSRegistrationConfig, profile voiceclient.IMSProfile, binding voiceclient.RegistrationBinding, voiceTransport voiceclient.SIPRequestTransport) messaging.USSDTransport {
@@ -1242,7 +1574,7 @@ func (r WireIMSRegistrar) profileFromConfig(cfg IMSRegistrationConfig) (voicecli
 		IMPI:              impi,
 		IMPU:              impu,
 		Domain:            domain,
-		LocalIP:           normalizedRuntimeIPHost(firstRuntimeNonEmpty(r.ContactHost, cfg.Tunnel.LocalInnerIP)),
+		LocalIP:           r.selectLocalInnerIP(cfg),
 		InstanceID:        imsInstanceID(cfg, impi),
 		UserAgent:         firstRuntimeNonEmpty(r.UserAgent, "vowifi-go"),
 		AccessNetworkInfo: accessNetworkInfo,
@@ -1356,11 +1688,14 @@ func cfgMCCMNC(cfg IMSRegistrationConfig) (string, string) {
 			mnc = strings.TrimSpace(cfg.Prepared.EffectiveCarrier.MNC)
 		}
 	}
-	if mcc == "" && len(imsi) >= 3 {
-		mcc = imsi[:3]
-	}
-	if mnc == "" && len(imsi) >= 6 {
-		mnc = imsi[3:6]
+	if mcc == "" || mnc == "" {
+		derivedMCC, derivedMNC := carrier.DerivePLMNFromIMSI(imsi)
+		if mcc == "" {
+			mcc = derivedMCC
+		}
+		if mnc == "" {
+			mnc = derivedMNC
+		}
 	}
 	trimmedMNC := strings.TrimLeft(mnc, "0")
 	if trimmedMNC == "" && mnc != "" {

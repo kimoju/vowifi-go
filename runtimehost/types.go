@@ -18,6 +18,7 @@ import (
 	"github.com/kimoju/vowifi-go/runtimehost/eventhost"
 	"github.com/kimoju/vowifi-go/runtimehost/identity"
 	"github.com/kimoju/vowifi-go/runtimehost/messaging"
+	"github.com/kimoju/vowifi-go/runtimehost/simauth"
 	"github.com/kimoju/vowifi-go/runtimehost/simtransport"
 	"github.com/kimoju/vowifi-go/runtimehost/voiceclient"
 	"github.com/kimoju/vowifi-go/runtimehost/voicehost"
@@ -216,6 +217,64 @@ func (a *modemAccessAdapter) getIMEIOnce() (string, error) {
 		return simtransport.NewAdapter(at).ReadIMEI()
 	}
 	return "", errors.New("modem does not expose IMEI")
+}
+
+func (a *modemAccessAdapter) GetSMSC() (string, error) {
+	if a == nil || a.modem == nil {
+		return "", errors.New("modem is nil")
+	}
+	var errs []error
+	if r, ok := a.modem.(interface{ GetSMSC() (string, error) }); ok {
+		if smsc, err := r.GetSMSC(); err == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc), nil
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("modem GetSMSC: %w", err))
+		}
+	}
+	if r, ok := a.modem.(interface{ QuerySMSC() (string, error) }); ok {
+		if smsc, err := r.QuerySMSC(); err == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc), nil
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("modem QuerySMSC: %w", err))
+		}
+	}
+	if apdu, ok := a.modem.(interface {
+		OpenLogicalChannel(aid string) (int, error)
+		CloseLogicalChannel(channel int) error
+		TransmitAPDU(channel int, hexAPDU string) (string, error)
+	}); ok {
+		if smsc, err := simauth.ReadUSIMSMSC(apdu); err == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc), nil
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("USIM EF_SMSP: %w", err))
+		}
+	}
+	if crsm, ok := a.modem.(CRSMAccess); ok {
+		if smsc, err := identity.ReadUSIMSMSCCRSM(crsm, "7FFF"); err == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc), nil
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("CRSM EF_SMSP: %w", err))
+		}
+	}
+	if at, ok := a.modem.(interface {
+		ExecuteATSilent(cmd string, timeout time.Duration) (string, error)
+	}); ok {
+		adapter := simtransport.NewAdapter(at)
+		if smsc, err := adapter.ReadSMSC(); err == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc), nil
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("AT+CSCA: %w", err))
+		}
+		if smsc, err := identity.ReadUSIMSMSCCRSM(adapter, "7FFF"); err == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc), nil
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("AT+CRSM EF_SMSP: %w", err))
+		}
+	}
+	if len(errs) > 0 {
+		return "", errors.Join(errs...)
+	}
+	return "", errors.New("modem does not expose SMSC")
 }
 
 func (a *modemAccessAdapter) GetISIMIdentity() (identity.Identity, error) {
@@ -500,16 +559,17 @@ type SessionConfig struct {
 }
 
 type IMSRegistrationConfig struct {
-	DeviceID    string
-	TraceID     string
-	Profile     identity.Profile
-	Prepared    *identity.PreparedSession
-	SIM         SIMAdapter
-	Access      ModemAccess
-	NetworkMode string
-	Dataplane   DataplanePolicy
-	Tunnel      swu.TunnelResult
-	Proxy       *ProxyConfig
+	DeviceID             string
+	TraceID              string
+	Profile              identity.Profile
+	Prepared             *identity.PreparedSession
+	SIM                  SIMAdapter
+	Access               ModemAccess
+	NetworkMode          string
+	Dataplane            DataplanePolicy
+	Tunnel               swu.TunnelResult
+	Proxy                *ProxyConfig
+	OnRegistrationUpdate func(IMSRegistrationResult)
 }
 
 type IMSRegistrationResult struct {
@@ -587,6 +647,8 @@ type StartRequest struct {
 	TunnelManagerFactory       TunnelManagerFactory
 	IMSRegistrar               IMSRegistrar
 	VoiceTransport             voiceclient.SIPRequestTransport
+	VoiceClientTransport       voiceclient.SIPRequestTransport
+	VoiceClientContactURI      string
 	VoiceUserAgent             string
 	VoiceSessionExpires        int
 	VoiceMediaRelay            *voicehost.RTPRelayConfig
@@ -600,30 +662,73 @@ type StartRequest struct {
 }
 
 type runtimeVoiceAgentConfig struct {
-	transport      voiceclient.SIPRequestTransport
-	userAgent      string
-	sessionExpires int
-	mediaRelay     *voicehost.RTPRelayConfig
+	deviceID         string
+	transport        voiceclient.SIPRequestTransport
+	clientTransport  voiceclient.SIPRequestTransport
+	clientContactURI string
+	userAgent        string
+	sessionExpires   int
+	mediaRelay       *voicehost.RTPRelayConfig
+	voiceGateway     *voicehost.Gateway
+}
+
+type registrationUpdateBridge struct {
+	mu      sync.Mutex
+	inst    *Instance
+	pending *IMSRegistrationResult
+}
+
+func (b *registrationUpdateBridge) handle(result IMSRegistrationResult) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	inst := b.inst
+	if inst == nil {
+		cp := result
+		b.pending = &cp
+		b.mu.Unlock()
+		return
+	}
+	b.mu.Unlock()
+	inst.applyIMSRegistrationResult(context.Background(), result, firstRuntimeNonEmpty(result.Reason, "IMS registration refreshed"), true)
+}
+
+func (b *registrationUpdateBridge) attach(inst *Instance) {
+	if b == nil || inst == nil {
+		return
+	}
+	b.mu.Lock()
+	b.inst = inst
+	pending := b.pending
+	b.pending = nil
+	b.mu.Unlock()
+	if pending != nil {
+		inst.applyIMSRegistrationResult(context.Background(), *pending, firstRuntimeNonEmpty(pending.Reason, "IMS registration refreshed"), true)
+	}
 }
 
 type Instance struct {
-	mu           sync.RWMutex
-	imsRecoverMu sync.Mutex
-	state        State
-	service      *messaging.Service
-	observers    []Observer
-	dispatch     eventhost.Dispatcher
-	notifier     func(string)
-	smsNotify    func(deviceID, sender, content string, ts time.Time)
-	tunnel       swu.TunnelSession
-	voice        voicehost.Agent
-	voiceConfig  runtimeVoiceAgentConfig
-	imsClose     func(context.Context) error
-	imsRecover   func(context.Context) (IMSRegistrationResult, error)
-	inbound      *runtimeIMSInbound
-	retryCancel  context.CancelFunc
-	retryDone    chan struct{}
-	stopped      bool
+	mu            sync.RWMutex
+	imsRecoverMu  sync.Mutex
+	state         State
+	service       *messaging.Service
+	observers     []Observer
+	dispatch      eventhost.Dispatcher
+	notifier      func(string)
+	smsNotify     func(deviceID, sender, content string, ts time.Time)
+	tunnelManager swu.TunnelManager
+	tunnel        swu.TunnelSession
+	voiceGateway  *voicehost.Gateway
+	voice         voicehost.Agent
+	inboundVoice  *voicehost.IMSInboundAgent
+	voiceConfig   runtimeVoiceAgentConfig
+	imsClose      func(context.Context) error
+	imsRecover    func(context.Context) (IMSRegistrationResult, error)
+	inbound       *runtimeIMSInbound
+	retryCancel   context.CancelFunc
+	retryDone     chan struct{}
+	stopped       bool
 }
 
 type runtimeIMSInbound struct {
@@ -694,18 +799,20 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	imsReady := req.IMSRegistrar == nil
 	imsReason := ""
 	imsResult := IMSRegistrationResult{}
+	regBridge := &registrationUpdateBridge{}
 	if req.IMSRegistrar != nil {
 		imsCfg := IMSRegistrationConfig{
-			DeviceID:    req.DeviceID,
-			TraceID:     req.TraceID,
-			Profile:     req.Profile,
-			Prepared:    req.Prepared,
-			SIM:         req.SIM,
-			Access:      req.Access,
-			NetworkMode: req.NetworkMode,
-			Dataplane:   req.Dataplane,
-			Tunnel:      tunnelResult,
-			Proxy:       req.Proxy,
+			DeviceID:             req.DeviceID,
+			TraceID:              req.TraceID,
+			Profile:              req.Profile,
+			Prepared:             req.Prepared,
+			SIM:                  req.SIM,
+			Access:               req.Access,
+			NetworkMode:          req.NetworkMode,
+			Dataplane:            req.Dataplane,
+			Tunnel:               tunnelResult,
+			Proxy:                req.Proxy,
+			OnRegistrationUpdate: regBridge.handle,
 		}
 		res, err := req.IMSRegistrar.RegisterIMS(ctx, imsCfg)
 		if err != nil {
@@ -752,15 +859,18 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	}
 	voiceConfig := runtimeVoiceAgentConfigFromStart(req)
 	inst := &Instance{
-		state:       state,
-		service:     svc,
-		dispatch:    req.Dispatch,
-		tunnel:      tunnel,
-		voice:       buildRuntimeVoiceAgentWithConfig(voiceConfig, imsResult),
-		voiceConfig: voiceConfig,
-		imsClose:    imsResult.Close,
-		imsRecover:  imsResult.Recover,
+		state:         state,
+		service:       svc,
+		dispatch:      req.Dispatch,
+		tunnelManager: tunnelManager,
+		tunnel:        tunnel,
+		voiceGateway:  req.VoiceGateway,
+		voiceConfig:   voiceConfig,
+		imsClose:      imsResult.Close,
+		imsRecover:    imsResult.Recover,
 	}
+	inst.voice = buildRuntimeVoiceAgentForInstance(voiceConfig, imsResult, inst)
+	inst.inboundVoice = buildRuntimeInboundVoiceAgent(voiceConfig, imsResult, inst)
 	if imsResult.Inbound != nil {
 		inbound, err := startRuntimeIMSInbound(*imsResult.Inbound, inst)
 		if err != nil {
@@ -781,6 +891,7 @@ func Start(ctx context.Context, req StartRequest) (*Instance, error) {
 	if req.VoiceGateway != nil {
 		req.VoiceGateway.RegisterAgent(req.DeviceID, inst)
 	}
+	regBridge.attach(inst)
 	inst.notify(ctx)
 	inst.dispatchRuntimeState(ctx)
 	inst.startIMSMessagingRetryWorker(req.IMSMessagingRetryWorker)
@@ -802,14 +913,22 @@ func buildRuntimeVoiceAgent(req StartRequest, reg IMSRegistrationResult) voiceho
 
 func runtimeVoiceAgentConfigFromStart(req StartRequest) runtimeVoiceAgentConfig {
 	return runtimeVoiceAgentConfig{
-		transport:      req.VoiceTransport,
-		userAgent:      req.VoiceUserAgent,
-		sessionExpires: req.VoiceSessionExpires,
-		mediaRelay:     req.VoiceMediaRelay,
+		deviceID:         strings.TrimSpace(req.DeviceID),
+		transport:        req.VoiceTransport,
+		clientTransport:  req.VoiceClientTransport,
+		clientContactURI: strings.TrimSpace(req.VoiceClientContactURI),
+		userAgent:        req.VoiceUserAgent,
+		sessionExpires:   req.VoiceSessionExpires,
+		mediaRelay:       req.VoiceMediaRelay,
+		voiceGateway:     req.VoiceGateway,
 	}
 }
 
 func buildRuntimeVoiceAgentWithConfig(cfg runtimeVoiceAgentConfig, reg IMSRegistrationResult) voicehost.Agent {
+	return buildRuntimeVoiceAgentForInstance(cfg, reg, nil)
+}
+
+func buildRuntimeVoiceAgentForInstance(cfg runtimeVoiceAgentConfig, reg IMSRegistrationResult, inst *Instance) voicehost.Agent {
 	transport := cfg.transport
 	if transport == nil {
 		transport = reg.VoiceTransport
@@ -828,7 +947,7 @@ func buildRuntimeVoiceAgentWithConfig(cfg runtimeVoiceAgentConfig, reg IMSRegist
 	if strings.TrimSpace(profile.Domain) == "" {
 		profile.Domain = sipDomainRuntime(profile.IMPU)
 	}
-	return &voicehost.IMSOutboundAgent{
+	agent := &voicehost.IMSOutboundAgent{
 		Transport:      transport,
 		Profile:        profile,
 		Registration:   binding,
@@ -836,6 +955,120 @@ func buildRuntimeVoiceAgentWithConfig(cfg runtimeVoiceAgentConfig, reg IMSRegist
 		UserAgent:      firstRuntimeNonEmpty(cfg.userAgent, profile.UserAgent),
 		SessionExpires: cfg.sessionExpires,
 		MediaRelay:     cfg.mediaRelay,
+	}
+	if inst != nil {
+		agent.OnDialogTerminated = func(ctx context.Context, callID string, reason string) {
+			inst.onOutboundVoiceDialogTerminated(ctx, callID, reason)
+		}
+	}
+	return agent
+}
+
+func buildRuntimeInboundVoiceAgent(cfg runtimeVoiceAgentConfig, reg IMSRegistrationResult, inst *Instance) *voicehost.IMSInboundAgent {
+	clientTransport := cfg.clientTransport
+	if clientTransport == nil {
+		clientTransport = voiceclient.WireSIPTransport{}
+	}
+	profile := reg.Profile
+	binding := reg.Binding
+	if strings.TrimSpace(profile.IMPU) == "" {
+		profile.IMPU = strings.TrimSpace(binding.PublicIdentity)
+	}
+	if strings.TrimSpace(profile.Domain) == "" {
+		profile.Domain = sipDomainRuntime(profile.IMPU)
+	}
+	localContact := strings.TrimSpace(binding.ContactURI)
+	if reg.Inbound != nil && strings.TrimSpace(reg.Inbound.ContactURI) != "" {
+		localContact = strings.TrimSpace(reg.Inbound.ContactURI)
+	}
+	agent := &voicehost.IMSInboundAgent{
+		DeviceID:         cfg.deviceID,
+		ClientTransport:  clientTransport,
+		Profile:          profile,
+		Registration:     binding,
+		ClientContactURI: cfg.clientContactURI,
+		LocalContactURI:  localContact,
+		UserAgent:        firstRuntimeNonEmpty(cfg.userAgent, profile.UserAgent),
+		MediaRelay:       cfg.mediaRelay,
+	}
+	if cfg.voiceGateway != nil {
+		gw := cfg.voiceGateway
+		agent.ResolveClientContact = func(deviceID string) (string, error) {
+			contactURI, _, _, err := gw.ClientContact(firstRuntimeNonEmpty(deviceID, cfg.deviceID))
+			return contactURI, err
+		}
+	}
+	if inst != nil {
+		agent.OnDialogEvent = func(ctx context.Context, info voicehost.DialogInfo, callerURI string, calleeURI string, statusCode int, reason string) {
+			inst.onInboundVoiceDialogEvent(ctx, info, callerURI, calleeURI, statusCode, reason)
+		}
+	}
+	return agent
+}
+
+func (i *Instance) inboundVoiceRegistrationWithContact(contactURI string) voiceclient.RegistrationBinding {
+	if i == nil || i.inboundVoice == nil {
+		return voiceclient.RegistrationBinding{ContactURI: strings.TrimSpace(contactURI)}
+	}
+	return voiceclient.RegistrationBinding{
+		PublicIdentity: i.inboundVoice.Registration.PublicIdentity,
+		ContactURI:     strings.TrimSpace(contactURI),
+		ServiceRoutes:  append([]string(nil), i.inboundVoice.Registration.ServiceRoutes...),
+		AssociatedURIs: append([]string(nil), i.inboundVoice.Registration.AssociatedURIs...),
+		Expires:        i.inboundVoice.Registration.Expires,
+	}
+}
+
+func (i *Instance) onOutboundVoiceDialogTerminated(ctx context.Context, callID string, reason string) {
+	if i == nil {
+		return
+	}
+	i.mu.RLock()
+	gw := i.voiceGateway
+	dispatcher := i.dispatch
+	devID := i.state.DeviceID
+	i.mu.RUnlock()
+	if gw != nil {
+		gw.MarkDialogTerminated(callID)
+	}
+	if dispatcher != nil {
+		dispatcher.Dispatch(ctx, eventhost.VoiceCallEvent{
+			DevID:      devID,
+			CallID:     strings.TrimSpace(callID),
+			Direction:  "outbound",
+			State:      string(voicehost.DialogStateTerminated),
+			StatusCode: 200,
+			Reason:     strings.TrimSpace(reason),
+			Time:       time.Now(),
+		})
+	}
+}
+
+func (i *Instance) onInboundVoiceDialogEvent(ctx context.Context, info voicehost.DialogInfo, callerURI string, calleeURI string, statusCode int, reason string) {
+	if i == nil {
+		return
+	}
+	i.mu.RLock()
+	gw := i.voiceGateway
+	dispatcher := i.dispatch
+	devID := firstRuntimeNonEmpty(info.DeviceID, i.state.DeviceID)
+	i.mu.RUnlock()
+	info.DeviceID = devID
+	if gw != nil {
+		gw.RecordDialog(info)
+	}
+	if dispatcher != nil {
+		dispatcher.Dispatch(ctx, eventhost.VoiceCallEvent{
+			DevID:      devID,
+			CallID:     strings.TrimSpace(info.CallID),
+			Direction:  "inbound",
+			State:      string(info.State),
+			Caller:     strings.TrimSpace(callerURI),
+			Callee:     strings.TrimSpace(calleeURI),
+			StatusCode: statusCode,
+			Reason:     strings.TrimSpace(reason),
+			Time:       time.Now(),
+		})
 	}
 }
 
@@ -1005,29 +1238,43 @@ func (i *Instance) Stop(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	i.mu.Lock()
+	tunnelManager := i.tunnelManager
 	tunnel := i.tunnel
 	imsClose := i.imsClose
 	inbound := i.inbound
 	voice := i.voice
+	inboundVoice := i.inboundVoice
+	voiceGateway := i.voiceGateway
+	deviceID := i.state.DeviceID
 	retryCancel := i.retryCancel
 	retryDone := i.retryDone
+	i.tunnelManager = nil
 	i.tunnel = nil
 	i.imsClose = nil
 	i.inbound = nil
+	i.inboundVoice = nil
+	i.voiceGateway = nil
 	i.retryCancel = nil
 	i.retryDone = nil
 	i.stopped = true
 	i.state.Phase = PhaseStopped
 	i.state.TunnelReady = false
+	i.state.IMSReady = false
+	i.state.SMSReady = false
 	i.state.LastReason = "stopped"
 	i.state.UpdatedAt = time.Now()
 	i.mu.Unlock()
+
 	var err error
-	if inbound != nil {
-		err = errors.Join(err, inbound.close(ctx))
+	// 1. Terminate active calls while the SWu tunnel and IMS sockets are still up.
+	if terminator, ok := voice.(interface{ TerminateAllDialogs(context.Context) error }); ok {
+		err = errors.Join(err, terminator.TerminateAllDialogs(ctx))
 	}
 	if stopper, ok := voice.(interface{ StopSessionTimers() }); ok {
 		stopper.StopSessionTimers()
+	}
+	if inboundVoice != nil {
+		err = errors.Join(err, inboundVoice.TerminateAllDialogs(ctx))
 	}
 	if retryCancel != nil {
 		retryCancel()
@@ -1039,11 +1286,27 @@ func (i *Instance) Stop(ctx context.Context) error {
 			}
 		}
 	}
-	if tunnel != nil {
-		err = tunnel.Close(ctx)
-	}
+	// 2. De-register IMS (REGISTER Expires: 0 + XFRM cleanup) while tunnel & inbound socket are still alive.
 	if imsClose != nil {
 		err = errors.Join(err, imsClose(ctx))
+	}
+	// 3. Close inbound SIP sockets.
+	if inbound != nil {
+		err = errors.Join(err, inbound.close(ctx))
+	}
+	// 4. Tear down SWu tunnel.
+	if tunnel != nil {
+		if stopper, ok := tunnelManager.(interface {
+			Stop(context.Context, swu.TunnelSession) error
+		}); ok {
+			err = errors.Join(err, stopper.Stop(ctx, tunnel))
+		} else {
+			err = errors.Join(err, tunnel.Close(ctx))
+		}
+	}
+	// 5. Unregister voice agent from host gateway.
+	if voiceGateway != nil {
+		voiceGateway.UnregisterAgent(deviceID)
 	}
 	i.notify(ctx)
 	i.dispatchRuntimeState(ctx)
@@ -1461,7 +1724,10 @@ func (i *Instance) applyIMSRegistrationResult(ctx context.Context, result IMSReg
 			if updater, ok := i.voice.(voicehost.IMSRegistrationUpdater); ok {
 				updater.UpdateIMSRegistration(update)
 			} else {
-				i.voice = buildRuntimeVoiceAgentWithConfig(i.voiceConfig, result)
+				i.voice = buildRuntimeVoiceAgentForInstance(i.voiceConfig, result, i)
+			}
+			if i.inboundVoice != nil {
+				i.inboundVoice.UpdateIMSRegistration(update)
 			}
 		} else {
 			i.voice = nil
@@ -2003,7 +2269,73 @@ func (i *Instance) SendIMSMessageDeliveryReport(ctx context.Context, report voic
 	return err
 }
 
+func (i *Instance) outboundDialogHandler() voicehost.IMSOutboundDialogHandler {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	handler, _ := i.voice.(voicehost.IMSOutboundDialogHandler)
+	stopped := i.stopped
+	i.mu.RUnlock()
+	if stopped {
+		return nil
+	}
+	return handler
+}
+
+func (i *Instance) HasOutboundDialog(callID string) bool {
+	if h := i.outboundDialogHandler(); h != nil {
+		return h.HasOutboundDialog(callID)
+	}
+	return false
+}
+
+func (i *Instance) HandleOutboundBye(ctx context.Context, req voicehost.IMSByeRequest) (voicehost.IMSByeResult, bool, error) {
+	if h := i.outboundDialogHandler(); h != nil {
+		return h.HandleOutboundBye(ctx, req)
+	}
+	return voicehost.IMSByeResult{}, false, nil
+}
+
+func (i *Instance) HandleOutboundUpdate(ctx context.Context, req voicehost.InboundDialogRequest) (voicehost.InboundCallResult, bool, error) {
+	if h := i.outboundDialogHandler(); h != nil {
+		return h.HandleOutboundUpdate(ctx, req)
+	}
+	return voicehost.InboundCallResult{}, false, nil
+}
+
+func (i *Instance) HandleOutboundReinvite(ctx context.Context, req voicehost.InboundCallRequest) (voicehost.InboundCallResult, bool, error) {
+	if h := i.outboundDialogHandler(); h != nil {
+		return h.HandleOutboundReinvite(ctx, req)
+	}
+	return voicehost.InboundCallResult{}, false, nil
+}
+
+func (i *Instance) AckOutboundReinvite(ctx context.Context, callID string) bool {
+	if h := i.outboundDialogHandler(); h != nil {
+		return h.AckOutboundReinvite(ctx, callID)
+	}
+	return false
+}
+
+func (i *Instance) HandleOutboundNotify(ctx context.Context, req voicehost.InboundDialogRequest) (voicehost.IMSInfoResult, bool, error) {
+	if h := i.outboundDialogHandler(); h != nil {
+		return h.HandleOutboundNotify(ctx, req)
+	}
+	return voicehost.IMSInfoResult{}, false, nil
+}
+
+func (i *Instance) HandleOutboundInfo(ctx context.Context, req voicehost.IMSInfoRequest) (voicehost.IMSInfoResult, bool, error) {
+	if h := i.outboundDialogHandler(); h != nil {
+		return h.HandleOutboundInfo(ctx, req)
+	}
+	return voicehost.IMSInfoResult{}, false, nil
+}
+
 func (i *Instance) HandleIMSInfo(ctx context.Context, req voicehost.IMSInfoRequest) (voicehost.IMSInfoResult, error) {
+	if result, matched, err := i.HandleOutboundInfo(ctx, req); matched {
+		return result, err
+	}
 	svc := i.Service()
 	if svc == nil {
 		return voicehost.IMSInfoResult{Handled: true, StatusCode: 503, Reason: "messaging service is nil"}, errors.New("messaging service is nil")
@@ -2030,6 +2362,9 @@ func (i *Instance) HandleIMSInfo(ctx context.Context, req voicehost.IMSInfoReque
 }
 
 func (i *Instance) HandleIMSBye(ctx context.Context, req voicehost.IMSByeRequest) (voicehost.IMSByeResult, error) {
+	if result, matched, err := i.HandleOutboundBye(ctx, req); matched {
+		return result, err
+	}
 	svc := i.Service()
 	if svc == nil {
 		return voicehost.IMSByeResult{Handled: true, StatusCode: 503, Reason: "messaging service is nil"}, errors.New("messaging service is nil")
@@ -2362,7 +2697,7 @@ func defaultTunnelManagerForStart(req StartRequest) (swu.TunnelManager, error) {
 		SA:                      ikev2.Default3GPPIKEProposal(),
 		ChildSA:                 ikev2.Default3GPPESPProposal(nil),
 	}
-	if strings.TrimSpace(req.Dataplane.Mode) == swu.DataplaneModeKernel {
+	if strings.TrimSpace(req.Dataplane.Mode) == swu.DataplaneModeKernel && !toSWUProxyConfig(req.Proxy).IsActive() {
 		return swu.NewIKEPacketTunnelManager(ikeCfg), nil
 	}
 	return swu.NewTUNIKETunnelManager(
@@ -2392,15 +2727,22 @@ func cloneRuntimeEPDGRouteExclusions(in []swu.EPDGRouteExclusion) []swu.EPDGRout
 }
 
 func buildTunnelConfig(req StartRequest, modem Modem) swu.TunnelConfig {
+	proxyCfg := toSWUProxyConfig(req.Proxy)
+	mode := req.Dataplane.Mode
+	if strings.TrimSpace(mode) == swu.DataplaneModeKernel && proxyCfg.IsActive() &&
+		req.TunnelManager == nil && req.Dataplane.TunnelManager == nil &&
+		req.TunnelManagerFactory == nil && req.Dataplane.TunnelManagerFactory == nil {
+		mode = swu.DataplaneModeUserspace
+	}
 	cfg := swu.TunnelConfig{
 		DeviceID:  strings.TrimSpace(req.DeviceID),
 		TraceID:   strings.TrimSpace(req.TraceID),
-		Mode:      req.Dataplane.Mode,
+		Mode:      mode,
 		IMSI:      strings.TrimSpace(req.Profile.IMSI),
 		MCC:       strings.TrimSpace(req.Profile.MCC),
 		MNC:       strings.TrimSpace(req.Profile.MNC),
 		IMEI:      strings.TrimSpace(req.Profile.IMEI),
-		Proxy:     toSWUProxyConfig(req.Proxy),
+		Proxy:     proxyCfg,
 		StartedAt: time.Now(),
 	}
 	if req.Prepared != nil {

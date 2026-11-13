@@ -37,10 +37,12 @@ type HeaderPair struct {
 }
 
 type HTTPRequest struct {
+	Context context.Context
 	Method  string
 	URL     string
 	Headers []HeaderPair
 	Body    []byte
+	Proxy   *ProxyConfig
 }
 
 type HTTPResponse struct {
@@ -55,10 +57,11 @@ type HTTPClient interface {
 
 type defaultHTTPClient struct {
 	client *http.Client
+	proxy  *ProxyConfig
 }
 
 func NewDefaultHTTPClient() HTTPClient {
-	return defaultHTTPClient{client: http.DefaultClient}
+	return defaultHTTPClient{client: newStandardHTTPClient(nil, defaultE911HTTPTimeout)}
 }
 
 func (c defaultHTTPClient) Do(req *HTTPRequest) (*HTTPResponse, error) {
@@ -69,7 +72,11 @@ func (c defaultHTTPClient) Do(req *HTTPRequest) (*HTTPResponse, error) {
 	if method == "" {
 		method = http.MethodGet
 	}
-	hreq, err := http.NewRequest(method, req.URL, bytes.NewReader(req.Body))
+	reqCtx := req.Context
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+	hreq, err := http.NewRequestWithContext(reqCtx, method, req.URL, bytes.NewReader(req.Body))
 	if err != nil {
 		return nil, err
 	}
@@ -77,15 +84,20 @@ func (c defaultHTTPClient) Do(req *HTTPRequest) (*HTTPResponse, error) {
 		hreq.Header.Add(h.Key, h.Value)
 	}
 	client := c.client
-	if client == nil {
-		client = http.DefaultClient
+	if req.Proxy.IsActive() && !c.proxy.IsActive() {
+		client = newStandardHTTPClient(req.Proxy, defaultE911HTTPTimeout)
+	} else if client == nil {
+		client = newStandardHTTPClient(c.proxy, defaultE911HTTPTimeout)
 	}
 	resp, err := client.Do(hreq)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxE911ResponseBodyBytes))
+	if err != nil {
+		return nil, err
+	}
 	return &HTTPResponse{StatusCode: resp.StatusCode, Headers: responseHeaderPairs(resp.Header), Body: body}, nil
 }
 
@@ -111,6 +123,7 @@ type Request struct {
 	AKAProvider         sim.AKAProvider
 	EAPReauthentication swu.EAPReauthenticationState
 	Client              HTTPClient
+	Proxy               *ProxyConfig
 	Trace               TraceSink
 	Random              io.Reader
 }
@@ -260,7 +273,11 @@ func StartEmergencyAddressUpdate(ctx context.Context, req Request) (WebsheetRequ
 func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req Request) (WebsheetRequest, error) {
 	client := req.Client
 	if client == nil {
-		client = NewDefaultHTTPClient()
+		if req.Proxy.IsActive() {
+			client = NewHTTPClientWithProxy(req.Proxy)
+		} else {
+			client = NewDefaultHTTPClient()
+		}
 	}
 	requestBody := map[string]any{
 		"message-id":      1,
@@ -282,10 +299,12 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 		return WebsheetRequest{}, err
 	}
 	resp, err := doEntitlementWithHTTPDigest(ctx, client, req.Trace, &HTTPRequest{
+		Context: ctx,
 		Method:  "POST",
 		URL:     endpoint,
 		Headers: entitlementHeaders(req),
 		Body:    payload,
+		Proxy:   cloneE911ProxyConfig(req.Proxy),
 	}, req)
 	if err != nil {
 		return WebsheetRequest{}, err
@@ -333,10 +352,12 @@ func startTS43EmergencyAddressUpdate(ctx context.Context, endpoint string, req R
 			return WebsheetRequest{}, err
 		}
 		resp, err = doEntitlementWithHTTPDigest(ctx, client, req.Trace, &HTTPRequest{
+			Context: ctx,
 			Method:  "POST",
 			URL:     endpoint,
 			Headers: entitlementHeaders(req),
 			Body:    answer,
+			Proxy:   cloneE911ProxyConfig(req.Proxy),
 		}, req)
 		if err != nil {
 			return WebsheetRequest{}, err
@@ -509,8 +530,16 @@ func fallbackWebsheetRequest(req Request) WebsheetRequest {
 }
 
 func doEntitlement(ctx context.Context, client HTTPClient, trace TraceSink, req *HTTPRequest) (*HTTPResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if req != nil && req.Context == nil {
+		copied := *req
+		copied.Context = ctx
+		req = &copied
 	}
 	if trace != nil {
 		trace.Request(req)

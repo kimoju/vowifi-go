@@ -39,11 +39,12 @@ const (
 )
 
 type Profile struct {
-	IMSI string
-	MCC  string
-	MNC  string
-	IMEI string
-	SMSC string
+	IMSI      string
+	MCC       string
+	MNC       string
+	IMEI      string
+	SMSC      string
+	MNCLength int
 }
 
 type Identity struct {
@@ -95,6 +96,7 @@ type PreparedSession struct {
 type PrepareStartInput struct {
 	DeviceID            string
 	Profile             Profile
+	EFAD                []byte
 	RuntimeEPDGOverride string
 	Access              interface {
 		GetISIMIdentity() (Identity, error)
@@ -102,12 +104,19 @@ type PrepareStartInput struct {
 }
 
 func NormalizeProfile(p Profile) Profile {
+	return NormalizeProfileWithAD(p, nil)
+}
+
+func NormalizeProfileWithAD(p Profile, efAD []byte) Profile {
 	p.IMSI = strings.TrimSpace(p.IMSI)
 	p.MCC = normalizeMCC(p.MCC)
 	p.MNC = normalizeProfileMNC(p.MNC)
 	p.IMEI = strings.TrimSpace(p.IMEI)
 	p.SMSC = strings.TrimSpace(p.SMSC)
-	imsiMCC, imsiMNC := plmnFromIMSI(p.IMSI)
+	if len(efAD) == 0 && (p.MNCLength == 2 || p.MNCLength == 3) {
+		efAD = []byte{0x00, 0x00, 0x00, byte(p.MNCLength)}
+	}
+	imsiMCC, imsiMNC := plmnFromIMSIWithAD(p.IMSI, efAD)
 	if p.MCC == "" {
 		p.MCC = imsiMCC
 	}
@@ -118,7 +127,16 @@ func NormalizeProfile(p Profile) Profile {
 }
 
 func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
-	profile, fallbacks, err := prepareProfile(in.Profile)
+	efAD := in.EFAD
+	if len(efAD) == 0 && (in.Profile.MNCLength == 2 || in.Profile.MNCLength == 3) {
+		efAD = []byte{0x00, 0x00, 0x00, byte(in.Profile.MNCLength)}
+	}
+	if len(efAD) == 0 && strings.TrimSpace(in.Profile.MNC) == "" {
+		if ad, err := accessEFAD(in.Access); err == nil && len(ad) > 0 {
+			efAD = ad
+		}
+	}
+	profile, fallbacks, err := prepareProfileWithAD(in.Profile, efAD)
 	if err != nil {
 		return PreparedSession{}, err
 	}
@@ -126,6 +144,7 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 		IMSI: profile.IMSI,
 		MCC:  profile.MCC,
 		MNC:  profile.MNC,
+		EFAD: efAD,
 	})
 	policy := carrier.CarrierPolicyForConfig(profile.IMSI, effectiveCfg)
 	if effectiveCfg.MCC != "" {
@@ -133,6 +152,11 @@ func PrepareStart(in PrepareStartInput) (PreparedSession, error) {
 	}
 	if effectiveCfg.MNC != "" && len(profile.MNC) != 2 {
 		profile.MNC = effectiveCfg.MNC
+	}
+	if profile.SMSC == "" {
+		if smsc := accessSMSC(in.Access); smsc != "" {
+			profile.SMSC = smsc
+		}
 	}
 	imeiSource := IMEISourceProfile
 	modemIMEIErr := error(nil)
@@ -257,6 +281,61 @@ func accessIMEI(access interface{}) (string, bool, error) {
 	return "", true, errors.New("modem IMEI is empty or invalid")
 }
 
+func accessEFAD(access interface{}) ([]byte, error) {
+	if access == nil {
+		return nil, nil
+	}
+	reader, ok := access.(interface{ GetEFAD() ([]byte, error) })
+	if !ok {
+		return nil, nil
+	}
+	return reader.GetEFAD()
+}
+
+func accessSMSC(access interface{}) string {
+	if access == nil {
+		return ""
+	}
+	if reader, ok := access.(interface{ GetSMSC() (string, error) }); ok {
+		if smsc, err := reader.GetSMSC(); err == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc)
+		}
+	}
+	if reader, ok := access.(interface{ QuerySMSC() (string, error) }); ok {
+		if smsc, err := reader.QuerySMSC(); err == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc)
+		}
+	}
+	return ""
+}
+
+// ReadUSIMSMSCCRSM reads the SMSC address from USIM EF_SMSP (0x6F42) via AT+CRSM.
+func ReadUSIMSMSCCRSM(access interface {
+	ReadCRSMRecord(fileID uint16, record, length int, pathID string) (simtransport.CRSMResult, error)
+}, pathID string) (string, error) {
+	if access == nil {
+		return "", errors.New("nil USIM CRSM access")
+	}
+	records, resp, err := readCRSMLinearFixedEF(access, 0x6F42, pathID, 4)
+	if err != nil {
+		return "", classifyCRSMEFReadError("CRSM read EF_SMSP", resp, err)
+	}
+	var errs []error
+	for _, rec := range records {
+		smsc, decErr := simauth.DecodeUSIMSMSP(rec)
+		if decErr == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc), nil
+		}
+		if decErr != nil {
+			errs = append(errs, decErr)
+		}
+	}
+	if len(errs) > 0 {
+		return "", errors.Join(errs...)
+	}
+	return "", errors.New("EF_SMSP has no valid SMSC record")
+}
+
 func ExtractIMEI(value string) string {
 	var digits []byte
 	for i := 0; i < len(value); i++ {
@@ -304,12 +383,17 @@ func ValidateIMSIdentityDomain(domain string, network carrier.NetworkConfig, mcc
 }
 
 func prepareProfile(p Profile) (Profile, []FallbackMetadata, error) {
+	return prepareProfileWithAD(p, nil)
+}
+
+func prepareProfileWithAD(p Profile, efAD []byte) (Profile, []FallbackMetadata, error) {
 	profile := Profile{
-		IMSI: strings.TrimSpace(p.IMSI),
-		MCC:  strings.TrimSpace(p.MCC),
-		MNC:  strings.TrimSpace(p.MNC),
-		IMEI: strings.TrimSpace(p.IMEI),
-		SMSC: strings.TrimSpace(p.SMSC),
+		IMSI:      strings.TrimSpace(p.IMSI),
+		MCC:       strings.TrimSpace(p.MCC),
+		MNC:       strings.TrimSpace(p.MNC),
+		IMEI:      strings.TrimSpace(p.IMEI),
+		SMSC:      strings.TrimSpace(p.SMSC),
+		MNCLength: p.MNCLength,
 	}
 	if profile.IMSI == "" {
 		return Profile{}, nil, errors.New("IMSI is empty")
@@ -320,7 +404,7 @@ func prepareProfile(p Profile) (Profile, []FallbackMetadata, error) {
 		return Profile{}, nil, fmt.Errorf("invalid IMSI %q: must be 5-15 decimal digits", profile.IMSI)
 	}
 
-	imsiMCC, imsiMNC := plmnFromIMSI(profile.IMSI)
+	imsiMCC, imsiMNC := plmnFromIMSIWithAD(profile.IMSI, efAD)
 	var fallbacks []FallbackMetadata
 	if mcc := normalizeMCC(profile.MCC); mcc != "" {
 		profile.MCC = mcc
@@ -390,19 +474,15 @@ func normalizeIdentityDomain(domain string) string {
 }
 
 func plmnFromIMSI(imsi string) (string, string) {
-	imsi = normalizeIMSI(imsi)
-	if imsi == "" {
+	return plmnFromIMSIWithAD(imsi, nil)
+}
+
+func plmnFromIMSIWithAD(imsi string, efAD []byte) (string, string) {
+	mcc, rawMNC := carrier.DerivePLMNFromIMSIWithAD(imsi, efAD)
+	if mcc == "" || rawMNC == "" {
 		return "", ""
 	}
-	mcc := normalizeMCC(imsi[:3])
-	mnc := ""
-	switch {
-	case len(imsi) >= 6:
-		mnc = normalizeMNC(imsi[3:6])
-	case len(imsi) >= 5:
-		mnc = normalizeMNC(imsi[3:5])
-	}
-	return mcc, mnc
+	return mcc, normalizeProfileMNC(rawMNC)
 }
 
 func isDecimalString(value string) bool {
@@ -530,6 +610,9 @@ func ReadISIMIdentity(access interface {
 	if access == nil {
 		return Identity{}, errors.New("nil ISIM access")
 	}
+	unlock := simauth.LockLogicalChannel(access)
+	defer unlock()
+
 	channel, _, _, err := simauth.OpenLogicalChannelWithAIDFallback(access, "isim", simauth.ISIMAIDPrefix, simauth.ISIMAIDPrefix)
 	if err != nil {
 		return Identity{}, err
@@ -632,12 +715,13 @@ func readCRSMTransparentEF(access interface {
 	if err != nil {
 		return nil, resp, err
 	}
-	if !resp.Success() {
+	raw, decodeErr := decodeCRSMHex(resp.Data)
+	eofWithData := resp.SW1 == 0x62 && resp.SW2 == 0x82 && decodeErr == nil && len(raw) > 0
+	if !resp.Success() && !eofWithData {
 		return nil, resp, fmt.Errorf("READ BINARY %04X failed: SW=%s", fid, resp.StatusString())
 	}
-	raw, err := decodeCRSMHex(resp.Data)
-	if err != nil {
-		return nil, resp, err
+	if decodeErr != nil {
+		return nil, resp, decodeErr
 	}
 	return raw, resp, nil
 }

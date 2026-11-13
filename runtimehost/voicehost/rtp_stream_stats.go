@@ -152,6 +152,11 @@ func (s RTPStreamStats) Diagnose(cfg RTPStreamDiagnosisConfig) RTPStreamDiagnosi
 	return diagnosis
 }
 
+const (
+	maxRTPTrackedStreams = 64
+	maxRTPSeenSequences  = 4096
+)
+
 // ObserveRTPPacket parses one RTP packet and updates the matching SSRC stream.
 func (t *RTPStreamStatsTracker) ObserveRTPPacket(packet []byte, arrival time.Time, clockRate int) (RTPStreamStats, error) {
 	if clockRate <= 0 {
@@ -166,6 +171,18 @@ func (t *RTPStreamStatsTracker) ObserveRTPPacket(packet []byte, arrival time.Tim
 	}
 	state := t.streams[header.SSRC]
 	if state == nil {
+		if len(t.streams) >= maxRTPTrackedStreams {
+			var evictSSRC uint32
+			first := true
+			for ssrc := range t.streams {
+				if first || ssrc < evictSSRC {
+					evictSSRC = ssrc
+					first = false
+				}
+			}
+			delete(t.streams, evictSSRC)
+			delete(t.senderReports, evictSSRC)
+		}
 		state = newRTPStreamStatsState(header, arrival)
 		if senderReport, ok := t.senderReports[header.SSRC]; ok {
 			state.senderReport = senderReport
@@ -401,6 +418,8 @@ type rtpStreamStatsState struct {
 	baseSeq       uint32
 	maxSeq        uint32
 	seenSequences map[uint32]struct{}
+	seenRing      []uint32
+	seenWrite     int
 	baseArrival   time.Time
 	baseTimestamp uint64
 	lastTimestamp uint64
@@ -427,6 +446,7 @@ func newRTPStreamStatsState(header rtpPacketHeader, arrival time.Time) *rtpStrea
 		baseSeq:       seq,
 		maxSeq:        seq,
 		seenSequences: map[uint32]struct{}{seq: {}},
+		seenRing:      []uint32{seq},
 		baseArrival:   arrival,
 		baseTimestamp: uint64(header.Timestamp),
 		lastTimestamp: uint64(header.Timestamp),
@@ -439,6 +459,20 @@ func (s *rtpStreamStatsState) observe(header rtpPacketHeader, arrival time.Time,
 	if _, ok := s.seenSequences[seq]; ok {
 		s.stats.DuplicatePackets++
 		return
+	}
+	if len(s.seenRing) >= maxRTPSeenSequences && s.maxSeq > seq && s.maxSeq-seq >= maxRTPSeenSequences {
+		// Packet falls behind the bounded deduplication window; count as duplicate
+		// rather than growing memory unboundedly or over-counting unique packets.
+		s.stats.DuplicatePackets++
+		return
+	}
+	if len(s.seenRing) < maxRTPSeenSequences {
+		s.seenRing = append(s.seenRing, seq)
+	} else {
+		evicted := s.seenRing[s.seenWrite]
+		delete(s.seenSequences, evicted)
+		s.seenRing[s.seenWrite] = seq
+		s.seenWrite = (s.seenWrite + 1) % maxRTPSeenSequences
 	}
 	s.seenSequences[seq] = struct{}{}
 	s.stats.Packets++

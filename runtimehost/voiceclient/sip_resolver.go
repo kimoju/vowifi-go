@@ -46,6 +46,7 @@ type NetSIPResolver struct {
 	Resolver          *net.Resolver
 	DNSServers        []string
 	LocalIP           string
+	LocalIPs          []string
 	Timeout           time.Duration
 	RequireResolvedIP bool
 }
@@ -71,7 +72,7 @@ func (r NetSIPResolver) ResolveSIPServers(ctx context.Context, network, uri stri
 	}
 	resolver := r.Resolver
 	if resolver == nil {
-		resolver = DNSResolverForServersFromLocal(r.DNSServers, r.LocalIP, r.Timeout)
+		resolver = DNSResolverForServersFromLocalIPs(r.DNSServers, r.LocalIP, r.LocalIPs, r.Timeout)
 	}
 	service := "sip"
 	if endpoint.Secure {
@@ -120,11 +121,15 @@ func DNSResolverForServers(servers []string, timeout time.Duration) *net.Resolve
 }
 
 func DNSResolverForServersFromLocal(servers []string, localIP string, timeout time.Duration) *net.Resolver {
+	return DNSResolverForServersFromLocalIPs(servers, localIP, nil, timeout)
+}
+
+func DNSResolverForServersFromLocalIPs(servers []string, localIP string, localIPs []string, timeout time.Duration) *net.Resolver {
 	addrs := normalizeDNSServerAddrs(servers)
 	if len(addrs) == 0 {
 		return net.DefaultResolver
 	}
-	localIP = normalizedDNSLocalIP(localIP)
+	candidates := normalizedDNSLocalIPCandidates(localIP, localIPs)
 	var next uint64
 	return &net.Resolver{
 		PreferGo: true,
@@ -139,9 +144,9 @@ func DNSResolverForServersFromLocal(servers []string, localIP string, timeout ti
 			var lastErr error
 			for i := 0; i < len(addrs); i++ {
 				addr := addrs[(start+i)%len(addrs)]
-				localAddr, compatible := dnsResolverLocalAddr(network, localIP, addr)
+				localAddr, compatible := dnsResolverLocalAddrFromCandidates(network, candidates, addr)
 				if !compatible {
-					lastErr = fmt.Errorf("DNS server %s address family does not match local IP %s", addr, localIP)
+					lastErr = fmt.Errorf("DNS server %s address family does not match local IP %s", addr, strings.Join(candidates, ","))
 					continue
 				}
 				dialer := net.Dialer{LocalAddr: localAddr}
@@ -157,6 +162,39 @@ func DNSResolverForServersFromLocal(servers []string, localIP string, timeout ti
 			return nil, errSIPDNSResolverEmpty()
 		},
 	}
+}
+
+func normalizedDNSLocalIPCandidates(primary string, extra []string) []string {
+	var out []string
+	add := func(raw string) {
+		v := normalizedDNSLocalIP(raw)
+		if v == "" {
+			return
+		}
+		for _, existing := range out {
+			if existing == v {
+				return
+			}
+		}
+		out = append(out, v)
+	}
+	add(primary)
+	for _, item := range extra {
+		add(item)
+	}
+	return out
+}
+
+func dnsResolverLocalAddrFromCandidates(network string, candidates []string, serverAddr string) (net.Addr, bool) {
+	if len(candidates) == 0 {
+		return nil, true
+	}
+	for _, candidate := range candidates {
+		if addr, ok := dnsResolverLocalAddr(network, candidate, serverAddr); ok {
+			return addr, true
+		}
+	}
+	return nil, false
 }
 
 func normalizedDNSLocalIP(value string) string {

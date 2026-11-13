@@ -92,10 +92,15 @@ func (p *AKAProvider) CalculateAKAWithPreference(rand16, autn16 []byte, preferen
 	}
 	switch pref {
 	case AKAAppPreferenceAuto, AKAAppPreferenceISIM, AKAAppPreferenceISIMStrict:
-		if res, err := p.calculateAKAOnApp("isim", ISIMAIDPrefix, ISIMAIDPrefix, rand16, autn16); err == nil {
+		res, err := p.calculateAKAOnApp("isim", ISIMAIDPrefix, ISIMAIDPrefix, rand16, autn16)
+		if err == nil {
 			return res, nil
-		} else if pref == AKAAppPreferenceISIMStrict {
-			return AKAResult{}, err
+		}
+		if errors.Is(err, swusim.ErrSyncFailure) || len(res.AUTS) > 0 {
+			return akaResultWithSyncFailureAUTS(res, err), err
+		}
+		if pref == AKAAppPreferenceISIMStrict || errors.Is(err, swusim.ErrAuthFailure) {
+			return res, err
 		}
 		return p.calculateAKAOnApp("usim", USIMAIDPrefix, USIMAIDPrefix, rand16, autn16)
 	default:
@@ -104,6 +109,9 @@ func (p *AKAProvider) CalculateAKAWithPreference(rand16, autn16 []byte, preferen
 }
 
 func (p *AKAProvider) calculateAKAOnApp(app, fallbackAID, expectedPrefix string, rand16, autn16 []byte) (AKAResult, error) {
+	unlock := LockLogicalChannel(p.Transport)
+	defer unlock()
+
 	ch, _, _, err := OpenLogicalChannelWithAIDFallback(p.Transport, app, fallbackAID, expectedPrefix)
 	if err != nil {
 		return AKAResult{}, err

@@ -121,6 +121,7 @@ type SubscriberProfileInput struct {
 	IMSI string
 	MCC  string
 	MNC  string
+	EFAD []byte
 }
 
 type SubscriberProfile struct {
@@ -138,6 +139,7 @@ type IMSAccessProfileInput struct {
 	IMSI string
 	MCC  string
 	MNC  string
+	EFAD []byte
 }
 
 type IMSAccessProfile struct {
@@ -165,6 +167,7 @@ type CarrierPolicyInput struct {
 	IMSI string
 	MCC  string
 	MNC  string
+	EFAD []byte
 }
 
 type CarrierPolicy struct {
@@ -180,6 +183,7 @@ type IMSRegistrationPlanInput struct {
 	IMSI        string
 	MCC         string
 	MNC         string
+	EFAD        []byte
 	LocalIP     string
 	ContactHost string
 	ContactPort int
@@ -226,11 +230,12 @@ type IMSIdentityDomainCandidate struct {
 }
 
 type EffectiveCarrierConfig struct {
-	MCC      string        `json:"mcc"`
-	MNC      string        `json:"mnc"`
-	PresetID string        `json:"preset_id"`
-	E911     E911Config    `json:"e911"`
-	Network  NetworkConfig `json:"network"`
+	MCC       string        `json:"mcc"`
+	MNC       string        `json:"mnc"`
+	PresetID  string        `json:"preset_id"`
+	E911      E911Config    `json:"e911"`
+	Network   NetworkConfig `json:"network"`
+	mncDigits int
 }
 
 func (cfg *EffectiveCarrierConfig) UnmarshalJSON(data []byte) error {
@@ -253,11 +258,12 @@ func (cfg *EffectiveCarrierConfig) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*cfg = EffectiveCarrierConfig{
-		MCC:      raw.MCC,
-		MNC:      raw.MNC,
-		PresetID: raw.PresetID,
-		E911:     raw.E911,
-		Network:  mergeNetworkAliasConfig(raw.Network, aliasNetwork),
+		MCC:       raw.MCC,
+		MNC:       raw.MNC,
+		PresetID:  raw.PresetID,
+		E911:      raw.E911,
+		Network:   mergeNetworkAliasConfig(raw.Network, aliasNetwork),
+		mncDigits: rawMNCDigits(raw.MNC),
 	}
 	return nil
 }
@@ -266,6 +272,7 @@ type EffectiveCarrierConfigInput struct {
 	IMSI string
 	MCC  string
 	MNC  string
+	EFAD []byte
 }
 
 type LoadResult struct {
@@ -281,9 +288,10 @@ var (
 
 var builtinCarriers = map[string]EffectiveCarrierConfig{
 	"310280": {
-		MCC:      "310",
-		MNC:      "280",
-		PresetID: "310280",
+		MCC:       "310",
+		MNC:       "280",
+		PresetID:  "310280",
+		mncDigits: 3,
 		E911: E911Config{
 			Enabled:             true,
 			Provider:            "att-ts43",
@@ -292,9 +300,10 @@ var builtinCarriers = map[string]EffectiveCarrierConfig{
 		},
 	},
 	"310410": {
-		MCC:      "310",
-		MNC:      "410",
-		PresetID: "310410",
+		MCC:       "310",
+		MNC:       "410",
+		PresetID:  "310410",
+		mncDigits: 3,
 		E911: E911Config{
 			Enabled:             true,
 			Provider:            "att-ts43",
@@ -325,6 +334,9 @@ func LoadCarrierOverrides(path string) (LoadResult, error) {
 		}
 		decoded = make(map[string]EffectiveCarrierConfig, len(list))
 		for _, cfg := range list {
+			if cfg.mncDigits == 0 {
+				cfg.mncDigits = rawMNCDigits(cfg.MNC)
+			}
 			if key := presetKey(cfg.MCC, cfg.MNC); key != "" {
 				decoded[key] = normalizeConfig(cfg)
 			}
@@ -333,9 +345,16 @@ func LoadCarrierOverrides(path string) (LoadResult, error) {
 	next := make(map[string]EffectiveCarrierConfig, len(decoded))
 	count := 0
 	for key, cfg := range decoded {
+		if cfg.mncDigits == 0 {
+			cfg.mncDigits = rawMNCDigits(cfg.MNC)
+		}
 		cfg = normalizeConfig(cfg)
 		if cfg.MCC == "" || cfg.MNC == "" {
-			cfg.MCC, cfg.MNC = splitPresetKey(key)
+			keyMCC, keyMNC := splitPresetKey(key)
+			if cfg.mncDigits == 0 {
+				cfg.mncDigits = rawMNCDigits(keyMNC)
+			}
+			cfg.MCC, cfg.MNC = keyMCC, keyMNC
 			cfg = normalizeConfig(cfg)
 		}
 		if storeCarrierOverride(next, key, cfg) {
@@ -361,6 +380,7 @@ func ResolveEffectiveCarrierConfig(in EffectiveCarrierConfigInput) EffectiveCarr
 		IMSI: in.IMSI,
 		MCC:  in.MCC,
 		MNC:  in.MNC,
+		EFAD: in.EFAD,
 	})
 	mcc := profile.MCC
 	mnc := profile.MNC
@@ -389,15 +409,13 @@ func NormalizeSubscriberProfile(in SubscriberProfileInput) SubscriberProfile {
 	imsi := strings.TrimSpace(in.IMSI)
 	mcc := normalizeMCC(in.MCC)
 	mnc := normalizeMNC(in.MNC)
-	if isDecimalString(imsi) && mcc == "" && len(imsi) >= 3 {
-		mcc = normalizeMCC(imsi[:3])
-	}
-	if isDecimalString(imsi) && mnc == "" {
-		switch {
-		case len(imsi) >= 6:
-			mnc = normalizeMNC(imsi[3:6])
-		case len(imsi) >= 5:
-			mnc = normalizeMNC(imsi[3:5])
+	if isDecimalString(imsi) && (mcc == "" || mnc == "") {
+		derivedMCC, derivedMNC := DerivePLMNFromIMSIWithAD(imsi, in.EFAD)
+		if mcc == "" {
+			mcc = normalizeMCC(derivedMCC)
+		}
+		if mnc == "" {
+			mnc = normalizeMNC(derivedMNC)
 		}
 	}
 	network := normalizeNetworkConfig(mcc, mnc, NetworkConfig{})
@@ -418,6 +436,7 @@ func IMSAccessProfileForSubscriber(in IMSAccessProfileInput) IMSAccessProfile {
 		IMSI: in.IMSI,
 		MCC:  in.MCC,
 		MNC:  in.MNC,
+		EFAD: in.EFAD,
 	})
 	return imsAccessProfileForConfig(in.IMSI, cfg)
 }
@@ -427,6 +446,7 @@ func CarrierPolicyForSubscriber(in CarrierPolicyInput) CarrierPolicy {
 		IMSI: in.IMSI,
 		MCC:  in.MCC,
 		MNC:  in.MNC,
+		EFAD: in.EFAD,
 	})
 	return CarrierPolicyForConfig(in.IMSI, cfg)
 }
@@ -448,6 +468,7 @@ func PlanIMSRegistration(in IMSRegistrationPlanInput) IMSRegistrationPlan {
 		IMSI: in.IMSI,
 		MCC:  in.MCC,
 		MNC:  in.MNC,
+		EFAD: in.EFAD,
 	})
 	return PlanIMSRegistrationForPolicy(policy, in)
 }
@@ -1152,6 +1173,118 @@ func normalizeIMSI(imsi string) string {
 		return ""
 	}
 	return imsi
+}
+
+func rawMNCDigits(mnc string) int {
+	mnc = strings.TrimSpace(mnc)
+	if !isDecimalString(mnc) {
+		return 0
+	}
+	if len(mnc) == 2 || len(mnc) == 3 {
+		return len(mnc)
+	}
+	return 0
+}
+
+// MNCLengthFromEFAD extracts the MNC length (2 or 3) from USIM EF_AD byte 4.
+func MNCLengthFromEFAD(efAD []byte) (int, bool) {
+	if len(efAD) < 4 {
+		return 0, false
+	}
+	mncLen := int(efAD[3] & 0x0F)
+	if mncLen != 2 && mncLen != 3 {
+		return 0, false
+	}
+	return mncLen, true
+}
+
+// DerivePLMNFromIMSI derives the native MCC and unpadded MNC (2 or 3 digits)
+// from an IMSI using known carrier table entries and ITU-T E.212 MCC rules.
+func DerivePLMNFromIMSI(imsi string) (string, string) {
+	return DerivePLMNFromIMSIWithAD(imsi, nil)
+}
+
+// DerivePLMNFromIMSIWithAD derives the native MCC and unpadded MNC (2 or 3 digits)
+// from an IMSI, preferring USIM EF_AD byte 4 when valid, then known carrier
+// overrides/presets, and defaulting to 2-digit MNC unless a 3-digit MCC matches.
+func DerivePLMNFromIMSIWithAD(imsi string, efAD []byte) (string, string) {
+	imsi = normalizeIMSI(imsi)
+	if imsi == "" {
+		return "", ""
+	}
+	mcc := imsi[:3]
+	if mncLen, ok := MNCLengthFromEFAD(efAD); ok && len(imsi) >= 3+mncLen {
+		return mcc, imsi[3 : 3+mncLen]
+	}
+	if len(imsi) == 5 {
+		return mcc, imsi[3:5]
+	}
+	mnc2 := imsi[3:5]
+	mnc3 := imsi[3:6]
+	if knownMNC, ok := lookupKnownCarrierMNC(mcc, mnc2, mnc3); ok {
+		return mcc, knownMNC
+	}
+	if isDefaultThreeDigitMNCMCC(mcc) {
+		return mcc, mnc3
+	}
+	return mcc, mnc2
+}
+
+func lookupKnownCarrierMNC(mcc, mnc2, mnc3 string) (string, bool) {
+	key2 := presetKey(mcc, mnc2)
+	key3 := mcc + mnc3
+
+	overridesMu.RLock()
+	cfg2, ok2 := overrides[key2]
+	cfg3, ok3 := overrides[key3]
+	overridesMu.RUnlock()
+
+	if mnc, ok := selectKnownCarrierMNC(mnc2, mnc3, key2, key3, cfg2, ok2, cfg3, ok3); ok {
+		return mnc, true
+	}
+
+	bcfg2, bok2 := builtinCarriers[key2]
+	bcfg3, bok3 := builtinCarriers[key3]
+	return selectKnownCarrierMNC(mnc2, mnc3, key2, key3, bcfg2, bok2, bcfg3, bok3)
+}
+
+func selectKnownCarrierMNC(
+	mnc2, mnc3, key2, key3 string,
+	cfg2 EffectiveCarrierConfig, ok2 bool,
+	cfg3 EffectiveCarrierConfig, ok3 bool,
+) (string, bool) {
+	if ok2 && cfg2.mncDigits == 2 {
+		return mnc2, true
+	}
+	if ok3 && key3 != key2 && cfg3.mncDigits != 2 {
+		return mnc3, true
+	}
+	if ok3 && key3 == key2 && cfg3.mncDigits == 3 {
+		return mnc3, true
+	}
+	if ok2 {
+		return mnc2, true
+	}
+	if ok3 {
+		return mnc3, true
+	}
+	return "", false
+}
+
+func isDefaultThreeDigitMNCMCC(mcc string) bool {
+	switch mcc {
+	case "001", // ITU test PLMN
+		"302", "308", // Canada, Saint Pierre & Miquelon
+		"310", "311", "312", "313", "314", "315", "316", "318", "319", "332", // USA / USVI
+		"334",                                                                              // Mexico
+		"338", "342", "344", "346", "348", "350", "352", "354", "356", "358", "360", "362", // Caribbean / Bermuda
+		"364", "365", "366", "368", "370", "372", "374", "376",
+		"405", "406", // India 3-digit MNC allocations
+		"722", "732": // Argentina, Colombia
+		return true
+	default:
+		return false
+	}
 }
 
 func isDecimalString(value string) bool {

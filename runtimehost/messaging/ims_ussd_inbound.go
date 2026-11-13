@@ -36,14 +36,15 @@ type IMSUSSDDialogTransport interface {
 }
 
 func (s *Service) HandleIMSUSSDInfo(ctx context.Context, req IMSUSSDDialogRequest) (IMSUSSDDialogResult, error) {
-	if s == nil || s.ussdTransport == nil {
+	ussd := s.currentUSSDTransport()
+	if s == nil || ussd == nil {
 		if isIMSUSSDDialogRequest(req) {
 			err := ErrUSSDTransportUnavailable
 			return IMSUSSDDialogResult{Handled: true, StatusCode: 503, Reason: err.Error()}, err
 		}
 		return IMSUSSDDialogResult{}, nil
 	}
-	transport, ok := s.ussdTransport.(IMSUSSDDialogTransport)
+	transport, ok := ussd.(IMSUSSDDialogTransport)
 	if !ok {
 		if isIMSUSSDDialogRequest(req) {
 			err := errors.New("USSD transport does not handle IMS dialog requests")
@@ -61,14 +62,15 @@ func (s *Service) HandleIMSUSSDInfo(ctx context.Context, req IMSUSSDDialogReques
 }
 
 func (s *Service) HandleIMSUSSDBye(ctx context.Context, req IMSUSSDDialogRequest) (IMSUSSDDialogResult, error) {
-	if s == nil || s.ussdTransport == nil {
+	ussd := s.currentUSSDTransport()
+	if s == nil || ussd == nil {
 		if isIMSUSSDDialogRequest(req) {
 			err := ErrUSSDTransportUnavailable
 			return IMSUSSDDialogResult{Handled: true, StatusCode: 503, Reason: err.Error()}, err
 		}
 		return IMSUSSDDialogResult{}, nil
 	}
-	transport, ok := s.ussdTransport.(IMSUSSDDialogTransport)
+	transport, ok := ussd.(IMSUSSDDialogTransport)
 	if !ok {
 		if isIMSUSSDDialogRequest(req) {
 			err := errors.New("USSD transport does not handle IMS dialog requests")

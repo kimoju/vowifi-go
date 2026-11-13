@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -81,15 +83,13 @@ type IMSSecurityAssociationInstallRequest struct {
 }
 
 func DefaultSecurityClientAgreement(random io.Reader) SecurityAgreement {
-	if random == nil {
-		random = cryptorand.Reader
-	}
+	spiC, spiS := nextSecuritySPIPair(random)
 	return SecurityAgreement{
 		Protocol:            DefaultSecurityProtocol,
 		Algorithm:           DefaultSecurityAlgorithm,
 		EncryptionAlgorithm: DefaultSecurityEAlg,
-		SPIClient:           randomSecuritySPI(random),
-		SPIServer:           randomSecuritySPI(random),
+		SPIClient:           spiC,
+		SPIServer:           spiS,
 		PortClient:          DefaultSecurityPortC,
 		PortServer:          DefaultSecurityPortS,
 	}
@@ -274,14 +274,15 @@ func completeSecurityAgreement(a SecurityAgreement) SecurityAgreement {
 
 func completeSecurityClientAgreement(a SecurityAgreement, random io.Reader) SecurityAgreement {
 	a = completeSecurityAgreement(a)
-	if random == nil {
-		random = cryptorand.Reader
-	}
-	if a.SPIClient == 0 {
-		a.SPIClient = randomSecuritySPI(random)
-	}
-	if a.SPIServer == 0 {
-		a.SPIServer = randomSecuritySPI(random)
+	if a.SPIClient == 0 && a.SPIServer == 0 {
+		a.SPIClient, a.SPIServer = nextSecuritySPIPair(random)
+	} else {
+		if a.SPIClient == 0 {
+			a.SPIClient = nextSecuritySingleSPI(random, a.SPIServer)
+		}
+		if a.SPIServer == 0 {
+			a.SPIServer = nextSecuritySingleSPI(random, a.SPIClient)
+		}
 	}
 	if a.PortClient == 0 {
 		a.PortClient = DefaultSecurityPortC
@@ -676,7 +677,73 @@ func parseSecurityPort(value string) int {
 	return n
 }
 
+var (
+	securityRegistryMu    sync.Mutex
+	allocatedSecuritySPIs = make(map[uint32]struct{})
+	allocatedSPIOrder     []uint32
+	reservedSecurityPorts = make(map[int]int)
+)
+
+const maxTrackedSecuritySPIs = 4096
+
+func nextSecuritySPIPair(random io.Reader) (uint32, uint32) {
+	spiC := nextSecuritySingleSPI(random, 0)
+	spiS := nextSecuritySingleSPI(random, spiC)
+	return spiC, spiS
+}
+
+func nextSecuritySingleSPI(random io.Reader, avoid uint32) uint32 {
+	if random != nil && random != cryptorand.Reader {
+		spi := randomSecuritySPI(random)
+		if spi == avoid {
+			if spi == ^uint32(0) {
+				return 256
+			}
+			return spi + 1
+		}
+		return spi
+	}
+	securityRegistryMu.Lock()
+	defer securityRegistryMu.Unlock()
+	for attempt := 0; attempt < 64; attempt++ {
+		spi := randomSecuritySPI(cryptorand.Reader)
+		if spi < 256 {
+			spi += 256
+		}
+		if spi == avoid {
+			continue
+		}
+		if _, exists := allocatedSecuritySPIs[spi]; exists {
+			continue
+		}
+		recordAllocatedSecuritySPILocked(spi)
+		return spi
+	}
+	for fallback := uint32(256); ; fallback++ {
+		if fallback == avoid {
+			continue
+		}
+		if _, exists := allocatedSecuritySPIs[fallback]; !exists {
+			recordAllocatedSecuritySPILocked(fallback)
+			return fallback
+		}
+	}
+}
+
+func recordAllocatedSecuritySPILocked(spi uint32) {
+	if len(allocatedSPIOrder) >= maxTrackedSecuritySPIs {
+		oldest := allocatedSPIOrder[0]
+		allocatedSPIOrder = allocatedSPIOrder[1:]
+		delete(allocatedSecuritySPIs, oldest)
+	}
+	allocatedSecuritySPIs[spi] = struct{}{}
+	allocatedSPIOrder = append(allocatedSPIOrder, spi)
+}
+
 func randomSecuritySPI(random io.Reader) uint32 {
+	if random == nil {
+		random = cryptorand.Reader
+	}
 	var b [4]byte
 	if _, err := io.ReadFull(random, b[:]); err != nil {
 		return 1
@@ -686,6 +753,209 @@ func randomSecuritySPI(random io.Reader) uint32 {
 		return 1
 	}
 	return spi
+}
+
+// AllocateSecurityClientPorts selects a client/server port pair for IMS
+// ipsec-3gpp negotiation, preferring DefaultSecurityPortC/DefaultSecurityPortS
+// when free and falling back to dynamically probed UDP/TCP ports when busy or
+// already reserved by another active modem/session.
+func AllocateSecurityClientPorts(localHost string, allowPortC, allowPortS int) (portC, portS int, release func()) {
+	host := normalizeSecurityBindHost(localHost)
+	bindable := isLocallyBindableSecurityHost(host)
+
+	securityRegistryMu.Lock()
+	defer securityRegistryMu.Unlock()
+
+	tryPair := func(candC, candS int) bool {
+		if candC <= 0 || candS <= 0 || candC == candS {
+			return false
+		}
+		if candC != allowPortC && reservedSecurityPorts[candC] > 0 {
+			return false
+		}
+		if candS != allowPortS && reservedSecurityPorts[candS] > 0 {
+			return false
+		}
+		if bindable {
+			if candC != allowPortC && !probeSecurityUDPPort(host, candC) {
+				return false
+			}
+			if candS != allowPortS && (!probeSecurityUDPPort(host, candS) || !probeSecurityTCPPort(host, candS)) {
+				return false
+			}
+		}
+		return true
+	}
+
+	reserve := func(c, s int) (int, int, func()) {
+		reservedSecurityPorts[c]++
+		reservedSecurityPorts[s]++
+		var once sync.Once
+		return c, s, func() {
+			once.Do(func() {
+				securityRegistryMu.Lock()
+				defer securityRegistryMu.Unlock()
+				if reservedSecurityPorts[c] <= 1 {
+					delete(reservedSecurityPorts, c)
+				} else {
+					reservedSecurityPorts[c]--
+				}
+				if reservedSecurityPorts[s] <= 1 {
+					delete(reservedSecurityPorts, s)
+				} else {
+					reservedSecurityPorts[s]--
+				}
+			})
+		}
+	}
+
+	if allowPortC > 0 && allowPortS > 0 && tryPair(allowPortC, allowPortS) {
+		return reserve(allowPortC, allowPortS)
+	}
+	if tryPair(DefaultSecurityPortC, DefaultSecurityPortS) {
+		return reserve(DefaultSecurityPortC, DefaultSecurityPortS)
+	}
+
+	if bindable {
+		for attempt := 0; attempt < 24; attempt++ {
+			candC, candS, ok := probeDynamicSecurityPortPair(host)
+			if !ok {
+				continue
+			}
+			if reservedSecurityPorts[candC] > 0 || reservedSecurityPorts[candS] > 0 {
+				continue
+			}
+			return reserve(candC, candS)
+		}
+	}
+
+	for base := 15062; base < 65000; base += 2 {
+		if tryPair(base, base+1) {
+			return reserve(base, base+1)
+		}
+	}
+	return reserve(DefaultSecurityPortC, DefaultSecurityPortS)
+}
+
+func normalizeSecurityBindHost(localHost string) string {
+	raw := strings.TrimSpace(localHost)
+	if raw == "" {
+		return ""
+	}
+	if host, _, ok := splitIMSSecurityEndpointAddr(raw); ok && strings.TrimSpace(host) != "" {
+		raw = host
+	}
+	raw = strings.Trim(strings.TrimSpace(raw), "[]")
+	if prefix, err := netip.ParsePrefix(raw); err == nil {
+		return prefix.Addr().String()
+	}
+	if addr, err := netip.ParseAddr(raw); err == nil {
+		return addr.Unmap().String()
+	}
+	return ""
+}
+
+func isLocallyBindableSecurityHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	want, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	if want.IsUnspecified() || want.IsLoopback() {
+		return true
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, assigned := range addrs {
+		val := strings.TrimSpace(assigned.String())
+		if pfx, pErr := netip.ParsePrefix(val); pErr == nil && pfx.Addr().Unmap() == want {
+			return true
+		}
+		if a, aErr := netip.ParseAddr(val); aErr == nil && a.Unmap() == want {
+			return true
+		}
+	}
+	return false
+}
+
+func probeSecurityUDPPort(host string, port int) bool {
+	network := "udp4"
+	if strings.Contains(host, ":") {
+		network = "udp6"
+	} else if host == "" {
+		network = "udp"
+	}
+	pc, err := net.ListenPacket(network, net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	_ = pc.Close()
+	return true
+}
+
+func probeSecurityTCPPort(host string, port int) bool {
+	network := "tcp4"
+	if strings.Contains(host, ":") {
+		network = "tcp6"
+	} else if host == "" {
+		network = "tcp"
+	}
+	ln, err := net.Listen(network, net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+func probeDynamicSecurityPortPair(host string) (int, int, bool) {
+	probeHost := host
+	udpNet := "udp4"
+	tcpNet := "tcp4"
+	if strings.Contains(probeHost, ":") {
+		udpNet = "udp6"
+		tcpNet = "tcp6"
+	} else if probeHost == "" {
+		probeHost = "127.0.0.1"
+	}
+	pcC, err := net.ListenPacket(udpNet, net.JoinHostPort(probeHost, "0"))
+	if err != nil {
+		return 0, 0, false
+	}
+	portC := udpAddrPort(pcC.LocalAddr())
+	pcS, err := net.ListenPacket(udpNet, net.JoinHostPort(probeHost, "0"))
+	if err != nil {
+		_ = pcC.Close()
+		return 0, 0, false
+	}
+	portS := udpAddrPort(pcS.LocalAddr())
+	lnS, tcpErr := net.Listen(tcpNet, net.JoinHostPort(probeHost, strconv.Itoa(portS)))
+	_ = pcC.Close()
+	_ = pcS.Close()
+	if tcpErr != nil {
+		return 0, 0, false
+	}
+	_ = lnS.Close()
+	if portC <= 0 || portS <= 0 || portC == portS {
+		return 0, 0, false
+	}
+	return portC, portS, true
+}
+
+func udpAddrPort(addr net.Addr) int {
+	if udp, ok := addr.(*net.UDPAddr); ok {
+		return udp.Port
+	}
+	_, p, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(p)
+	return n
 }
 
 func validateSecurityClientHeader(header string) error {

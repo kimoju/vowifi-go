@@ -18,6 +18,7 @@ import (
 const (
 	DefaultNonceLength          = 32
 	DefaultIKEKeyMaterialLength = 192
+	defaultIKEMaxRetransmits    = 2
 )
 
 var (
@@ -30,11 +31,14 @@ type InitTransport interface {
 }
 
 type UDPTransport struct {
-	RemoteAddr      string
-	LocalAddr       string
-	Timeout         time.Duration
-	UseNonESPMarker bool
-	ReadBufferSize  int
+	RemoteAddr        string
+	LocalAddr         string
+	Timeout           time.Duration
+	UseNonESPMarker   bool
+	ReadBufferSize    int
+	MaxRetransmits    int
+	RetransmitTimeout time.Duration
+	DialFunc          func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // PersistentUDPTransport keeps one UDP socket for the lifetime of an IKE SA.
@@ -67,11 +71,7 @@ func (t *PersistentUDPTransport) ExchangeIKE(ctx context.Context, request []byte
 		}
 		t.conn = conn
 	}
-	if err := setIKEUDPDeadline(t.conn, ctx, t.Config.Timeout); err != nil {
-		t.closeLocked()
-		return nil, err
-	}
-	resp, err := exchangeIKEUDP(t.conn, request, t.Config)
+	resp, err := exchangeIKEUDPWithRetransmit(ctx, t.conn, request, t.Config)
 	if err != nil {
 		t.closeLocked()
 		return nil, err
@@ -106,16 +106,16 @@ func (t UDPTransport) ExchangeIKE(ctx context.Context, request []byte) ([]byte, 
 		return nil, err
 	}
 	defer conn.Close()
-	if err := setIKEUDPDeadline(conn, ctx, t.Timeout); err != nil {
-		return nil, err
-	}
-	return exchangeIKEUDP(conn, request, t)
+	return exchangeIKEUDPWithRetransmit(ctx, conn, request, t)
 }
 
 func dialIKEUDP(ctx context.Context, config UDPTransport) (net.Conn, error) {
 	remote := strings.TrimSpace(config.RemoteAddr)
 	if remote == "" {
 		return nil, fmt.Errorf("%w: remote address is empty", ErrInvalidInitConfig)
+	}
+	if config.DialFunc != nil {
+		return config.DialFunc(ctx, "udp", remote)
 	}
 	dialer := net.Dialer{}
 	if strings.TrimSpace(config.LocalAddr) != "" {
@@ -141,6 +141,81 @@ func setIKEUDPDeadline(conn net.Conn, ctx context.Context, timeout time.Duration
 		deadline = ctxDeadline
 	}
 	return conn.SetDeadline(deadline)
+}
+
+func exchangeIKEUDPWithRetransmit(ctx context.Context, conn net.Conn, request []byte, config UDPTransport) ([]byte, error) {
+	maxRetransmits := config.MaxRetransmits
+	if maxRetransmits == 0 && config.Timeout >= 2*time.Second {
+		maxRetransmits = defaultIKEMaxRetransmits
+	}
+	if maxRetransmits < 0 {
+		maxRetransmits = 0
+	}
+	overallDeadline := time.Time{}
+	if config.Timeout > 0 {
+		overallDeadline = time.Now().Add(config.Timeout)
+	}
+	if ctxDeadline, ok := ctx.Deadline(); ok && (overallDeadline.IsZero() || ctxDeadline.Before(overallDeadline)) {
+		overallDeadline = ctxDeadline
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetransmits; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		attemptTimeout := config.RetransmitTimeout
+		if attemptTimeout <= 0 {
+			if !overallDeadline.IsZero() {
+				remaining := time.Until(overallDeadline)
+				if remaining <= 0 {
+					if lastErr != nil {
+						return nil, lastErr
+					}
+					return nil, context.DeadlineExceeded
+				}
+				slots := maxRetransmits - attempt + 1
+				attemptTimeout = remaining / time.Duration(slots)
+				if attemptTimeout <= 0 {
+					attemptTimeout = remaining
+				}
+			} else {
+				attemptTimeout = config.Timeout
+			}
+		}
+		if !overallDeadline.IsZero() {
+			candidate := time.Now().Add(attemptTimeout)
+			if attemptTimeout <= 0 || candidate.After(overallDeadline) {
+				if err := conn.SetDeadline(overallDeadline); err != nil {
+					return nil, err
+				}
+			} else if err := conn.SetDeadline(candidate); err != nil {
+				return nil, err
+			}
+		} else if err := setIKEUDPDeadline(conn, ctx, attemptTimeout); err != nil {
+			return nil, err
+		}
+		resp, err := exchangeIKEUDP(conn, request, config)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !isTimeoutNetError(err) || ctx.Err() != nil {
+			return nil, err
+		}
+		if !overallDeadline.IsZero() && !time.Now().Before(overallDeadline) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func isTimeoutNetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func exchangeIKEUDP(conn net.Conn, request []byte, config UDPTransport) ([]byte, error) {
@@ -247,16 +322,43 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 	if err != nil {
 		return InitResult{}, err
 	}
-	payloads := []Payload{
-		saPayload,
-		KeyExchangePayload(dhGroup, pubI),
-		NoncePayload(nonceI),
-	}
-	payloads = append(payloads, initNATPayloads(cfg, spiI, 0)...)
-	payloads = append(payloads, MOBIKESupportedNotify())
-	req, reqBytes, resp, respBytes, err := runIKESAInitRequest(ctx, cfg.Transport, spiI, payloads)
-	if err != nil {
-		return InitResult{}, err
+	natPayloads := initNATPayloads(cfg, spiI, 0)
+	var (
+		req              Message
+		reqBytes         []byte
+		resp             Message
+		respBytes        []byte
+		activeCookie     []byte
+		retriedInvalidKE bool
+	)
+	for {
+		payloads := []Payload{
+			saPayload,
+			KeyExchangePayload(dhGroup, pubI),
+			NoncePayload(nonceI),
+		}
+		payloads = append(payloads, natPayloads...)
+		payloads = append(payloads, MOBIKESupportedNotify())
+		req, reqBytes, resp, respBytes, activeCookie, err = runIKESAInitRequest(ctx, cfg.Transport, spiI, payloads, activeCookie)
+		if err != nil {
+			altGroup, isInvalidKE, altErr := InvalidKEPayloadAlternativeGroupFromError(err)
+			if altErr == nil && isInvalidKE && !retriedInvalidKE && altGroup != dhGroup && saOffersDHGroup(sa, altGroup) {
+				var retryPriv []byte
+				if altGroup == DHGroupCurve25519 && len(cfg.X25519PrivateKey) > 0 {
+					retryPriv = cfg.X25519PrivateKey
+				}
+				nextDH, dhErr := newDHKeyExchange(altGroup, retryPriv, random)
+				if dhErr == nil {
+					retriedInvalidKE = true
+					dhGroup = altGroup
+					dh = nextDH
+					pubI = dh.public
+					continue
+				}
+			}
+			return InitResult{}, err
+		}
+		break
 	}
 	parsed, err := parseInitResponse(resp, spiI, dhGroup)
 	if err != nil {
@@ -315,15 +417,18 @@ func RunIKE_SA_INIT(ctx context.Context, cfg InitConfig) (InitResult, error) {
 	}, nil
 }
 
-func runIKESAInitRequest(ctx context.Context, transport InitTransport, spiI uint64, payloads []Payload) (Message, []byte, Message, []byte, error) {
-	var cookie []byte
+func runIKESAInitRequest(ctx context.Context, transport InitTransport, spiI uint64, payloads []Payload, initialCookie []byte) (Message, []byte, Message, []byte, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cookie := append([]byte(nil), initialCookie...)
 	var retriedCookie bool
 	for {
 		reqPayloads := clonePayloads(payloads)
 		if len(cookie) > 0 {
 			cookiePayload, err := CookieNotify(cookie)
 			if err != nil {
-				return Message{}, nil, Message{}, nil, err
+				return Message{}, nil, Message{}, nil, cookie, err
 			}
 			reqPayloads = append([]Payload{cookiePayload}, reqPayloads...)
 		}
@@ -337,29 +442,51 @@ func runIKESAInitRequest(ctx context.Context, transport InitTransport, spiI uint
 		}
 		reqBytes, err := req.MarshalBinary()
 		if err != nil {
-			return Message{}, nil, Message{}, nil, err
+			return Message{}, nil, Message{}, nil, cookie, err
 		}
-		respBytes, err := transport.ExchangeIKE(ctx, reqBytes)
+		respBytes, err := exchangeIKEInitWithRetransmit(ctx, transport, reqBytes)
 		if err != nil {
-			return Message{}, nil, Message{}, nil, err
+			return Message{}, nil, Message{}, nil, cookie, err
 		}
 		resp, err := ParseMessage(respBytes)
 		if err != nil {
-			return Message{}, nil, Message{}, nil, err
+			return Message{}, nil, Message{}, nil, cookie, err
 		}
 		nextCookie, ok, err := initResponseCookie(resp, spiI)
 		if err != nil {
-			return Message{}, nil, Message{}, nil, err
+			return Message{}, nil, Message{}, nil, cookie, err
 		}
 		if !ok {
-			return req, reqBytes, resp, respBytes, nil
+			return req, reqBytes, resp, respBytes, cookie, nil
 		}
 		if retriedCookie {
-			return Message{}, nil, Message{}, nil, fmt.Errorf("%w: repeated COOKIE notify", ErrInvalidInitResponse)
+			return Message{}, nil, Message{}, nil, cookie, fmt.Errorf("%w: repeated COOKIE notify", ErrInvalidInitResponse)
 		}
 		cookie = nextCookie
 		retriedCookie = true
 	}
+}
+
+func exchangeIKEInitWithRetransmit(ctx context.Context, transport InitTransport, reqBytes []byte) ([]byte, error) {
+	switch transport.(type) {
+	case UDPTransport, *UDPTransport, *PersistentUDPTransport:
+		return transport.ExchangeIKE(ctx, reqBytes)
+	}
+	var lastErr error
+	for attempt := 0; attempt <= defaultIKEMaxRetransmits; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		respBytes, err := transport.ExchangeIKE(ctx, reqBytes)
+		if err == nil {
+			return respBytes, nil
+		}
+		lastErr = err
+		if !isTimeoutNetError(err) || ctx.Err() != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
 }
 
 func initResponseCookie(resp Message, spiI uint64) ([]byte, bool, error) {

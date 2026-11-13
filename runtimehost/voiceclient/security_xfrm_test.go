@@ -22,7 +22,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 	want := []IMSSecurityAssociationXFRMCommand{
 		{
 			Args: []string{
-				"xfrm", "state", "add",
+				"xfrm", "state", "update",
 				"src", "192.0.2.20",
 				"dst", "198.51.100.10",
 				"proto", "esp",
@@ -36,7 +36,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 		},
 		{
 			Args: []string{
-				"xfrm", "state", "add",
+				"xfrm", "state", "update",
 				"src", "198.51.100.10",
 				"dst", "192.0.2.20",
 				"proto", "esp",
@@ -50,7 +50,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 		},
 		{
 			Args: []string{
-				"xfrm", "policy", "add",
+				"xfrm", "policy", "update",
 				"src", "192.0.2.20",
 				"dst", "198.51.100.10",
 				"proto", "udp",
@@ -68,7 +68,7 @@ func TestBuildIMSSecurityAssociationXFRMInstallPlanBuildsTransportCommands(t *te
 		},
 		{
 			Args: []string{
-				"xfrm", "policy", "add",
+				"xfrm", "policy", "update",
 				"src", "198.51.100.10",
 				"dst", "192.0.2.20",
 				"proto", "udp",

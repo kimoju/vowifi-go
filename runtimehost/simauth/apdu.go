@@ -4,7 +4,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
+	"sync"
 )
 
 const (
@@ -18,6 +20,36 @@ type LogicalChannelTransport interface {
 	OpenLogicalChannel(aid string) (int, error)
 	CloseLogicalChannel(channel int) error
 	TransmitAPDU(channel int, hexAPDU string) (string, error)
+}
+
+// LogicalChannelSessionLocker is optionally implemented by transports to
+// serialize multi-step logical channel open/transmit/close sequences.
+type LogicalChannelSessionLocker interface {
+	LockLogicalChannelSession() func()
+}
+
+var logicalChannelSessionLocks sync.Map
+
+// LockLogicalChannel serializes logical channel open/transmit/close sequences
+// against concurrent access on the same LogicalChannelTransport.
+func LockLogicalChannel(t LogicalChannelTransport) func() {
+	if t == nil {
+		return func() {}
+	}
+	if locker, ok := t.(LogicalChannelSessionLocker); ok {
+		return locker.LockLogicalChannelSession()
+	}
+	typ := reflect.TypeOf(t)
+	if typ == nil || !typ.Comparable() {
+		return func() {}
+	}
+	if typ.Kind() == reflect.Ptr && reflect.ValueOf(t).IsNil() {
+		return func() {}
+	}
+	val, _ := logicalChannelSessionLocks.LoadOrStore(t, &sync.Mutex{})
+	mu := val.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 type LogicalChannelAIDResolver interface {
@@ -454,16 +486,72 @@ func ReadTransparentEF(t LogicalChannelTransport, channel int, fid uint16) ([]by
 		if err != nil {
 			return nil, resp, err
 		}
-		if !resp.Success() {
+		eofWarning := resp.SW1 == 0x62 && resp.SW2 == 0x82
+		if !resp.Success() && !(eofWarning && (len(resp.Body) > 0 || len(out) > 0)) {
 			return nil, resp, newStatusError(fmt.Sprintf("READ BINARY %04X offset=%d", fid, offset), resp)
 		}
 		out = append(out, resp.Body...)
-		if len(resp.Body) == 0 || size == 256 && len(resp.Body) < chunk {
+		if eofWarning || len(resp.Body) == 0 || size == 256 && len(resp.Body) < chunk {
 			break
 		}
 		offset += len(resp.Body)
 	}
 	return out, selectResp, nil
+}
+
+// ReadUSIMEFAD opens a USIM logical channel and reads EF_AD (0x6FAD).
+func ReadUSIMEFAD(t LogicalChannelTransport) ([]byte, error) {
+	if t == nil {
+		return nil, errors.New("nil logical channel transport")
+	}
+	unlock := LockLogicalChannel(t)
+	defer unlock()
+
+	channel, _, _, err := OpenLogicalChannelWithAIDFallback(t, "usim", USIMAIDPrefix, USIMAIDPrefix)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = t.CloseLogicalChannel(channel) }()
+
+	raw, _, err := ReadTransparentEF(t, channel, 0x6FAD)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// ReadUSIMSMSC opens a USIM logical channel and reads the SMSC address from EF_SMSP (0x6F42).
+func ReadUSIMSMSC(t LogicalChannelTransport) (string, error) {
+	if t == nil {
+		return "", errors.New("nil logical channel transport")
+	}
+	unlock := LockLogicalChannel(t)
+	defer unlock()
+
+	channel, _, _, err := OpenLogicalChannelWithAIDFallback(t, "usim", USIMAIDPrefix, USIMAIDPrefix)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = t.CloseLogicalChannel(channel) }()
+
+	records, _, err := ReadLinearFixedEF(t, channel, 0x6F42, 4)
+	if err != nil {
+		return "", err
+	}
+	var errs []error
+	for _, rec := range records {
+		smsc, decErr := DecodeUSIMSMSP(rec)
+		if decErr == nil && strings.TrimSpace(smsc) != "" {
+			return strings.TrimSpace(smsc), nil
+		}
+		if decErr != nil {
+			errs = append(errs, decErr)
+		}
+	}
+	if len(errs) > 0 {
+		return "", errors.Join(errs...)
+	}
+	return "", errors.New("EF_SMSP has no valid SMSC record")
 }
 
 func ReadLinearFixedEF(t LogicalChannelTransport, channel int, fid uint16, maxRecords int) ([][]byte, Response, error) {

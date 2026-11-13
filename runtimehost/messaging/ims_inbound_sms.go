@@ -431,11 +431,12 @@ func (s *Service) handleIMS3GPPSMS(ctx context.Context, msg IMSMessageRequest) (
 			return out, nil
 		}
 		report := SMSDeliveryReport{
-			CallID:   msg.CallID,
-			RPMR:     int(rpdu.MR),
-			State:    "delivered",
-			SIPCode:  200,
-			ReportAt: time.Time{},
+			InReplyTo: strings.TrimSpace(imsHeaderValue(msg.Headers, "In-Reply-To")),
+			CallID:    firstNonEmpty(msg.CallID, imsHeaderValue(msg.Headers, "Call-ID")),
+			RPMR:      int(rpdu.MR),
+			State:     "delivered",
+			SIPCode:   200,
+			ReportAt:  time.Time{},
 		}
 		_, err := s.HandleSMSDeliveryReport(ctx, report)
 		out.DeliveryReport = &report
@@ -447,7 +448,8 @@ func (s *Service) handleIMS3GPPSMS(ctx context.Context, msg IMSMessageRequest) (
 		return out, nil
 	case SMSRPDUKindError:
 		report := SMSDeliveryReport{
-			CallID:    msg.CallID,
+			InReplyTo: strings.TrimSpace(imsHeaderValue(msg.Headers, "In-Reply-To")),
+			CallID:    firstNonEmpty(msg.CallID, imsHeaderValue(msg.Headers, "Call-ID")),
 			RPMR:      int(rpdu.MR),
 			State:     "failed",
 			SIPCode:   200,
@@ -556,7 +558,8 @@ func (s *Service) handleIMSRPData(ctx context.Context, msg IMSMessageRequest, rp
 
 func (s *Service) handleIMSSMSStatusReport(ctx context.Context, msg IMSMessageRequest, reportTPDU SMSStatusReport) (SMSDeliveryReport, error) {
 	report := SMSDeliveryReport{
-		CallID:                msg.CallID,
+		InReplyTo:             strings.TrimSpace(imsHeaderValue(msg.Headers, "In-Reply-To")),
+		CallID:                firstNonEmpty(msg.CallID, imsHeaderValue(msg.Headers, "Call-ID")),
 		RPMR:                  int(reportTPDU.Reference),
 		State:                 reportTPDU.State,
 		SIPCode:               200,

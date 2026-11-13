@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -735,15 +736,19 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 	if expires <= 0 {
 		expires = 3600
 	}
+	if flow, ok := s.Transport.(*WireSIPFlow); ok {
+		defer flow.ReleaseUnusedSecurityClientPorts()
+	}
 	securityClients := s.securityClientAgreements()
 	securityClientHeader := BuildSecurityClientHeaderList(securityClients)
+	activeContactURI := contactURI
 
 	attempts := 0
 	cseq := 1
 	sendRegister := func(cseq int, authHeaderName, authz string, challengeHeaders map[string][]string) (RegisterResponse, error) {
 		msg := RegisterMessage{
 			URI:     registrarURI,
-			Headers: BuildRegisterHeaders(s.Profile, contactURI, callID, strconv.Itoa(cseq)),
+			Headers: BuildRegisterHeaders(s.Profile, activeContactURI, callID, strconv.Itoa(cseq)),
 		}
 		msg.Headers["Expires"] = strconv.Itoa(expires)
 		msg.Headers["Security-Client"] = securityClientHeader
@@ -838,6 +843,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		result.AuthHeaderName = authzHeader
 		return result, err
 	}
+	activeContactURI = s.negotiatedContactURI(contactURI, resp.Headers, securityClients)
 
 	cseq++
 	resp2, err := sendRegister(cseq, authzHeader, authz, resp.Headers)
@@ -853,7 +859,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		if isSIPSuccess(resp2.StatusCode) {
 			authState := newDigestAuthState(authzHeader, ch, currentAuthInput, authz)
 			authState, err = updateDigestAuthStateFromInfo(authState, resp2.Headers, authzHeader, resp2.Body)
-			binding := bindDigestAuthWithChallengeInput(buildRegistrationBindingForClients(s.Profile, contactURI, resp2, expires, securityClients, securityHeaders), authzHeader, authz, authState, s.digestChallengeInputFunc())
+			binding := bindDigestAuthWithChallengeInput(buildRegistrationBindingForClients(s.Profile, activeContactURI, resp2, expires, securityClients, securityHeaders), authzHeader, authz, authState, s.digestChallengeInputFunc())
 			result := RegisterResult{
 				Registered:     true,
 				StatusCode:     resp2.StatusCode,
@@ -912,6 +918,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 			result.AuthHeaderName = authzHeader
 			return result, err
 		}
+		activeContactURI = s.negotiatedContactURI(contactURI, nextChallengeHeaders, securityClients)
 		cseq++
 		resp2, err = sendRegister(cseq, authzHeader, authz, nextChallengeHeaders)
 		if err != nil {
@@ -930,7 +937,7 @@ func (s RegisterSession) Register(ctx context.Context) (RegisterResult, error) {
 		Attempts:       attempts,
 		RetryAfter:     SIPResponseRetryAfter(resp2),
 		Challenge:      ch,
-		Binding:        buildRegistrationBindingForClients(s.Profile, contactURI, resp2, expires, securityClients, securityHeaders),
+		Binding:        buildRegistrationBindingForClients(s.Profile, activeContactURI, resp2, expires, securityClients, securityHeaders),
 		AuthHeader:     authz,
 		AuthHeaderName: authzHeader,
 		AuthState:      newDigestAuthState(authzHeader, ch, currentAuthInput, authz),
@@ -1229,10 +1236,14 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		expires = 3600
 	}
 	attempts := 0
+	activeContactURI := contactURI
+	if len(req.Binding.SecurityServer) > 0 {
+		activeContactURI = s.negotiatedContactURI(contactURI, map[string][]string{"Security-Server": req.Binding.SecurityServer}, securityClientsFromBinding(req.Binding))
+	}
 	sendRefresh := func(cseq int, authHeaderName, authz string, challengeHeaders map[string][]string) (RegisterResponse, error) {
 		msg := RegisterMessage{
 			URI:     registrarURI,
-			Headers: BuildRegisterHeaders(s.Profile, contactURI, callID, strconv.Itoa(cseq)),
+			Headers: BuildRegisterHeaders(s.Profile, activeContactURI, callID, strconv.Itoa(cseq)),
 		}
 		msg.Headers["Expires"] = strconv.Itoa(expires)
 		if securityClient := strings.TrimSpace(req.Binding.SecurityClient); securityClient != "" {
@@ -1285,7 +1296,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		return RefreshResult{Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 	}
 	if isSIPSuccess(resp.StatusCode) {
-		binding := mergeRefreshBinding(req.Binding, buildRegistrationBindingForClients(s.Profile, contactURI, resp, expires, securityClientsFromBinding(req.Binding), nil))
+		binding := mergeRefreshBinding(req.Binding, buildRegistrationBindingForClients(s.Profile, activeContactURI, resp, expires, securityClientsFromBinding(req.Binding), nil))
 		authState, err = updateDigestAuthStateFromInfo(authState, resp.Headers, authHeaderName, resp.Body)
 		binding = bindDigestAuthWithChallengeInput(binding, authHeaderName, authz, authState, s.digestChallengeInputFunc())
 		result := RefreshResult{
@@ -1326,13 +1337,15 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	} else {
 		authState = newDigestAuthState(authHeaderName, ch, authInput, authz)
 	}
-	securityReq, securityOK, err := s.installChallengeSecurityPlan(ctx, resp.Headers, securityClientsFromBinding(req.Binding), akaKeys)
+	refreshClients := securityClientsFromBinding(req.Binding)
+	securityReq, securityOK, err := s.installChallengeSecurityPlan(ctx, resp.Headers, refreshClients, akaKeys)
 	if err != nil {
 		return refreshFailureResult(resp, attempts, authz, authHeaderName, authState), err
 	}
 	if err := s.useChallengeSecurityAssociation(ctx, securityReq, securityOK); err != nil {
 		return refreshFailureResult(resp, attempts, authz, authHeaderName, authState), err
 	}
+	activeContactURI = s.negotiatedContactURI(contactURI, resp.Headers, refreshClients)
 	cseq++
 	resp2, err := sendRefresh(cseq, authHeaderName, authz, resp.Headers)
 	if err != nil {
@@ -1361,13 +1374,14 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 		}
 		authState = newDigestAuthState(authHeaderName, ch, authInput, authz)
 		challengeHeaders = resp2.Headers
-		securityReq, securityOK, err = s.installChallengeSecurityPlan(ctx, challengeHeaders, securityClientsFromBinding(req.Binding), akaKeys)
+		securityReq, securityOK, err = s.installChallengeSecurityPlan(ctx, challengeHeaders, refreshClients, akaKeys)
 		if err != nil {
 			return refreshFailureResult(resp2, attempts, authz, authHeaderName, authState), err
 		}
 		if err := s.useChallengeSecurityAssociation(ctx, securityReq, securityOK); err != nil {
 			return refreshFailureResult(resp2, attempts, authz, authHeaderName, authState), err
 		}
+		activeContactURI = s.negotiatedContactURI(contactURI, challengeHeaders, refreshClients)
 		cseq++
 		resp2, err = sendRefresh(cseq, authHeaderName, authz, challengeHeaders)
 		if err != nil {
@@ -1378,7 +1392,7 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 	if err != nil {
 		return RefreshResult{Attempts: attempts, AuthHeader: authz, AuthHeaderName: authHeaderName, AuthState: authState}, err
 	}
-	resultBinding := mergeRefreshBinding(req.Binding, buildRegistrationBindingForClients(s.Profile, contactURI, resp2, expires, securityClientsFromBinding(req.Binding), challengeHeaders))
+	resultBinding := mergeRefreshBinding(req.Binding, buildRegistrationBindingForClients(s.Profile, activeContactURI, resp2, expires, refreshClients, challengeHeaders))
 	result := RefreshResult{
 		Refreshed:      isSIPSuccess(resp2.StatusCode),
 		StatusCode:     resp2.StatusCode,
@@ -1405,13 +1419,68 @@ func (s RegisterSession) Refresh(ctx context.Context, req RefreshRequest) (Refre
 }
 
 func (s RegisterSession) securityClientAgreements() []SecurityAgreement {
+	var allocatedPortC, allocatedPortS int
+	if flow, ok := s.Transport.(*WireSIPFlow); ok {
+		localHost := firstNonEmpty(s.SecurityLocalAddr, s.Profile.LocalIP)
+		if localHost == "" {
+			if endpoint, err := parseSIPURIEndpoint(s.ContactURI); err == nil {
+				localHost = endpoint.Host
+			}
+		}
+		allocatedPortC, allocatedPortS = flow.EnsureSecurityClientPorts(localHost)
+	}
+	applyPorts := func(in []SecurityAgreement) []SecurityAgreement {
+		if allocatedPortC <= 0 || allocatedPortS <= 0 {
+			return in
+		}
+		for i := range in {
+			if in[i].PortClient == 0 {
+				in[i].PortClient = allocatedPortC
+			}
+			if in[i].PortServer == 0 {
+				in[i].PortServer = allocatedPortS
+			}
+		}
+		return in
+	}
 	if len(s.SecurityClients) > 0 {
-		return completeSecurityClientAgreements(s.SecurityClients, s.SecurityRandom)
+		cloned := make([]SecurityAgreement, len(s.SecurityClients))
+		for i := range s.SecurityClients {
+			cloned[i] = cloneSecurityAgreement(s.SecurityClients[i])
+		}
+		return completeSecurityClientAgreements(applyPorts(cloned), s.SecurityRandom)
 	}
 	if !isZeroSecurityAgreement(s.SecurityClient) {
-		return []SecurityAgreement{completeSecurityClientAgreement(s.SecurityClient, s.SecurityRandom)}
+		cloned := applyPorts([]SecurityAgreement{cloneSecurityAgreement(s.SecurityClient)})
+		return []SecurityAgreement{completeSecurityClientAgreement(cloned[0], s.SecurityRandom)}
 	}
-	return []SecurityAgreement{DefaultSecurityClientAgreement(s.SecurityRandom)}
+	def := SecurityAgreement{}
+	cloned := applyPorts([]SecurityAgreement{def})
+	return []SecurityAgreement{completeSecurityClientAgreement(cloned[0], s.SecurityRandom)}
+}
+
+func (s RegisterSession) negotiatedContactURI(baseContactURI string, challengeHeaders map[string][]string, clients []SecurityAgreement) string {
+	updated := strings.TrimSpace(baseContactURI)
+	if updated == "" {
+		return updated
+	}
+	if provider, ok := s.Transport.(SecurityAssociationEndpointProvider); ok {
+		localAddr, _ := provider.SecurityAssociationAddresses()
+		localIP := net.ParseIP(strings.Trim(strings.TrimSpace(localAddr), "[]"))
+		if localIP != nil && !localIP.IsUnspecified() {
+			if ep, err := parseSIPURIEndpoint(updated); err == nil {
+				if curIP := net.ParseIP(strings.Trim(strings.TrimSpace(ep.Host), "[]")); curIP != nil {
+					if (curIP.To4() == nil) != (localIP.To4() == nil) {
+						updated = rewriteSIPURIHost(updated, localIP.String())
+					}
+				}
+			}
+		}
+	}
+	if _, clientAgreement, _, ok := securityPlanFromChallenge(challengeHeaders, clients); ok && clientAgreement.PortServer > 0 {
+		updated = rewriteSIPURIPort(updated, clientAgreement.PortServer)
+	}
+	return updated
 }
 
 func (s RegisterSession) installChallengeSecurityPlan(ctx context.Context, headers map[string][]string, clients []SecurityAgreement, akaKeys IMSSecurityAKAKeys) (IMSSecurityAssociationInstallRequest, bool, error) {
@@ -1875,8 +1944,11 @@ func buildRegistrationBindingForClients(profile IMSProfile, contactURI string, r
 		Expires:          registrationExpires(resp.Headers, contactURI, requestedExpires),
 		RegistrarContact: registrarContact,
 	}
-	if selected, ok := SelectSecurityAgreementForClients(binding.SecurityServer, securityClients); ok {
+	if selected, client, ok := selectSecurityAgreementPair(binding.SecurityServer, securityClients); ok {
 		binding.SecurityAgreement = selected
+		if client.PortServer > 0 && binding.ContactURI != "" {
+			binding.ContactURI = rewriteSIPURIPort(binding.ContactURI, client.PortServer)
+		}
 		if plan, ok := BuildIMSSecurityAssociationPlan(selected); ok {
 			binding.SecurityPlan = plan
 		}
@@ -2402,7 +2474,41 @@ func matchingRegistrationContactHeader(headers map[string][]string, contactURI s
 			return contact, true
 		}
 	}
+	targetUserHost := normalizeSIPURIUserHostForContactMatch(contactURI)
+	if targetUserHost != "" {
+		for _, contact := range contacts {
+			if normalizeSIPURIUserHostForContactMatch(extractAddressURI(contact)) == targetUserHost {
+				return contact, true
+			}
+		}
+	}
 	return "", false
+}
+
+func normalizeSIPURIUserHostForContactMatch(uri string) string {
+	base := normalizeSIPURIForContactMatch(uri)
+	if base == "" {
+		return ""
+	}
+	colon := strings.IndexByte(base, ':')
+	if colon <= 0 {
+		return base
+	}
+	scheme := base[:colon+1]
+	rest := base[colon+1:]
+	userPrefix := ""
+	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+		userPrefix = rest[:at+1]
+		rest = rest[at+1:]
+	}
+	host := parseSIPHostOnly(rest)
+	if host == "" {
+		return base
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return scheme + userPrefix + host
 }
 
 func normalizeSIPURIForContactMatch(uri string) string {

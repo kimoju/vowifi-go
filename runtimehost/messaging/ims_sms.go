@@ -2,6 +2,8 @@ package messaging
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -28,7 +30,28 @@ type IMSSMSTransport struct {
 	DisableStatusReports bool
 }
 
-var imsDeliveryReportCallCounter atomic.Uint64
+var (
+	imsDeliveryReportCallCounter atomic.Uint64
+	imsSMSMessageRefCounter      atomic.Uint32
+)
+
+func nextIMSSMSMessageRef() byte {
+	return byte(imsSMSMessageRefCounter.Add(1) & 0xff)
+}
+
+func randomSIPTag(prefix string) string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		if prefix == "" {
+			return strconv.FormatInt(time.Now().UnixNano(), 16)
+		}
+		return fmt.Sprintf("%s-%x", prefix, time.Now().UnixNano())
+	}
+	if prefix == "" {
+		return hex.EncodeToString(b[:])
+	}
+	return prefix + "-" + hex.EncodeToString(b[:])
+}
 
 func (t IMSSMSTransport) SendIMSDeliveryReport(ctx context.Context, req IMSDeliveryReportRequest) (IMSDeliveryReportResult, error) {
 	if ctx == nil {
@@ -50,7 +73,7 @@ func (t IMSSMSTransport) SendIMSDeliveryReport(ctx context.Context, req IMSDeliv
 		RemoteURI:       remoteURI,
 		RemoteTargetURI: firstNonEmpty(req.RemoteTargetURI, remoteURI),
 		CallID:          fmt.Sprintf("sms-report-%d-%d@vowifi-go", time.Now().UnixNano(), imsDeliveryReportCallCounter.Add(1)),
-		LocalTag:        "sms-report",
+		LocalTag:        randomSIPTag("sms-report"),
 		CSeq:            1,
 		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
 	}
@@ -86,10 +109,17 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 	if t.Transport == nil {
 		return SMSSendResult{State: "failed", ErrorText: ErrSMSTransportUnavailable.Error()}, ErrSMSTransportUnavailable
 	}
-	remoteURI := t.remoteURI(req.Peer)
-	if remoteURI == "" {
+	peerURI := t.remoteURI(req.Peer)
+	if peerURI == "" {
 		err := errors.New("sms peer is empty")
 		return SMSSendResult{State: "failed", ErrorText: err.Error()}, err
+	}
+	remoteURI := peerURI
+	configuredContentType := firstNonEmpty(t.ContentType, IMS3GPPSMSContentType)
+	if !strings.HasPrefix(strings.ToLower(configuredContentType), "text/plain") {
+		if smscURI := t.remoteURI(t.SMSC); smscURI != "" {
+			remoteURI = smscURI
+		}
 	}
 	localURI := firstNonEmpty(t.LocalURI, t.Registration.PublicIdentity, t.Profile.IMPU)
 	if localURI == "" {
@@ -101,9 +131,10 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 	if cseq <= 0 {
 		cseq = 1
 	}
-	contentType, body, err := t.messagePayload(req, byte(cseq), localURI, remoteURI, callID)
+	rpMR := nextIMSSMSMessageRef()
+	contentType, body, err := t.messagePayload(req, rpMR, localURI, peerURI, callID)
 	if err != nil {
-		return SMSSendResult{CallID: callID, RPMR: cseq, State: "failed", ErrorText: err.Error()}, err
+		return SMSSendResult{CallID: callID, RPMR: int(rpMR), State: "failed", ErrorText: err.Error()}, err
 	}
 	cfg := voiceclient.DialogRequestConfig{
 		Profile:         t.Profile,
@@ -113,7 +144,7 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		RemoteURI:       remoteURI,
 		RemoteTargetURI: firstNonEmpty(t.RemoteTargetURI, remoteURI),
 		CallID:          callID,
-		LocalTag:        "sms",
+		LocalTag:        randomSIPTag("sms"),
 		CSeq:            cseq,
 		UserAgent:       firstNonEmpty(t.UserAgent, t.Profile.UserAgent, "vowifi-go"),
 	}
@@ -127,7 +158,7 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		resp, err = voiceclient.RoundTripRequestWithDigestAuth(ctx, t.Transport, msg)
 		if err != nil {
 			handling := imsMessagingResponseHandlingFor(resp)
-			result := SMSSendResult{CallID: callID, RPMR: cseq, SIPCode: resp.StatusCode, RetryAfter: handling.RetryAfter}
+			result := SMSSendResult{CallID: callID, RPMR: int(rpMR), SIPCode: resp.StatusCode, RetryAfter: handling.RetryAfter}
 			result.State = "failed"
 			result.ErrorText = err.Error()
 			result.RegistrationRecoveryNeeded = true
@@ -143,7 +174,7 @@ func (t IMSSMSTransport) SendSMSPart(ctx context.Context, req SMSSendRequest) (S
 		break
 	}
 	handling := imsMessagingResponseHandlingFor(resp)
-	result := SMSSendResult{CallID: callID, RPMR: cseq, SIPCode: handling.StatusCode, RetryAfter: handling.RetryAfter}
+	result := SMSSendResult{CallID: callID, RPMR: int(rpMR), SIPCode: handling.StatusCode, RetryAfter: handling.RetryAfter}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		result.State = "failed"
 		result.ErrorText = handling.FailureText
@@ -179,7 +210,14 @@ func (t IMSSMSTransport) messagePayload(req SMSSendRequest, rpMR byte, localURI,
 	if err != nil {
 		return "", nil, err
 	}
-	rpData, err := BuildSMSRPData(rpMR, t.SMSC, tpdu)
+	rpSMSC := strings.TrimSpace(t.SMSC)
+	if rpSMSC != "" {
+		if _, rpAddrErr := encodeRPAddress(rpSMSC); rpAddrErr != nil {
+			// Non-numeric SIP PSI URIs still route via Request-URI; omit BCD RP-DA.
+			rpSMSC = ""
+		}
+	}
+	rpData, err := BuildSMSRPData(rpMR, rpSMSC, tpdu)
 	if err != nil {
 		return "", nil, err
 	}

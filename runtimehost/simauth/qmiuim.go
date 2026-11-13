@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,10 +31,22 @@ type QMIUIMTransport struct {
 	Slot        uint8
 	Timeout     time.Duration
 	ContextHook QMIUIMContextHook
+
+	cmdMu     sync.Mutex
+	sessionMu sync.Mutex
 }
 
 var _ LogicalChannelTransport = (*QMIUIMTransport)(nil)
 var _ LogicalChannelAIDResolver = (*QMIUIMTransport)(nil)
+var _ LogicalChannelSessionLocker = (*QMIUIMTransport)(nil)
+
+func (t *QMIUIMTransport) LockLogicalChannelSession() func() {
+	if t == nil {
+		return func() {}
+	}
+	t.sessionMu.Lock()
+	return t.sessionMu.Unlock
+}
 
 func NewQMIUIMTransport(manager QMIUIMManager, opts ...QMIUIMTransportOption) *QMIUIMTransport {
 	t := &QMIUIMTransport{Manager: manager}
@@ -82,7 +95,9 @@ func (t *QMIUIMTransport) OpenLogicalChannel(aid string) (int, error) {
 		return 0, err
 	}
 	defer cancel()
+	t.cmdMu.Lock()
 	channel, err := t.Manager.OpenLogicalChannelContext(ctx, t.Slot, aidBytes)
+	t.cmdMu.Unlock()
 	if err != nil {
 		return 0, err
 	}
@@ -105,6 +120,8 @@ func (t *QMIUIMTransport) CloseLogicalChannel(channel int) error {
 		return err
 	}
 	defer cancel()
+	t.cmdMu.Lock()
+	defer t.cmdMu.Unlock()
 	return t.Manager.CloseLogicalChannelContext(ctx, t.Slot, channelByte)
 }
 
@@ -125,7 +142,9 @@ func (t *QMIUIMTransport) TransmitAPDU(channel int, hexAPDU string) (string, err
 		return "", err
 	}
 	defer cancel()
+	t.cmdMu.Lock()
 	resp, err := t.Manager.SendAPDUContext(ctx, t.Slot, channelByte, apdu)
+	t.cmdMu.Unlock()
 	if err != nil {
 		return "", err
 	}

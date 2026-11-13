@@ -534,9 +534,32 @@ func parseSMSRPErrorCauseFields(body []byte) (cause byte, diagnostics []byte, ne
 	return body[3] & 0x7f, diagnostics, 3 + causeLen, nil
 }
 
+const smsRPUserDataIEI byte = 0x41
+
 func parseSMSRPUserData(body []byte, offset int, label string) ([]byte, error) {
 	if offset >= len(body) {
 		return nil, nil
+	}
+	if body[offset] == smsRPUserDataIEI {
+		if offset+1 >= len(body) {
+			return nil, fmt.Errorf("%s user data truncated", label)
+		}
+		tlvLen := int(body[offset+1])
+		tlvEnd := offset + 2 + tlvLen
+		if tlvEnd == len(body) {
+			if tlvLen == 0 {
+				return nil, nil
+			}
+			return append([]byte(nil), body[offset+2:tlvEnd]...), nil
+		}
+		// Remain tolerant of bare-LV callers only when byte 0x41 exactly matches
+		// a bare length-65 TPDU without TLV framing.
+		if offset+1+int(smsRPUserDataIEI) != len(body) {
+			if tlvEnd > len(body) {
+				return nil, fmt.Errorf("%s user data truncated", label)
+			}
+			return nil, fmt.Errorf("%s has trailing data", label)
+		}
 	}
 	udLen := int(body[offset])
 	offset++
@@ -564,14 +587,17 @@ func BuildSMSRPAckWithTPDU(rpMR byte, tpdu []byte) ([]byte, error) {
 	if len(tpdu) > 255 {
 		return nil, fmt.Errorf("SMS TPDU too long: %d", len(tpdu))
 	}
-	out := make([]byte, 0, 3+len(tpdu))
-	out = append(out, 0x02, rpMR, byte(len(tpdu)))
+	if len(tpdu) == 0 {
+		return BuildSMSRPAck(rpMR), nil
+	}
+	out := make([]byte, 0, 4+len(tpdu))
+	out = append(out, 0x02, rpMR, smsRPUserDataIEI, byte(len(tpdu)))
 	out = append(out, tpdu...)
 	return out, nil
 }
 
 func BuildSMSRPError(rpMR byte, cause byte) []byte {
-	return []byte{0x04, rpMR, 0x01, cause, 0x00}
+	return []byte{0x04, rpMR, 0x01, cause}
 }
 
 func BuildSMSRPErrorWithDiagnostics(rpMR byte, cause byte, diagnostics []byte, tpdu []byte) ([]byte, error) {
@@ -581,11 +607,17 @@ func BuildSMSRPErrorWithDiagnostics(rpMR byte, cause byte, diagnostics []byte, t
 	if len(tpdu) > 255 {
 		return nil, fmt.Errorf("SMS TPDU too long: %d", len(tpdu))
 	}
-	out := make([]byte, 0, 5+len(diagnostics)+len(tpdu))
+	extra := 0
+	if len(tpdu) > 0 {
+		extra = 2 + len(tpdu)
+	}
+	out := make([]byte, 0, 4+len(diagnostics)+extra)
 	out = append(out, 0x04, rpMR, byte(1+len(diagnostics)), cause)
 	out = append(out, diagnostics...)
-	out = append(out, byte(len(tpdu)))
-	out = append(out, tpdu...)
+	if len(tpdu) > 0 {
+		out = append(out, smsRPUserDataIEI, byte(len(tpdu)))
+		out = append(out, tpdu...)
+	}
 	return out, nil
 }
 

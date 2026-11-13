@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -368,17 +369,28 @@ func prepareUSSDInfo(msg *voiceclient.SIPRequestMessage) {
 }
 
 func buildIMSUSSDMultipartBody(localIP, boundary string, ussdBody []byte) []byte {
-	localIP = firstNonEmpty(localIP, "0.0.0.0")
+	localIP = strings.Trim(strings.TrimSpace(localIP), "[]")
+	addrFamily := "IP4"
+	if ip := net.ParseIP(localIP); ip != nil && ip.To4() == nil {
+		addrFamily = "IP6"
+		localIP = ip.String()
+	} else if localIP == "" {
+		localIP = "0.0.0.0"
+	}
 	var out bytes.Buffer
 	out.WriteString("--")
 	out.WriteString(boundary)
 	out.WriteString("\r\nContent-Type: application/sdp\r\n\r\n")
 	out.WriteString("v=0\r\n")
-	out.WriteString("o=- 0 0 IN IP4 ")
+	out.WriteString("o=- 0 0 IN ")
+	out.WriteString(addrFamily)
+	out.WriteString(" ")
 	out.WriteString(localIP)
 	out.WriteString("\r\n")
 	out.WriteString("s=-\r\n")
-	out.WriteString("c=IN IP4 ")
+	out.WriteString("c=IN ")
+	out.WriteString(addrFamily)
+	out.WriteString(" ")
 	out.WriteString(localIP)
 	out.WriteString("\r\n")
 	out.WriteString("t=0 0\r\n")

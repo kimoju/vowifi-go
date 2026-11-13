@@ -24,13 +24,22 @@ func startRuntimeIMSInbound(cfg IMSInboundConfig, inst *Instance) (*runtimeIMSIn
 		return nil, errors.New("IMS inbound local address is empty")
 	}
 
+	contactURI := strings.TrimSpace(cfg.ContactURI)
+	if inst.inboundVoice != nil && contactURI != "" {
+		inst.inboundVoice.UpdateIMSRegistration(voicehost.IMSRegistrationUpdate{
+			Registration: inst.inboundVoiceRegistrationWithContact(contactURI),
+		})
+		contactURI = ""
+	}
 	server := &voicehost.IMSInboundWireServer{
+		Agent:                       inst.inboundVoice,
+		OutboundDialogHandler:       inst,
 		MessageHandler:              inst,
 		MessageDeliveryReportSender: inst,
 		ResponsePacketHandler:       cfg.ResponsePacketHandler,
 		InfoHandler:                 inst,
 		ByeHandler:                  inst,
-		ContactURI:                  strings.TrimSpace(cfg.ContactURI),
+		ContactURI:                  contactURI,
 		UserAgent:                   strings.TrimSpace(cfg.UserAgent),
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -39,17 +48,17 @@ func startRuntimeIMSInbound(cfg IMSInboundConfig, inst *Instance) (*runtimeIMSIn
 	var serve func() error
 	switch network {
 	case "udp", "udp4", "udp6":
-		pc := cfg.PacketConn
-		if pc == nil {
-			var err error
-			pc, err = net.ListenPacket(network, address)
-			if err != nil {
-				cancel()
-				return nil, err
-			}
+		pc, ln, bindErr := bindIMSInboundUDPAndTCP(network, address, cfg.PacketConn)
+		if bindErr != nil {
+			cancel()
+			return nil, bindErr
 		}
 		inbound.packet = pc
-		serve = func() error { return server.ServePacket(runCtx, pc) }
+		inbound.listener = ln
+		if binder, ok := cfg.ResponsePacketHandler.(interface{ BindExternalResponseAddr(string) }); ok && pc != nil && pc.LocalAddr() != nil {
+			binder.BindExternalResponseAddr(pc.LocalAddr().String())
+		}
+		serve = func() error { return server.ServePacketAndListener(runCtx, pc, ln) }
 	case "tcp", "tcp4", "tcp6":
 		ln, err := net.Listen(network, address)
 		if err != nil {
@@ -101,6 +110,62 @@ func (r *runtimeIMSInbound) close(ctx context.Context) error {
 		}
 	}
 	return err
+}
+
+func bindIMSInboundUDPAndTCP(udpNetwork, address string, existing net.PacketConn) (net.PacketConn, net.Listener, error) {
+	tcpNetwork := matchingIMSInboundTCPNetwork(udpNetwork)
+	if existing != nil {
+		if existing.LocalAddr() == nil {
+			return existing, nil, nil
+		}
+		ln, err := net.Listen(tcpNetwork, existing.LocalAddr().String())
+		if err != nil {
+			if _, isRealUDP := existing.(*net.UDPConn); !isRealUDP {
+				return existing, nil, nil
+			}
+			if strings.Contains(strings.ToLower(err.Error()), "cannot assign requested address") {
+				return existing, nil, nil
+			}
+			return nil, nil, err
+		}
+		return existing, ln, nil
+	}
+
+	_, requestedPort, _ := net.SplitHostPort(address)
+	ephemeral := requestedPort == "0" || requestedPort == ""
+	attempts := 1
+	if ephemeral {
+		attempts = 8
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		pc, err := net.ListenPacket(udpNetwork, address)
+		if err != nil {
+			return nil, nil, err
+		}
+		tcpAddr := address
+		if pc.LocalAddr() != nil {
+			tcpAddr = pc.LocalAddr().String()
+		}
+		ln, tcpErr := net.Listen(tcpNetwork, tcpAddr)
+		if tcpErr == nil {
+			return pc, ln, nil
+		}
+		_ = pc.Close()
+		lastErr = tcpErr
+	}
+	return nil, nil, lastErr
+}
+
+func matchingIMSInboundTCPNetwork(udpNetwork string) string {
+	switch strings.ToLower(strings.TrimSpace(udpNetwork)) {
+	case "udp4":
+		return "tcp4"
+	case "udp6":
+		return "tcp6"
+	default:
+		return "tcp"
+	}
 }
 
 func (i *Instance) markIMSInboundFailed(err error) {

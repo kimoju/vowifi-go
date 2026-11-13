@@ -32,7 +32,7 @@ func TestIMSSMSTransportSendsSIPMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendSMSPart() error = %v", err)
 	}
-	if result.State != "accepted" || result.SIPCode != 202 || result.RPMR != 2 || result.CallID != "msg-1-2@vowifi-go" {
+	if result.State != "accepted" || result.SIPCode != 202 || result.CallID != "msg-1-2@vowifi-go" {
 		t.Fatalf("result=%+v", result)
 	}
 	if len(transport.requests) != 1 {
@@ -49,8 +49,8 @@ func TestIMSSMSTransportSendsSIPMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSMSRPData() error = %v body=%x", err, req.Body)
 	}
-	if rpMR != 2 || len(tpdu) == 0 || tpdu[0] != 0x21 || !strings.HasSuffix(strings.ToUpper(hexString(req.Body)), "E8329BFD06") {
-		t.Fatalf("RP-DATA rpMR=%d tpdu=%x body=%x", rpMR, tpdu, req.Body)
+	if result.RPMR != int(rpMR) || len(tpdu) < 2 || tpdu[0] != 0x21 || tpdu[1] != rpMR || !strings.HasSuffix(strings.ToUpper(hexString(req.Body)), "E8329BFD06") {
+		t.Fatalf("RP-DATA rpMR=%d result.RPMR=%d tpdu=%x body=%x", rpMR, result.RPMR, tpdu, req.Body)
 	}
 	if req.Headers["P-Preferred-Service"] != "urn:urn-7:3gpp-service.ims.icsi.sms" || req.Headers["Accept-Contact"] != "*;+g.3gpp.smsip" {
 		t.Fatalf("SMS service headers=%+v", req.Headers)
@@ -168,8 +168,8 @@ func TestIMSSMSTransportCanWrap3GPPSMSInCPIMWithIMDN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSMSRPData(CPIM body) error = %v body=%x", err, cpim.Body)
 	}
-	if rpMR != 1 || len(tpdu) == 0 || tpdu[0] != 0x21 {
-		t.Fatalf("CPIM RP-DATA rpMR=%d tpdu=%x", rpMR, tpdu)
+	if result.RPMR != int(rpMR) || len(tpdu) < 2 || tpdu[0] != 0x21 || tpdu[1] != rpMR {
+		t.Fatalf("CPIM RP-DATA rpMR=%d result.RPMR=%d tpdu=%x", rpMR, result.RPMR, tpdu)
 	}
 }
 
@@ -248,8 +248,8 @@ func TestIMSSMSTransportFollowsRedirectContact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSMSRPData(redirect) error = %v", err)
 	}
-	if firstMR != 1 || redirectMR != 1 || string(firstTPDU) != string(redirectTPDU) {
-		t.Fatalf("RP-DATA changed firstMR=%d redirectMR=%d first=%x redirect=%x", firstMR, redirectMR, firstTPDU, redirectTPDU)
+	if firstMR != redirectMR || result.RPMR != int(firstMR) || string(firstTPDU) != string(redirectTPDU) {
+		t.Fatalf("RP-DATA changed firstMR=%d redirectMR=%d result.RPMR=%d first=%x redirect=%x", firstMR, redirectMR, result.RPMR, firstTPDU, redirectTPDU)
 	}
 }
 

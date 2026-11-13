@@ -49,11 +49,61 @@ func newDHKeyExchange(group uint16, rawPrivate []byte, random io.Reader) (dhKeyE
 				return secret, nil
 			},
 		}, nil
+	case DHGroup256BitECP:
+		return newECDHKeyExchange(ecdh.P256(), 32, rawPrivate, random)
+	case DHGroup384BitECP:
+		return newECDHKeyExchange(ecdh.P384(), 48, rawPrivate, random)
+	case DHGroup521BitECP:
+		return newECDHKeyExchange(ecdh.P521(), 66, rawPrivate, random)
 	case DHGroup2048BitMODP:
 		return newMODPKeyExchange(group, rawPrivate, random)
 	default:
 		return dhKeyExchange{}, fmt.Errorf("%w: unsupported DH group %d", ErrInvalidInitConfig, group)
 	}
+}
+
+// newECDHKeyExchange implements RFC 5903 §7 NIST ECP groups for IKEv2:
+// KE payload data is uncompressed X||Y (without the 0x04 ANSI X9.62 prefix),
+// and the shared secret is the big-endian X coordinate of the shared point.
+func newECDHKeyExchange(curve ecdh.Curve, coordBytes int, rawPrivate []byte, random io.Reader) (dhKeyExchange, error) {
+	var (
+		priv *ecdh.PrivateKey
+		err  error
+	)
+	if len(rawPrivate) > 0 {
+		priv, err = curve.NewPrivateKey(append([]byte(nil), rawPrivate...))
+	} else {
+		priv, err = curve.GenerateKey(random)
+	}
+	if err != nil {
+		return dhKeyExchange{}, fmt.Errorf("%w: generate ECP private key: %w", ErrInvalidInitConfig, err)
+	}
+	rawPub := priv.PublicKey().Bytes()
+	wantUncompressed := 1 + 2*coordBytes
+	if len(rawPub) != wantUncompressed || rawPub[0] != 0x04 {
+		return dhKeyExchange{}, fmt.Errorf("%w: unexpected ECP public key encoding (len=%d)", ErrInvalidInitConfig, len(rawPub))
+	}
+	public := append([]byte(nil), rawPub[1:]...)
+	return dhKeyExchange{
+		public: public,
+		shared: func(peer []byte) ([]byte, error) {
+			if len(peer) != 2*coordBytes {
+				return nil, fmt.Errorf("%w: invalid ECP peer key length %d (want %d)", ErrInvalidInitResponse, len(peer), 2*coordBytes)
+			}
+			uncompressed := make([]byte, 1+len(peer))
+			uncompressed[0] = 0x04
+			copy(uncompressed[1:], peer)
+			pub, err := curve.NewPublicKey(uncompressed)
+			if err != nil {
+				return nil, fmt.Errorf("%w: responder ECP KE: %w", ErrInvalidInitResponse, err)
+			}
+			secret, err := priv.ECDH(pub)
+			if err != nil {
+				return nil, fmt.Errorf("%w: ECP ECDH: %w", ErrInvalidInitResponse, err)
+			}
+			return secret, nil
+		},
+	}, nil
 }
 
 func newMODPKeyExchange(group uint16, rawPrivate []byte, random io.Reader) (dhKeyExchange, error) {
@@ -121,4 +171,18 @@ func dhGroupFromSA(sa SecurityAssociation) (uint16, error) {
 		}
 	}
 	return 0, fmt.Errorf("%w: IKE proposal missing DH group", ErrInvalidInitConfig)
+}
+
+func saOffersDHGroup(sa SecurityAssociation, group uint16) bool {
+	if group == 0 {
+		return false
+	}
+	for _, proposal := range sa.Proposals {
+		for _, transform := range proposal.Transforms {
+			if transform.Type == TransformDHRGroup && transform.ID == group {
+				return true
+			}
+		}
+	}
+	return false
 }

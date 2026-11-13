@@ -17,6 +17,7 @@ type UDPESPPacketTransport struct {
 	LocalAddr      string
 	Timeout        time.Duration
 	ReadBufferSize int
+	Proxy          *ProxyConfig
 
 	mu     sync.Mutex
 	conn   net.Conn
@@ -152,6 +153,19 @@ func (t *UDPESPPacketTransport) LocalNetworkAddr() net.Addr {
 	return t.conn.LocalAddr()
 }
 
+func (t *UDPESPPacketTransport) proxyRouteIPs() []net.IP {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	conn := t.conn
+	t.mu.Unlock()
+	if provider, ok := conn.(proxyRouteIPProvider); ok {
+		return provider.proxyRouteIPs()
+	}
+	return nil
+}
+
 func (t *UDPESPPacketTransport) getConn(ctx context.Context) (net.Conn, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -160,6 +174,18 @@ func (t *UDPESPPacketTransport) getConn(ctx context.Context) (net.Conn, error) {
 	}
 	if t.conn != nil {
 		return t.conn, nil
+	}
+	if t.Proxy.IsActive() {
+		conn, err := dialSOCKS5UDPConn(ctx, t.Proxy, t.RemoteAddr, t.LocalAddr, t.Timeout)
+		if err != nil {
+			return nil, err
+		}
+		if t.closed {
+			_ = conn.Close()
+			return nil, ErrPacketTunnelClosed
+		}
+		t.conn = conn
+		return conn, nil
 	}
 	remote, err := udpAddrWithDefaultPort(t.RemoteAddr, DefaultNATTUDPPort)
 	if err != nil {

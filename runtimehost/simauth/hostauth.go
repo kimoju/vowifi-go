@@ -193,8 +193,12 @@ func calculateFallbackAKA(provider swusim.AKAProvider, rand16, autn16 []byte, pr
 		return isim.CalculateISIMAKA(rand16, autn16)
 	case AKAAppPreferenceAuto, AKAAppPreferenceISIM:
 		if isim, ok := provider.(swusim.ISIMAKAProvider); ok {
-			if res, err := isim.CalculateISIMAKA(rand16, autn16); err == nil {
+			res, err := isim.CalculateISIMAKA(rand16, autn16)
+			if err == nil {
 				return res, nil
+			}
+			if errors.Is(err, swusim.ErrSyncFailure) || len(res.AUTS) > 0 || errors.Is(err, swusim.ErrAuthFailure) {
+				return akaResultWithSyncFailureAUTS(res, err), err
 			}
 		}
 		return provider.CalculateAKA(rand16, autn16)

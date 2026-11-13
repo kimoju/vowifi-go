@@ -2,12 +2,16 @@ package swu
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/kimoju/vowifi-go/engine/swu/ikev2"
 )
 
 // sharedNATTUDPConn demultiplexes IKE (four-byte non-ESP marker) and ESP on
@@ -17,6 +21,7 @@ type sharedNATTUDPConn struct {
 	remoteAddr string
 	localAddr  string
 	timeout    time.Duration
+	proxy      *ProxyConfig
 
 	mu        sync.Mutex
 	conn      net.Conn
@@ -26,7 +31,8 @@ type sharedNATTUDPConn struct {
 	failedCh  chan struct{}
 	failOnce  sync.Once
 	readErr   error
-	ikeCh     chan []byte
+	ikeRespCh chan []byte
+	ikeReqCh  chan []byte
 	espCh     chan []byte
 	ikeMu     sync.Mutex
 	writeMu   sync.Mutex
@@ -39,15 +45,29 @@ type sharedNATTESPProvider interface {
 	sharedESPTransport() ESPPacketTransport
 }
 
+type ikeRequestReceiver interface {
+	ReadIKERequest(context.Context) ([]byte, error)
+}
+
+type ikeMessageSender interface {
+	SendIKEMessage(context.Context, []byte) error
+}
+
 func newSharedNATTTransport(remoteAddr, localAddr string, timeout time.Duration) *sharedNATTIKETransport {
+	return newSharedNATTTransportWithProxy(remoteAddr, localAddr, timeout, nil)
+}
+
+func newSharedNATTTransportWithProxy(remoteAddr, localAddr string, timeout time.Duration, proxy *ProxyConfig) *sharedNATTIKETransport {
 	core := &sharedNATTUDPConn{
 		remoteAddr: strings.TrimSpace(remoteAddr),
 		localAddr:  strings.TrimSpace(localAddr),
 		timeout:    timeout,
+		proxy:      cloneProxyConfig(proxy),
 		closedCh:   make(chan struct{}),
 		failedCh:   make(chan struct{}),
-		ikeCh:      make(chan []byte, 16),
-		espCh:      make(chan []byte, 256),
+		ikeRespCh:  make(chan []byte, 32),
+		ikeReqCh:   make(chan []byte, 32),
+		espCh:      make(chan []byte, 512),
 	}
 	return &sharedNATTIKETransport{core: core}
 }
@@ -64,6 +84,28 @@ func (t *sharedNATTIKETransport) ExchangeIKE(ctx context.Context, request []byte
 		return nil, ErrInvalidPacketTunnel
 	}
 	return t.core.exchangeIKE(ctx, request)
+}
+
+func (t *sharedNATTIKETransport) SendIKEMessage(ctx context.Context, payload []byte) error {
+	if t == nil || t.core == nil {
+		return ErrInvalidPacketTunnel
+	}
+	wire := append([]byte{0, 0, 0, 0}, payload...)
+	return t.core.write(ctx, wire)
+}
+
+func (t *sharedNATTIKETransport) ReadIKERequest(ctx context.Context) ([]byte, error) {
+	if t == nil || t.core == nil {
+		return nil, ErrInvalidPacketTunnel
+	}
+	return t.core.readIKERequest(ctx)
+}
+
+func (t *sharedNATTIKETransport) proxyRouteIPs() []net.IP {
+	if t == nil || t.core == nil {
+		return nil
+	}
+	return t.core.proxyRouteIPs()
 }
 
 func (t *sharedNATTIKETransport) prepareNetworkEndpoints(ctx context.Context) (net.Addr, net.Addr, error) {
@@ -105,6 +147,21 @@ func (t *sharedNATTESPTransport) ReadESPPacket(ctx context.Context) ([]byte, err
 	return t.core.readESP(ctx)
 }
 
+func (t *sharedNATTESPTransport) SendIKEMessage(ctx context.Context, payload []byte) error {
+	if t == nil || t.core == nil {
+		return ErrInvalidPacketTunnel
+	}
+	wire := append([]byte{0, 0, 0, 0}, payload...)
+	return t.core.write(ctx, wire)
+}
+
+func (t *sharedNATTESPTransport) ReadIKERequest(ctx context.Context) ([]byte, error) {
+	if t == nil || t.core == nil {
+		return nil, ErrInvalidPacketTunnel
+	}
+	return t.core.readIKERequest(ctx)
+}
+
 func (t *sharedNATTESPTransport) Close(context.Context) error {
 	if t == nil || t.core == nil {
 		return nil
@@ -119,6 +176,13 @@ func (t *sharedNATTESPTransport) LocalNetworkAddr() net.Addr {
 	return t.core.localNetworkAddr()
 }
 
+func (t *sharedNATTESPTransport) proxyRouteIPs() []net.IP {
+	if t == nil || t.core == nil {
+		return nil
+	}
+	return t.core.proxyRouteIPs()
+}
+
 func (c *sharedNATTUDPConn) ensureConn(ctx context.Context) (net.Conn, error) {
 	if c == nil {
 		return nil, ErrInvalidPacketTunnel
@@ -130,6 +194,15 @@ func (c *sharedNATTUDPConn) ensureConn(ctx context.Context) (net.Conn, error) {
 	}
 	if c.conn != nil {
 		return c.conn, nil
+	}
+	if c.proxy.IsActive() {
+		conn, err := dialSOCKS5UDPConn(ctx, c.proxy, c.remoteAddr, c.localAddr, c.timeout)
+		if err != nil {
+			return nil, err
+		}
+		c.conn = conn
+		go c.readLoop(conn)
+		return conn, nil
 	}
 	remote, err := udpAddrWithDefaultPort(c.remoteAddr, DefaultNATTUDPPort)
 	if err != nil {
@@ -162,6 +235,7 @@ func (c *sharedNATTUDPConn) exchangeIKE(ctx context.Context, request []byte) ([]
 	}
 	c.ikeMu.Lock()
 	defer c.ikeMu.Unlock()
+	reqMsgID, hasReqHeader := parseWireIKEMessageID(request)
 	wire := append([]byte{0, 0, 0, 0}, request...)
 	if err := c.write(ctx, wire); err != nil {
 		return nil, err
@@ -170,13 +244,39 @@ func (c *sharedNATTUDPConn) exchangeIKE(ctx context.Context, request []byte) ([]
 	if timer != nil {
 		defer timer.Stop()
 	}
+	for {
+		select {
+		case packet := <-c.ikeRespCh:
+			if hasReqHeader {
+				if respMsgID, ok := parseWireIKEMessageID(packet); ok && respMsgID != reqMsgID {
+					continue
+				}
+			}
+			return packet, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timerCh:
+			return nil, &sharedNATTTimeoutError{op: "read"}
+		case <-c.failedCh:
+			return nil, c.failure()
+		case <-c.closedCh:
+			return nil, ErrPacketTunnelClosed
+		}
+	}
+}
+
+func (c *sharedNATTUDPConn) readIKERequest(ctx context.Context) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := c.ensureConn(ctx); err != nil {
+		return nil, err
+	}
 	select {
-	case packet := <-c.ikeCh:
+	case packet := <-c.ikeReqCh:
 		return packet, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-timerCh:
-		return nil, &sharedNATTTimeoutError{op: "read"}
 	case <-c.failedCh:
 		return nil, c.failure()
 	case <-c.closedCh:
@@ -225,9 +325,18 @@ func (c *sharedNATTUDPConn) readLoop(conn net.Conn) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				c.fail(err)
+			if errors.Is(err, net.ErrClosed) {
+				return
 			}
+			select {
+			case <-c.closedCh:
+				return
+			default:
+			}
+			if isTransientUDPReadError(err) {
+				continue
+			}
+			c.fail(err)
 			return
 		}
 		packet := append([]byte(nil), buf[:n]...)
@@ -236,19 +345,87 @@ func (c *sharedNATTUDPConn) readLoop(conn net.Conn) {
 			continue
 		case isNonESPMarker(packet):
 			packet = packet[4:]
-			select {
-			case c.ikeCh <- packet:
-			case <-c.closedCh:
-				return
+			if isInboundIKERequestPacket(packet) {
+				enqueueNonBlockingPacket(c.ikeReqCh, packet, c.closedCh)
+			} else {
+				enqueueNonBlockingPacket(c.ikeRespCh, packet, c.closedCh)
 			}
 		case len(packet) >= 8:
+			enqueueNonBlockingPacket(c.espCh, packet, c.closedCh)
+		}
+	}
+}
+
+func enqueueNonBlockingPacket(ch chan []byte, packet []byte, closedCh <-chan struct{}) {
+	for {
+		select {
+		case <-closedCh:
+			return
+		case ch <- packet:
+			return
+		default:
 			select {
-			case c.espCh <- packet:
-			case <-c.closedCh:
-				return
+			case <-ch:
+			default:
 			}
 		}
 	}
+}
+
+func isInboundIKERequestPacket(packet []byte) bool {
+	if len(packet) < ikev2.HeaderLength {
+		return false
+	}
+	if packet[17] != 0x20 {
+		return false
+	}
+	msgLen := int(binary.BigEndian.Uint32(packet[24:28]))
+	if msgLen < ikev2.HeaderLength || msgLen != len(packet) {
+		return false
+	}
+	return packet[19]&ikev2.FlagResponse == 0
+}
+
+func parseWireIKEMessageID(packet []byte) (uint32, bool) {
+	if len(packet) < ikev2.HeaderLength || packet[17] != 0x20 {
+		return 0, false
+	}
+	msgLen := int(binary.BigEndian.Uint32(packet[24:28]))
+	if msgLen < ikev2.HeaderLength || msgLen != len(packet) {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(packet[20:24]), true
+}
+
+func isTransientUDPReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EMSGSIZE) ||
+		errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EWOULDBLOCK) ||
+		errors.Is(err, syscall.EINTR) ||
+		errors.Is(err, syscall.ENOBUFS)
+}
+
+func (c *sharedNATTUDPConn) proxyRouteIPs() []net.IP {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if provider, ok := conn.(proxyRouteIPProvider); ok {
+		return provider.proxyRouteIPs()
+	}
+	return nil
 }
 
 func (c *sharedNATTUDPConn) close() error {

@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	NextHeaderIPv4 = 4
-	NextHeaderIPv6 = 41
+	NextHeaderIPv4   = 4
+	NextHeaderIPv6   = 41
+	NextHeaderNoNext = 59
 )
 
 const (
