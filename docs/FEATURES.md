@@ -406,6 +406,26 @@ protocol layers needed by VoHive:
   for request/status lines, compact headers, `CSeq`, and `Content-Length`
   assertions, including SIP URI user identity validation in fixture redaction
   checks
+- hardened SWu `IKE_AUTH` responder X.509 certificate chain, RSA/ECDSA, and RFC
+  7427 signature verification alongside `EAP_ONLY_AUTHENTICATION` negotiation,
+  pre-USIM `AT_KDF_INPUT == "WLAN"` and `AT_CHECKCODE` validation before
+  forwarding AKA challenges to the card, salted monotonic AEAD AES-GCM IV
+  generation, 64-bit Extended Sequence Number (ESN) anti-replay windows, RFC
+  7383 `SKF` encrypted IKEv2 fragmentation/reassembly, bidirectional IKE SA and
+  Child SA rekeying, 3GPP `16384`/`16386` P-CSCF and 17-byte IPv6 configuration
+  payload attributes, non-blocking Linux TUN dataplane with MTU/TCP MSS clamping
+  and ICMP Packet Too Big generation, and SOCKS5 `UDP ASSOCIATE` keepalive
+  monitoring
+- RFC 3680 `Event: reg` IMS registration state `SUBSCRIBE`/`NOTIFY` lifecycle,
+  live `sec-agree` listener port rebinding with full XFRM SA/SP teardown,
+  automatic `>1300B` / `513 Message Too Large` SIP UDP-to-TCP transport
+  fallback, shared `DigestAuthSession` `nc`/`cnonce`/`nextnonce` tracking, 3GPP
+  `precondition` (`183 Session Progress` / `PRACK` / `UPDATE`) negotiation,
+  `RTP/AVP` ↔ `RTP/SAVP` SRTP media bridging, deferred `CANCEL` and `491` glare
+  handling, compound `RTCP` report emission, async uplink `RP-ERROR` correlation,
+  interactive `<UnstructuredSS-Request>` IMS USSD sessions, RFC 3842
+  `message-summary` MWI notifications, and Apple Plist / OMA XML TS.43
+  entitlement parsing without leaking AKA session keys
 
 ## Known Gaps
 
